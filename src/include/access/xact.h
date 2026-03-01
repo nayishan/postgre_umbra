@@ -181,6 +181,8 @@ typedef void (*SubXactCallback) (SubXactEvent event, SubTransactionId mySubid,
 #define XACT_XINFO_HAS_ORIGIN			(1U << 5)
 #define XACT_XINFO_HAS_AE_LOCKS			(1U << 6)
 #define XACT_XINFO_HAS_GID				(1U << 7)
+#define	XACT_XINFO_HAS_DATABASE			(1U << 8)
+#define XACT_XINFO_HAS_REL_METAS		(1U << 9)
 
 /*
  * Also stored in xinfo, these indicating a variety of additional actions that
@@ -258,6 +260,13 @@ typedef struct xl_xact_relfilenodes
 } xl_xact_relfilenodes;
 #define MinSizeOfXactRelfilenodes offsetof(xl_xact_relfilenodes, xnodes)
 
+typedef struct xl_xact_rel_metas
+{
+	int			nmetas;			/* number of subtransaction XIDs */
+	ShdRelMeta	metas[FLEXIBLE_ARRAY_MEMBER];
+} xl_xact_rel_metas;
+#define MinSizeOfXactRelMetas offsetof(xl_xact_rel_metas, metas)
+
 typedef struct xl_xact_invals
 {
 	int			nmsgs;			/* number of shared inval msgs */
@@ -319,6 +328,8 @@ typedef struct xl_xact_parsed_commit
 	Oid			dbId;			/* MyDatabaseId */
 	Oid			tsId;			/* MyDatabaseTableSpace */
 
+	int			dbmeta;
+
 	int			nsubxacts;
 	TransactionId *subxacts;
 
@@ -332,6 +343,11 @@ typedef struct xl_xact_parsed_commit
 	char		twophase_gid[GIDSIZE];	/* only for 2PC */
 	int			nabortrels;		/* only for 2PC */
 	RelFileNode *abortnodes;	/* only for 2PC */
+	
+	int			ncommitmetas;
+	ShdRelMeta	*commitmetas;
+	int			nabortmetas;
+	ShdRelMeta	*abortmetas;
 
 	XLogRecPtr	origin_lsn;
 	TimestampTz origin_timestamp;
@@ -347,11 +363,16 @@ typedef struct xl_xact_parsed_abort
 	Oid			dbId;			/* MyDatabaseId */
 	Oid			tsId;			/* MyDatabaseTableSpace */
 
+	int			dbmeta;
+
 	int			nsubxacts;
 	TransactionId *subxacts;
 
 	int			nrels;
 	RelFileNode *xnodes;
+
+	int			nmetas;
+	ShdRelMeta	*metas;
 
 	TransactionId twophase_xid; /* only for 2PC */
 	char		twophase_gid[GIDSIZE];	/* only for 2PC */
@@ -429,6 +450,8 @@ extern int	xactGetCommittedChildren(TransactionId **ptr);
 extern XLogRecPtr XactLogCommitRecord(TimestampTz commit_time,
 									  int nsubxacts, TransactionId *subxacts,
 									  int nrels, RelFileNode *rels,
+									  int nmetas, ShdRelMeta *metas,
+									  bool hasdbmeta,	int dbmeta,
 									  int nmsgs, SharedInvalidationMessage *msgs,
 									  bool relcacheInval, bool forceSync,
 									  int xactflags,
@@ -438,6 +461,8 @@ extern XLogRecPtr XactLogCommitRecord(TimestampTz commit_time,
 extern XLogRecPtr XactLogAbortRecord(TimestampTz abort_time,
 									 int nsubxacts, TransactionId *subxacts,
 									 int nrels, RelFileNode *rels,
+									 int nmetas, ShdRelMeta *metas,
+									 bool hasdbmeta,	int dbmeta,
 									 int xactflags, TransactionId twophase_xid,
 									 const char *twophase_gid);
 extern void xact_redo(XLogReaderState *record);

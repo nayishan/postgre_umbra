@@ -178,6 +178,8 @@ ShmemAllocNoError(Size size)
 	Size		newStart;
 	Size		newFree;
 	void	   *newSpace;
+	static  Size total;
+	total = total + size;
 
 	/*
 	 * Ensure all space is adequately aligned.  We used to only MAXALIGN this

@@ -452,6 +452,19 @@ InitializeLWLocks(void)
 	for (id = 0; id < NUM_PREDICATELOCK_PARTITIONS; id++, lock++)
 		LWLockInitialize(&lock->lock, LWTRANCHE_PREDICATE_LOCK_MANAGER);
 
+	/* Init shdblk locks*/
+	lock = MainLWLockArray + NUM_INDIVIDUAL_LWLOCKS +
+		NUM_BUFFER_PARTITIONS + NUM_LOCK_PARTITIONS + NUM_PREDICATELOCK_PARTITIONS;
+	for (id = 0; id < NUM_SHD_REL_LOCKS; id++, lock++)
+		LWLockInitialize(&lock->lock, LWTRANCHE_SHDBLK_MAPPING);
+
+	/* Init Shdreg locks*/
+	lock = MainLWLockArray + NUM_INDIVIDUAL_LWLOCKS +
+		NUM_BUFFER_PARTITIONS + NUM_LOCK_PARTITIONS + NUM_PREDICATELOCK_PARTITIONS +
+		NUM_SHD_REL_LOCKS;
+	for (id = 0; id < MAX_SHD_DBS; id++, lock++)
+		LWLockInitialize(&lock->lock, LWTRANCHE_SHD_RELID_MAPPING);
+
 	/* Initialize named tranches. */
 	if (NamedLWLockTrancheRequests > 0)
 	{
@@ -509,6 +522,10 @@ RegisterLWLockTranches(void)
 	LWLockRegisterTranche(LWTRANCHE_LOCK_MANAGER, "lock_manager");
 	LWLockRegisterTranche(LWTRANCHE_PREDICATE_LOCK_MANAGER,
 						  "predicate_lock_manager");
+	LWLockRegisterTranche(LWTRANCHE_SHDBLK_MAPPING,
+						  "shdblk_manager");
+	LWLockRegisterTranche(LWTRANCHE_SHD_RELID_MAPPING,
+						  "shdrelid_manager");
 	LWLockRegisterTranche(LWTRANCHE_PARALLEL_QUERY_DSA,
 						  "parallel_query_dsa");
 	LWLockRegisterTranche(LWTRANCHE_SESSION_DSA,
@@ -998,7 +1015,9 @@ LWLockQueueSelf(LWLock *lock, LWLockMode mode)
 	 * memory initialization.
 	 */
 	if (MyProc == NULL)
-		elog(PANIC, "cannot wait without a PGPROC structure");
+	{
+		elog(PANIC, "11cannot wait without a PGPROC structure");
+	}
 
 	if (MyProc->lwWaiting != LW_WS_NOT_WAITING)
 		elog(PANIC, "queueing for lock while waiting on another one");

@@ -199,6 +199,7 @@ extern PGDLLIMPORT Oid MyDatabaseId;
 
 extern PGDLLIMPORT Oid MyDatabaseTableSpace;
 
+#define SMGR_WHICH 1
 /*
  * Date/Time Configuration
  *
@@ -233,6 +234,13 @@ extern PGDLLIMPORT Oid MyDatabaseTableSpace;
 #define DATEORDER_DMY			1
 #define DATEORDER_MDY			2
 
+
+// 3 level dbs->reg->blk
+#define NUM_FORK		(3)
+#define MAX_SHD_DBS			(9)
+#define SHD_MAX_REL_PER_DB			(2048)
+#define SHD_REL_GROUP_SIZE	(SHD_MAX_REL_PER_DB * NUM_FORK) //1 reg 3 files main/vm/fsm
+#define MAX_SHD_REL			 (MAX_SHD_DBS * SHD_REL_GROUP_SIZE)
 extern PGDLLIMPORT int DateStyle;
 extern PGDLLIMPORT int DateOrder;
 

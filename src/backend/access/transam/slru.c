@@ -1545,3 +1545,4 @@ SlruScanDirectory(SlruCtl ctl, SlruScanCallback callback, void *data)
 
 	return retval;
 }
+

@@ -1034,7 +1034,6 @@ DropRelationFiles(RelFileNode *delrels, int ndelrels, bool isRedo)
 	pfree(srels);
 }
 
-
 /*
  *	_fdvec_resize() -- Resize the fork's open segments array
  */

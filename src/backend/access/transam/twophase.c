@@ -206,6 +206,8 @@ static void RecordTransactionCommitPrepared(TransactionId xid,
 											TransactionId *children,
 											int nrels,
 											RelFileNode *rels,
+											int	nmetas,
+											ShdRelMeta *metas,
 											int ninvalmsgs,
 											SharedInvalidationMessage *invalmsgs,
 											bool initfileinval,
@@ -215,6 +217,8 @@ static void RecordTransactionAbortPrepared(TransactionId xid,
 										   TransactionId *children,
 										   int nrels,
 										   RelFileNode *rels,
+										   int	nmetas,
+										   ShdRelMeta *metas,
 										   const char *gid);
 static void ProcessRecords(char *bufptr, TransactionId xid,
 						   const TwoPhaseCallback callbacks[]);
@@ -980,6 +984,8 @@ typedef struct TwoPhaseFileHeader
 	int32		nsubxacts;		/* number of following subxact XIDs */
 	int32		ncommitrels;	/* number of delete-on-commit rels */
 	int32		nabortrels;		/* number of delete-on-abort rels */
+	int32		ncommitmetas;
+	int32		nabortmetas;
 	int32		ninvalmsgs;		/* number of cache invalidation messages */
 	bool		initfileinval;	/* does relcache init file need invalidation? */
 	uint16		gidlen;			/* length of the GID - GID follows the header */
@@ -1068,6 +1074,8 @@ StartPrepare(GlobalTransaction gxact)
 	TransactionId *children;
 	RelFileNode *commitrels;
 	RelFileNode *abortrels;
+	ShdRelMeta	*commitmetas;
+	ShdRelMeta	*abortmetas;
 	SharedInvalidationMessage *invalmsgs;
 
 	/* Initialize linked list */
@@ -1093,6 +1101,8 @@ StartPrepare(GlobalTransaction gxact)
 	hdr.nsubxacts = xactGetCommittedChildren(&children);
 	hdr.ncommitrels = smgrGetPendingDeletes(true, &commitrels);
 	hdr.nabortrels = smgrGetPendingDeletes(false, &abortrels);
+	hdr.ncommitmetas = smgrGetPendingDeleteMetas(true, &commitmetas);
+	hdr.nabortmetas = smgrGetPendingDeleteMetas(false, &abortmetas);
 	hdr.ninvalmsgs = xactGetCommittedInvalidationMessages(&invalmsgs,
 														  &hdr.initfileinval);
 	hdr.gidlen = strlen(gxact->gid) + 1;	/* Include '\0' */
@@ -1119,6 +1129,16 @@ StartPrepare(GlobalTransaction gxact)
 	{
 		save_state_data(abortrels, hdr.nabortrels * sizeof(RelFileNode));
 		pfree(abortrels);
+	}
+	if (hdr.ncommitmetas > 0)
+	{
+		save_state_data(commitmetas, hdr.ncommitmetas * sizeof(ShdRelMeta));
+		pfree(commitmetas);
+	}
+	if (hdr.nabortmetas > 0)
+	{
+		save_state_data(abortmetas, hdr.nabortmetas * sizeof(ShdRelMeta));
+		pfree(abortmetas);
 	}
 	if (hdr.ninvalmsgs > 0)
 	{
@@ -1409,6 +1429,8 @@ ParsePrepareRecord(uint8 info, char *xlrec, xl_xact_parsed_prepare *parsed)
 	parsed->nsubxacts = hdr->nsubxacts;
 	parsed->nrels = hdr->ncommitrels;
 	parsed->nabortrels = hdr->nabortrels;
+	parsed->ncommitmetas = hdr->ncommitmetas;
+	parsed->nabortmetas = hdr->nabortmetas;
 	parsed->nmsgs = hdr->ninvalmsgs;
 
 	strncpy(parsed->twophase_gid, bufptr, hdr->gidlen);
@@ -1422,6 +1444,12 @@ ParsePrepareRecord(uint8 info, char *xlrec, xl_xact_parsed_prepare *parsed)
 
 	parsed->abortnodes = (RelFileNode *) bufptr;
 	bufptr += MAXALIGN(hdr->nabortrels * sizeof(RelFileNode));
+
+	parsed->commitmetas = (ShdRelMeta *) bufptr;
+	bufptr += MAXALIGN(hdr->ncommitmetas * sizeof(ShdRelMeta));
+
+	parsed->abortmetas = (ShdRelMeta *) bufptr;
+	bufptr += MAXALIGN(hdr->nabortmetas * sizeof(ShdRelMeta));
 
 	parsed->msgs = (SharedInvalidationMessage *) bufptr;
 	bufptr += MAXALIGN(hdr->ninvalmsgs * sizeof(SharedInvalidationMessage));
@@ -1547,6 +1575,8 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 	RelFileNode *commitrels;
 	RelFileNode *abortrels;
 	RelFileNode *delrels;
+	ShdRelMeta	*commitmetas;
+	ShdRelMeta	*abortmetas;
 	int			ndelrels;
 	SharedInvalidationMessage *invalmsgs;
 
@@ -1583,6 +1613,10 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 	bufptr += MAXALIGN(hdr->ncommitrels * sizeof(RelFileNode));
 	abortrels = (RelFileNode *) bufptr;
 	bufptr += MAXALIGN(hdr->nabortrels * sizeof(RelFileNode));
+	commitmetas = (ShdRelMeta *) bufptr;
+	bufptr += MAXALIGN(hdr->ncommitmetas * sizeof(ShdRelMeta));
+	abortmetas = (ShdRelMeta *) bufptr;
+	bufptr += MAXALIGN(hdr->nabortmetas * sizeof(ShdRelMeta));
 	invalmsgs = (SharedInvalidationMessage *) bufptr;
 	bufptr += MAXALIGN(hdr->ninvalmsgs * sizeof(SharedInvalidationMessage));
 
@@ -1604,12 +1638,14 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 		RecordTransactionCommitPrepared(xid,
 										hdr->nsubxacts, children,
 										hdr->ncommitrels, commitrels,
+										hdr->ncommitmetas, commitmetas,
 										hdr->ninvalmsgs, invalmsgs,
 										hdr->initfileinval, gid);
 	else
 		RecordTransactionAbortPrepared(xid,
 									   hdr->nsubxacts, children,
 									   hdr->nabortrels, abortrels,
+									   hdr->nabortmetas, abortmetas,
 									   gid);
 
 	ProcArrayRemove(proc, latestXid);
@@ -2144,6 +2180,8 @@ RecoverPreparedTransactions(void)
 		bufptr += MAXALIGN(hdr->nsubxacts * sizeof(TransactionId));
 		bufptr += MAXALIGN(hdr->ncommitrels * sizeof(RelFileNode));
 		bufptr += MAXALIGN(hdr->nabortrels * sizeof(RelFileNode));
+		bufptr += MAXALIGN(hdr->ncommitmetas * sizeof(ShdRelMeta));
+		bufptr += MAXALIGN(hdr->nabortmetas * sizeof(ShdRelMeta));
 		bufptr += MAXALIGN(hdr->ninvalmsgs * sizeof(SharedInvalidationMessage));
 
 		/*
@@ -2326,6 +2364,8 @@ RecordTransactionCommitPrepared(TransactionId xid,
 								TransactionId *children,
 								int nrels,
 								RelFileNode *rels,
+								int	nmetas,
+								ShdRelMeta *metas,
 								int ninvalmsgs,
 								SharedInvalidationMessage *invalmsgs,
 								bool initfileinval,
@@ -2355,6 +2395,8 @@ RecordTransactionCommitPrepared(TransactionId xid,
 	 */
 	recptr = XactLogCommitRecord(committs,
 								 nchildren, children, nrels, rels,
+								 nmetas, metas,
+								 false, 0,
 								 ninvalmsgs, invalmsgs,
 								 initfileinval, false,
 								 MyXactFlags | XACT_FLAGS_ACQUIREDACCESSEXCLUSIVELOCK,
@@ -2390,8 +2432,10 @@ RecordTransactionCommitPrepared(TransactionId xid,
 	/* Flush XLOG to disk */
 	XLogFlush(recptr);
 
+	ShdDropRelationMetas(metas, nmetas, false);
 	/* Mark the transaction committed in pg_xact */
 	TransactionIdCommitTree(xid, nchildren, children);
+
 
 	/* Checkpoint can proceed now */
 	MyPgXact->delayChkpt = false;
@@ -2421,6 +2465,8 @@ RecordTransactionAbortPrepared(TransactionId xid,
 							   TransactionId *children,
 							   int nrels,
 							   RelFileNode *rels,
+							   int nmetas,
+							   ShdRelMeta *metas,
 							   const char *gid)
 {
 	XLogRecPtr	recptr;
@@ -2443,12 +2489,15 @@ RecordTransactionAbortPrepared(TransactionId xid,
 	recptr = XactLogAbortRecord(GetCurrentTimestamp(),
 								nchildren, children,
 								nrels, rels,
+								nmetas,	metas,
+								false, 0,
 								MyXactFlags | XACT_FLAGS_ACQUIREDACCESSEXCLUSIVELOCK,
 								xid, gid);
 
 	/* Always flush, since we're about to remove the 2PC state file */
 	XLogFlush(recptr);
 
+	ShdDropRelationMetas(metas, nmetas, false);
 	/*
 	 * Mark the transaction aborted in clog.  This is not absolutely necessary
 	 * but we may as well do it while we are here.

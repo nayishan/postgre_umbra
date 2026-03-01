@@ -64,6 +64,7 @@
 #include "utils/pg_locale.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "catalog/storage.h"
 
 
 typedef struct
@@ -698,6 +699,15 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 		 * Perhaps if we ever implement CREATE DATABASE in a less cheesy way,
 		 * we can avoid this.
 		 */
+
+		/*
+		 * only need registercallback fix smgrcreatedatabase failed.
+		 * but we can not handle crash for now , luckly if db create failed
+		 * it will not be used, it is a reason we do not handle it for now.
+		 * work to do.
+		 */
+		DataBaseCreateMeta(src_dboid, dboid, false);
+
 		RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
 
 		/*
@@ -711,6 +721,7 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 		 * we crash before committing, we'll have a DB that's taking up disk
 		 * space but is not in pg_database, which is not good.
 		 */
+
 		ForceSyncCommit();
 	}
 	PG_END_ENSURE_ERROR_CLEANUP(createdb_failure_callback,
@@ -987,6 +998,12 @@ dropdb(const char *dbname, bool missing_ok)
 	 * with the same OID.
 	 */
 	ForgetDatabaseSyncRequests(db_id);
+	/*
+	 * only register drop dbs , only after transactioncommit, drop it ,
+	 * if after commit wal before change shddbmeta crash , shddbmeta still
+	 * in it, but still this db will not be used.
+	 */
+	DatabaseDropMeta(db_id);
 
 	/*
 	 * Force a checkpoint to make sure the checkpointer has received the

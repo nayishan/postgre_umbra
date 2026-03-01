@@ -61,6 +61,12 @@ typedef struct RelFileNode
 	Oid			relNode;		/* relation */
 } RelFileNode;
 
+typedef struct ShdRelMeta
+{
+	int	sdbId;
+	int	lrelId;
+}ShdRelMeta;
+
 /*
  * Augmenting a relfilenode with the backend ID provides all the information
  * we need to locate the physical storage.  The backend ID is InvalidBackendId

@@ -25,7 +25,9 @@ typedef enum SyncRequestType
 	SYNC_REQUEST,				/* schedule a call of sync function */
 	SYNC_UNLINK_REQUEST,		/* schedule a call of unlink function */
 	SYNC_FORGET_REQUEST,		/* forget all calls for a tag */
-	SYNC_FILTER_REQUEST			/* forget all calls satisfying match fn */
+	SYNC_FILTER_REQUEST,		/* forget all calls satisfying match fn */
+	SYNC_UNLINK_META_REQUEST,
+	SYNC_UNLINK_DB_META_REQUEST
 } SyncRequestType;
 
 /*
@@ -34,7 +36,8 @@ typedef enum SyncRequestType
  */
 typedef enum SyncRequestHandler
 {
-	SYNC_HANDLER_MD = 0			/* md smgr */
+	SYNC_HANDLER_MD = 0,			/* md smgr */
+	SYNC_HANDLER_SHD = 1
 } SyncRequestHandler;
 
 /*
@@ -53,6 +56,8 @@ typedef struct FileTag
 extern void InitSync(void);
 extern void SyncPreCheckpoint(void);
 extern void SyncPostCheckpoint(void);
+extern void SyncDbMetaPostCheckpoint(void);
+extern void SyncMetaPostCheckpoint(void);
 extern void ProcessSyncRequests(void);
 extern void RememberSyncRequest(const FileTag *ftag, SyncRequestType type);
 extern void EnableSyncRequestForwarding(void);

@@ -50,3 +50,10 @@ to relfilenode and block number, to identify which relation fork you want to
 access. Since most code wants to access the main fork, a shortcut version of
 ReadBuffer that accesses MAIN_FORKNUM is provided in the buffer manager for
 convenience.
+
+
+
+shadow need to do list:
+reg extend
+smgr api expand
+boot in shadow mode

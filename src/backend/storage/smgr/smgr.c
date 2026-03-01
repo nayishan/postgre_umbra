@@ -22,10 +22,11 @@
 #include "storage/bufmgr.h"
 #include "storage/ipc.h"
 #include "storage/md.h"
+#include "storage/shadow.h"
 #include "storage/smgr.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
-
+#include "miscadmin.h"
 
 /*
  * This struct of function pointers defines the API between smgr.c and
@@ -61,6 +62,23 @@ typedef struct f_smgr
 	void		(*smgr_truncate) (SMgrRelation reln, ForkNumber forknum,
 								  BlockNumber nblocks);
 	void		(*smgr_immedsync) (SMgrRelation reln, ForkNumber forknum);
+	int			(*smgr_blk_toggle)(RelFileNode node, ForkNumber fork, BlockNumber blk, XLogRecPtr lsn);
+	int			(*smgr_blk_getopp)(RelFileNode node, ForkNumber fork, BlockNumber blk, int *grelId);
+	void 		(*smgr_blk_setopp)(RelFileNode node, ForkNumber fork, BlockNumber blk, int grelId, int status);
+	void 		(*smgr_blk_set)(RelFileNode node, ForkNumber fork, BlockNumber blk, int grelId, int status);
+
+	void		(*smgr_db_getid)(Oid dbOid, int *dbId);
+	void 		(*smgr_db_create)(Oid srcOid, Oid dbOid, bool isRedo, int *dbId);
+	void		(*smgr_db_drop)(int sdbId, bool isRedo);
+	void		(*smgr_rel_create)(SMgrRelation reln,  ShdRelMeta *meta);
+	void		(*smgr_rel_drop)(ShdRelMeta meta, bool isRedo);
+	void		(*smgr_rel_get)(RelFileNode node, ShdRelMeta *meta);
+	void		(*smgr_meta_bootstrap)(void);
+	Size		(*smgr_meta_shmem_size)(void);
+	void		(*smgr_meta_shmem_init)(void);
+	void 		(*smgr_meta_checkpoint)(void);
+	void		(*smgr_meta_startup)(void);
+	void		(*smgr_meta_shutdown)(void);
 } f_smgr;
 
 static const f_smgr smgrsw[] = {
@@ -80,6 +98,55 @@ static const f_smgr smgrsw[] = {
 		.smgr_nblocks = mdnblocks,
 		.smgr_truncate = mdtruncate,
 		.smgr_immedsync = mdimmedsync,
+		.smgr_blk_toggle = NULL,
+		.smgr_blk_getopp = NULL,
+		.smgr_blk_setopp = NULL,
+
+		.smgr_blk_set = NULL,
+		.smgr_db_getid = NULL,
+		.smgr_db_create = NULL,
+		.smgr_db_drop = NULL,
+		.smgr_rel_create = NULL,
+		.smgr_rel_get = NULL,
+		.smgr_rel_drop = NULL,
+		.smgr_meta_bootstrap = NULL,
+		.smgr_meta_shmem_size = NULL,
+		.smgr_meta_shmem_init = NULL,
+		.smgr_meta_checkpoint = NULL,
+		.smgr_meta_startup = NULL,
+		.smgr_meta_shutdown = NULL,
+	},
+	{
+		.smgr_init = shdinit,
+		.smgr_shutdown = NULL,
+		.smgr_close = shdclose,
+		.smgr_create = shdcreate,
+		.smgr_exists = shdexists,
+		.smgr_unlink = shdunlink,
+		.smgr_extend = shdextend,
+		.smgr_prefetch = shdprefetch,
+		.smgr_read = shdread,
+		.smgr_write = shdwrite,
+		.smgr_writeback = shdwriteback,
+		.smgr_nblocks = shdnblocks,
+		.smgr_truncate = shdtruncate,
+		.smgr_immedsync = shdimmedsync,
+		.smgr_blk_toggle = ShdBlkToggle,
+		.smgr_blk_setopp = ShdBlkSetOpp,
+		.smgr_blk_getopp = ShdBlkGetOpp,
+		.smgr_blk_set = ShdBlkSet,
+		.smgr_db_getid = ShdDbGetId,
+		.smgr_db_create = ShdDbCreate,
+		.smgr_db_drop = ShdDbDrop,
+		.smgr_rel_create = ShdRelCreate,
+		.smgr_rel_get = ShdRelGet,
+		.smgr_rel_drop = ShdRelDrop,
+		.smgr_meta_bootstrap = BootStrapShdMeta,
+		.smgr_meta_shmem_size = ShdMetaShmemSize,
+		.smgr_meta_shmem_init = ShdMetaShmemInit,
+		.smgr_meta_checkpoint = CheckPointShdMeta,
+		.smgr_meta_startup = StartupShdMeta,
+		.smgr_meta_shutdown = ShutdownShdMeta,
 	}
 };
 
@@ -177,11 +244,13 @@ smgropen(RelFileNode rnode, BackendId backend)
 		reln->smgr_targblock = InvalidBlockNumber;
 		reln->smgr_fsm_nblocks = InvalidBlockNumber;
 		reln->smgr_vm_nblocks = InvalidBlockNumber;
-		reln->smgr_which = 0;	/* we only have md.c at present */
+		reln->smgr_which = SMGR_WHICH;	/* using shadow storage manager */
 
 		/* mark it not open */
 		for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
+		{
 			reln->md_num_open_segs[forknum] = 0;
+		}
 
 		/* it has no owner yet */
 		dlist_push_tail(&unowned_relns, &reln->node);
@@ -698,6 +767,125 @@ smgrimmedsync(SMgrRelation reln, ForkNumber forknum)
 	smgrsw[reln->smgr_which].smgr_immedsync(reln, forknum);
 }
 
+int
+smgrblktoggle(RelFileNode node, ForkNumber forknum, BlockNumber blk, XLogRecPtr lsn)
+{
+	if (smgrsw[SMGR_WHICH].smgr_blk_toggle != NULL)
+	{
+		return smgrsw[SMGR_WHICH].smgr_blk_toggle(node, forknum, blk, lsn);
+	}
+	return -1;
+}
+int
+smgrblkgetopp(RelFileNode node, ForkNumber forknum, BlockNumber blk, int *grelId)
+{
+	if (smgrsw[SMGR_WHICH].smgr_blk_getopp != NULL)
+	{
+		return smgrsw[SMGR_WHICH].smgr_blk_getopp(node, forknum, blk, grelId);
+	}
+	return -1;
+}
+void smgrblksetopp(RelFileNode node, ForkNumber fork, BlockNumber blk, int grelId, int status)
+{
+	if (smgrsw[SMGR_WHICH].smgr_blk_setopp != NULL)
+	{
+		smgrsw[SMGR_WHICH].smgr_blk_setopp(node, fork, blk, grelId, status);
+	}
+}
+void
+smgrblkset(RelFileNode node, ForkNumber fork, BlockNumber blk, int grelId, int status)
+{
+	if (smgrsw[SMGR_WHICH].smgr_blk_set != NULL)
+	{
+		smgrsw[SMGR_WHICH].smgr_blk_set(node, fork, blk, grelId, status);
+	}
+}
+void smgrdbcreate(Oid srcOid, Oid dbOid, bool isRedo, int *dbId)
+{
+	if (smgrsw[SMGR_WHICH].smgr_db_create != NULL)
+	{
+		smgrsw[SMGR_WHICH].smgr_db_create(srcOid, dbOid, isRedo, dbId);
+	}
+}
+void smgrdbgetid(Oid dbOid ,int *sdbId)
+{
+	if (smgrsw[SMGR_WHICH].smgr_db_getid != NULL)
+	{
+		smgrsw[SMGR_WHICH].smgr_db_getid(dbOid, sdbId);
+	}
+}
+void smgrdbdrop(int sdbId, bool isRedo)
+{
+	if (smgrsw[SMGR_WHICH].smgr_db_drop != NULL)
+	{
+		smgrsw[SMGR_WHICH].smgr_db_drop(sdbId, isRedo);
+	}
+}
+void smgrrelcreate(SMgrRelation reln,  ShdRelMeta *meta)
+{
+	if (smgrsw[SMGR_WHICH].smgr_rel_create != NULL)
+	{
+		smgrsw[SMGR_WHICH].smgr_rel_create(reln, meta);
+	}
+}
+void smgrrelget(RelFileNode node, ShdRelMeta *meta)
+{
+	if (smgrsw[SMGR_WHICH].smgr_rel_get != NULL)
+	{
+		smgrsw[SMGR_WHICH].smgr_rel_get(node, meta);
+	}
+}
+void smgrreldrop(ShdRelMeta meta, bool isRedo)
+{
+	if (smgrsw[SMGR_WHICH].smgr_rel_drop != NULL)
+	{
+		smgrsw[SMGR_WHICH].smgr_rel_drop(meta, isRedo);
+	}
+}
+void smgrmetabootstrap(void)
+{
+	if (smgrsw[SMGR_WHICH].smgr_meta_bootstrap != NULL)
+	{
+		smgrsw[SMGR_WHICH].smgr_meta_bootstrap();
+	}
+}
+Size smgrmetashmemsize(void)
+{
+	if (smgrsw[SMGR_WHICH].smgr_meta_shmem_size != NULL)
+	{
+		return smgrsw[SMGR_WHICH].smgr_meta_shmem_size();
+	}
+	return 0;
+}
+void smgrmetashmeminit(void)
+{
+	if (smgrsw[SMGR_WHICH].smgr_meta_shmem_init != NULL)
+	{
+		smgrsw[SMGR_WHICH].smgr_meta_shmem_init();
+	}
+}
+void smgrmetacheckpoint(void)
+{
+	if (smgrsw[SMGR_WHICH].smgr_meta_checkpoint != NULL)
+	{
+		return smgrsw[SMGR_WHICH].smgr_meta_checkpoint();
+	}
+}
+void smgrstartup(void)
+{
+	if (smgrsw[SMGR_WHICH].smgr_meta_startup != NULL)
+	{
+		return smgrsw[SMGR_WHICH].smgr_meta_startup();
+	}
+}
+void smgrmetashutdown(void)
+{
+	if (smgrsw[SMGR_WHICH].smgr_meta_shutdown != NULL)
+	{
+		return smgrsw[SMGR_WHICH].smgr_meta_shutdown();
+	}
+}
+
 /*
  * AtEOXact_SMgr
  *
@@ -729,3 +917,13 @@ AtEOXact_SMgr(void)
 		smgrclose(rel);
 	}
 }
+
+bool IsShadowStorage(void)
+{
+	if (SMGR_WHICH == 1)
+	{
+		return true;
+	}
+	return false;
+}
+

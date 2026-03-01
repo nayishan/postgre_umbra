@@ -29,6 +29,7 @@
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/md.h"
+#include "storage/shadow.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/inval.h"
@@ -69,8 +70,22 @@ typedef struct
 	CycleCtr	cycle_ctr;		/* checkpoint_cycle_ctr when request was made */
 } PendingUnlinkEntry;
 
+typedef struct
+{
+  FileTag	  tag;
+  CycleCtr    cycle_ctr;
+}PendingUnlinkMetaEntry;
+
+typedef struct
+{
+  FileTag	  tag;
+  CycleCtr    cycle_ctr;
+}PendingUnlinkDbMetaEntry;
+
 static HTAB *pendingOps = NULL;
 static List *pendingUnlinks = NIL;
+static List *pendingUnlinkMetas = NIL;
+static List *pendingUnlinkDbMetas = NIL;
 static MemoryContext pendingOpsCxt; /* context for the above  */
 
 static CycleCtr sync_cycle_ctr = 0;
@@ -89,6 +104,8 @@ typedef struct SyncOps
 	int			(*sync_unlinkfiletag) (const FileTag *ftag, char *path);
 	bool		(*sync_filetagmatches) (const FileTag *ftag,
 										const FileTag *candidate);
+	void		(*sync_unlinkmeta) (const FileTag *ftag);
+	void		(*sync_unlinkdbmeta) (const FileTag *ftag);
 } SyncOps;
 
 static const SyncOps syncsw[] = {
@@ -96,7 +113,16 @@ static const SyncOps syncsw[] = {
 	{
 		.sync_syncfiletag = mdsyncfiletag,
 		.sync_unlinkfiletag = mdunlinkfiletag,
-		.sync_filetagmatches = mdfiletagmatches
+		.sync_filetagmatches = mdfiletagmatches,
+		.sync_unlinkmeta  = NULL,
+		.sync_unlinkdbmeta = NULL
+	},
+	{
+		.sync_syncfiletag = shdsyncfiletag,
+		.sync_unlinkfiletag = shdunlinkfiletag,
+		.sync_filetagmatches = shdfiletagmatches,
+		.sync_unlinkmeta  = shd_unlink_relmeta,
+		.sync_unlinkdbmeta = shd_unlink_dbmeta
 	}
 };
 
@@ -138,6 +164,8 @@ InitSync(void)
 								 &hash_ctl,
 								 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 		pendingUnlinks = NIL;
+		pendingUnlinkMetas = NIL;
+		pendingUnlinkDbMetas = NIL;
 	}
 
 }
@@ -178,6 +206,63 @@ SyncPreCheckpoint(void)
 	checkpoint_cycle_ctr++;
 }
 
+void
+SyncDbMetaPostCheckpoint(void)
+{
+	while (pendingUnlinkDbMetas != NIL)
+	{
+		PendingUnlinkDbMetaEntry *entry = (PendingUnlinkDbMetaEntry *) linitial(pendingUnlinkDbMetas);
+
+		/*
+		 * New entries are appended to the end, so if the entry is new we've
+		 * reached the end of old entries.
+		 *
+		 * Note: if just the right number of consecutive checkpoints fail, we
+		 * could be fooled here by cycle_ctr wraparound.  However, the only
+		 * consequence is that we'd delay unlinking for one more checkpoint,
+		 * which is perfectly tolerable.
+		 */
+		if (entry->cycle_ctr == checkpoint_cycle_ctr)
+			break;
+
+		/* drop the meta */
+		syncsw[entry->tag.handler].sync_unlinkdbmeta(&entry->tag);
+
+		/* And remove the list entry */
+		pendingUnlinkDbMetas = list_delete_first(pendingUnlinkDbMetas);
+		pfree(entry);
+	}
+}
+/*
+ * maybe cause a leak
+ */ 
+void
+SyncMetaPostCheckpoint(void)
+{
+	while (pendingUnlinkMetas != NIL)
+	{
+		PendingUnlinkMetaEntry *entry = (PendingUnlinkMetaEntry *) linitial(pendingUnlinkMetas);
+
+		/*
+		 * New entries are appended to the end, so if the entry is new we've
+		 * reached the end of old entries.
+		 *
+		 * Note: if just the right number of consecutive checkpoints fail, we
+		 * could be fooled here by cycle_ctr wraparound.  However, the only
+		 * consequence is that we'd delay unlinking for one more checkpoint,
+		 * which is perfectly tolerable.
+		 */
+		if (entry->cycle_ctr == checkpoint_cycle_ctr)
+			break;
+
+		/* drop the meta */
+		syncsw[entry->tag.handler].sync_unlinkmeta(&entry->tag);
+
+		/* And remove the list entry */
+		pendingUnlinkMetas = list_delete_first(pendingUnlinkMetas);
+		pfree(entry);
+	}
+}
 /*
  * SyncPostCheckpoint() -- Do post-checkpoint work
  *
@@ -242,7 +327,6 @@ SyncPostCheckpoint(void)
 }
 
 /*
-
  *	ProcessSyncRequests() -- Process queued fsync requests.
  */
 void
@@ -508,6 +592,32 @@ RememberSyncRequest(const FileTag *ftag, SyncRequestType type)
 		entry->cycle_ctr = checkpoint_cycle_ctr;
 
 		pendingUnlinks = lappend(pendingUnlinks, entry);
+
+		MemoryContextSwitchTo(oldcxt);
+	}
+	else if (type == SYNC_UNLINK_META_REQUEST)
+	{
+		MemoryContext oldcxt = MemoryContextSwitchTo(pendingOpsCxt);
+		PendingUnlinkMetaEntry *entry;
+
+		entry = palloc(sizeof(PendingUnlinkMetaEntry));
+		entry->tag = *ftag;
+		entry->cycle_ctr = checkpoint_cycle_ctr;
+
+		pendingUnlinkMetas = lappend(pendingUnlinkMetas, entry);
+
+		MemoryContextSwitchTo(oldcxt);
+	}
+	else if (type == SYNC_UNLINK_DB_META_REQUEST)
+	{
+		MemoryContext oldcxt = MemoryContextSwitchTo(pendingOpsCxt);
+		PendingUnlinkDbMetaEntry *entry;
+
+		entry = palloc(sizeof(PendingUnlinkDbMetaEntry));
+		entry->tag = *ftag;
+		entry->cycle_ctr = checkpoint_cycle_ctr;
+
+		pendingUnlinkDbMetas = lappend(pendingUnlinkDbMetas, entry);
 
 		MemoryContextSwitchTo(oldcxt);
 	}

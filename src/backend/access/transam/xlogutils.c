@@ -57,6 +57,31 @@ typedef struct xl_invalid_page
 static HTAB *invalid_page_tab = NULL;
 
 
+static XLogRedoAction
+XLogMdReadBufferForRedoExtended(XLogReaderState *record,
+							  uint8 block_id,
+							  ReadBufferMode mode, bool get_cleanup_lock,
+							  Buffer *buf);
+static XLogRedoAction
+XLogShdReadBufferForRedoExtended(XLogReaderState *record,
+							  uint8 block_id,
+							  ReadBufferMode mode, bool get_cleanup_lock,
+							  Buffer *buf);
+typedef struct reader_mgr
+{
+	XLogRedoAction	(*xlog_readbuffer_forredo_extended)(XLogReaderState *record,
+							  					uint8 block_id,
+							  					ReadBufferMode mode, bool get_cleanup_lock,
+							  					Buffer *buf);
+} reader_mgr;
+static const reader_mgr reader_mgr_f[] = {
+	{
+		.xlog_readbuffer_forredo_extended = XLogMdReadBufferForRedoExtended,
+	},
+	{
+		.xlog_readbuffer_forredo_extended = XLogShdReadBufferForRedoExtended,
+	}
+};
 /* Report a reference to an invalid page */
 static void
 report_invalid_page(int elevel, RelFileNode node, ForkNumber forkno,
@@ -322,8 +347,8 @@ XLogInitBufferForRedo(XLogReaderState *record, uint8 block_id)
  * If 'get_cleanup_lock' is true, a "cleanup lock" is acquired on the buffer
  * using LockBufferForCleanup(), instead of a regular exclusive lock.
  */
-XLogRedoAction
-XLogReadBufferForRedoExtended(XLogReaderState *record,
+static XLogRedoAction
+XLogMdReadBufferForRedoExtended(XLogReaderState *record,
 							  uint8 block_id,
 							  ReadBufferMode mode, bool get_cleanup_lock,
 							  Buffer *buf)
@@ -406,6 +431,125 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 			return BLK_NOTFOUND;
 	}
 }
+static XLogRedoAction
+XLogShdReadBufferForRedoExtended(XLogReaderState *record,
+							  uint8 block_id,
+							  ReadBufferMode mode, bool get_cleanup_lock,
+							  Buffer *buf)
+{
+	XLogRecPtr	lsn = record->EndRecPtr;
+	RelFileNode rnode;
+	ForkNumber	forknum;
+	BlockNumber blkno;
+	Page		page;
+	bool		zeromode;
+	bool		willinit;
+
+	if (!XLogRecGetBlockTag(record, block_id, &rnode, &forknum, &blkno))
+	{
+		/* Caller specified a bogus block_id */
+		elog(PANIC, "failed to locate backup block with ID %d", block_id);
+	}
+
+	/*
+	 * Make sure that if the block is marked with WILL_INIT, the caller is
+	 * going to initialize it. And vice versa.
+	 */
+	zeromode = (mode == RBM_ZERO_AND_LOCK || mode == RBM_ZERO_AND_CLEANUP_LOCK);
+	willinit = (record->blocks[block_id].flags & BKPBLOCK_WILL_INIT) != 0;
+	if (willinit && !zeromode)
+		elog(PANIC, "block with WILL_INIT flag in WAL record must be zeroed by redo routine");
+	if (!willinit && zeromode)
+		elog(PANIC, "block to be initialized in redo routine must be marked with WILL_INIT flag in the WAL record");
+
+	/* If it has a full-page image and it should be restored, do it. */
+	if (XLogRecBlockImageApply(record, block_id))
+	{
+		Assert(XLogRecHasBlockImage(record, block_id));
+		Assert(!XLogRecBlockHasShadow(record, block_id));
+		*buf = XLogReadBufferExtended(rnode, forknum, blkno,
+									  get_cleanup_lock ? RBM_ZERO_AND_CLEANUP_LOCK : RBM_ZERO_AND_LOCK);
+		page = BufferGetPage(*buf);
+		if (!RestoreBlockImage(record, block_id, page))
+			elog(ERROR, "failed to restore block image");
+
+		/*
+		 * The page may be uninitialized. If so, we can't set the LSN because
+		 * that would corrupt the page.
+		 */
+		if (!PageIsNew(page))
+		{
+			PageSetLSN(page, lsn);
+		}
+
+		MarkBufferDirty(*buf);
+
+		/*
+		 * At the end of crash recovery the init forks of unlogged relations
+		 * are copied, without going through shared buffers. So we need to
+		 * force the on-disk state of init forks to always be in sync with the
+		 * state in shared buffers.
+		 */
+		if (forknum == INIT_FORKNUM)
+			FlushOneBuffer(*buf);
+
+		return BLK_RESTORED;
+	}
+	else if (XLogRecBlockHasShadow(record, block_id))
+	{
+		int grelId = record->blocks[block_id].grelId;
+		int status = record->blocks[block_id].status;
+		smgrblksetopp(rnode, forknum, blkno, grelId, status);
+		*buf = XLogReadBufferExtended(rnode, forknum, blkno, mode);
+		if (BufferIsValid(*buf))
+		{
+			LockBuffer(*buf, BUFFER_LOCK_EXCLUSIVE);
+
+			FlushOneBuffer(*buf);
+		}
+		smgrblkset(rnode, forknum, blkno, grelId, status);
+		/*
+		 * Primary and standby checkpoints aren't synced; 
+		 * the primary may finish several checkpoints before the standby completes one. 
+		 * Ensuring shadow file identity is the first priority. 
+		 * Therefore, we may encounter FlushBuffer situations where lsn <= PageGetLSN(BufferGetPage(*buf))."
+		 */
+		if (lsn <= PageGetLSN(BufferGetPage(*buf)))
+			return BLK_DONE;
+		else
+			return BLK_NEEDS_REDO;
+	}
+	else
+	{
+		*buf = XLogReadBufferExtended(rnode, forknum, blkno, mode);
+		if (BufferIsValid(*buf))
+		{
+			if (mode != RBM_ZERO_AND_LOCK && mode != RBM_ZERO_AND_CLEANUP_LOCK)
+			{
+				if (get_cleanup_lock)
+					LockBufferForCleanup(*buf);
+				else
+					LockBuffer(*buf, BUFFER_LOCK_EXCLUSIVE);
+			}
+			if (lsn <= PageGetLSN(BufferGetPage(*buf)))
+				return BLK_DONE;
+			else
+				return BLK_NEEDS_REDO;
+		}
+		else
+			return BLK_NOTFOUND;
+	}
+}
+XLogRedoAction
+XLogReadBufferForRedoExtended(XLogReaderState *record,
+							  uint8 block_id,
+							  ReadBufferMode mode, bool get_cleanup_lock,
+							  Buffer *buf)
+{
+	return reader_mgr_f[SMGR_WHICH].xlog_readbuffer_forredo_extended(
+									record, block_id, mode, get_cleanup_lock, buf);
+}
+
 
 /*
  * XLogReadBufferExtended

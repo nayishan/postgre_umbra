@@ -222,7 +222,11 @@ static const char *const subdirs[] = {
 	"pg_xact",
 	"pg_logical",
 	"pg_logical/snapshots",
-	"pg_logical/mappings"
+	"pg_logical/mappings",
+	"pg_shadow",
+	"pg_shadow/db",
+	"pg_shadow/rel",
+	"pg_shadow/block"
 };
 
 
@@ -2906,6 +2910,34 @@ warn_on_mount_point(int error)
 			  "Create a subdirectory under the mount point.\n"));
 }
 
+static void init_shadow_subdir(void)
+{
+	int i;
+	for (i = 0; i < MAX_SHD_DBS; i++)
+	{
+		char * path = psprintf("%s/%s/%s_%d", pg_data, "pg_shadow/rel", "shd_rel", i);
+
+		if (mkdir(path, pg_dir_create_mode) < 0)
+		{
+			pg_log_error("could not create directory \"%s\": %m", path);
+			exit(1);
+		}
+
+		free(path);
+	}
+	for (i = 0; i < MAX_SHD_REL; i++)
+	{
+		char * path = psprintf("%s/%s/%s_%d", pg_data, "pg_shadow/block", "shd_blk", i);
+
+		if (mkdir(path, pg_dir_create_mode) < 0)
+		{
+			pg_log_error("could not create directory \"%s\": %m", path);
+			exit(1);
+		}
+
+		free(path);
+	}
+}
 
 void
 initialize_data_directory(void)
@@ -2949,6 +2981,7 @@ initialize_data_directory(void)
 
 		free(path);
 	}
+	init_shadow_subdir();
 
 	check_ok();
 

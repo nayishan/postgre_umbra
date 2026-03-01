@@ -1212,6 +1212,10 @@ RecordTransactionCommit(void)
 	TransactionId latestXid = InvalidTransactionId;
 	int			nrels;
 	RelFileNode *rels;
+	int			nmetas;
+	ShdRelMeta	*metas;
+	bool		hasdbmeta;
+	int			dbmeta;
 	int			nchildren;
 	TransactionId *children;
 	int			nmsgs = 0;
@@ -1221,6 +1225,8 @@ RecordTransactionCommit(void)
 
 	/* Get data needed for commit record */
 	nrels = smgrGetPendingDeletes(true, &rels);
+	nmetas = smgrGetPendingDeleteMetas(true, &metas);
+	hasdbmeta = smgrGetPendingDeleteDb(true, &dbmeta);
 	nchildren = xactGetCommittedChildren(&children);
 	if (XLogStandbyInfoActive())
 		nmsgs = xactGetCommittedInvalidationMessages(&invalMessages,
@@ -1314,6 +1320,8 @@ RecordTransactionCommit(void)
 
 		XactLogCommitRecord(xactStopTimestamp,
 							nchildren, children, nrels, rels,
+							nmetas,	metas,
+							hasdbmeta, dbmeta,
 							nmsgs, invalMessages,
 							RelcacheInitFileInval, forceSyncCommit,
 							MyXactFlags,
@@ -1409,6 +1417,8 @@ RecordTransactionCommit(void)
 	 */
 	if (markXidCommitted)
 	{
+		smgrDoPendingDeleteMetas(true);
+		smgrDoPendingDeleteDb(true);
 		MyPgXact->delayChkpt = false;
 		END_CRIT_SECTION();
 	}
@@ -1435,6 +1445,8 @@ RecordTransactionCommit(void)
 	XactLastRecEnd = 0;
 cleanup:
 	/* Clean up local data */
+	if (metas)
+		pfree(metas);
 	if (rels)
 		pfree(rels);
 
@@ -1617,6 +1629,10 @@ RecordTransactionAbort(bool isSubXact)
 	TransactionId latestXid;
 	int			nrels;
 	RelFileNode *rels;
+	int			nmetas;
+	ShdRelMeta	*metas;
+	int			dbmeta;
+	bool		hasdbmeta;
 	int			nchildren;
 	TransactionId *children;
 	TimestampTz xact_time;
@@ -1652,6 +1668,8 @@ RecordTransactionAbort(bool isSubXact)
 
 	/* Fetch the data we need for the abort record */
 	nrels = smgrGetPendingDeletes(false, &rels);
+	nmetas = smgrGetPendingDeleteMetas(false, &metas);
+	hasdbmeta = smgrGetPendingDeleteDb(false, &dbmeta);
 	nchildren = xactGetCommittedChildren(&children);
 
 	/* XXX do we really need a critical section here? */
@@ -1669,6 +1687,8 @@ RecordTransactionAbort(bool isSubXact)
 	XactLogAbortRecord(xact_time,
 					   nchildren, children,
 					   nrels, rels,
+					   nmetas, metas,
+					   hasdbmeta, dbmeta,
 					   MyXactFlags, InvalidTransactionId,
 					   NULL);
 
@@ -1694,6 +1714,9 @@ RecordTransactionAbort(bool isSubXact)
 	 */
 	TransactionIdAbortTree(xid, nchildren, children);
 
+	smgrDoPendingDeleteMetas(false);
+	smgrDoPendingDeleteDb(false);
+
 	END_CRIT_SECTION();
 
 	/* Compute latestXid while we have the child XIDs handy */
@@ -1713,6 +1736,8 @@ RecordTransactionAbort(bool isSubXact)
 		XactLastRecEnd = 0;
 
 	/* And clean up local data */
+	if (metas)
+		pfree(metas);
 	if (rels)
 		pfree(rels);
 
@@ -5507,6 +5532,8 @@ XLogRecPtr
 XactLogCommitRecord(TimestampTz commit_time,
 					int nsubxacts, TransactionId *subxacts,
 					int nrels, RelFileNode *rels,
+					int nmetas,	ShdRelMeta *metas,
+					bool hasmeta, int dbmeta,
 					int nmsgs, SharedInvalidationMessage *msgs,
 					bool relcacheInval, bool forceSync,
 					int xactflags, TransactionId twophase_xid,
@@ -5517,6 +5544,7 @@ XactLogCommitRecord(TimestampTz commit_time,
 	xl_xact_dbinfo xl_dbinfo;
 	xl_xact_subxacts xl_subxacts;
 	xl_xact_relfilenodes xl_relfilenodes;
+	xl_xact_rel_metas	xl_rel_metas;
 	xl_xact_invals xl_invals;
 	xl_xact_twophase xl_twophase;
 	xl_xact_origin xl_origin;
@@ -5561,6 +5589,9 @@ XactLogCommitRecord(TimestampTz commit_time,
 		xl_dbinfo.tsId = MyDatabaseTableSpace;
 	}
 
+	if (hasmeta)
+		xl_xinfo.xinfo |= XACT_XINFO_HAS_DATABASE;
+
 	if (nsubxacts > 0)
 	{
 		xl_xinfo.xinfo |= XACT_XINFO_HAS_SUBXACTS;
@@ -5571,6 +5602,12 @@ XactLogCommitRecord(TimestampTz commit_time,
 	{
 		xl_xinfo.xinfo |= XACT_XINFO_HAS_RELFILENODES;
 		xl_relfilenodes.nrels = nrels;
+	}
+	
+	if (nmetas > 0)
+	{
+		xl_xinfo.xinfo |= XACT_XINFO_HAS_REL_METAS;
+		xl_rel_metas.nmetas = nmetas;
 	}
 
 	if (nmsgs > 0)
@@ -5613,6 +5650,9 @@ XactLogCommitRecord(TimestampTz commit_time,
 	if (xl_xinfo.xinfo & XACT_XINFO_HAS_DBINFO)
 		XLogRegisterData((char *) (&xl_dbinfo), sizeof(xl_dbinfo));
 
+	if (xl_xinfo.xinfo & XACT_XINFO_HAS_DATABASE)
+		XLogRegisterData((char *) (&dbmeta), sizeof(int));
+
 	if (xl_xinfo.xinfo & XACT_XINFO_HAS_SUBXACTS)
 	{
 		XLogRegisterData((char *) (&xl_subxacts),
@@ -5627,6 +5667,14 @@ XactLogCommitRecord(TimestampTz commit_time,
 						 MinSizeOfXactRelfilenodes);
 		XLogRegisterData((char *) rels,
 						 nrels * sizeof(RelFileNode));
+	}
+
+	if (xl_xinfo.xinfo & XACT_XINFO_HAS_REL_METAS)
+	{
+		XLogRegisterData((char *) (&xl_rel_metas),
+						 MinSizeOfXactRelMetas);
+		XLogRegisterData((char *) metas,
+						 nmetas * sizeof(ShdRelMeta));
 	}
 
 	if (xl_xinfo.xinfo & XACT_XINFO_HAS_INVALS)
@@ -5662,6 +5710,8 @@ XLogRecPtr
 XactLogAbortRecord(TimestampTz abort_time,
 				   int nsubxacts, TransactionId *subxacts,
 				   int nrels, RelFileNode *rels,
+				   int nmetas, ShdRelMeta *metas,
+				   bool hasdbmeta, int dbmeta,
 				   int xactflags, TransactionId twophase_xid,
 				   const char *twophase_gid)
 {
@@ -5669,6 +5719,7 @@ XactLogAbortRecord(TimestampTz abort_time,
 	xl_xact_xinfo xl_xinfo;
 	xl_xact_subxacts xl_subxacts;
 	xl_xact_relfilenodes xl_relfilenodes;
+	xl_xact_rel_metas	xl_rel_metas;
 	xl_xact_twophase xl_twophase;
 	xl_xact_dbinfo xl_dbinfo;
 	xl_xact_origin xl_origin;
@@ -5705,6 +5756,12 @@ XactLogAbortRecord(TimestampTz abort_time,
 		xl_relfilenodes.nrels = nrels;
 	}
 
+	if (nmetas > 0)
+	{
+		xl_xinfo.xinfo |= XACT_XINFO_HAS_REL_METAS;
+		xl_rel_metas.nmetas = nmetas;
+	}
+
 	if (TransactionIdIsValid(twophase_xid))
 	{
 		xl_xinfo.xinfo |= XACT_XINFO_HAS_TWOPHASE;
@@ -5721,6 +5778,9 @@ XactLogAbortRecord(TimestampTz abort_time,
 		xl_dbinfo.dbId = MyDatabaseId;
 		xl_dbinfo.tsId = MyDatabaseTableSpace;
 	}
+
+	if (hasdbmeta)
+		xl_xinfo.xinfo |= XACT_XINFO_HAS_DATABASE;
 
 	/* dump transaction origin information only for abort prepared */
 	if ((replorigin_session_origin != InvalidRepOriginId) &&
@@ -5748,6 +5808,9 @@ XactLogAbortRecord(TimestampTz abort_time,
 	if (xl_xinfo.xinfo & XACT_XINFO_HAS_DBINFO)
 		XLogRegisterData((char *) (&xl_dbinfo), sizeof(xl_dbinfo));
 
+	if (xl_xinfo.xinfo & XACT_XINFO_HAS_DATABASE)
+		XLogRegisterData((char *) (&dbmeta), sizeof(int));
+
 	if (xl_xinfo.xinfo & XACT_XINFO_HAS_SUBXACTS)
 	{
 		XLogRegisterData((char *) (&xl_subxacts),
@@ -5762,6 +5825,14 @@ XactLogAbortRecord(TimestampTz abort_time,
 						 MinSizeOfXactRelfilenodes);
 		XLogRegisterData((char *) rels,
 						 nrels * sizeof(RelFileNode));
+	}
+
+	if (xl_xinfo.xinfo & XACT_XINFO_HAS_REL_METAS)
+	{
+		XLogRegisterData((char *) (&xl_rel_metas),
+						 MinSizeOfXactRelMetas);
+		XLogRegisterData((char *) metas,
+						 nmetas * sizeof(ShdRelMeta));
 	}
 
 	if (xl_xinfo.xinfo & XACT_XINFO_HAS_TWOPHASE)
@@ -5869,6 +5940,10 @@ xact_redo_commit(xl_xact_parsed_commit *parsed,
 			StandbyReleaseLockTree(xid, parsed->nsubxacts, parsed->subxacts);
 	}
 
+	if (parsed->xinfo & XACT_XINFO_HAS_DATABASE)
+		smgrdbdrop(parsed->dbmeta, true);
+
+
 	if (parsed->xinfo & XACT_XINFO_HAS_ORIGIN)
 	{
 		/* recover apply progress */
@@ -5876,6 +5951,10 @@ xact_redo_commit(xl_xact_parsed_commit *parsed,
 						   false /* backward */ , false /* WAL */ );
 	}
 
+	if (parsed->ncommitmetas > 0)
+	{
+		ShdDropRelationMetas(parsed->commitmetas, parsed->ncommitmetas, true);
+	}
 	/* Make sure files supposed to be dropped are dropped */
 	if (parsed->nrels > 0)
 	{
@@ -5985,6 +6064,13 @@ xact_redo_abort(xl_xact_parsed_abort *parsed, TransactionId xid,
 			StandbyReleaseLockTree(xid, parsed->nsubxacts, parsed->subxacts);
 	}
 
+	if (parsed->xinfo & XACT_XINFO_HAS_DATABASE)
+		smgrdbdrop(parsed->dbmeta, true);
+
+	if (parsed->nmetas > 0)
+	{
+		ShdDropRelationMetas(parsed->metas, parsed->nmetas, true);
+	}
 	/* Make sure files supposed to be dropped are dropped */
 	if (parsed->nrels > 0)
 	{

@@ -46,6 +46,7 @@
 #include "storage/spin.h"
 #include "utils/snapmgr.h"
 
+
 /* GUCs */
 int			shared_memory_type = DEFAULT_SHARED_MEMORY_TYPE;
 
@@ -150,6 +151,7 @@ CreateSharedMemoryAndSemaphores(int port)
 #ifdef EXEC_BACKEND
 		size = add_size(size, ShmemBackendArraySize());
 #endif
+		size = add_size(size, smgrmetashmemsize());
 
 		/* freeze the addin request size and include it */
 		addin_request_allowed = false;
@@ -212,6 +214,7 @@ CreateSharedMemoryAndSemaphores(int port)
 	 * Set up xlog, clog, and buffers
 	 */
 	XLOGShmemInit();
+	smgrmetashmeminit();
 	CLOGShmemInit();
 	CommitTsShmemInit();
 	SUBTRANSShmemInit();

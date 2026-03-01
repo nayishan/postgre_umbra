@@ -182,6 +182,7 @@ typedef struct BufferDesc
 
 	/* state of the tag, containing flags, refcount and usagecount */
 	pg_atomic_uint32 state;
+	bool		drop_after_use;
 
 	int			wait_backend_pid;	/* backend PID of pin-count waiter */
 	int			freeNext;		/* link in freelist chain */

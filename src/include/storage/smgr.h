@@ -17,6 +17,7 @@
 #include "lib/ilist.h"
 #include "storage/block.h"
 #include "storage/relfilenode.h"
+#include "access/xlogdefs.h"
 
 /*
  * smgr.c maintains a table of SMgrRelation objects, which are essentially
@@ -105,6 +106,29 @@ extern BlockNumber smgrnblocks(SMgrRelation reln, ForkNumber forknum);
 extern void smgrtruncate(SMgrRelation reln, ForkNumber forknum,
 						 BlockNumber nblocks);
 extern void smgrimmedsync(SMgrRelation reln, ForkNumber forknum);
+extern void smgrdbdrop(int dbsId, bool isRedo);
+extern void smgrdbgetid(Oid dbOid ,int *dbsId);
+extern void smgrdbcreate(Oid srcOid, Oid dbOid, bool isRedo, int *dbId);
+extern void smgrrelcreate(SMgrRelation reln,  ShdRelMeta *meta);
+extern void smgrrelget(RelFileNode node, ShdRelMeta *meta);
+extern void smgrreldrop(ShdRelMeta meta, bool isRedo);
+extern void smgrmetabootstrap(void);
+extern void smgrmetacheckpoint(void);
+extern void smgrstartup(void);
+extern void smgrmetashutdown(void);
+extern Size smgrmetashmemsize(void);
+extern void smgrmetashmeminit(void);
 extern void AtEOXact_SMgr(void);
+extern bool IsShadowStorage(void);
+
+extern int
+smgrblktoggle(RelFileNode node, ForkNumber forknum, BlockNumber blk, XLogRecPtr lsn);
+extern int
+smgrblkgetopp(RelFileNode node, ForkNumber forknum, BlockNumber blk, int *grelId);
+extern void
+smgrblkset(RelFileNode node, ForkNumber fork, BlockNumber blk, int grelId, int status);
+extern
+void smgrblksetopp(RelFileNode node, ForkNumber fork, BlockNumber blk, int grelId, int status);
+
 
 #endif							/* SMGR_H */

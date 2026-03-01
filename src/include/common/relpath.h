@@ -41,8 +41,11 @@ typedef enum ForkNumber
 {
 	InvalidForkNumber = -1,
 	MAIN_FORKNUM = 0,
+	SHADOW_FORKNUM, /*use in shadow.c inner*/
 	FSM_FORKNUM,
+	FSM_SHADOW_FORKNUM,
 	VISIBILITYMAP_FORKNUM,
+	VISIBILITYMAP_SHADOW_FORKNUM,
 	INIT_FORKNUM
 
 	/*
@@ -54,7 +57,7 @@ typedef enum ForkNumber
 
 #define MAX_FORKNUM		INIT_FORKNUM
 
-#define FORKNAMECHARS	4		/* max chars for a fork name */
+#define FORKNAMECHARS	7		/* max chars for a fork name */
 
 extern const char *const forkNames[];
 

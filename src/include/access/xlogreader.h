@@ -53,6 +53,9 @@ typedef struct
 	/* Information on full-page image, if any */
 	bool		has_image;		/* has image, even for consistency checking */
 	bool		apply_image;	/* has image that should be restored */
+	bool		has_shadow;
+	int			grelId;
+	int			status;
 	char	   *bkp_image;
 	uint16		hole_offset;
 	uint16		hole_length;
@@ -249,6 +252,8 @@ extern bool DecodeXLogRecord(XLogReaderState *state, XLogRecord *record,
 	((decoder)->blocks[block_id].has_image)
 #define XLogRecBlockImageApply(decoder, block_id) \
 	((decoder)->blocks[block_id].apply_image)
+#define XLogRecBlockHasShadow(decoder, block_id) \
+	((decoder)->blocks[block_id].has_shadow)
 
 extern bool RestoreBlockImage(XLogReaderState *recoder, uint8 block_id, char *dst);
 extern char *XLogRecGetBlockData(XLogReaderState *record, uint8 block_id, Size *len);

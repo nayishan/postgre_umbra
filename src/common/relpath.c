@@ -32,8 +32,11 @@
  */
 const char *const forkNames[] = {
 	"main",						/* MAIN_FORKNUM */
+	"shd",						/* SHADOW_FORKNUM*/
 	"fsm",						/* FSM_FORKNUM */
+	"fsm_shd",
 	"vm",						/* VISIBILITYMAP_FORKNUM */
+	"vm_shd",
 	"init"						/* INIT_FORKNUM */
 };
 

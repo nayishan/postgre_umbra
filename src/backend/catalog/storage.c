@@ -64,6 +64,17 @@ typedef struct PendingRelDelete
 } PendingRelDelete;
 
 static PendingRelDelete *pendingDeletes = NULL; /* head of linked list */
+static int pendingDeleteDbs[2] = {MAX_SHD_DBS, MAX_SHD_DBS};
+
+typedef struct PendingRelDeleteMeta
+{
+	RelFileNode relnode;		/* relation that may need to be deleted */
+	ShdRelMeta	relmeta;		/* relation meta that may need to be deleted */
+	bool		atCommit;		/* T=delete at commit; F=delete at abort */
+	int			nestLevel;		/* xact nesting level of request */
+	struct PendingRelDeleteMeta *next;	/* linked-list link */
+} PendingRelDeleteMeta;
+static PendingRelDeleteMeta *pendingDeleteMetas = NULL; /* head of linked list */
 
 /*
  * RelationCreateStorage
@@ -83,20 +94,24 @@ RelationCreateStorage(RelFileNode rnode, char relpersistence)
 	SMgrRelation srel;
 	BackendId	backend;
 	bool		needs_wal;
+	bool		needs_shd;
 
 	switch (relpersistence)
 	{
 		case RELPERSISTENCE_TEMP:
 			backend = BackendIdForTempRelations();
 			needs_wal = false;
+			needs_shd = false;
 			break;
 		case RELPERSISTENCE_UNLOGGED:
 			backend = InvalidBackendId;
 			needs_wal = false;
+			needs_shd = true;
 			break;
 		case RELPERSISTENCE_PERMANENT:
 			backend = InvalidBackendId;
 			needs_wal = true;
+			needs_shd = true;
 			break;
 		default:
 			elog(ERROR, "invalid relpersistence: %c", relpersistence);
@@ -118,7 +133,17 @@ RelationCreateStorage(RelFileNode rnode, char relpersistence)
 	pending->nestLevel = GetCurrentTransactionNestLevel();
 	pending->next = pendingDeletes;
 	pendingDeletes = pending;
-
+	if (needs_shd && IsShadowStorage())
+	{
+		PendingRelDeleteMeta *pendingMeta = (PendingRelDeleteMeta *)
+				MemoryContextAlloc(TopMemoryContext, sizeof(PendingRelDeleteMeta));
+		smgrrelcreate(srel, &(pendingMeta->relmeta));
+		pendingMeta->relnode = rnode;
+		pendingMeta->atCommit = false;	/* delete if abort */
+		pendingMeta->nestLevel = GetCurrentTransactionNestLevel();
+		pendingMeta->next = pendingDeleteMetas;
+		pendingDeleteMetas = pendingMeta;
+	}
 	return srel;
 }
 
@@ -149,6 +174,7 @@ void
 RelationDropStorage(Relation rel)
 {
 	PendingRelDelete *pending;
+	bool needs_shd;
 
 	/* Add the relation to the list of stuff to delete at commit */
 	pending = (PendingRelDelete *)
@@ -169,7 +195,31 @@ RelationDropStorage(Relation rel)
 	 * the existing list entry and delete the physical file immediately, but
 	 * for now I'll keep the logic simple.
 	 */
-
+	switch (rel->rd_rel->relpersistence)
+	{
+		case RELPERSISTENCE_TEMP:
+			needs_shd = false;
+			break;
+		case RELPERSISTENCE_UNLOGGED:
+			needs_shd = true;
+			break;
+		case RELPERSISTENCE_PERMANENT:
+			needs_shd = true;
+			break;
+		default:
+			elog(ERROR, "invalid relpersistence: %c", rel->rd_rel->relpersistence);
+	}
+	if (needs_shd && IsShadowStorage())
+	{
+		PendingRelDeleteMeta *pendingMeta = (PendingRelDeleteMeta *)
+				MemoryContextAlloc(TopMemoryContext, sizeof(PendingRelDeleteMeta));
+		smgrrelget(rel->rd_node, &(pendingMeta->relmeta));
+		pendingMeta->relnode = rel->rd_node;
+		pendingMeta->atCommit = true;	/* delete if commit */
+		pendingMeta->nestLevel = pending->nestLevel;
+		pendingMeta->next = pendingDeleteMetas;
+		pendingDeleteMetas = pendingMeta;
+	}
 	RelationCloseSmgr(rel);
 }
 
@@ -196,6 +246,9 @@ RelationPreserveStorage(RelFileNode rnode, bool atCommit)
 	PendingRelDelete *pending;
 	PendingRelDelete *prev;
 	PendingRelDelete *next;
+	PendingRelDeleteMeta *pendingMeta;
+	PendingRelDeleteMeta *prevMeta;
+	PendingRelDeleteMeta *nextMeta;
 
 	prev = NULL;
 	for (pending = pendingDeletes; pending != NULL; pending = next)
@@ -216,6 +269,31 @@ RelationPreserveStorage(RelFileNode rnode, bool atCommit)
 		{
 			/* unrelated entry, don't touch it */
 			prev = pending;
+		}
+	}
+
+	if (!IsShadowStorage())
+		return;
+
+	prevMeta = NULL;
+	for (pendingMeta = pendingDeleteMetas; pendingMeta != NULL; pendingMeta = nextMeta)
+	{
+		nextMeta = pendingMeta->next;
+		if (RelFileNodeEquals(rnode, pendingMeta->relnode)
+			&& pendingMeta->atCommit == atCommit)
+		{
+			/* unlink and delete list entry */
+			if (prevMeta)
+				prevMeta->next = nextMeta;
+			else
+				pendingDeleteMetas = nextMeta;
+			pfree(pendingMeta);
+			/* prev does not change */
+		}
+		else
+		{
+			/* unrelated entry, don't touch it */
+			prevMeta = pendingMeta;
 		}
 	}
 }
@@ -502,6 +580,44 @@ smgrDoPendingDeletes(bool isCommit)
 	}
 }
 
+void
+smgrDoPendingDeleteMetas(bool isCommit)
+{
+	int			nestLevel = GetCurrentTransactionNestLevel();
+	PendingRelDeleteMeta *pendingMeta;
+	PendingRelDeleteMeta *prevMeta;
+	PendingRelDeleteMeta *nextMeta;
+	if (!IsShadowStorage())
+		return;
+
+	prevMeta = NULL;
+	for (pendingMeta = pendingDeleteMetas; pendingMeta != NULL; pendingMeta = nextMeta)
+	{
+		nextMeta = pendingMeta->next;
+		if (pendingMeta->nestLevel < nestLevel)
+		{
+			/* outer-level entries should not be processed yet */
+			prevMeta = pendingMeta;
+		}
+		else
+		{
+			/* unlink list entry first, so we don't retry on failure */
+			if (prevMeta)
+				prevMeta->next = nextMeta;
+			else
+				pendingDeleteMetas = nextMeta;
+			/* do deletion if called for */
+			if (pendingMeta->atCommit == isCommit)
+			{
+				smgrreldrop(pendingMeta->relmeta, false);
+			}
+			/* must explicitly free the list entry */
+			pfree(pendingMeta);
+			/* prev does not change */
+		}
+	}
+}
+
 /*
  * smgrGetPendingDeletes() -- Get a list of non-temp relations to be deleted.
  *
@@ -553,6 +669,42 @@ smgrGetPendingDeletes(bool forCommit, RelFileNode **ptr)
 	return nrels;
 }
 
+int
+smgrGetPendingDeleteMetas(bool forCommit, ShdRelMeta **ptr)
+{
+	int			nestLevel = GetCurrentTransactionNestLevel();
+	int			nrels;
+	ShdRelMeta *rptr;
+	PendingRelDeleteMeta *pendingMeta;
+	if (!IsShadowStorage())
+	{
+		*ptr = NULL;
+		return 0;
+	}
+
+	nrels = 0;
+	for (pendingMeta = pendingDeleteMetas; pendingMeta != NULL; pendingMeta = pendingMeta->next)
+	{
+		if (pendingMeta->nestLevel >= nestLevel && pendingMeta->atCommit == forCommit)
+			nrels++;
+	}
+	if (nrels == 0)
+	{
+		*ptr = NULL;
+		return 0;
+	}
+	rptr = (ShdRelMeta *) palloc(nrels * sizeof(ShdRelMeta));
+	*ptr = rptr;
+	for (pendingMeta = pendingDeleteMetas; pendingMeta != NULL; pendingMeta = pendingMeta->next)
+	{
+		if (pendingMeta->nestLevel >= nestLevel && pendingMeta->atCommit == forCommit)
+		{
+			*rptr = pendingMeta->relmeta;
+			rptr++;
+		}
+	}
+	return nrels;
+}
 /*
  *	PostPrepare_smgr -- Clean up after a successful PREPARE
  *
@@ -565,6 +717,8 @@ PostPrepare_smgr(void)
 {
 	PendingRelDelete *pending;
 	PendingRelDelete *next;
+	PendingRelDeleteMeta *pendingMeta;
+	PendingRelDeleteMeta *nextMeta;
 
 	for (pending = pendingDeletes; pending != NULL; pending = next)
 	{
@@ -573,8 +727,17 @@ PostPrepare_smgr(void)
 		/* must explicitly free the list entry */
 		pfree(pending);
 	}
-}
+	if (!IsShadowStorage())
+		return;
 
+	for (pendingMeta = pendingDeleteMetas; pendingMeta != NULL; pendingMeta = nextMeta)
+	{
+		nextMeta = pendingMeta->next;
+		pendingDeleteMetas = nextMeta;
+		/* must explicitly free the list entry */
+		pfree(pendingMeta);
+	}
+}
 
 /*
  * AtSubCommit_smgr() --- Take care of subtransaction commit.
@@ -586,11 +749,20 @@ AtSubCommit_smgr(void)
 {
 	int			nestLevel = GetCurrentTransactionNestLevel();
 	PendingRelDelete *pending;
+	PendingRelDeleteMeta *pendingMeta;
 
 	for (pending = pendingDeletes; pending != NULL; pending = pending->next)
 	{
 		if (pending->nestLevel >= nestLevel)
 			pending->nestLevel = nestLevel - 1;
+	}
+	if (!IsShadowStorage())
+		return;
+
+	for (pendingMeta = pendingDeleteMetas; pendingMeta != NULL; pendingMeta = pendingMeta->next)
+	{
+		if (pendingMeta->nestLevel >= nestLevel)
+			pendingMeta->nestLevel = nestLevel - 1;
 	}
 }
 
@@ -604,6 +776,7 @@ AtSubCommit_smgr(void)
 void
 AtSubAbort_smgr(void)
 {
+	smgrDoPendingDeleteMetas(false);
 	smgrDoPendingDeletes(false);
 }
 
@@ -680,3 +853,60 @@ smgr_redo(XLogReaderState *record)
 	else
 		elog(PANIC, "smgr_redo: unknown op code %u", info);
 }
+
+void DatabaseDropMeta(Oid dboid)
+{
+	int		dbId;
+	smgrdbgetid(dboid, &dbId);
+	pendingDeleteDbs[0] = dbId;
+}
+
+void DataBaseCreateMeta(Oid src_dboid, Oid dbOid, bool isRedo)
+{
+	int	dbId;
+	smgrdbcreate(src_dboid, dbOid, false, &dbId);
+	pendingDeleteDbs[1] = dbId;
+}
+
+bool smgrGetPendingDeleteDb(bool isCommit, int *dbs)
+{
+	if (isCommit)
+	{
+		if (pendingDeleteDbs[0] != MAX_SHD_DBS)
+		{
+			*dbs = pendingDeleteDbs[0];
+			return true;
+		}
+	}
+	else
+	{
+		if (pendingDeleteDbs[1] != MAX_SHD_DBS)
+		{
+			*dbs = pendingDeleteDbs[1];
+			return true;
+		}
+	}
+	return false;
+}
+
+void smgrDoPendingDeleteDb(bool isCommit)
+{
+	if (isCommit)
+	{
+		if (pendingDeleteDbs[0] != MAX_SHD_DBS)
+		{
+			smgrdbdrop(pendingDeleteDbs[0] , false);
+		}
+	}
+	else
+	{
+		if (pendingDeleteDbs[1] != MAX_SHD_DBS)
+		{
+			smgrdbdrop(pendingDeleteDbs[1] , false);
+		}
+	}
+
+	pendingDeleteDbs[0] = MAX_SHD_DBS;
+	pendingDeleteDbs[1] = MAX_SHD_DBS;
+}
+

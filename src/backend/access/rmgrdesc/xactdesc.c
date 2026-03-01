@@ -61,6 +61,15 @@ ParseCommitRecord(uint8 info, xl_xact_commit *xlrec, xl_xact_parsed_commit *pars
 		data += sizeof(xl_xact_dbinfo);
 	}
 
+	if (parsed->xinfo & XACT_XINFO_HAS_DATABASE)
+	{
+		int dbmeta = *(int *) data;
+
+		parsed->dbmeta = dbmeta;
+
+		data += sizeof(int);
+	}
+
 	if (parsed->xinfo & XACT_XINFO_HAS_SUBXACTS)
 	{
 		xl_xact_subxacts *xl_subxacts = (xl_xact_subxacts *) data;
@@ -81,6 +90,17 @@ ParseCommitRecord(uint8 info, xl_xact_commit *xlrec, xl_xact_parsed_commit *pars
 
 		data += MinSizeOfXactRelfilenodes;
 		data += xl_relfilenodes->nrels * sizeof(RelFileNode);
+	}
+
+	if (parsed->xinfo & XACT_XINFO_HAS_REL_METAS)
+	{
+		xl_xact_rel_metas *xl_rel_metas = (xl_xact_rel_metas *) data;
+
+		parsed->ncommitmetas = xl_rel_metas->nmetas;
+		parsed->commitmetas = xl_rel_metas->metas;
+		
+		data += MinSizeOfXactRelMetas;
+		data += xl_rel_metas->nmetas * sizeof(ShdRelMeta);
 	}
 
 	if (parsed->xinfo & XACT_XINFO_HAS_INVALS)
@@ -156,6 +176,15 @@ ParseAbortRecord(uint8 info, xl_xact_abort *xlrec, xl_xact_parsed_abort *parsed)
 		data += sizeof(xl_xact_dbinfo);
 	}
 
+	if (parsed->xinfo & XACT_XINFO_HAS_DATABASE)
+	{
+		int dbmeta = *(int *) data;
+
+		parsed->dbmeta = dbmeta;
+
+		data += sizeof(int);
+	}
+
 	if (parsed->xinfo & XACT_XINFO_HAS_SUBXACTS)
 	{
 		xl_xact_subxacts *xl_subxacts = (xl_xact_subxacts *) data;
@@ -176,6 +205,17 @@ ParseAbortRecord(uint8 info, xl_xact_abort *xlrec, xl_xact_parsed_abort *parsed)
 
 		data += MinSizeOfXactRelfilenodes;
 		data += xl_relfilenodes->nrels * sizeof(RelFileNode);
+	}
+
+	if (parsed->xinfo & XACT_XINFO_HAS_REL_METAS)
+	{
+		xl_xact_rel_metas *xl_rel_metas = (xl_xact_rel_metas *) data;
+
+		parsed->nmetas = xl_rel_metas->nmetas;
+		parsed->metas = xl_rel_metas->metas;
+		
+		data += MinSizeOfXactRelMetas;
+		data += xl_rel_metas->nmetas * sizeof(ShdRelMeta);
 	}
 
 	if (parsed->xinfo & XACT_XINFO_HAS_TWOPHASE)
@@ -223,6 +263,9 @@ xact_desc_commit(StringInfo buf, uint8 info, xl_xact_commit *xlrec, RepOriginId 
 
 	appendStringInfoString(buf, timestamptz_to_str(xlrec->xact_time));
 
+	if (parsed.xinfo & XACT_XINFO_HAS_DATABASE)
+	  appendStringInfo(buf, "; dbId:%d", parsed.dbmeta);
+
 	if (parsed.nrels > 0)
 	{
 		appendStringInfoString(buf, "; rels:");
@@ -234,6 +277,16 @@ xact_desc_commit(StringInfo buf, uint8 info, xl_xact_commit *xlrec, RepOriginId 
 			pfree(path);
 		}
 	}
+
+	if (parsed.ncommitmetas > 0)
+	{
+		appendStringInfoString(buf, "; metas:");
+		for (i = 0; i < parsed.nrels; i++)
+		{
+			appendStringInfo(buf, " %d:%d", parsed.commitmetas[i].sdbId, parsed.commitmetas[i].lrelId);
+		}
+	}
+
 	if (parsed.nsubxacts > 0)
 	{
 		appendStringInfoString(buf, "; subxacts:");
@@ -273,6 +326,10 @@ xact_desc_abort(StringInfo buf, uint8 info, xl_xact_abort *xlrec)
 		appendStringInfo(buf, "%u: ", parsed.twophase_xid);
 
 	appendStringInfoString(buf, timestamptz_to_str(xlrec->xact_time));
+
+	if (parsed.xinfo & XACT_XINFO_HAS_DATABASE)
+	  appendStringInfo(buf, "; dbId:%d", parsed.dbmeta);
+
 	if (parsed.nrels > 0)
 	{
 		appendStringInfoString(buf, "; rels:");
@@ -282,6 +339,15 @@ xact_desc_abort(StringInfo buf, uint8 info, xl_xact_abort *xlrec)
 
 			appendStringInfo(buf, " %s", path);
 			pfree(path);
+		}
+	}
+
+	if (parsed.nmetas > 0)
+	{
+		appendStringInfoString(buf, "; metas:");
+		for (i = 0; i < parsed.nmetas; i++)
+		{
+			appendStringInfo(buf, " %d:%d", parsed.metas[i].sdbId, parsed.metas[i].lrelId);
 		}
 	}
 

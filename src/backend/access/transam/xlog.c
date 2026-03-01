@@ -76,6 +76,7 @@
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
 #include "pg_trace.h"
+#include "storage/smgr.h"
 
 extern uint32 bootstrap_data_checksum_version;
 
@@ -5343,6 +5344,7 @@ BootStrapXLOG(void)
 
 	WriteControlFile();
 
+	smgrmetabootstrap();
 	/* Bootstrap the commit log, too */
 	BootStrapCLOG();
 	BootStrapCommitTs();
@@ -6739,6 +6741,7 @@ StartupXLOG(void)
 					 checkPoint.newestCommitTsXid);
 	XLogCtl->ckptFullXid = checkPoint.nextFullXid;
 
+	smgrstartup();
 	/*
 	 * Initialize replication slots, before there's a chance to remove
 	 * required resources.
@@ -8608,6 +8611,7 @@ ShutdownXLOG(int code, Datum arg)
 		CreateCheckPoint(CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_IMMEDIATE);
 	}
 	ShutdownCLOG();
+	smgrmetashutdown();
 	ShutdownCommitTs();
 	ShutdownSUBTRANS();
 	ShutdownMultiXact();
@@ -9143,6 +9147,8 @@ CreateCheckPoint(int flags)
 	/*
 	 * Let smgr do post-checkpoint cleanup (eg, deleting old files).
 	 */
+	SyncDbMetaPostCheckpoint();
+	SyncMetaPostCheckpoint();
 	SyncPostCheckpoint();
 
 	/*
@@ -9299,6 +9305,7 @@ static void
 CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 {
 	CheckPointCLOG();
+	smgrmetacheckpoint();
 	CheckPointCommitTs();
 	CheckPointSUBTRANS();
 	CheckPointMultiXact();
