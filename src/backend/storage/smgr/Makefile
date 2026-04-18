@@ -19,6 +19,7 @@ OBJS = \
 
 ifeq ($(with_umbra), yes)
 OBJS += \
+	umfile.o \
 	umbra.o
 endif
 
