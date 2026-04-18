@@ -17,6 +17,18 @@
 #include "storage/block.h"
 #include "storage/relfilelocator.h"
 #include "storage/smgr.h"
+#include "storage/um_defs.h"
+
+extern bool UmMetadataExists(SMgrRelation reln);
+extern bool UmMetadataOpenOrCreate(SMgrRelation reln, bool isRedo, bool *created);
+extern BlockNumber UmMetadataNblocks(SMgrRelation reln);
+extern void UmMetadataRead(SMgrRelation reln, BlockNumber blkno, void *buffer);
+extern void UmMetadataWrite(SMgrRelation reln, BlockNumber blkno,
+							const void *buffer, bool skipFsync);
+extern void UmMetadataExtend(SMgrRelation reln, BlockNumber blkno,
+							 const void *buffer, bool skipFsync);
+extern void UmMetadataImmediateSync(SMgrRelation reln);
+extern void UmMetadataUnlink(RelFileLocatorBackend rlocator, bool isRedo);
 
 extern void uminit(void);
 extern void umopen(SMgrRelation reln);
