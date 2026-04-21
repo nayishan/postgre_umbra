@@ -113,6 +113,12 @@ extern void smgrwriteback(SMgrRelation reln, ForkNumber forknum,
 						  BlockNumber blocknum, BlockNumber nblocks);
 extern BlockNumber smgrnblocks(SMgrRelation reln, ForkNumber forknum);
 extern BlockNumber smgrnblocks_cached(SMgrRelation reln, ForkNumber forknum);
+extern void smgrcreaterelationmetadata(SMgrRelation reln);
+extern void smgrcopyrelationmetadata(SMgrRelation src, SMgrRelation dst,
+									 char relpersistence);
+extern void smgrsyncrelationmetadata(SMgrRelation reln);
+extern void smgrunlinkrelationmetadata(RelFileLocatorBackend rlocator,
+									   bool isRedo);
 extern void smgrtruncate(SMgrRelation reln, ForkNumber *forknum, int nforks,
 						 BlockNumber *old_nblocks,
 						 BlockNumber *nblocks);

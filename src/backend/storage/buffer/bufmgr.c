@@ -5514,6 +5514,8 @@ CreateAndCopyRelationData(RelFileLocator src_rlocator,
 										   permanent);
 		}
 	}
+
+	smgrcopyrelationmetadata(src_rel, dst_rel, relpersistence);
 }
 
 /* ---------------------------------------------------------------------
