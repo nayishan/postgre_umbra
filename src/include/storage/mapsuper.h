@@ -1,12 +1,11 @@
 /*-------------------------------------------------------------------------
  *
  * mapsuper.h
- *	  Umbra metadata superblock helpers.
+ *	  MAP superblock metadata helpers.
  *
- * The superblock is stored in metadata block 0. Its first 512 bytes contain a
- * versioned payload plus CRC, and the remainder of the block is reserved.
- *
- * src/include/storage/mapsuper.h
+ * The on-disk layout is a 512-byte sector:
+ * - first 64 bytes: MapSuperblockData payload
+ * - remaining 448 bytes: zero padding
  *
  *-------------------------------------------------------------------------
  */
@@ -14,9 +13,9 @@
 #define MAPSUPER_H
 
 #include "access/xlogdefs.h"
+#include "common/relpath.h"
 #include "port/pg_crc32c.h"
 #include "storage/block.h"
-#include "storage/smgr.h"
 
 #define MAP_SUPERBLOCK_MAGIC		0x554D4252U	/* "UMBR" */
 #define MAP_SUPERBLOCK_VERSION		1U
@@ -27,11 +26,13 @@
 
 typedef struct pg_attribute_packed() MapSuperblockData
 {
+	/* identity/version */
 	uint32		magic;
 	uint32		version;
 	uint32		blcksz;
 	uint32		flags;
 
+	/* physical allocator state */
 	BlockNumber next_free_phys_block_main;
 	BlockNumber phys_capacity_main;
 	BlockNumber next_free_phys_block_fsm;
@@ -39,10 +40,12 @@ typedef struct pg_attribute_packed() MapSuperblockData
 	BlockNumber next_free_phys_block_vm;
 	BlockNumber phys_capacity_vm;
 
+	/* logical block count cache */
 	BlockNumber logical_nblocks_main;
 	BlockNumber logical_nblocks_fsm;
 	BlockNumber logical_nblocks_vm;
 
+	/* crash-safety metadata */
 	XLogRecPtr	last_updated_lsn;
 	pg_crc32c	crc;
 } MapSuperblockData;
@@ -88,13 +91,10 @@ extern BlockNumber MapSuperblockGetLogicalNblocks(const MapSuperblock *super,
 extern void MapSuperblockSetLogicalNblocks(MapSuperblock *super, ForkNumber forknum,
 										   BlockNumber nblocks);
 
-extern void MapSuperblockPackPage(const MapSuperblock *super, char page[BLCKSZ]);
-extern void MapSuperblockUnpackPage(MapSuperblock *super, const char page[BLCKSZ]);
-
-extern bool MapSBlockRead(SMgrRelation reln, MapSuperblock *super);
-extern void MapSBlockWrite(SMgrRelation reln, const MapSuperblock *super,
-						   bool skipFsync);
-extern void MapSBlockInitNew(SMgrRelation reln, uint32 flags, XLogRecPtr lsn,
-							 bool skipFsync);
+/* 512-byte sector I/O helpers */
+extern void MapSuperblockPackSector(const MapSuperblock *super,
+									char sector[MAP_SUPERBLOCK_SIZE]);
+extern void MapSuperblockUnpackSector(MapSuperblock *super,
+									  const char sector[MAP_SUPERBLOCK_SIZE]);
 
 #endif							/* MAPSUPER_H */

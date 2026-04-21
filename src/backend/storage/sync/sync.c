@@ -29,6 +29,9 @@
 #include "storage/fd.h"
 #include "storage/latch.h"
 #include "storage/md.h"
+#ifdef USE_UMBRA
+#include "storage/umbra.h"
+#endif
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/wait_event.h"
@@ -115,7 +118,14 @@ static const SyncOps syncsw[] = {
 	/* pg_multixact/members */
 	[SYNC_HANDLER_MULTIXACT_MEMBER] = {
 		.sync_syncfiletag = multixactmemberssyncfiletag
-	}
+	},
+#ifdef USE_UMBRA
+	[SYNC_HANDLER_UMBRA] = {
+		.sync_syncfiletag = umsyncfiletag,
+		.sync_unlinkfiletag = umunlinkfiletag,
+		.sync_filetagmatches = umfiletagmatches
+	},
+#endif
 };
 
 /*

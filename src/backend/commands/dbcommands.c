@@ -1059,6 +1059,17 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 					 errhint("Valid strategies are \"wal_log\" and \"file_copy\".")));
 	}
 
+	/*
+	 * Umbra currently supports only the legacy file-copy CREATE DATABASE copy
+	 * semantics.
+	 *
+	 * Accept STRATEGY = WAL_LOG for compatibility, but route through the
+	 * file-copy path until Umbra owns a WAL_LOG implementation.
+	 */
+	if (dbstrategy == CREATEDB_WAL_LOG &&
+		!smgrcreatedballowswallog())
+		dbstrategy = CREATEDB_FILE_COPY;
+
 	/* If encoding or locales are defaulted, use source's setting */
 	if (encoding < 0)
 		encoding = src_encoding;
@@ -1873,6 +1884,7 @@ dropdb(const char *dbname, bool missing_ok, bool force)
 	 * dirty buffer to the dead database later...
 	 */
 	DropDatabaseBuffers(db_id);
+	smgrinvalidatedatabase(db_id);
 
 	/*
 	 * Tell checkpointer to forget any pending fsync and unlink requests for
@@ -2164,6 +2176,7 @@ movedb(const char *dbname, const char *tblspcname)
 	 * src_tblspcoid, but bufmgr.c presently provides no API for that.
 	 */
 	DropDatabaseBuffers(db_id);
+	smgrinvalidatedatabasetablespaces(db_id, 1, &src_tblspcoid);
 
 	/*
 	 * Check for existence of files in the target directory, i.e., objects of
@@ -3370,9 +3383,12 @@ dbase_redo(XLogReaderState *record)
 		 * up-to-date for the copy.
 		 */
 		FlushDatabaseBuffers(xlrec->src_db_id);
+		smgrcheckpointdatabasetablespaces(xlrec->src_db_id, 1,
+										  &xlrec->src_tablespace_id);
 
 		/* Close all smgr fds in all backends. */
 		WaitForProcSignalBarrier(EmitProcSignalBarrier(PROCSIGNAL_BARRIER_SMGRRELEASE));
+		smgrreleaseall();
 
 		/*
 		 * Copy this subdirectory to the new location
@@ -3431,6 +3447,8 @@ dbase_redo(XLogReaderState *record)
 
 		/* Drop pages for this database that are in the shared buffer cache */
 		DropDatabaseBuffers(xlrec->db_id);
+		smgrinvalidatedatabasetablespaces(xlrec->db_id, xlrec->ntablespaces,
+										  xlrec->tablespace_ids);
 
 		/* Also, clean out any fsync requests that might be pending in md.c */
 		ForgetDatabaseSyncRequests(xlrec->db_id);
@@ -3440,6 +3458,7 @@ dbase_redo(XLogReaderState *record)
 
 		/* Close all smgr fds in all backends. */
 		WaitForProcSignalBarrier(EmitProcSignalBarrier(PROCSIGNAL_BARRIER_SMGRRELEASE));
+		smgrreleaseall();
 
 		for (i = 0; i < xlrec->ntablespaces; i++)
 		{

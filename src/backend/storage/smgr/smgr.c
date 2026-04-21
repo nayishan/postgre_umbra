@@ -134,6 +134,13 @@ typedef struct f_smgr
 	void		(*smgr_sync_relation_metadata) (SMgrRelation reln);
 	void		(*smgr_unlink_relation_metadata) (RelFileLocatorBackend rlocator,
 												  bool isRedo);
+	bool		(*smgr_createdb_allows_wal_log) (void);
+	void		(*smgr_checkpoint_database_tablespaces) (Oid dbid,
+														 int ntablespaces,
+														 const Oid *tablespace_ids);
+	void		(*smgr_invalidate_database_tablespaces) (Oid dbid,
+														 int ntablespaces,
+														 const Oid *tablespace_ids);
 	int			(*smgr_fd) (SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint32 *off);
 } f_smgr;
 
@@ -172,6 +179,9 @@ static const f_smgr smgrsw[] = {
 		.smgr_copy_relation_metadata = NULL,
 		.smgr_sync_relation_metadata = NULL,
 		.smgr_unlink_relation_metadata = NULL,
+		.smgr_createdb_allows_wal_log = NULL,
+		.smgr_checkpoint_database_tablespaces = NULL,
+		.smgr_invalidate_database_tablespaces = NULL,
 		.smgr_fd = mdfd,
 	},
 #ifdef USE_UMBRA
@@ -201,6 +211,9 @@ static const f_smgr smgrsw[] = {
 		.smgr_copy_relation_metadata = umcopyrelationmetadata,
 		.smgr_sync_relation_metadata = umsyncrelationmetadata,
 		.smgr_unlink_relation_metadata = umunlinkrelationmetadata,
+		.smgr_createdb_allows_wal_log = umcreatedballowswallog,
+		.smgr_checkpoint_database_tablespaces = umcheckpointdatabasetablespaces,
+		.smgr_invalidate_database_tablespaces = uminvalidatedatabasetablespaces,
 		.smgr_fd = umfd,
 	},
 #endif
@@ -569,8 +582,43 @@ smgrsyncrelationmetadata(SMgrRelation reln)
 void
 smgrunlinkrelationmetadata(RelFileLocatorBackend rlocator, bool isRedo)
 {
-	if (smgrsw[0].smgr_unlink_relation_metadata)
-		smgrsw[0].smgr_unlink_relation_metadata(rlocator, isRedo);
+	if (smgrsw[SMGR_DEFAULT].smgr_unlink_relation_metadata)
+		smgrsw[SMGR_DEFAULT].smgr_unlink_relation_metadata(rlocator, isRedo);
+}
+
+bool
+smgrcreatedballowswallog(void)
+{
+	if (smgrsw[SMGR_DEFAULT].smgr_createdb_allows_wal_log)
+		return smgrsw[SMGR_DEFAULT].smgr_createdb_allows_wal_log();
+
+	return true;
+}
+
+void
+smgrcheckpointdatabasetablespaces(Oid dbid, int ntablespaces,
+								  const Oid *tablespace_ids)
+{
+	if (smgrsw[SMGR_DEFAULT].smgr_checkpoint_database_tablespaces)
+		smgrsw[SMGR_DEFAULT].smgr_checkpoint_database_tablespaces(dbid,
+																  ntablespaces,
+																  tablespace_ids);
+}
+
+void
+smgrinvalidatedatabasetablespaces(Oid dbid, int ntablespaces,
+								  const Oid *tablespace_ids)
+{
+	if (smgrsw[SMGR_DEFAULT].smgr_invalidate_database_tablespaces)
+		smgrsw[SMGR_DEFAULT].smgr_invalidate_database_tablespaces(dbid,
+																  ntablespaces,
+																  tablespace_ids);
+}
+
+void
+smgrinvalidatedatabase(Oid dbid)
+{
+	smgrinvalidatedatabasetablespaces(dbid, 0, NULL);
 }
 /*
  * smgrdosyncall() -- Immediately sync all forks of all given relations

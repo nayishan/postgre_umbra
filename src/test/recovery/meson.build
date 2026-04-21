@@ -62,6 +62,9 @@ tests += {
       't/051_effective_wal_level.pl',
       't/052_checkpoint_segment_missing.pl',
       't/053_standby_login_event_trigger.pl',
+      't/060_umbra_map_superblock_watermark.pl',
+      't/061_umbra_map_fork_policy.pl',
+      't/070_umbra_mainfork_head_unlink_checkpoint.pl',
     ],
   },
 }

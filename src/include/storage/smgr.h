@@ -119,6 +119,12 @@ extern void smgrcopyrelationmetadata(SMgrRelation src, SMgrRelation dst,
 extern void smgrsyncrelationmetadata(SMgrRelation reln);
 extern void smgrunlinkrelationmetadata(RelFileLocatorBackend rlocator,
 									   bool isRedo);
+extern bool smgrcreatedballowswallog(void);
+extern void smgrcheckpointdatabasetablespaces(Oid dbid, int ntablespaces,
+											  const Oid *tablespace_ids);
+extern void smgrinvalidatedatabasetablespaces(Oid dbid, int ntablespaces,
+											  const Oid *tablespace_ids);
+extern void smgrinvalidatedatabase(Oid dbid);
 extern void smgrtruncate(SMgrRelation reln, ForkNumber *forknum, int nforks,
 						 BlockNumber *old_nblocks,
 						 BlockNumber *nblocks);
