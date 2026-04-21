@@ -91,6 +91,22 @@ typedef struct XLogRecord
 #define XLR_CHECK_CONSISTENCY	0x02
 
 /*
+ * Legacy Umbra-only record flags formerly used for compact remap encodings.
+ *
+ * New WAL records always use the full remap header. Reader-side code keeps
+ * these bits only to reject unsupported old-format records explicitly.
+ */
+#ifdef USE_UMBRA
+#define XLR_UMBRA_REMAP_FORMAT_MASK		0x0C
+#define XLR_UMBRA_COMPACT_BIRTH_REMAP	0x04
+#define XLR_UMBRA_ORDINARY_SLIM_REMAP	0x08
+#else
+#define XLR_UMBRA_REMAP_FORMAT_MASK		0x00
+#define XLR_UMBRA_COMPACT_BIRTH_REMAP	0x00
+#define XLR_UMBRA_ORDINARY_SLIM_REMAP	0x00
+#endif
+
+/*
  * Header info for block data appended to an XLOG record.
  *
  * 'data_length' is the length of the rmgr-specific payload data associated

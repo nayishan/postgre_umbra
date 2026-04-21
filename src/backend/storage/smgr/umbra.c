@@ -28,6 +28,7 @@
 
 #include "postgres.h"
 
+#include "access/umbra_xlog.h"
 #include "access/xlog.h"
 #include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
@@ -793,6 +794,12 @@ void
 UmRebuildMapAndSuperblockForSkipWAL(SMgrRelation reln)
 {
 	UmbraFileContext *ctx = um_ctx_acquire(reln);
+	xl_umbra_skip_wal_dense_map_entry apply_entries[MAX_FORKNUM + 1];
+	xl_umbra_skip_wal_dense_map_entry wal_entries[MAX_FORKNUM + 1];
+	uint16		apply_count = 0;
+	uint16		wal_count = 0;
+	XLogRecPtr	map_lsn = InvalidXLogRecPtr;
+	bool		wal_insert_enabled;
 
 	/*
 	 * Rebuild assumes the relation stayed on direct lblk==pblk access during
@@ -812,27 +819,54 @@ UmRebuildMapAndSuperblockForSkipWAL(SMgrRelation reln)
 			continue;
 
 		if (!umfile_exists(ctx, forknum, UMFILE_EXISTS_DENSE))
-		{
-			MapSBlockSetLogicalNblocks(ctx, reln->smgr_rlocator.locator,
-									   forknum, 0, InvalidXLogRecPtr);
 			continue;
-		}
 
 		nblocks = umfile_nblocks(ctx, forknum, UMFILE_NBLOCKS_DENSE);
+		apply_entries[apply_count].forknum = forknum;
+		apply_entries[apply_count].nblocks = nblocks;
+		apply_count++;
+
+		/*
+		 * The redo anchor records dense [0, nblocks) mapping. Empty forks
+		 * don't need an anchor and may correspond to zero-length metadata left
+		 * by aborted storage operations.
+		 */
+		if (nblocks > 0)
+		{
+			wal_entries[wal_count].forknum = forknum;
+			wal_entries[wal_count].nblocks = nblocks;
+			wal_count++;
+		}
+	}
+
+	wal_insert_enabled =
+		XLogInsertAllowed() &&
+		!IsBootstrapProcessingMode() &&
+		!IsInitProcessingMode();
+
+	if (wal_count > 0 && wal_insert_enabled)
+		map_lsn = log_umbra_skip_wal_dense_map(reln->smgr_rlocator.locator,
+											   wal_count, wal_entries);
+
+	for (uint16 i = 0; i < apply_count; i++)
+	{
+		ForkNumber	forknum = apply_entries[i].forknum;
+		BlockNumber nblocks = apply_entries[i].nblocks;
+		XLogRecPtr	fork_lsn = nblocks > 0 ? map_lsn : InvalidXLogRecPtr;
 
 		for (BlockNumber lblk = 0; lblk < nblocks; lblk++)
 			MapSetMapping(ctx, reln->smgr_rlocator.locator, forknum,
-						  lblk, lblk, InvalidXLogRecPtr);
+						  lblk, lblk, fork_lsn);
 
 		if (nblocks > 0)
 		{
 			MapSBlockBumpNextFreePhysBlock(ctx, reln->smgr_rlocator.locator,
-										   forknum, nblocks, InvalidXLogRecPtr);
+										   forknum, nblocks, fork_lsn);
 			MapSBlockBumpPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
-										 forknum, nblocks, InvalidXLogRecPtr);
+										 forknum, nblocks, fork_lsn);
 		}
 		MapSBlockSetLogicalNblocks(ctx, reln->smgr_rlocator.locator,
-								   forknum, nblocks, InvalidXLogRecPtr);
+								   forknum, nblocks, fork_lsn);
 	}
 }
 

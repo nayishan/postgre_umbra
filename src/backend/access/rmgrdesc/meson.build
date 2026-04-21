@@ -26,4 +26,10 @@ rmgr_desc_sources = files(
   'xlogdesc.c',
 )
 
+if get_option('umbra').enabled()
+  rmgr_desc_sources += files(
+    'umbradesc.c',
+  )
+endif
+
 backend_sources += rmgr_desc_sources

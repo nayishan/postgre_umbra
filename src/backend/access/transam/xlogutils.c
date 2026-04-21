@@ -25,6 +25,10 @@
 #include "access/xlogutils.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
+#ifdef USE_UMBRA
+#include "storage/map.h"
+#include "storage/umbra.h"
+#endif
 #include "storage/smgr.h"
 #include "utils/hsearch.h"
 #include "utils/rel.h"
@@ -77,9 +81,44 @@ typedef struct xl_invalid_page
 
 static HTAB *invalid_page_tab = NULL;
 
+#ifdef USE_UMBRA
+typedef struct xl_missing_metadata_key
+{
+	RelFileLocator locator;		/* relation whose Umbra metadata is missing */
+} xl_missing_metadata_key;
+
+typedef struct xl_missing_metadata
+{
+	xl_missing_metadata_key key;	/* hash key ... must be first */
+} xl_missing_metadata;
+
+static HTAB *missing_metadata_tab = NULL;
+#endif
+
 static int	read_local_xlog_page_guts(XLogReaderState *state, XLogRecPtr targetPagePtr,
 									  int reqLen, XLogRecPtr targetRecPtr,
 									  char *cur_page, bool wait_for_wal);
+
+#ifndef USE_UMBRA
+static XLogRedoAction XLogReadBufferForRedoExtendedMd(XLogReaderState *record,
+													 uint8 block_id,
+													 ReadBufferMode mode,
+													 bool get_cleanup_lock,
+													 Buffer *buf);
+#endif
+#ifdef USE_UMBRA
+static XLogRedoAction XLogReadBufferForRedoExtendedUmbra(XLogReaderState *record,
+														uint8 block_id,
+														ReadBufferMode mode,
+														bool get_cleanup_lock,
+														Buffer *buf);
+static uint8 XLogUmbraMapStateForRedo(SMgrRelation smgr, ForkNumber forknum);
+static bool XLogUmbraEnsureMappedBlockForRedo(RelFileLocator rlocator,
+											  ForkNumber forknum,
+											  BlockNumber blkno);
+static bool XLogUmbraEnsureMetadataForRedo(RelFileLocator rlocator,
+										   ForkNumber forknum);
+#endif
 
 /* Report a reference to an invalid page */
 static void
@@ -95,6 +134,16 @@ report_invalid_page(int elevel, RelFileLocator locator, ForkNumber forkno,
 		elog(elevel, "page %u of relation %s does not exist",
 			 blkno, path.str);
 }
+
+#ifdef USE_UMBRA
+static void
+report_missing_metadata(int elevel, RelFileLocator locator)
+{
+	RelPathStr	path = UmMetadataRelPathPerm(locator);
+
+	elog(elevel, "MAP metadata for relation %s is missing", path.str);
+}
+#endif
 
 /* Log a reference to an invalid page */
 static void
@@ -160,6 +209,39 @@ log_invalid_page(RelFileLocator locator, ForkNumber forkno, BlockNumber blkno,
 	}
 }
 
+#ifdef USE_UMBRA
+void
+XLogLogMissingRelationMetadata(RelFileLocator locator)
+{
+	xl_missing_metadata_key key;
+	xl_missing_metadata *hentry;
+	bool		found;
+
+	if (message_level_is_interesting(DEBUG1))
+		report_missing_metadata(DEBUG1, locator);
+
+	if (missing_metadata_tab == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(xl_missing_metadata_key);
+		ctl.entrysize = sizeof(xl_missing_metadata);
+
+		missing_metadata_tab = hash_create("XLOG missing-metadata table",
+										   32,
+										   &ctl,
+										   HASH_ELEM | HASH_BLOBS);
+	}
+
+	key.locator = locator;
+	hentry = (xl_missing_metadata *)
+		hash_search(missing_metadata_tab, &key, HASH_ENTER, &found);
+
+	(void) hentry;
+	(void) found;
+}
+#endif
+
 /* Forget any invalid pages >= minblkno, because they've been dropped */
 static void
 forget_invalid_pages(RelFileLocator locator, ForkNumber forkno,
@@ -219,6 +301,48 @@ forget_invalid_pages_db(Oid dbid)
 	}
 }
 
+#ifdef USE_UMBRA
+static void
+forget_missing_metadata(RelFileLocator locator)
+{
+	xl_missing_metadata_key key;
+
+	if (missing_metadata_tab == NULL)
+		return;
+
+	key.locator = locator;
+	if (hash_search(missing_metadata_tab, &key, HASH_REMOVE, NULL) != NULL)
+		elog(DEBUG2, "MAP metadata for relation %s has been resolved",
+			 UmMetadataRelPathPerm(locator).str);
+}
+
+static void
+forget_missing_metadata_db(Oid dbid)
+{
+	HASH_SEQ_STATUS status;
+	xl_missing_metadata *hentry;
+
+	if (missing_metadata_tab == NULL)
+		return;
+
+	hash_seq_init(&status, missing_metadata_tab);
+
+	while ((hentry = (xl_missing_metadata *) hash_seq_search(&status)) != NULL)
+	{
+		if (hentry->key.locator.dbOid == dbid)
+		{
+			elog(DEBUG2, "MAP metadata for relation %s has been resolved",
+				 UmMetadataRelPathPerm(hentry->key.locator).str);
+
+			if (hash_search(missing_metadata_tab,
+							&hentry->key,
+							HASH_REMOVE, NULL) == NULL)
+				elog(ERROR, "hash table corrupted");
+		}
+	}
+}
+#endif
+
 /* Are there any unresolved references to invalid pages? */
 bool
 XLogHaveInvalidPages(void)
@@ -226,6 +350,11 @@ XLogHaveInvalidPages(void)
 	if (invalid_page_tab != NULL &&
 		hash_get_num_entries(invalid_page_tab) > 0)
 		return true;
+#ifdef USE_UMBRA
+	if (missing_metadata_tab != NULL &&
+		hash_get_num_entries(missing_metadata_tab) > 0)
+		return true;
+#endif
 	return false;
 }
 
@@ -237,21 +366,43 @@ XLogCheckInvalidPages(void)
 	xl_invalid_page *hentry;
 	bool		foundone = false;
 
+#ifdef USE_UMBRA
+	if (invalid_page_tab == NULL && missing_metadata_tab == NULL)
+#else
 	if (invalid_page_tab == NULL)
+#endif
 		return;					/* nothing to do */
 
-	hash_seq_init(&status, invalid_page_tab);
-
-	/*
-	 * Our strategy is to emit WARNING messages for all remaining entries and
-	 * only PANIC after we've dumped all the available info.
-	 */
-	while ((hentry = (xl_invalid_page *) hash_seq_search(&status)) != NULL)
+	if (invalid_page_tab != NULL)
 	{
-		report_invalid_page(WARNING, hentry->key.locator, hentry->key.forkno,
-							hentry->key.blkno, hentry->present);
-		foundone = true;
+		hash_seq_init(&status, invalid_page_tab);
+
+		/*
+		 * Our strategy is to emit WARNING messages for all remaining entries and
+		 * only PANIC after we've dumped all the available info.
+		 */
+		while ((hentry = (xl_invalid_page *) hash_seq_search(&status)) != NULL)
+		{
+			report_invalid_page(WARNING, hentry->key.locator, hentry->key.forkno,
+								hentry->key.blkno, hentry->present);
+			foundone = true;
+		}
 	}
+
+#ifdef USE_UMBRA
+	if (missing_metadata_tab != NULL)
+	{
+		HASH_SEQ_STATUS missing_status;
+		xl_missing_metadata *mentry;
+
+		hash_seq_init(&missing_status, missing_metadata_tab);
+		while ((mentry = (xl_missing_metadata *) hash_seq_search(&missing_status)) != NULL)
+		{
+			report_missing_metadata(WARNING, mentry->key.locator);
+			foundone = true;
+		}
+	}
+#endif
 
 	if (foundone)
 		elog(ignore_invalid_pages ? WARNING : PANIC,
@@ -259,7 +410,98 @@ XLogCheckInvalidPages(void)
 
 	hash_destroy(invalid_page_tab);
 	invalid_page_tab = NULL;
+
+#ifdef USE_UMBRA
+	if (missing_metadata_tab != NULL)
+	{
+		hash_destroy(missing_metadata_tab);
+		missing_metadata_tab = NULL;
+	}
+#endif
 }
+
+#ifdef USE_UMBRA
+/*
+ * Redo is an owner point for handle-local Umbra MAP state.
+ *
+ * Mapped permanent forks replay under REQUIRE_MAP even if a later restartpoint
+ * cleanup already removed the MAP fork from disk. The only runtime override
+ * is the durable skip-WAL-pending bit stored in the MAP superblock.
+ * INIT/internal/temp forks stay on BYPASS_MAP.
+ */
+static uint8
+XLogUmbraMapStateForRedo(SMgrRelation smgr, ForkNumber forknum)
+{
+	UmbraFileContext *ctx = umfile_ctx_acquire(smgr->smgr_rlocator);
+
+	if (!UmbraForkUsesMapTranslation(forknum) ||
+		forknum == INIT_FORKNUM ||
+		smgrisinternalfork(forknum) ||
+		RelFileLocatorBackendIsTemp(smgr->smgr_rlocator))
+		return UMBRA_MAP_POLICY_BYPASS_MAP;
+
+	if (UmMetadataExists(smgr) &&
+		MapSBlockIsSkipWalPending(ctx, smgr->smgr_rlocator.locator))
+		return UMBRA_MAP_POLICY_SKIP_WAL_PENDING_MAP;
+
+	return UMBRA_MAP_POLICY_REQUIRE_MAP;
+}
+
+/*
+ * For mapped forks, redo must not silently invent local mappings.
+ * Missing mapping source is treated as an invalid-page reference.
+ */
+static bool
+XLogUmbraEnsureMappedBlockForRedo(RelFileLocator rlocator, ForkNumber forknum,
+								  BlockNumber blkno)
+{
+	SMgrRelation smgr;
+	BlockNumber	pblkno;
+
+	if (forknum == INIT_FORKNUM || smgrisinternalfork(forknum))
+		return true;
+
+	smgr = smgropen(rlocator, INVALID_PROC_NUMBER);
+
+	if (!UmMetadataExists(smgr))
+	{
+		XLogLogMissingRelationMetadata(rlocator);
+		return false;
+	}
+
+	if (!UmMapTryLookupPblkno(smgr, forknum, blkno, &pblkno))
+	{
+		if (UmMapIsLogicalUnmaterialized(smgr, forknum, blkno))
+			return true;
+		log_invalid_page(rlocator, forknum, blkno, false);
+		return false;
+	}
+
+	return true;
+}
+
+static bool
+XLogUmbraEnsureMetadataForRedo(RelFileLocator rlocator, ForkNumber forknum)
+{
+	SMgrRelation smgr;
+	uint8		map_state;
+
+	if (forknum == INIT_FORKNUM || smgrisinternalfork(forknum))
+		return true;
+
+	smgr = smgropen(rlocator, INVALID_PROC_NUMBER);
+	map_state = XLogUmbraMapStateForRedo(smgr, forknum);
+	smgrsetmapstate(smgr, map_state);
+	if (map_state != UMBRA_MAP_POLICY_REQUIRE_MAP)
+		return true;
+
+	if (!UmMetadataExists(smgr))
+		smgrcreaterelationmetadata(smgr);
+
+	return true;
+}
+
+#endif
 
 
 /*
@@ -342,6 +584,22 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 							  ReadBufferMode mode, bool get_cleanup_lock,
 							  Buffer *buf)
 {
+ #ifdef USE_UMBRA
+	return XLogReadBufferForRedoExtendedUmbra(record, block_id, mode,
+											  get_cleanup_lock, buf);
+ #else
+	return XLogReadBufferForRedoExtendedMd(record, block_id, mode,
+										   get_cleanup_lock, buf);
+ #endif
+}
+
+#ifndef USE_UMBRA
+static XLogRedoAction
+XLogReadBufferForRedoExtendedMd(XLogReaderState *record,
+								uint8 block_id,
+								ReadBufferMode mode, bool get_cleanup_lock,
+								Buffer *buf)
+{
 	XLogRecPtr	lsn = record->EndRecPtr;
 	RelFileLocator rlocator;
 	ForkNumber	forknum;
@@ -354,15 +612,10 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 	if (!XLogRecGetBlockTagExtended(record, block_id, &rlocator, &forknum, &blkno,
 									&prefetch_buffer))
 	{
-		/* Caller specified a bogus block_id */
 		elog(PANIC, "failed to locate backup block with ID %d in WAL record",
 			 block_id);
 	}
 
-	/*
-	 * Make sure that if the block is marked with WILL_INIT, the caller is
-	 * going to initialize it. And vice versa.
-	 */
 	zeromode = (mode == RBM_ZERO_AND_LOCK || mode == RBM_ZERO_AND_CLEANUP_LOCK);
 	willinit = (XLogRecGetBlock(record, block_id)->flags & BKPBLOCK_WILL_INIT) != 0;
 	if (willinit && !zeromode)
@@ -370,7 +623,6 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 	if (!willinit && zeromode)
 		elog(PANIC, "block to be initialized in redo routine must be marked with WILL_INIT flag in the WAL record");
 
-	/* If it has a full-page image and it should be restored, do it. */
 	if (XLogRecBlockImageApply(record, block_id))
 	{
 		Assert(XLogRecHasBlockImage(record, block_id));
@@ -383,49 +635,105 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 					(errcode(ERRCODE_INTERNAL_ERROR),
 					 errmsg_internal("%s", record->errormsg_buf)));
 
-		/*
-		 * The page may be uninitialized. If so, we can't set the LSN because
-		 * that would corrupt the page.
-		 */
 		if (!PageIsNew(page))
-		{
 			PageSetLSN(page, lsn);
-		}
 
 		MarkBufferDirty(*buf);
-
-		/*
-		 * At the end of crash recovery the init forks of unlogged relations
-		 * are copied, without going through shared buffers. So we need to
-		 * force the on-disk state of init forks to always be in sync with the
-		 * state in shared buffers.
-		 */
 		if (forknum == INIT_FORKNUM)
 			FlushOneBuffer(*buf);
 
 		return BLK_RESTORED;
 	}
-	else
+
+	*buf = XLogReadBufferExtended(rlocator, forknum, blkno, mode, prefetch_buffer);
+	if (BufferIsValid(*buf))
 	{
-		*buf = XLogReadBufferExtended(rlocator, forknum, blkno, mode, prefetch_buffer);
-		if (BufferIsValid(*buf))
+		if (mode != RBM_ZERO_AND_LOCK && mode != RBM_ZERO_AND_CLEANUP_LOCK)
 		{
-			if (mode != RBM_ZERO_AND_LOCK && mode != RBM_ZERO_AND_CLEANUP_LOCK)
-			{
-				if (get_cleanup_lock)
-					LockBufferForCleanup(*buf);
-				else
-					LockBuffer(*buf, BUFFER_LOCK_EXCLUSIVE);
-			}
-			if (lsn <= PageGetLSN(BufferGetPage(*buf)))
-				return BLK_DONE;
+			if (get_cleanup_lock)
+				LockBufferForCleanup(*buf);
 			else
-				return BLK_NEEDS_REDO;
+				LockBuffer(*buf, BUFFER_LOCK_EXCLUSIVE);
 		}
-		else
-			return BLK_NOTFOUND;
+		if (lsn <= PageGetLSN(BufferGetPage(*buf)))
+			return BLK_DONE;
+		return BLK_NEEDS_REDO;
 	}
+
+	return BLK_NOTFOUND;
 }
+#endif
+
+#ifdef USE_UMBRA
+static XLogRedoAction
+XLogReadBufferForRedoExtendedUmbra(XLogReaderState *record,
+								   uint8 block_id,
+								   ReadBufferMode mode, bool get_cleanup_lock,
+								   Buffer *buf)
+{
+	XLogRecPtr	lsn = record->EndRecPtr;
+	RelFileLocator rlocator;
+	ForkNumber	forknum;
+	BlockNumber blkno;
+	Buffer		prefetch_buffer;
+	Page		page;
+	bool		zeromode;
+	bool		willinit;
+
+	if (!XLogRecGetBlockTagExtended(record, block_id, &rlocator, &forknum, &blkno,
+									&prefetch_buffer))
+	{
+		elog(PANIC, "failed to locate backup block with ID %d in WAL record",
+			 block_id);
+	}
+
+	*buf = InvalidBuffer;
+
+	zeromode = (mode == RBM_ZERO_AND_LOCK || mode == RBM_ZERO_AND_CLEANUP_LOCK);
+	willinit = (XLogRecGetBlock(record, block_id)->flags & BKPBLOCK_WILL_INIT) != 0;
+	if (willinit && !zeromode)
+		elog(PANIC, "block with WILL_INIT flag in WAL record must be zeroed by redo routine");
+	if (!willinit && zeromode)
+		elog(PANIC, "block to be initialized in redo routine must be marked with WILL_INIT flag in the WAL record");
+
+	if (!XLogUmbraEnsureMetadataForRedo(rlocator, forknum))
+		return BLK_NOTFOUND;
+
+	if (XLogRecBlockImageApply(record, block_id))
+	{
+		Assert(XLogRecHasBlockImage(record, block_id));
+		*buf = XLogReadBufferExtended(rlocator, forknum, blkno,
+									  get_cleanup_lock ? RBM_ZERO_AND_CLEANUP_LOCK : RBM_ZERO_AND_LOCK,
+									  prefetch_buffer);
+		page = BufferGetPage(*buf);
+		if (!RestoreBlockImage(record, block_id, page))
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg_internal("%s", record->errormsg_buf)));
+
+		if (!PageIsNew(page))
+			PageSetLSN(page, lsn);
+
+		MarkBufferDirty(*buf);
+		if (forknum == INIT_FORKNUM)
+			FlushOneBuffer(*buf);
+
+		return BLK_RESTORED;
+	}
+
+	if (!XLogUmbraEnsureMappedBlockForRedo(rlocator, forknum, blkno))
+		return BLK_NOTFOUND;
+
+	*buf = XLogReadBufferExtended(rlocator, forknum, blkno, mode,
+								  prefetch_buffer);
+	if (!BufferIsValid(*buf))
+		return BLK_NOTFOUND;
+
+	if (lsn <= PageGetLSN(BufferGetPage(*buf)))
+		return BLK_DONE;
+	return BLK_NEEDS_REDO;
+}
+#endif
 
 /*
  * XLogReadBufferExtended
@@ -630,6 +938,9 @@ void
 XLogDropRelation(RelFileLocator rlocator, ForkNumber forknum)
 {
 	forget_invalid_pages(rlocator, forknum, 0);
+#ifdef USE_UMBRA
+	forget_missing_metadata(rlocator);
+#endif
 }
 
 /*
@@ -649,6 +960,9 @@ XLogDropDatabase(Oid dbid)
 	smgrdestroyall();
 
 	forget_invalid_pages_db(dbid);
+#ifdef USE_UMBRA
+	forget_missing_metadata_db(dbid);
+#endif
 }
 
 /*

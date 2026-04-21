@@ -858,7 +858,10 @@ MapSuperPrepareEntryForUpdate(UmbraFileContext *map_ctx, RelFileLocator rnode,
 		if (status == MAP_SBLOCK_READ_MISSING)
 		{
 			if (InRecovery)
+			{
+				XLogLogMissingRelationMetadata(rnode);
 				return false;
+			}
 			elog(ERROR, "%s", missing_errmsg);
 		}
 

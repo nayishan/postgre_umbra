@@ -39,6 +39,11 @@ OBJS = \
 	xlogutils.o \
 	xlogwait.o
 
+ifeq ($(with_umbra), yes)
+OBJS += \
+	umbra_xlog.o
+endif
+
 include $(top_srcdir)/src/backend/common.mk
 
 # ensure that version checks in xlog.c get recompiled when catversion.h changes

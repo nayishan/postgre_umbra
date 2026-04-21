@@ -61,6 +61,9 @@ extern PGDLLIMPORT HotStandbyState standbyState;
 
 
 extern bool XLogHaveInvalidPages(void);
+#ifdef USE_UMBRA
+extern void XLogLogMissingRelationMetadata(RelFileLocator locator);
+#endif
 extern void XLogCheckInvalidPages(void);
 
 extern void XLogDropRelation(RelFileLocator rlocator, ForkNumber forknum);
