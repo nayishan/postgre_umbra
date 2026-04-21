@@ -17457,7 +17457,8 @@ index_copy_data(Relation rel, RelFileLocator newrlocator)
 	{
 		if (smgrexists(RelationGetSmgr(rel), forkNum))
 		{
-			smgrcreate(dstrel, forkNum, false);
+			if (!smgrisinternalfork(forkNum))
+				smgrcreate(dstrel, forkNum, false);
 
 			/*
 			 * WAL log creation if the relation is persistent, or this is the
@@ -17467,10 +17468,14 @@ index_copy_data(Relation rel, RelFileLocator newrlocator)
 				(rel->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED &&
 				 forkNum == INIT_FORKNUM))
 				log_smgrcreate(&newrlocator, forkNum);
-			RelationCopyStorage(RelationGetSmgr(rel), dstrel, forkNum,
-								rel->rd_rel->relpersistence);
+			if (!smgrisinternalfork(forkNum))
+				RelationCopyStorage(RelationGetSmgr(rel), dstrel, forkNum,
+									rel->rd_rel->relpersistence);
 		}
 	}
+
+	smgrcopyrelationmetadata(RelationGetSmgr(rel), dstrel,
+							 rel->rd_rel->relpersistence);
 
 	/* drop old relation, and close new one */
 	RelationDropStorage(rel);

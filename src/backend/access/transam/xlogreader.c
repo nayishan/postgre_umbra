@@ -1795,10 +1795,20 @@ DecodeXLogRecord(XLogReaderState *state,
 			blk = &decoded->blocks[block_id];
 			blk->in_use = true;
 			blk->apply_image = false;
+#ifdef USE_UMBRA
+			blk->has_remap = false;
+			blk->old_pblkno = InvalidBlockNumber;
+			blk->new_pblkno = InvalidBlockNumber;
+			blk->logical_nblocks = InvalidBlockNumber;
+			blk->next_free_pblkno = InvalidBlockNumber;
+#endif
 
 			COPY_HEADER_FIELD(&fork_flags, sizeof(uint8));
 			blk->forknum = fork_flags & BKPBLOCK_FORK_MASK;
 			blk->flags = fork_flags;
+#ifdef USE_UMBRA
+			blk->has_remap = ((fork_flags & BKPBLOCK_HAS_REMAP) != 0);
+#endif
 			blk->has_image = ((fork_flags & BKPBLOCK_HAS_IMAGE) != 0);
 			blk->has_data = ((fork_flags & BKPBLOCK_HAS_DATA) != 0);
 
@@ -1822,6 +1832,36 @@ DecodeXLogRecord(XLogReaderState *state,
 				goto err;
 			}
 			datatotal += blk->data_len;
+
+#ifdef USE_UMBRA
+			if (blk->has_remap)
+			{
+				uint8		remap_format =
+					decoded->header.xl_info & XLR_UMBRA_REMAP_FORMAT_MASK;
+
+				if (remap_format != 0)
+				{
+					report_invalid_record(state,
+										  "unsupported remap format bits 0x%02X at %X/%X",
+										  remap_format,
+										  LSN_FORMAT_ARGS(state->ReadRecPtr));
+					goto err;
+				}
+
+				COPY_HEADER_FIELD(&blk->old_pblkno, sizeof(BlockNumber));
+				COPY_HEADER_FIELD(&blk->new_pblkno, sizeof(BlockNumber));
+				COPY_HEADER_FIELD(&blk->logical_nblocks, sizeof(BlockNumber));
+				COPY_HEADER_FIELD(&blk->next_free_pblkno, sizeof(BlockNumber));
+			}
+#else
+			if (fork_flags & BKPBLOCK_HAS_REMAP)
+			{
+				report_invalid_record(state,
+									  "BKPBLOCK_HAS_REMAP is not allowed in this storage mode at %X/%X",
+									  LSN_FORMAT_ARGS(state->ReadRecPtr));
+				goto err;
+			}
+#endif
 
 			if (blk->has_image)
 			{

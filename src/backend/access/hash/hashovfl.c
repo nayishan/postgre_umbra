@@ -390,7 +390,7 @@ found:
 		XLogBeginInsert();
 		XLogRegisterData(&xlrec, SizeOfHashAddOvflPage);
 
-		XLogRegisterBuffer(0, ovflbuf, REGBUF_WILL_INIT);
+		XLogRegisterBuffer(0, ovflbuf, REGBUF_WILL_INIT_BIRTH);
 		XLogRegisterBufData(0, &pageopaque->hasho_bucket, sizeof(Bucket));
 
 		XLogRegisterBuffer(1, buf, REGBUF_STANDARD);
@@ -402,7 +402,7 @@ found:
 		}
 
 		if (BufferIsValid(newmapbuf))
-			XLogRegisterBuffer(3, newmapbuf, REGBUF_WILL_INIT);
+			XLogRegisterBuffer(3, newmapbuf, REGBUF_WILL_INIT_BIRTH);
 
 		XLogRegisterBuffer(4, metabuf, REGBUF_STANDARD);
 		XLogRegisterBufData(4, &metap->hashm_firstfree, sizeof(uint32));

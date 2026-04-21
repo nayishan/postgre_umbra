@@ -199,6 +199,7 @@ _hash_getnewbuf(Relation rel, BlockNumber blkno, ForkNumber forkNum)
 {
 	BlockNumber nblocks = RelationGetNumberOfBlocksInFork(rel, forkNum);
 	Buffer		buf;
+	bool		extend_path;
 
 	if (blkno == P_NEW)
 		elog(ERROR, "hash AM does not use P_NEW");
@@ -209,6 +210,7 @@ _hash_getnewbuf(Relation rel, BlockNumber blkno, ForkNumber forkNum)
 	/* smgr insists we explicitly extend the relation */
 	if (blkno == nblocks)
 	{
+		extend_path = true;
 		buf = ExtendBufferedRel(BMR_REL(rel), forkNum, NULL,
 								EB_LOCK_FIRST | EB_SKIP_EXTENSION_LOCK);
 		if (BufferGetBlockNumber(buf) != blkno)
@@ -217,6 +219,7 @@ _hash_getnewbuf(Relation rel, BlockNumber blkno, ForkNumber forkNum)
 	}
 	else
 	{
+		extend_path = false;
 		buf = ReadBufferExtended(rel, forkNum, blkno, RBM_ZERO_AND_LOCK,
 								 NULL);
 	}
@@ -395,7 +398,8 @@ _hash_init(Relation rel, double num_tuples, ForkNumber forkNum)
 
 		XLogBeginInsert();
 		XLogRegisterData(&xlrec, SizeOfHashInitMetaPage);
-		XLogRegisterBuffer(0, metabuf, REGBUF_WILL_INIT | REGBUF_STANDARD);
+		XLogRegisterBuffer(0, metabuf,
+						   REGBUF_WILL_INIT_BIRTH | REGBUF_STANDARD);
 
 		recptr = XLogInsert(RM_HASH_ID, XLOG_HASH_INIT_META_PAGE);
 
@@ -427,9 +431,9 @@ _hash_init(Relation rel, double num_tuples, ForkNumber forkNum)
 		_hash_initbuf(buf, metap->hashm_maxbucket, i, LH_BUCKET_PAGE, false);
 		MarkBufferDirty(buf);
 
-		if (use_wal)
-			log_newpage(&rel->rd_locator,
-						forkNum,
+			if (use_wal)
+				log_newpage(&rel->rd_locator,
+							forkNum,
 						blkno,
 						BufferGetPage(buf),
 						true);
@@ -469,7 +473,7 @@ _hash_init(Relation rel, double num_tuples, ForkNumber forkNum)
 
 		XLogBeginInsert();
 		XLogRegisterData(&xlrec, SizeOfHashInitBitmapPage);
-		XLogRegisterBuffer(0, bitmapbuf, REGBUF_WILL_INIT);
+		XLogRegisterBuffer(0, bitmapbuf, REGBUF_WILL_INIT_BIRTH);
 
 		/*
 		 * This is safe only because nobody else can be modifying the index at
@@ -910,7 +914,7 @@ restart_expand:
 		XLogBeginInsert();
 
 		XLogRegisterBuffer(0, buf_oblkno, REGBUF_STANDARD);
-		XLogRegisterBuffer(1, buf_nblkno, REGBUF_WILL_INIT);
+		XLogRegisterBuffer(1, buf_nblkno, REGBUF_WILL_INIT_BIRTH);
 		XLogRegisterBuffer(2, metabuf, REGBUF_STANDARD);
 
 		if (metap_update_masks)

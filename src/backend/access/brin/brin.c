@@ -1148,7 +1148,7 @@ brinbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 
 		XLogBeginInsert();
 		XLogRegisterData(&xlrec, SizeOfBrinCreateIdx);
-		XLogRegisterBuffer(0, meta, REGBUF_WILL_INIT | REGBUF_STANDARD);
+		XLogRegisterBuffer(0, meta, REGBUF_WILL_INIT_BIRTH | REGBUF_STANDARD);
 
 		recptr = XLogInsert(RM_BRIN_ID, XLOG_BRIN_CREATE_INDEX);
 

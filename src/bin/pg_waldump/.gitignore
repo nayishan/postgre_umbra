@@ -21,6 +21,7 @@
 /spgdesc.c
 /standbydesc.c
 /tblspcdesc.c
+/umbradesc.c
 /xactdesc.c
 /xlogdesc.c
 

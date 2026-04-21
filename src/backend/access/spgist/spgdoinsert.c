@@ -299,7 +299,7 @@ addLeafTuple(Relation index, SpGistState *state, SpGistLeafTuple leafTuple,
 
 		flags = REGBUF_STANDARD;
 		if (xlrec.newPage)
-			flags |= REGBUF_WILL_INIT;
+			flags |= REGBUF_WILL_INIT_BIRTH;
 		XLogRegisterBuffer(0, current->buffer, flags);
 		if (xlrec.offnumParent != InvalidOffsetNumber)
 			XLogRegisterBuffer(1, parent->buffer, REGBUF_STANDARD);
@@ -536,7 +536,7 @@ moveLeafs(Relation index, SpGistState *state,
 		XLogRegisterData(leafdata, leafptr - leafdata);
 
 		XLogRegisterBuffer(0, current->buffer, REGBUF_STANDARD);
-		XLogRegisterBuffer(1, nbuf, REGBUF_STANDARD | (xlrec.newPage ? REGBUF_WILL_INIT : 0));
+		XLogRegisterBuffer(1, nbuf, REGBUF_STANDARD | (xlrec.newPage ? REGBUF_WILL_INIT_BIRTH : 0));
 		XLogRegisterBuffer(2, parent->buffer, REGBUF_STANDARD);
 
 		recptr = XLogInsert(RM_SPGIST_ID, XLOG_SPGIST_MOVE_LEAFS);
@@ -1377,7 +1377,7 @@ doPickSplit(Relation index, SpGistState *state,
 		{
 			flags = REGBUF_STANDARD;
 			if (xlrec.initSrc)
-				flags |= REGBUF_WILL_INIT;
+				flags |= REGBUF_WILL_INIT_BIRTH;
 			XLogRegisterBuffer(0, saveCurrent.buffer, flags);
 		}
 
@@ -1386,14 +1386,14 @@ doPickSplit(Relation index, SpGistState *state,
 		{
 			flags = REGBUF_STANDARD;
 			if (xlrec.initDest)
-				flags |= REGBUF_WILL_INIT;
+				flags |= REGBUF_WILL_INIT_BIRTH;
 			XLogRegisterBuffer(1, newLeafBuffer, flags);
 		}
 
 		/* Inner page */
 		flags = REGBUF_STANDARD;
 		if (xlrec.initInner)
-			flags |= REGBUF_WILL_INIT;
+			flags |= REGBUF_WILL_INIT_BIRTH;
 		XLogRegisterBuffer(2, current->buffer, flags);
 
 		/* Parent page, if different from inner page */
@@ -1675,7 +1675,7 @@ spgAddNodeAction(Relation index, SpGistState *state,
 			/* new page */
 			flags = REGBUF_STANDARD;
 			if (xlrec.newPage)
-				flags |= REGBUF_WILL_INIT;
+			flags |= REGBUF_WILL_INIT_BIRTH;
 			XLogRegisterBuffer(1, current->buffer, flags);
 			/* parent page (if different from orig and new) */
 			if (xlrec.parentBlk == 2)
@@ -1874,7 +1874,7 @@ spgSplitNodeAction(Relation index, SpGistState *state,
 
 			flags = REGBUF_STANDARD;
 			if (xlrec.newPage)
-				flags |= REGBUF_WILL_INIT;
+				flags |= REGBUF_WILL_INIT_BIRTH;
 			XLogRegisterBuffer(1, newBuffer, flags);
 		}
 

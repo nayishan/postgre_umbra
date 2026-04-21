@@ -654,6 +654,18 @@ MapSBlockRead(UmbraFileContext *map_ctx, RelFileLocator rnode, MapSuperblock *su
 				entry->page_lsn = MapSuperblockGetLastUpdatedLSN(&disk_super);
 				entry->flags = MAPSUPER_FLAG_VALID;
 				MapSuperResetReservedNextFrees(entry);
+				Assert(MapNormalizeForkBlockCount(MAIN_FORKNUM,
+												  MapSuperblockGetNextFreePhysBlock(&entry->super,
+																					MAIN_FORKNUM)) <=
+					   MapSuperGetReservedNextFree(entry, MAIN_FORKNUM));
+				Assert(MapNormalizeForkBlockCount(FSM_FORKNUM,
+												  MapSuperblockGetNextFreePhysBlock(&entry->super,
+																					FSM_FORKNUM)) <=
+					   MapSuperGetReservedNextFree(entry, FSM_FORKNUM));
+				Assert(MapNormalizeForkBlockCount(VISIBILITYMAP_FORKNUM,
+												  MapSuperblockGetNextFreePhysBlock(&entry->super,
+																					VISIBILITYMAP_FORKNUM)) <=
+					   MapSuperGetReservedNextFree(entry, VISIBILITYMAP_FORKNUM));
 			}
 			else
 			{
@@ -661,6 +673,18 @@ MapSBlockRead(UmbraFileContext *map_ctx, RelFileLocator rnode, MapSuperblock *su
 				entry->page_lsn = InvalidXLogRecPtr;
 				entry->flags = MAPSUPER_FLAG_VALID | MAPSUPER_FLAG_CORRUPT;
 				MapSuperResetReservedNextFrees(entry);
+				Assert(MapNormalizeForkBlockCount(MAIN_FORKNUM,
+												  MapSuperblockGetNextFreePhysBlock(&entry->super,
+																					MAIN_FORKNUM)) <=
+					   MapSuperGetReservedNextFree(entry, MAIN_FORKNUM));
+				Assert(MapNormalizeForkBlockCount(FSM_FORKNUM,
+												  MapSuperblockGetNextFreePhysBlock(&entry->super,
+																					FSM_FORKNUM)) <=
+					   MapSuperGetReservedNextFree(entry, FSM_FORKNUM));
+				Assert(MapNormalizeForkBlockCount(VISIBILITYMAP_FORKNUM,
+												  MapSuperblockGetNextFreePhysBlock(&entry->super,
+																					VISIBILITYMAP_FORKNUM)) <=
+					   MapSuperGetReservedNextFree(entry, VISIBILITYMAP_FORKNUM));
 			}
 		}
 		else if (entry->flags & MAPSUPER_FLAG_CORRUPT)
@@ -684,6 +708,18 @@ MapSBlockRead(UmbraFileContext *map_ctx, RelFileLocator rnode, MapSuperblock *su
 				entry->page_lsn = MapSuperblockGetLastUpdatedLSN(&disk_super);
 				entry->flags = MAPSUPER_FLAG_VALID;
 				MapSuperResetReservedNextFrees(entry);
+				Assert(MapNormalizeForkBlockCount(MAIN_FORKNUM,
+												  MapSuperblockGetNextFreePhysBlock(&entry->super,
+																					MAIN_FORKNUM)) <=
+					   MapSuperGetReservedNextFree(entry, MAIN_FORKNUM));
+				Assert(MapNormalizeForkBlockCount(FSM_FORKNUM,
+												  MapSuperblockGetNextFreePhysBlock(&entry->super,
+																					FSM_FORKNUM)) <=
+					   MapSuperGetReservedNextFree(entry, FSM_FORKNUM));
+				Assert(MapNormalizeForkBlockCount(VISIBILITYMAP_FORKNUM,
+												  MapSuperblockGetNextFreePhysBlock(&entry->super,
+																					VISIBILITYMAP_FORKNUM)) <=
+					   MapSuperGetReservedNextFree(entry, VISIBILITYMAP_FORKNUM));
 			}
 			else
 			{
@@ -691,6 +727,18 @@ MapSBlockRead(UmbraFileContext *map_ctx, RelFileLocator rnode, MapSuperblock *su
 				entry->page_lsn = InvalidXLogRecPtr;
 				entry->flags = MAPSUPER_FLAG_VALID | MAPSUPER_FLAG_CORRUPT;
 				MapSuperResetReservedNextFrees(entry);
+				Assert(MapNormalizeForkBlockCount(MAIN_FORKNUM,
+												  MapSuperblockGetNextFreePhysBlock(&entry->super,
+																					MAIN_FORKNUM)) <=
+					   MapSuperGetReservedNextFree(entry, MAIN_FORKNUM));
+				Assert(MapNormalizeForkBlockCount(FSM_FORKNUM,
+												  MapSuperblockGetNextFreePhysBlock(&entry->super,
+																					FSM_FORKNUM)) <=
+					   MapSuperGetReservedNextFree(entry, FSM_FORKNUM));
+				Assert(MapNormalizeForkBlockCount(VISIBILITYMAP_FORKNUM,
+												  MapSuperblockGetNextFreePhysBlock(&entry->super,
+																					VISIBILITYMAP_FORKNUM)) <=
+					   MapSuperGetReservedNextFree(entry, VISIBILITYMAP_FORKNUM));
 			}
 		}
 		else if (entry->flags & MAPSUPER_FLAG_CORRUPT)
@@ -705,6 +753,18 @@ MapSBlockRead(UmbraFileContext *map_ctx, RelFileLocator rnode, MapSuperblock *su
 		 * should consume that runtime state directly. Disk identity/CRC
 		 * validation belongs to the slow path that populates shared state.
 		 */
+		Assert(MapNormalizeForkBlockCount(MAIN_FORKNUM,
+										  MapSuperblockGetNextFreePhysBlock(&entry->super,
+																			MAIN_FORKNUM)) <=
+			   MapSuperGetReservedNextFree(entry, MAIN_FORKNUM));
+		Assert(MapNormalizeForkBlockCount(FSM_FORKNUM,
+										  MapSuperblockGetNextFreePhysBlock(&entry->super,
+																			FSM_FORKNUM)) <=
+			   MapSuperGetReservedNextFree(entry, FSM_FORKNUM));
+		Assert(MapNormalizeForkBlockCount(VISIBILITYMAP_FORKNUM,
+										  MapSuperblockGetNextFreePhysBlock(&entry->super,
+																			VISIBILITYMAP_FORKNUM)) <=
+			   MapSuperGetReservedNextFree(entry, VISIBILITYMAP_FORKNUM));
 		*super = entry->super;
 		status = (entry->flags & MAPSUPER_FLAG_CORRUPT) ?
 			MAP_SBLOCK_READ_CORRUPT : MAP_SBLOCK_READ_OK;
@@ -835,9 +895,6 @@ MapSuperSetExtendingTarget(MapSuperEntry *entry, ForkNumber forknum,
 	}
 }
 
-
-
-
 static bool
 MapSuperPrepareEntryForUpdate(UmbraFileContext *map_ctx, RelFileLocator rnode,
 							  XLogRecPtr map_lsn, const char *missing_errmsg,
@@ -955,6 +1012,10 @@ MapSBlockUpdateLogicalNblocks(UmbraFileContext *map_ctx, RelFileLocator rnode,
 		entry->flags |= MAPSUPER_FLAG_DIRTY;
 	}
 
+	Assert(MapNormalizeForkBlockCount(forknum,
+									  MapSuperblockGetNextFreePhysBlock(&entry->super,
+																		forknum)) <=
+		   MapSuperGetReservedNextFree(entry, forknum));
 	LWLockRelease(&entry->lock);
 }
 
@@ -1197,6 +1258,19 @@ MapSBlockInit(UmbraFileContext *map_ctx, RelFileLocator rnode, XLogRecPtr map_ls
 		map_lsn : GetXLogWriteRecPtr();
 	MapSuperblockSetLastUpdatedLSN(&entry->super, entry->page_lsn);
 	entry->flags = MAPSUPER_FLAG_VALID | MAPSUPER_FLAG_DIRTY;
+	MapSuperResetReservedNextFrees(entry);
+	Assert(MapNormalizeForkBlockCount(MAIN_FORKNUM,
+									  MapSuperblockGetNextFreePhysBlock(&entry->super,
+																		MAIN_FORKNUM)) <=
+		   MapSuperGetReservedNextFree(entry, MAIN_FORKNUM));
+	Assert(MapNormalizeForkBlockCount(FSM_FORKNUM,
+									  MapSuperblockGetNextFreePhysBlock(&entry->super,
+																		FSM_FORKNUM)) <=
+		   MapSuperGetReservedNextFree(entry, FSM_FORKNUM));
+	Assert(MapNormalizeForkBlockCount(VISIBILITYMAP_FORKNUM,
+									  MapSuperblockGetNextFreePhysBlock(&entry->super,
+																		VISIBILITYMAP_FORKNUM)) <=
+		   MapSuperGetReservedNextFree(entry, VISIBILITYMAP_FORKNUM));
 
 	/*
 	 * Persist superblock immediately so later backends in bootstrap/initdb can
@@ -1246,16 +1320,30 @@ MapSBlockEnsureLoaded(UmbraFileContext *map_ctx, RelFileLocator rnode)
 				entry->super = disk_super;
 				entry->page_lsn = MapSuperblockGetLastUpdatedLSN(&disk_super);
 				entry->flags = MAPSUPER_FLAG_VALID;
+				MapSuperResetReservedNextFrees(entry);
 			}
 			else
 			{
 				MapSuperblockInit(&entry->super, 0);
 				entry->page_lsn = InvalidXLogRecPtr;
 				entry->flags = MAPSUPER_FLAG_VALID | MAPSUPER_FLAG_CORRUPT;
+				MapSuperResetReservedNextFrees(entry);
 			}
 		}
 	}
 
+	Assert(MapNormalizeForkBlockCount(MAIN_FORKNUM,
+									  MapSuperblockGetNextFreePhysBlock(&entry->super,
+																		MAIN_FORKNUM)) <=
+		   MapSuperGetReservedNextFree(entry, MAIN_FORKNUM));
+	Assert(MapNormalizeForkBlockCount(FSM_FORKNUM,
+									  MapSuperblockGetNextFreePhysBlock(&entry->super,
+																		FSM_FORKNUM)) <=
+		   MapSuperGetReservedNextFree(entry, FSM_FORKNUM));
+	Assert(MapNormalizeForkBlockCount(VISIBILITYMAP_FORKNUM,
+									  MapSuperblockGetNextFreePhysBlock(&entry->super,
+																		VISIBILITYMAP_FORKNUM)) <=
+		   MapSuperGetReservedNextFree(entry, VISIBILITYMAP_FORKNUM));
 	LWLockRelease(&entry->lock);
 	return true;
 }
@@ -1377,8 +1465,6 @@ MapSBlockTryGetNextFreePhysBlock(UmbraFileContext *map_ctx, RelFileLocator rnode
 												 MapSuperblockGetNextFreePhysBlock(&super, forknum));
 	return true;
 }
-
-
 
 void
 MapSBlockBumpLogicalNblocks(UmbraFileContext *map_ctx, RelFileLocator rnode,
@@ -1505,6 +1591,9 @@ MapSuperTableShmemInit(void)
 		entry->next_free =
 			(i == MapSuperCapacity - 1) ? MAPSUPER_FREENEXT_END : (i + 1);
 		entry->in_use = false;
+		entry->reserved_next_free_main = 0;
+		entry->reserved_next_free_fsm = 0;
+		entry->reserved_next_free_vm = 0;
 		entry->extending_target_main = InvalidBlockNumber;
 		entry->extending_target_fsm = InvalidBlockNumber;
 		entry->extending_target_vm = InvalidBlockNumber;

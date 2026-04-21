@@ -124,7 +124,7 @@ writeListPage(Relation index, Buffer buffer,
 		XLogBeginInsert();
 		XLogRegisterData(&data, sizeof(ginxlogInsertListPage));
 
-		XLogRegisterBuffer(0, buffer, REGBUF_WILL_INIT);
+		XLogRegisterBuffer(0, buffer, REGBUF_WILL_INIT_BIRTH);
 		XLogRegisterBufData(0, workspace.data, size);
 
 		recptr = XLogInsert(RM_GIN_ID, XLOG_GIN_INSERT_LISTPAGE);
@@ -430,7 +430,7 @@ ginHeapTupleFastInsert(GinState *ginstate, GinTupleCollector *collector)
 
 		memcpy(&data.metadata, metadata, sizeof(GinMetaPageData));
 
-		XLogRegisterBuffer(0, metabuffer, REGBUF_WILL_INIT | REGBUF_STANDARD);
+		XLogRegisterBuffer(0, metabuffer, REGBUF_WILL_INIT_BIRTH | REGBUF_STANDARD);
 		XLogRegisterData(&data, sizeof(ginxlogUpdateMeta));
 
 		recptr = XLogInsert(RM_GIN_ID, XLOG_GIN_UPDATE_META_PAGE);
@@ -640,9 +640,9 @@ shiftList(Relation index, Buffer metabuffer, BlockNumber newHead,
 
 			XLogBeginInsert();
 			XLogRegisterBuffer(0, metabuffer,
-							   REGBUF_WILL_INIT | REGBUF_STANDARD);
+							   REGBUF_WILL_INIT_BIRTH | REGBUF_STANDARD);
 			for (i = 0; i < data.ndeleted; i++)
-				XLogRegisterBuffer(i + 1, buffers[i], REGBUF_WILL_INIT);
+				XLogRegisterBuffer(i + 1, buffers[i], REGBUF_WILL_INIT_BIRTH);
 
 			memcpy(&data.metadata, metadata, sizeof(GinMetaPageData));
 

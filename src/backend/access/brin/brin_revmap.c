@@ -630,7 +630,7 @@ revmap_physical_extend(BrinRevmap *revmap)
 		XLogRegisterData(&xlrec, SizeOfBrinRevmapExtend);
 		XLogRegisterBuffer(0, revmap->rm_metaBuf, REGBUF_STANDARD);
 
-		XLogRegisterBuffer(1, buf, REGBUF_WILL_INIT);
+		XLogRegisterBuffer(1, buf, REGBUF_WILL_INIT_BIRTH);
 
 		recptr = XLogInsert(RM_BRIN_ID, XLOG_BRIN_REVMAP_EXTEND);
 		PageSetLSN(metapage, recptr);

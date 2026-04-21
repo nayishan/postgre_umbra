@@ -289,7 +289,7 @@ _bt_set_cleanup_info(Relation rel, BlockNumber num_delpages)
 		xl_btree_metadata md;
 
 		XLogBeginInsert();
-		XLogRegisterBuffer(0, metabuf, REGBUF_WILL_INIT | REGBUF_STANDARD);
+		XLogRegisterBuffer(0, metabuf, REGBUF_WILL_INIT_BIRTH | REGBUF_STANDARD);
 
 		Assert(metad->btm_version >= BTREE_NOVAC_VERSION);
 		md.version = metad->btm_version;
@@ -479,8 +479,8 @@ _bt_getroot(Relation rel, Relation heaprel, int access)
 			xl_btree_metadata md;
 
 			XLogBeginInsert();
-			XLogRegisterBuffer(0, rootbuf, REGBUF_WILL_INIT);
-			XLogRegisterBuffer(2, metabuf, REGBUF_WILL_INIT | REGBUF_STANDARD);
+			XLogRegisterBuffer(0, rootbuf, REGBUF_WILL_INIT_BIRTH);
+			XLogRegisterBuffer(2, metabuf, REGBUF_WILL_INIT_BIRTH | REGBUF_STANDARD);
 
 			Assert(metad->btm_version >= BTREE_NOVAC_VERSION);
 			md.version = metad->btm_version;
@@ -2294,7 +2294,7 @@ _bt_mark_page_halfdead(Relation rel, Relation heaprel, Buffer leafbuf,
 			xlrec.topparent = InvalidBlockNumber;
 
 		XLogBeginInsert();
-		XLogRegisterBuffer(0, leafbuf, REGBUF_WILL_INIT);
+		XLogRegisterBuffer(0, leafbuf, REGBUF_WILL_INIT_BIRTH);
 		XLogRegisterBuffer(1, subtreeparent, REGBUF_STANDARD);
 
 		page = BufferGetPage(leafbuf);
@@ -2713,12 +2713,12 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, BlockNumber scanblkno,
 
 		XLogBeginInsert();
 
-		XLogRegisterBuffer(0, buf, REGBUF_WILL_INIT);
+		XLogRegisterBuffer(0, buf, REGBUF_WILL_INIT_BIRTH);
 		if (BufferIsValid(lbuf))
 			XLogRegisterBuffer(1, lbuf, REGBUF_STANDARD);
 		XLogRegisterBuffer(2, rbuf, REGBUF_STANDARD);
 		if (target != leafblkno)
-			XLogRegisterBuffer(3, leafbuf, REGBUF_WILL_INIT);
+			XLogRegisterBuffer(3, leafbuf, REGBUF_WILL_INIT_BIRTH);
 
 		/* information stored on the target/to-be-unlinked block */
 		xlrec.leftsib = leftsib;
@@ -2735,7 +2735,7 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, BlockNumber scanblkno,
 
 		if (BufferIsValid(metabuf))
 		{
-			XLogRegisterBuffer(4, metabuf, REGBUF_WILL_INIT | REGBUF_STANDARD);
+			XLogRegisterBuffer(4, metabuf, REGBUF_WILL_INIT_BIRTH | REGBUF_STANDARD);
 
 			Assert(metad->btm_version >= BTREE_NOVAC_VERSION);
 			xlmeta.version = metad->btm_version;

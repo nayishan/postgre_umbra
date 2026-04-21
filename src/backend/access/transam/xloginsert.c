@@ -39,6 +39,12 @@
 #include "replication/origin.h"
 #include "storage/bufmgr.h"
 #include "storage/proc.h"
+#include "storage/smgr.h"
+#ifdef USE_UMBRA
+#include "storage/map.h"
+#include "storage/umbra.h"
+#include "storage/umfile.h"
+#endif
 #include "utils/memutils.h"
 #include "utils/pgstat_internal.h"
 #include "utils/rel.h"
@@ -84,6 +90,18 @@ typedef struct
 
 	XLogRecData bkp_rdatas[2];	/* temporary rdatas used to hold references to
 								 * backup block data in XLogRecordAssemble() */
+
+#ifdef USE_UMBRA
+	bool		has_remap;		/* true if remap metadata is prepared */
+	bool		remap_in_record; /* true if current assembled record includes remap */
+	bool		remap_committed; /* true if mapping switch was committed after insert */
+	bool		wal_owns_firstborn; /* this WAL block owns first-born mapping */
+	SMgrRelation remap_reln;	/* cached relation handle for remap commit */
+	BlockNumber old_pblkno;		/* remap: old physical block number */
+	BlockNumber new_pblkno;		/* remap: new physical block number */
+	BlockNumber remap_logical_nblocks; /* assembled logical frontier payload */
+	BlockNumber remap_next_free_pblkno; /* assembled allocator frontier payload */
+#endif
 
 	/* buffer to store a compressed version of backup block image */
 	char		compressed_page[COMPRESS_BUFSIZE];
@@ -137,13 +155,158 @@ static bool begininsert_called = false;
 /* Memory context to hold the registered buffer and data references. */
 static MemoryContext xloginsert_cxt;
 
-static XLogRecData *XLogRecordAssemble(RmgrId rmid, uint8 info,
-									   XLogRecPtr RedoRecPtr, bool doPageWrites,
-									   XLogRecPtr *fpw_lsn, int *num_fpi,
-									   uint64 *fpi_bytes,
-									   bool *topxid_included);
+#ifndef USE_UMBRA
+static XLogRecData *XLogRecordAssembleMd(RmgrId rmid, uint8 info,
+										 XLogRecPtr RedoRecPtr, bool doPageWrites,
+										 XLogRecPtr *fpw_lsn, int *num_fpi,
+										 uint64 *fpi_bytes,
+										 bool *topxid_included);
+#endif
+#ifdef USE_UMBRA
+static XLogRecData *XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
+											XLogRecPtr RedoRecPtr, bool doPageWrites,
+											XLogRecPtr *fpw_lsn, int *num_fpi,
+											uint64 *fpi_bytes,
+											bool *topxid_included);
+static void XLogCommitBlockRemapsUmbra(XLogRecPtr record_endptr);
+static void XLogAbortBlockRemapsUmbra(void);
+static void XLogFillBlockRemapFrontierUmbra(registered_buffer *regbuf,
+											XLogRecordBlockRemapHeader *rbmh);
+#else
+static void XLogCommitBlockRemapsMd(XLogRecPtr record_endptr);
+#endif
 static bool XLogCompressBackupBlock(const PageData *page, uint16 hole_offset,
 									uint16 hole_length, void *dest, uint16 *dlen);
+
+typedef struct xlog_storage_mgr
+{
+	XLogRecData *(*xlog_record_assemble) (RmgrId rmid, uint8 info,
+										  XLogRecPtr RedoRecPtr,
+										  bool doPageWrites,
+										  XLogRecPtr *fpw_lsn, int *num_fpi,
+										  uint64 *fpi_bytes,
+										  bool *topxid_included);
+	void	(*xlog_insert_finish) (XLogRecPtr record_endptr);
+} xlog_storage_mgr;
+
+static const xlog_storage_mgr xlog_storage_mgr_f = {
+#ifdef USE_UMBRA
+	.xlog_record_assemble = XLogRecordAssembleUmbra,
+	.xlog_insert_finish = XLogCommitBlockRemapsUmbra,
+#else
+	.xlog_record_assemble = XLogRecordAssembleMd,
+	.xlog_insert_finish = XLogCommitBlockRemapsMd,
+#endif
+};
+
+#ifdef USE_UMBRA
+static void
+XLogFillBlockRemapFrontierUmbra(registered_buffer *regbuf,
+								XLogRecordBlockRemapHeader *rbmh)
+{
+	SMgrRelation	reln = regbuf->remap_reln;
+	UmbraFileContext *ctx;
+	BlockNumber		logical_nblocks = InvalidBlockNumber;
+	BlockNumber		next_free_pblk = InvalidBlockNumber;
+
+	Assert(rbmh != NULL);
+
+	if (reln == NULL)
+		reln = smgropen(regbuf->rlocator, INVALID_PROC_NUMBER);
+
+	ctx = umfile_ctx_acquire(reln->smgr_rlocator);
+
+	if (MapSBlockTryGetLogicalNblocks(ctx, regbuf->rlocator,
+									  regbuf->forkno, &logical_nblocks))
+		rbmh->logical_nblocks = Max(logical_nblocks, regbuf->block + 1);
+	else
+		rbmh->logical_nblocks = regbuf->block + 1;
+
+	if (MapSBlockTryGetNextFreePhysBlock(ctx, regbuf->rlocator,
+										 regbuf->forkno, &next_free_pblk))
+		rbmh->next_free_pblkno = Max(next_free_pblk,
+									 regbuf->new_pblkno + 1);
+	else
+		rbmh->next_free_pblkno = regbuf->new_pblkno + 1;
+
+	regbuf->remap_logical_nblocks = rbmh->logical_nblocks;
+	regbuf->remap_next_free_pblkno = rbmh->next_free_pblkno;
+}
+
+static void
+XLogCommitBlockRemapsUmbra(XLogRecPtr record_endptr)
+{
+	int			block_id;
+
+	for (block_id = 0; block_id < max_registered_block_id; block_id++)
+	{
+		registered_buffer *regbuf = &registered_buffers[block_id];
+		UmbraFileContext *ctx;
+
+		if (!regbuf->in_use || !regbuf->has_remap || !regbuf->remap_in_record)
+			continue;
+		if (regbuf->remap_reln == NULL)
+			continue;
+
+		ctx = umfile_ctx_acquire(regbuf->remap_reln->smgr_rlocator);
+
+		UmMapSetMapping(regbuf->remap_reln, regbuf->forkno, regbuf->block,
+						regbuf->new_pblkno, record_endptr);
+		if (regbuf->old_pblkno == InvalidBlockNumber)
+		{
+			MapSBlockBumpLogicalNblocks(ctx,
+										regbuf->rlocator,
+										regbuf->forkno,
+										regbuf->remap_logical_nblocks != InvalidBlockNumber ?
+										regbuf->remap_logical_nblocks :
+										regbuf->block + 1,
+										record_endptr);
+			smgrbumpcachednblocks(regbuf->remap_reln,
+								  regbuf->forkno,
+								  regbuf->block + 1);
+		}
+
+		MapSBlockBumpNextFreePhysBlock(ctx,
+									   regbuf->rlocator,
+									   regbuf->forkno,
+									   regbuf->remap_next_free_pblkno != InvalidBlockNumber ?
+									   regbuf->remap_next_free_pblkno :
+									   regbuf->new_pblkno + 1,
+									   record_endptr);
+		MapInflightRelease(regbuf->rlocator, regbuf->forkno,
+						   regbuf->block);
+		regbuf->wal_owns_firstborn = false;
+		regbuf->remap_committed = true;
+	}
+}
+
+static void
+XLogAbortBlockRemapsUmbra(void)
+{
+	int			block_id;
+
+	for (block_id = 0; block_id < max_registered_block_id; block_id++)
+	{
+		registered_buffer *regbuf = &registered_buffers[block_id];
+
+		if (!regbuf->in_use || !regbuf->has_remap)
+			continue;
+		if (regbuf->remap_committed)
+			continue;
+
+		MapInflightRelease(regbuf->rlocator, regbuf->forkno,
+						   regbuf->block);
+		regbuf->wal_owns_firstborn = false;
+		regbuf->remap_in_record = false;
+	}
+}
+#else
+static void
+XLogCommitBlockRemapsMd(XLogRecPtr record_endptr)
+{
+	(void) record_endptr;
+}
+#endif
 
 /*
  * Begin constructing a WAL record. This must be called before the
@@ -227,8 +390,25 @@ XLogResetInsertion(void)
 {
 	int			i;
 
+#ifdef USE_UMBRA
+	XLogAbortBlockRemapsUmbra();
+#endif
+
 	for (i = 0; i < max_registered_block_id; i++)
+	{
 		registered_buffers[i].in_use = false;
+#ifdef USE_UMBRA
+		registered_buffers[i].has_remap = false;
+		registered_buffers[i].remap_in_record = false;
+		registered_buffers[i].remap_committed = false;
+		registered_buffers[i].wal_owns_firstborn = false;
+		registered_buffers[i].remap_reln = NULL;
+		registered_buffers[i].old_pblkno = InvalidBlockNumber;
+		registered_buffers[i].new_pblkno = InvalidBlockNumber;
+		registered_buffers[i].remap_logical_nblocks = InvalidBlockNumber;
+		registered_buffers[i].remap_next_free_pblkno = InvalidBlockNumber;
+#endif
+	}
 
 	num_rdatas = 0;
 	max_registered_block_id = 0;
@@ -283,6 +463,17 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
 	regbuf->flags = flags;
 	regbuf->rdata_tail = (XLogRecData *) &regbuf->rdata_head;
 	regbuf->rdata_len = 0;
+#ifdef USE_UMBRA
+	regbuf->has_remap = false;
+	regbuf->remap_in_record = false;
+	regbuf->remap_committed = false;
+	regbuf->wal_owns_firstborn = false;
+	regbuf->remap_reln = NULL;
+	regbuf->old_pblkno = InvalidBlockNumber;
+	regbuf->new_pblkno = InvalidBlockNumber;
+	regbuf->remap_logical_nblocks = InvalidBlockNumber;
+	regbuf->remap_next_free_pblkno = InvalidBlockNumber;
+#endif
 
 	/*
 	 * Check that this page hasn't already been registered with some other
@@ -336,6 +527,17 @@ XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator, ForkNumber forknum,
 	regbuf->flags = flags;
 	regbuf->rdata_tail = (XLogRecData *) &regbuf->rdata_head;
 	regbuf->rdata_len = 0;
+#ifdef USE_UMBRA
+	regbuf->has_remap = false;
+	regbuf->remap_in_record = false;
+	regbuf->remap_committed = false;
+	regbuf->wal_owns_firstborn = false;
+	regbuf->remap_reln = NULL;
+	regbuf->old_pblkno = InvalidBlockNumber;
+	regbuf->new_pblkno = InvalidBlockNumber;
+	regbuf->remap_logical_nblocks = InvalidBlockNumber;
+	regbuf->remap_next_free_pblkno = InvalidBlockNumber;
+#endif
 
 	/*
 	 * Check that this page hasn't already been registered with some other
@@ -509,30 +711,37 @@ XLogInsert(RmgrId rmid, uint8 info)
 		return EndPos;
 	}
 
-	do
+	PG_TRY();
 	{
-		XLogRecPtr	RedoRecPtr;
-		bool		doPageWrites;
-		bool		topxid_included = false;
-		XLogRecPtr	fpw_lsn;
-		XLogRecData *rdt;
-		int			num_fpi = 0;
-		uint64		fpi_bytes = 0;
+		do
+		{
+			XLogRecPtr	RedoRecPtr;
+			bool		doPageWrites;
+			bool		topxid_included = false;
+			XLogRecPtr	fpw_lsn;
+			XLogRecData *rdt;
+			int			num_fpi = 0;
+			uint64		fpi_bytes = 0;
 
-		/*
-		 * Get values needed to decide whether to do full-page writes. Since
-		 * we don't yet have an insertion lock, these could change under us,
-		 * but XLogInsertRecord will recheck them once it has a lock.
-		 */
-		GetFullPageWriteInfo(&RedoRecPtr, &doPageWrites);
+			GetFullPageWriteInfo(&RedoRecPtr, &doPageWrites);
 
-		rdt = XLogRecordAssemble(rmid, info, RedoRecPtr, doPageWrites,
-								 &fpw_lsn, &num_fpi, &fpi_bytes,
-								 &topxid_included);
+			rdt = xlog_storage_mgr_f.xlog_record_assemble(rmid, info, RedoRecPtr,
+														  doPageWrites, &fpw_lsn,
+														  &num_fpi, &fpi_bytes,
+														  &topxid_included);
 
-		EndPos = XLogInsertRecord(rdt, fpw_lsn, curinsert_flags, num_fpi,
-								  fpi_bytes, topxid_included);
-	} while (!XLogRecPtrIsValid(EndPos));
+			EndPos = XLogInsertRecord(rdt, fpw_lsn, curinsert_flags, num_fpi,
+									  fpi_bytes, topxid_included);
+		} while (!XLogRecPtrIsValid(EndPos));
+
+		xlog_storage_mgr_f.xlog_insert_finish(EndPos);
+	}
+	PG_CATCH();
+	{
+		XLogResetInsertion();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	XLogResetInsertion();
 
@@ -617,11 +826,12 @@ XLogGetFakeLSN(Relation rel)
  * *topxid_included is set if the topmost transaction ID is logged with the
  * current subtransaction.
  */
+#ifndef USE_UMBRA
 static XLogRecData *
-XLogRecordAssemble(RmgrId rmid, uint8 info,
-				   XLogRecPtr RedoRecPtr, bool doPageWrites,
-				   XLogRecPtr *fpw_lsn, int *num_fpi, uint64 *fpi_bytes,
-				   bool *topxid_included)
+XLogRecordAssembleMd(RmgrId rmid, uint8 info,
+					 XLogRecPtr RedoRecPtr, bool doPageWrites,
+					 XLogRecPtr *fpw_lsn, int *num_fpi, uint64 *fpi_bytes,
+					 bool *topxid_included)
 {
 	XLogRecData *rdt;
 	uint64		total_len = 0;
@@ -1009,6 +1219,470 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 
 	return &hdr_rdt;
 }
+#endif
+
+#ifdef USE_UMBRA
+static XLogRecData *
+XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
+						XLogRecPtr RedoRecPtr, bool doPageWrites,
+						XLogRecPtr *fpw_lsn, int *num_fpi,
+						uint64 *fpi_bytes,
+						bool *topxid_included)
+{
+	XLogRecData *rdt;
+	uint64		total_len = 0;
+	int			block_id;
+	pg_crc32c	rdata_crc;
+	bool		needs_backup_by_block[XLR_MAX_BLOCK_ID + 1] = {0};
+	bool		needs_data_by_block[XLR_MAX_BLOCK_ID + 1] = {0};
+	bool		include_image_by_block[XLR_MAX_BLOCK_ID + 1] = {0};
+	bool		include_remap_by_block[XLR_MAX_BLOCK_ID + 1] = {0};
+	registered_buffer *prev_regbuf = NULL;
+	XLogRecData *rdt_datas_last;
+	XLogRecord *rechdr;
+	char	   *scratch = hdr_scratch;
+
+	rechdr = (XLogRecord *) scratch;
+	scratch += SizeOfXLogRecord;
+
+	hdr_rdt.next = NULL;
+	rdt_datas_last = &hdr_rdt;
+	hdr_rdt.data = hdr_scratch;
+
+	if (wal_consistency_checking[rmid])
+		info |= XLR_CHECK_CONSISTENCY;
+
+	*fpw_lsn = InvalidXLogRecPtr;
+	for (block_id = 0; block_id < max_registered_block_id; block_id++)
+	{
+		registered_buffer *regbuf = &registered_buffers[block_id];
+		bool		needs_backup;
+		bool		needs_remap;
+		XLogRecordBlockRemapHeader rbmh;
+		bool		include_image;
+		bool		include_remap = false;
+		bool		wal_owned_remap_available = false;
+		SMgrRelation reln = NULL;
+
+		if (!regbuf->in_use)
+			continue;
+
+		regbuf->remap_in_record = false;
+		regbuf->wal_owns_firstborn = false;
+
+		if (regbuf->flags & REGBUF_FORCE_IMAGE)
+		{
+			needs_backup = true;
+			needs_remap = false;
+		}
+		else if (regbuf->flags & REGBUF_NO_IMAGE)
+		{
+			needs_backup = false;
+			needs_remap = false;
+		}
+		else if (!doPageWrites)
+		{
+			needs_backup = false;
+			needs_remap = false;
+		}
+		else
+		{
+			XLogRecPtr	page_lsn = PageGetLSN(regbuf->page);
+
+			if (rmid != RM_XLOG_ID || info != XLOG_FPI_FOR_HINT)
+			{
+				reln = smgropen(regbuf->rlocator, INVALID_PROC_NUMBER);
+				regbuf->remap_reln = reln;
+				wal_owned_remap_available =
+					UmWalOwnedRemapAvailable(reln, regbuf->forkno);
+			}
+
+			if (!wal_owned_remap_available ||
+				(rmid == RM_XLOG_ID && info == XLOG_FPI_FOR_HINT))
+			{
+				needs_backup = (page_lsn <= RedoRecPtr);
+				needs_remap = false;
+			}
+			else
+			{
+				needs_backup = false;
+				needs_remap = (page_lsn <= RedoRecPtr);
+			}
+			if (!needs_backup && !needs_remap)
+			{
+				if (!XLogRecPtrIsValid(*fpw_lsn) || page_lsn < *fpw_lsn)
+					*fpw_lsn = page_lsn;
+			}
+		}
+
+		Assert(!(needs_backup && needs_remap));
+
+		if (!regbuf->has_remap &&
+			(regbuf->flags & REGBUF_LOGICAL_BIRTH) != 0)
+		{
+			bool		got_mapping;
+
+			if (reln == NULL)
+			{
+				reln = smgropen(regbuf->rlocator, INVALID_PROC_NUMBER);
+				regbuf->remap_reln = reln;
+			}
+			if (!UmWalOwnedFirstbornAvailable(reln, regbuf->forkno,
+											 regbuf->block))
+				goto remap_birth_done;
+
+			/*
+			 * For WAL-owned first-born, the producer must have already created
+			 * any needed birth claim through smgrextend()/smgrzeroextend().
+			 *
+			 * We first probe committed MAP state. If the mapping is still
+			 * private to this backend, UmMapReserveFreshPbkno() must reuse the
+			 * owner-local in-flight claim instead of reserving a second pblk.
+			 *
+			 * Keep this order aligned with bulk_write.c: claim birth first,
+			 * then let page WAL own the final commit of that same claim.
+			 */
+			got_mapping = UmMapTryLookupPblkno(reln, regbuf->forkno,
+											  regbuf->block,
+											  &regbuf->new_pblkno);
+			if (!got_mapping)
+			{
+				UmMapReserveFreshPbkno(reln, regbuf->forkno,
+									   regbuf->block,
+									   &regbuf->new_pblkno);
+				regbuf->old_pblkno = InvalidBlockNumber;
+				regbuf->has_remap = true;
+				regbuf->remap_committed = false;
+			}
+	remap_birth_done:
+			;
+		}
+
+		include_image = needs_backup || (info & XLR_CHECK_CONSISTENCY) != 0;
+		if (regbuf->has_remap)
+			include_remap = regbuf->has_remap;
+		else if (needs_remap)
+		{
+			if (reln == NULL)
+			{
+				reln = smgropen(regbuf->rlocator, INVALID_PROC_NUMBER);
+				regbuf->remap_reln = reln;
+			}
+			UmMapGetNewPbkno(reln, regbuf->forkno, regbuf->block,
+							 &regbuf->new_pblkno,
+							 &regbuf->old_pblkno);
+
+			regbuf->has_remap = true;
+			regbuf->remap_committed = false;
+			include_remap = true;
+
+			if (include_remap &&
+				regbuf->new_pblkno == regbuf->old_pblkno)
+				elog(PANIC,
+					 "remap decision produced unchanged pblk for %u/%u/%u fork %u block %u",
+					 regbuf->rlocator.spcOid,
+					 regbuf->rlocator.dbOid,
+					 regbuf->rlocator.relNumber,
+					 regbuf->forkno,
+					 regbuf->block);
+		}
+
+		if (include_remap)
+		{
+			rbmh.old_pblkno = regbuf->old_pblkno;
+			rbmh.new_pblkno = regbuf->new_pblkno;
+			XLogFillBlockRemapFrontierUmbra(regbuf, &rbmh);
+
+			if ((regbuf->flags & REGBUF_FORCE_IMAGE) == 0 &&
+				(info & XLR_CHECK_CONSISTENCY) == 0)
+				include_image = false;
+		}
+
+		if (regbuf->rdata_len == 0)
+			needs_data_by_block[block_id] = false;
+		else if ((regbuf->flags & REGBUF_KEEP_DATA) != 0)
+			needs_data_by_block[block_id] = true;
+		else
+			needs_data_by_block[block_id] = (!needs_backup || include_remap);
+
+		needs_backup_by_block[block_id] = needs_backup;
+		include_image_by_block[block_id] = include_image;
+		include_remap_by_block[block_id] = include_remap;
+	}
+
+	for (block_id = 0; block_id < max_registered_block_id; block_id++)
+	{
+		registered_buffer *regbuf = &registered_buffers[block_id];
+		bool		needs_backup;
+		bool		needs_data;
+		XLogRecordBlockHeader bkpb;
+		XLogRecordBlockRemapHeader rbmh;
+		XLogRecordBlockImageHeader bimg;
+		XLogRecordBlockCompressHeader cbimg = {0};
+		bool		samerel;
+		bool		is_compressed = false;
+		bool		include_image;
+		bool		include_remap;
+
+		if (!regbuf->in_use)
+			continue;
+
+		needs_backup = needs_backup_by_block[block_id];
+		needs_data = needs_data_by_block[block_id];
+		include_image = include_image_by_block[block_id];
+		include_remap = include_remap_by_block[block_id];
+
+		regbuf->remap_in_record = false;
+		regbuf->wal_owns_firstborn = false;
+
+		bkpb.id = block_id;
+		bkpb.fork_flags = regbuf->forkno;
+		bkpb.data_length = 0;
+
+		if ((regbuf->flags & REGBUF_WILL_INIT) == REGBUF_WILL_INIT)
+			bkpb.fork_flags |= BKPBLOCK_WILL_INIT;
+
+		if (include_remap)
+		{
+			bkpb.fork_flags |= BKPBLOCK_HAS_REMAP;
+			regbuf->remap_in_record = true;
+		}
+
+		if (include_image)
+		{
+			const PageData *page = regbuf->page;
+			uint16		compressed_len = 0;
+
+			if (regbuf->flags & REGBUF_STANDARD)
+			{
+				uint16		lower = ((PageHeader) page)->pd_lower;
+				uint16		upper = ((PageHeader) page)->pd_upper;
+
+				if (lower >= SizeOfPageHeaderData &&
+					upper > lower &&
+					upper <= BLCKSZ)
+				{
+					bimg.hole_offset = lower;
+					cbimg.hole_length = upper - lower;
+				}
+				else
+				{
+					bimg.hole_offset = 0;
+					cbimg.hole_length = 0;
+				}
+			}
+			else
+			{
+				bimg.hole_offset = 0;
+				cbimg.hole_length = 0;
+			}
+
+			if (wal_compression != WAL_COMPRESSION_NONE)
+			{
+				is_compressed =
+					XLogCompressBackupBlock(page, bimg.hole_offset,
+											cbimg.hole_length,
+											regbuf->compressed_page,
+											&compressed_len);
+			}
+
+			bkpb.fork_flags |= BKPBLOCK_HAS_IMAGE;
+			*num_fpi += 1;
+
+			rdt_datas_last->next = &regbuf->bkp_rdatas[0];
+			rdt_datas_last = rdt_datas_last->next;
+
+			bimg.bimg_info = (cbimg.hole_length == 0) ? 0 : BKPIMAGE_HAS_HOLE;
+
+			if (needs_backup)
+				bimg.bimg_info |= BKPIMAGE_APPLY;
+
+			if (is_compressed)
+			{
+				bimg.length = compressed_len;
+
+				switch ((WalCompression) wal_compression)
+				{
+					case WAL_COMPRESSION_PGLZ:
+						bimg.bimg_info |= BKPIMAGE_COMPRESS_PGLZ;
+						break;
+
+					case WAL_COMPRESSION_LZ4:
+#ifdef USE_LZ4
+						bimg.bimg_info |= BKPIMAGE_COMPRESS_LZ4;
+#else
+						elog(ERROR, "LZ4 is not supported by this build");
+#endif
+						break;
+
+					case WAL_COMPRESSION_ZSTD:
+#ifdef USE_ZSTD
+						bimg.bimg_info |= BKPIMAGE_COMPRESS_ZSTD;
+#else
+						elog(ERROR, "zstd is not supported by this build");
+#endif
+						break;
+
+					case WAL_COMPRESSION_NONE:
+						Assert(false);
+						break;
+				}
+
+				rdt_datas_last->data = regbuf->compressed_page;
+				rdt_datas_last->len = compressed_len;
+			}
+			else
+			{
+				bimg.length = BLCKSZ - cbimg.hole_length;
+
+				if (cbimg.hole_length == 0)
+				{
+					rdt_datas_last->data = page;
+					rdt_datas_last->len = BLCKSZ;
+				}
+				else
+				{
+					rdt_datas_last->data = page;
+					rdt_datas_last->len = bimg.hole_offset;
+
+					rdt_datas_last->next = &regbuf->bkp_rdatas[1];
+					rdt_datas_last = rdt_datas_last->next;
+
+					rdt_datas_last->data =
+						page + (bimg.hole_offset + cbimg.hole_length);
+					rdt_datas_last->len =
+						BLCKSZ - (bimg.hole_offset + cbimg.hole_length);
+				}
+			}
+
+			total_len += bimg.length;
+			*fpi_bytes += bimg.length;
+		}
+
+		if (needs_data)
+		{
+			Assert(regbuf->rdata_len <= UINT16_MAX);
+
+			bkpb.fork_flags |= BKPBLOCK_HAS_DATA;
+			bkpb.data_length = (uint16) regbuf->rdata_len;
+			total_len += regbuf->rdata_len;
+
+			rdt_datas_last->next = regbuf->rdata_head;
+			rdt_datas_last = regbuf->rdata_tail;
+		}
+
+		if (prev_regbuf && RelFileLocatorEquals(regbuf->rlocator, prev_regbuf->rlocator))
+		{
+			samerel = true;
+			bkpb.fork_flags |= BKPBLOCK_SAME_REL;
+		}
+		else
+			samerel = false;
+		prev_regbuf = regbuf;
+
+		memcpy(scratch, &bkpb, SizeOfXLogRecordBlockHeader);
+		scratch += SizeOfXLogRecordBlockHeader;
+		if (include_remap)
+		{
+			rbmh.old_pblkno = regbuf->old_pblkno;
+			rbmh.new_pblkno = regbuf->new_pblkno;
+			rbmh.logical_nblocks = regbuf->remap_logical_nblocks;
+			rbmh.next_free_pblkno = regbuf->remap_next_free_pblkno;
+			memcpy(scratch, &rbmh, SizeOfXLogRecordBlockRemapHeader);
+			scratch += SizeOfXLogRecordBlockRemapHeader;
+		}
+		if (include_image)
+		{
+			memcpy(scratch, &bimg, SizeOfXLogRecordBlockImageHeader);
+			scratch += SizeOfXLogRecordBlockImageHeader;
+			if (cbimg.hole_length != 0 && is_compressed)
+			{
+				memcpy(scratch, &cbimg,
+					   SizeOfXLogRecordBlockCompressHeader);
+				scratch += SizeOfXLogRecordBlockCompressHeader;
+			}
+		}
+		if (!samerel)
+		{
+			memcpy(scratch, &regbuf->rlocator, sizeof(RelFileLocator));
+			scratch += sizeof(RelFileLocator);
+		}
+		memcpy(scratch, &regbuf->block, sizeof(BlockNumber));
+		scratch += sizeof(BlockNumber);
+	}
+
+	if ((curinsert_flags & XLOG_INCLUDE_ORIGIN) &&
+		replorigin_xact_state.origin != InvalidReplOriginId)
+	{
+		*(scratch++) = (char) XLR_BLOCK_ID_ORIGIN;
+		memcpy(scratch, &replorigin_xact_state.origin, sizeof(replorigin_xact_state.origin));
+		scratch += sizeof(replorigin_xact_state.origin);
+	}
+
+	if (IsSubxactTopXidLogPending())
+	{
+		TransactionId xid = GetTopTransactionIdIfAny();
+
+		*topxid_included = true;
+
+		*(scratch++) = (char) XLR_BLOCK_ID_TOPLEVEL_XID;
+		memcpy(scratch, &xid, sizeof(TransactionId));
+		scratch += sizeof(TransactionId);
+	}
+
+	if (mainrdata_len > 0)
+	{
+		if (mainrdata_len > 255)
+		{
+			uint32 mainrdata_len_4b;
+
+			if (mainrdata_len > PG_UINT32_MAX)
+				ereport(ERROR,
+						(errmsg_internal("too much WAL data"),
+						 errdetail_internal("Main data length is %" PRIu64 " bytes for a maximum of %u bytes.",
+											mainrdata_len,
+											PG_UINT32_MAX)));
+
+			mainrdata_len_4b = (uint32) mainrdata_len;
+			*(scratch++) = (char) XLR_BLOCK_ID_DATA_LONG;
+			memcpy(scratch, &mainrdata_len_4b, sizeof(uint32));
+			scratch += sizeof(uint32);
+		}
+		else
+		{
+			*(scratch++) = (char) XLR_BLOCK_ID_DATA_SHORT;
+			*(scratch++) = (uint8) mainrdata_len;
+		}
+		rdt_datas_last->next = mainrdata_head;
+		rdt_datas_last = mainrdata_last;
+		total_len += mainrdata_len;
+	}
+	rdt_datas_last->next = NULL;
+
+	hdr_rdt.len = (scratch - hdr_scratch);
+	total_len += hdr_rdt.len;
+
+	INIT_CRC32C(rdata_crc);
+	COMP_CRC32C(rdata_crc, hdr_scratch + SizeOfXLogRecord, hdr_rdt.len - SizeOfXLogRecord);
+	for (rdt = hdr_rdt.next; rdt != NULL; rdt = rdt->next)
+		COMP_CRC32C(rdata_crc, rdt->data, rdt->len);
+
+	if (total_len > XLogRecordMaxSize)
+		ereport(ERROR,
+				(errmsg_internal("oversized WAL record"),
+				 errdetail_internal("WAL record would be %" PRIu64 " bytes (of maximum %u bytes); rmid %u flags %u.",
+									total_len, XLogRecordMaxSize, rmid, info)));
+
+	rechdr->xl_xid = GetCurrentTransactionIdIfAny();
+	rechdr->xl_tot_len = (uint32) total_len;
+	rechdr->xl_info = info;
+	rechdr->xl_rmid = rmid;
+	rechdr->xl_prev = InvalidXLogRecPtr;
+	rechdr->xl_crc = rdata_crc;
+
+	return &hdr_rdt;
+}
+#endif
 
 /*
  * Create a compressed version of a backup block image.
@@ -1194,7 +1868,7 @@ log_newpage(RelFileLocator *rlocator, ForkNumber forknum, BlockNumber blkno,
 	int			flags;
 	XLogRecPtr	recptr;
 
-	flags = REGBUF_FORCE_IMAGE;
+	flags = REGBUF_FORCE_IMAGE | REGBUF_LOGICAL_BIRTH;
 	if (page_std)
 		flags |= REGBUF_STANDARD;
 
@@ -1228,7 +1902,7 @@ log_newpages(RelFileLocator *rlocator, ForkNumber forknum, int num_pages,
 	int			i;
 	int			j;
 
-	flags = REGBUF_FORCE_IMAGE;
+	flags = REGBUF_FORCE_IMAGE | REGBUF_LOGICAL_BIRTH;
 	if (page_std)
 		flags |= REGBUF_STANDARD;
 
@@ -1322,7 +1996,7 @@ log_newpage_range(Relation rel, ForkNumber forknum,
 	int			flags;
 	BlockNumber blkno;
 
-	flags = REGBUF_FORCE_IMAGE;
+	flags = REGBUF_FORCE_IMAGE | REGBUF_LOGICAL_BIRTH;
 	if (page_std)
 		flags |= REGBUF_STANDARD;
 
