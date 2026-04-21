@@ -14,6 +14,7 @@
 #ifndef SMGR_H
 #define SMGR_H
 
+#include "access/xlogdefs.h"
 #include "lib/ilist.h"
 #include "storage/aio_types.h"
 #include "storage/block.h"
@@ -21,11 +22,11 @@
 
 /*
  * smgr.c maintains a table of SMgrRelation objects, which are essentially
- * cached storage-manager handles for a relation.  An SMgrRelation is created
- * (if not already present) by smgropen(), and destroyed by smgrdestroy().
- * Note that neither of these operations imply I/O, they just create or destroy
- * a hashtable entry.  (But smgrdestroy() may release associated resources,
- * such as OS-level file descriptors.)
+ * cached file handles.  An SMgrRelation is created (if not already present)
+ * by smgropen(), and destroyed by smgrdestroy().  Note that neither of these
+ * operations imply I/O, they just create or destroy a hashtable entry.  (But
+ * smgrdestroy() may release associated resources, such as OS-level file
+ * descriptors.)
  *
  * An SMgrRelation may be "pinned", to prevent it from being destroyed while
  * it's in use.  We use this to prevent pointers in relcache to smgr from being
@@ -113,18 +114,34 @@ extern void smgrwriteback(SMgrRelation reln, ForkNumber forknum,
 						  BlockNumber blocknum, BlockNumber nblocks);
 extern BlockNumber smgrnblocks(SMgrRelation reln, ForkNumber forknum);
 extern BlockNumber smgrnblocks_cached(SMgrRelation reln, ForkNumber forknum);
+extern void smgrbumpcachednblocks(SMgrRelation reln, ForkNumber forknum,
+								  BlockNumber nblocks);
+extern bool smgrisinternalfork(ForkNumber forknum);
 extern void smgrcreaterelationmetadata(SMgrRelation reln);
 extern void smgrcopyrelationmetadata(SMgrRelation src, SMgrRelation dst,
 									 char relpersistence);
 extern void smgrsyncrelationmetadata(SMgrRelation reln);
 extern void smgrunlinkrelationmetadata(RelFileLocatorBackend rlocator,
 									   bool isRedo);
+extern void smgrsetmapstate(SMgrRelation reln, uint8 map_state);
 extern bool smgrcreatedballowswallog(void);
+extern void smgrinitnewrelation(SMgrRelation reln, bool needs_wal);
+extern void smgrredocreatefork(SMgrRelation reln, ForkNumber forknum,
+							   XLogRecPtr lsn);
 extern void smgrcheckpointdatabasetablespaces(Oid dbid, int ntablespaces,
 											  const Oid *tablespace_ids);
 extern void smgrinvalidatedatabasetablespaces(Oid dbid, int ntablespaces,
 											  const Oid *tablespace_ids);
 extern void smgrinvalidatedatabase(Oid dbid);
+extern void smgrregistershutdowncleanup(void);
+extern void smgrmarkskipwalpending(RelFileLocator rlocator);
+extern void smgrclearskipwalpending(RelFileLocator rlocator);
+extern bool smgrpreparependingsync(SMgrRelation reln);
+extern bool smgrneedsrecoveryfsmvacuum(SMgrRelation reln);
+extern void smgrpretruncate(SMgrRelation reln, ForkNumber *forknum, int nforks,
+							BlockNumber *old_nblocks,
+							BlockNumber *nblocks,
+							XLogRecPtr truncate_lsn);
 extern void smgrtruncate(SMgrRelation reln, ForkNumber *forknum, int nforks,
 						 BlockNumber *old_nblocks,
 						 BlockNumber *nblocks);
@@ -150,7 +167,8 @@ smgrwrite(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 extern void pgaio_io_set_target_smgr(PgAioHandle *ioh,
 									 SMgrRelationData *smgr,
 									 ForkNumber forknum,
-									 BlockNumber blocknum,
+									 BlockNumber logical_blocknum,
+									 BlockNumber physical_blocknum,
 									 int nblocks,
 									 bool skip_fsync);
 

@@ -43,6 +43,8 @@ typedef struct MapTruncatePreloadState
 
 static MapTruncatePreloadState MapTruncatePreload[MAX_FORKNUM + 1];
 
+#define MAP_PENDING_WAIT_RETRIES 10000
+#define MAP_PENDING_WAIT_USEC 1000
 
 typedef enum MapCachedLookupResult
 {
@@ -114,6 +116,20 @@ static MapCachedLookupResult MapTryLookupCachedPblknoInternal(RelFileLocator rno
 															  BlockNumber lblkno,
 															  bool adjust_usage,
 															  BlockNumber *pblkno);
+static bool MapTryReserveFreshPblknoInternal(UmbraFileContext *map_ctx,
+											 RelFileLocator rnode,
+											 ForkNumber forknum,
+											 BlockNumber lblkno,
+											 BlockNumber *new_pblkno,
+											 bool nowait);
+static bool MapWaitForForeignInflightToClear(RelFileLocator rnode,
+											 ForkNumber forknum,
+											 BlockNumber lblkno);
+bool MapReserveNextPblkno(UmbraFileContext *map_ctx, RelFileLocator rnode,
+						  ForkNumber forknum, BlockNumber lblkno,
+						  BlockNumber *new_pblkno,
+						  bool nowait);
+
 void
 MapResetAllTruncatePreloads(void)
 {
@@ -531,13 +547,207 @@ done:
 	return run_blocks;
 }
 
+/*
+ * Reserve a brand-new in-flight physical target for lblkno.
+ *
+ * This helper does not consult existing in-flight state before consuming the
+ * next frontier block. If another backend already published an in-flight
+ * target for the same lblkno, publication will fail and the freshly reserved
+ * frontier slot becomes a hole. Callers that want a stable winner should
+ * fall back to a lookup after a false return.
+ */
+bool
+MapTryReserveFreshPblkno(UmbraFileContext *map_ctx, RelFileLocator rnode,
+						 ForkNumber forknum, BlockNumber lblkno,
+						 BlockNumber *new_pblkno, bool nowait)
+{
+	return MapTryReserveFreshPblknoInternal(map_ctx, rnode, forknum, lblkno,
+											new_pblkno, nowait);
+}
+
+static bool
+MapTryReserveFreshPblknoInternal(UmbraFileContext *map_ctx, RelFileLocator rnode,
+								 ForkNumber forknum, BlockNumber lblkno,
+								 BlockNumber *new_pblkno, bool nowait)
+{
+	MapSuperEntry *entry;
+	BlockNumber		next;
+	uint32			flags;
+	bool			reserved = false;
+
+	Assert(new_pblkno != NULL);
+
+	if (!MapForkHasMappedState(forknum))
+		return false;
+
+	if (!MapSBlockEnsureLoaded(map_ctx, rnode))
+		return false;
+
+	if (!MapInflightTryClaim(map_ctx, rnode, forknum, lblkno))
+		return false;
+
+	PG_TRY();
+	{
+		if (nowait)
+		{
+			if (!MapSuperFindEntryTryLocked(rnode, LW_EXCLUSIVE, &entry))
+				goto reserve_done;
+		}
+		else
+		{
+			if (!MapSuperFindEntryLocked(rnode, LW_EXCLUSIVE, &entry))
+				goto reserve_done;
+		}
+
+		flags = entry->flags;
+		if ((flags & MAPSUPER_FLAG_CORRUPT) ||
+			!MapSuperblockHasValidIdentity(&entry->super) ||
+			((flags & MAPSUPER_FLAG_DIRTY) == 0 &&
+			 !MapSuperblockCheckCRC(&entry->super)))
+		{
+			LWLockRelease(&entry->lock);
+			if (!InRecovery)
+				MapSBlockReportCorrupt(rnode, "invalid identity or CRC");
+			goto reserve_done;
+		}
+
+		Assert(MapNormalizeForkBlockCount(forknum,
+										  MapSuperblockGetNextFreePhysBlock(&entry->super,
+																			forknum)) <=
+			   MapSuperGetReservedNextFree(entry, forknum));
+		next = MapSuperGetReservedNextFree(entry, forknum);
+		if (next == InvalidBlockNumber - 1)
+		{
+			LWLockRelease(&entry->lock);
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("cannot allocate more physical blocks for relation %u/%u/%u fork %d",
+							rnode.spcOid, rnode.dbOid, rnode.relNumber, forknum)));
+		}
+
+		MapSuperSetReservedNextFree(entry, forknum, next + 1);
+		Assert(MapNormalizeForkBlockCount(forknum,
+										  MapSuperblockGetNextFreePhysBlock(&entry->super,
+																			forknum)) <=
+			   MapSuperGetReservedNextFree(entry, forknum));
+
+		*new_pblkno = next;
+		LWLockRelease(&entry->lock);
+		MapInflightFinishClaim(rnode, forknum, lblkno, next);
+		reserved = true;
+
+reserve_done:
+		;
+	}
+	PG_CATCH();
+	{
+		MapInflightRelease(rnode, forknum, lblkno);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	if (!reserved)
+	{
+		MapInflightRelease(rnode, forknum, lblkno);
+		return false;
+	}
+
+	return true;
+}
+
+static bool
+MapWaitForForeignInflightToClear(RelFileLocator rnode,
+								 ForkNumber forknum,
+								 BlockNumber lblkno)
+{
+	int			wait_retries = 0;
+
+	for (;;)
+	{
+		if (!MapInflightBitIsSet(rnode, forknum, lblkno))
+		{
+			if (wait_retries > 0)
+				elog(LOG,
+					 "foreground remap waited for in-flight remap on relation %u/%u/%u fork %d block %u (%d retries, %d usec)",
+					 rnode.spcOid, rnode.dbOid, rnode.relNumber,
+					 forknum, lblkno,
+					 wait_retries,
+					 wait_retries * MAP_PENDING_WAIT_USEC);
+			return wait_retries > 0;
+		}
+
+		CHECK_FOR_INTERRUPTS();
+		pg_usleep(MAP_PENDING_WAIT_USEC);
+		wait_retries++;
+
+		if (wait_retries >= MAP_PENDING_WAIT_RETRIES)
+			ereport(ERROR,
+					(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+					 errmsg("timed out waiting for in-flight remap of relation %u/%u/%u fork %d block %u",
+							rnode.spcOid, rnode.dbOid, rnode.relNumber,
+							forknum, lblkno)));
+	}
+}
+
+/*
+ * MapReserveNextPblkno - return a locally owned in-flight pblk for lblkno,
+ * creating it if needed.
+ *
+ * The shared MAP bit remains visible to other backends so they can observe
+ * contention, but the selected pblk stays owner-local and must not be
+ * borrowed by foreign callers. Foreign collisions are surfaced as false so
+ * callers can fail or fallback according to their ownership rules.
+ */
+bool
+MapReserveNextPblkno(UmbraFileContext *map_ctx, RelFileLocator rnode,
+					 ForkNumber forknum, BlockNumber lblkno,
+					 BlockNumber *new_pblkno, bool nowait)
+{
+	if (MapInflightLookupOwnedPblk(rnode, forknum, lblkno, new_pblkno))
+		return true;
+
+	if (MapTryReserveFreshPblknoInternal(map_ctx, rnode, forknum, lblkno,
+										 new_pblkno, nowait))
+		return true;
+
+	return MapInflightLookupOwnedPblk(rnode, forknum, lblkno, new_pblkno);
+}
+
+/*
+ * Reserve a fresh physical target without consulting or updating any current
+ * mapping entry.
+ *
+ * Callers use this when they already own first publication for lblkno and
+ * must not reuse a locally visible old mapping.
+ */
+bool
+MapReserveFreshPblkno(UmbraFileContext *map_ctx, RelFileLocator rnode,
+					  ForkNumber forknum, BlockNumber lblkno,
+					  BlockNumber *new_pblkno)
+{
+	if (MapReserveNextPblkno(map_ctx, rnode, forknum, lblkno,
+							 new_pblkno, false))
+	{
+		return true;
+	}
+
+	/*
+	 * "Fresh" callers are first-born owners. Seeing a foreign in-flight owner
+	 * here means the caller's ownership assumption was wrong, so surface the
+	 * conflict immediately and let the caller decide whether this is an
+	 * invariant violation or a fast-path fallback.
+	 */
+	return false;
+}
+
 
 /*
  * MapReadBuffer - read a map page into buffer
  *
  * Returns the slot_id of the buffer, with the buffer pinned.
  *
- * The caller owns the returned buffer pin.
+ * This function is extern because direct mapping publication needs to load
+ * and update MAP pages from outside map.c.
  */
 int
 MapReadBuffer(UmbraFileContext *map_ctx, RelFileLocator rnode,
@@ -629,9 +839,19 @@ MapReadBuffer(UmbraFileContext *map_ctx, RelFileLocator rnode,
 				continue;
 			}
 		}
+
+		if (buf->pending_count != 0)
+		{
+			LWLockRelease(&buf->buffer_lock);
+			MapUnpinBuffer(slot_id);
+			continue;
+		}
+
 		old_page_number = buf->page_number;
 		old_forknum = buf->forknum;
 		old_rnode = buf->rnode;
+		MemSet(buf->pending_bits, 0, sizeof(buf->pending_bits));
+
 		existing_slot_id = MapCacheInsert(rnode, forknum, map_blkno, slot_id);
 		if (existing_slot_id >= 0 && existing_slot_id != slot_id)
 			retry = true;
@@ -1043,7 +1263,7 @@ MapInvalidateDatabase(Oid dbid)
 }
 
 /*
- * MapGetLogicalBlockCount - return the persisted logical block count.
+ * MapGetLogicalBlockCount - get logical block count from the MAP superblock
  */
 BlockNumber
 MapGetLogicalBlockCount(UmbraFileContext *map_ctx, RelFileLocator rnode, ForkNumber forknum)
@@ -1136,4 +1356,115 @@ MapGetPhysicalBlockCount(UmbraFileContext *map_ctx, RelFileLocator rnode,
 						InvalidBlockNumber - 1)));
 
 	return max_pblkno + 1;
+}
+
+/*
+ * MapGetNewPblkno - allocate new physical block and return both old and new
+ *
+ * This queries the current mapping, reserves a new physical block, and returns
+ * both the old and new physical block numbers to the caller that owns the
+ * mapping transition.
+ *
+ * Parameters:
+ *   map_ctx: MAP fork context for file I/O operations
+ *   rnode: relation identifier
+ *   forknum: fork number
+ *   lblkno: logical block number
+ *   new_pblkno: output parameter for the new physical block number
+ *   old_pblkno: output parameter for the old physical block number
+ */
+void MapGetNewPbkno(UmbraFileContext *map_ctx, RelFileLocator rnode, ForkNumber forknum,
+				BlockNumber lblkno, BlockNumber *new_pblkno,
+				BlockNumber *old_pblkno)
+{
+	BlockNumber cur_pblkno;
+
+	Assert(new_pblkno != NULL);
+	Assert(old_pblkno != NULL);
+
+	for (;;)
+	{
+		if (!MapTryLookup(map_ctx, rnode, forknum, lblkno, &cur_pblkno))
+		{
+			*old_pblkno = InvalidBlockNumber;
+		}
+		else
+		{
+			*old_pblkno = cur_pblkno;
+		}
+
+		if (MapReserveNextPblkno(map_ctx, rnode, forknum, lblkno,
+								 new_pblkno, false))
+			break;
+
+		/*
+		 * A foreign in-flight owner controls the current mapping publication
+		 * decision. Wait for it to publish, then retry against committed MAP
+		 * state instead of guessing from buffers or page LSNs.
+		 */
+		if (!MapWaitForForeignInflightToClear(rnode, forknum, lblkno))
+			elog(ERROR,
+				 "failed to reserve physical block for relation %u/%u/%u fork %d blk %u",
+				 rnode.spcOid, rnode.dbOid, rnode.relNumber, forknum, lblkno);
+	}
+}
+
+/*
+ * MapSetMapping - set a mapping entry directly
+ *
+ * This function sets a mapping entry directly without allocating a new
+ * physical block. Callers must already own the mapping publication decision.
+ *
+ * Parameters:
+ *   map_ctx: MAP fork context for file I/O operations
+ *   rnode: relation identifier
+ *   forknum: fork number
+ *   lblkno: logical block number
+ *   new_pblkno: physical block number to set
+ *
+ * This function does NOT allocate a new physical block and does NOT advance
+ * superblock frontier/watermark state. Callers that own a fresh physical
+ * allocation must publish frontier changes explicitly.
+ */
+void
+MapSetMapping(UmbraFileContext *map_ctx, RelFileLocator rnode, ForkNumber forknum,
+			  BlockNumber lblkno, BlockNumber new_pblkno, XLogRecPtr map_lsn)
+{
+	BlockNumber  map_blkno;
+	int          slot_id;
+	int          entry_idx;
+	MapPage     *page;
+	MapBufferDesc *buf;
+
+	/* Convert (forknum, lblkno) to Umbra metadata-fork block number */
+	map_blkno = MapLblknoToMapBlkno(forknum, lblkno);
+	entry_idx = map_blkno % MAP_ENTRIES_PER_PAGE;
+	map_blkno = map_blkno / MAP_ENTRIES_PER_PAGE;
+
+	/* Read or allocate the map page */
+	slot_id = MapReadBuffer(map_ctx, rnode, forknum, map_blkno);
+	buf = &MapBuffers[slot_id];
+	page = MapGetPage(slot_id);
+
+	/* Acquire buffer lock for modifying map page content */
+	LWLockAcquire(&buf->buffer_lock, LW_EXCLUSIVE);
+
+	/* Set the mapping directly */
+	page->pblknos[entry_idx] = new_pblkno;
+
+	/* Record LSN while holding page lock to avoid content/LSN reordering. */
+	if (map_lsn == InvalidXLogRecPtr)
+	{
+		if (InRecovery)
+			map_lsn = GetXLogReplayRecPtr(NULL);
+		else
+			map_lsn = GetXLogWriteRecPtr();
+	}
+	MapMarkBufferDirty(map_ctx, buf, map_lsn);
+
+	/* Release buffer lock after modification */
+	LWLockRelease(&buf->buffer_lock);
+
+	/* Unpin the buffer */
+	MapUnpinBuffer(slot_id);
 }

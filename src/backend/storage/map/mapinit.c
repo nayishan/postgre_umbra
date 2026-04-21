@@ -66,7 +66,9 @@ MapBackendInit(void)
 		return;
 
 	MapRefreshBufferSlots();
-	MapEnsurePrivateRefCount();	initialized = true;
+	MapEnsurePrivateRefCount();
+	MapInflightBackendInit();
+	initialized = true;
 }
 
 static void
@@ -121,6 +123,9 @@ MapShmemInit(void *arg)
 		buf->forknum = InvalidForkNumber;
 		buf->page_number = -1;
 		buf->page_lsn = 0;
+		buf->pending_count = 0;
+		MemSet(buf->pending_bits, 0, sizeof(buf->pending_bits));
+
 		LWLockInitialize(&buf->buffer_lock, LWTRANCHE_MAP_BUFFER_CONTENT);
 		LWLockInitialize(&buf->io_in_progress_lock, LWTRANCHE_MAP_BUFFER_CONTENT);
 	}

@@ -1620,7 +1620,6 @@ umfile_zeroextend(UmbraFileContext *ctx, ForkNumber forknum, BlockNumber blocknu
 		nblocks -= numblocks;
 		blocknum += numblocks;
 	}
-
 }
 
 bool
@@ -1832,7 +1831,6 @@ umfile_readv(UmbraFileContext *ctx, ForkNumber forknum, BlockNumber blocknum,
 		buffers += nblocks_this_segment;
 		blocknum += nblocks_this_segment;
 	}
-
 }
 
 void
@@ -1897,12 +1895,10 @@ umfile_startreadv_physical(PgAioHandle *ioh, UmbraFileContext *ctx,
 	 * Umbra MAP translation enforces single-block I/O via ummaxcombine().
 	 */
 	Assert(nblocks >= 1);
-	{
-		v = umfile_getseg(ctx, ctx->rlocator,
-						  forknum, physical_blocknum, false /* skipFsync */,
-						  UM_EXTENSION_FAIL,
-						  RelFileLocatorBackendIsTemp(ctx->rlocator));
-	}
+	v = umfile_getseg(ctx, ctx->rlocator,
+					  forknum, physical_blocknum, false /* skipFsync */,
+					  UM_EXTENSION_FAIL,
+					  RelFileLocatorBackendIsTemp(ctx->rlocator));
 
 	seekpos = (off_t) BLCKSZ * (physical_blocknum % ((BlockNumber) RELSEG_SIZE));
 	Assert(seekpos < (off_t) BLCKSZ * RELSEG_SIZE);
@@ -1926,10 +1922,8 @@ umfile_startreadv_physical(PgAioHandle *ioh, UmbraFileContext *ctx,
 	 * Preserve logical identity for AIO completion reporting and reopen.
 	 * The started I/O uses physical addressing (file/seekpos).
 	 */
-	{
-		ret = FileStartReadV(ioh, v->umfd_vfd, iovcnt, seekpos,
-							 WAIT_EVENT_DATA_FILE_READ);
-	}
+	ret = FileStartReadV(ioh, v->umfd_vfd, iovcnt, seekpos,
+						 WAIT_EVENT_DATA_FILE_READ);
 	if (ret != 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
@@ -2026,7 +2020,6 @@ umfile_writev(UmbraFileContext *ctx, ForkNumber forknum, BlockNumber blocknum,
 		buffers += nblocks_this_segment;
 		blocknum += nblocks_this_segment;
 	}
-
 }
 
 void

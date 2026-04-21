@@ -258,6 +258,8 @@ MapBackendExitCleanup(void)
 	 * progress even if current backend is leaving via ERROR/abort.
 	 */
 	MapAbortBufferIO();
+	MapInflightCleanupOwned();
+
 	if (MapPrivateRefCount == NULL)
 		return;
 
@@ -401,6 +403,18 @@ retry:
 		MapWaitIO(buf);
 		goto retry;
 	}
+
+	if (buf->pending_count != 0)
+	{
+		LWLockRelease(&buf->buffer_lock);
+		LWLockRelease(&buf->io_in_progress_lock);
+		CHECK_FOR_INTERRUPTS();
+		pg_usleep(1000L);
+		goto retry;
+	}
+
+	MemSet(buf->pending_bits, 0, sizeof(buf->pending_bits));
+
 	buf->page_number = -1;
 	buf->forknum = InvalidForkNumber;
 	memset(&buf->rnode, 0, sizeof(RelFileLocator));

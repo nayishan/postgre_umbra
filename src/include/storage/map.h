@@ -77,6 +77,9 @@ typedef struct MapPage
 	uint32		pblknos[MAP_ENTRIES_PER_PAGE];
 } MapPage;
 
+#define MAP_PENDING_BITS_PER_WORD 64
+#define MAP_PENDING_BITMAP_WORDS \
+	((MAP_ENTRIES_PER_PAGE + MAP_PENDING_BITS_PER_WORD - 1) / MAP_PENDING_BITS_PER_WORD)
 
 /* Shared memory control structure */
 typedef struct MapSharedData
@@ -109,12 +112,20 @@ typedef struct MapBufferDesc
 	XLogRecPtr	page_lsn;	/* LSN of last modification */
 	int			id;			/* slot ID */
 	pg_atomic_uint32 state; /* state flags */
+	uint32		pending_count;	/* in-flight remaps protected by pending_bits */
+	uint64		pending_bits[MAP_PENDING_BITMAP_WORDS];
 	int			freeNext;	/* next buffer in free list */
 	int			wait_backend_pid;	/* backend PID of pin-count waiter */
 	LWLock		buffer_lock;		/* lock for buffer content access */
 	LWLock		io_in_progress_lock; /* lock for buffer I/O state */
 } MapBufferDesc;
 
+typedef struct MapInflightBarrier
+{
+	bool		valid;
+	int			slot_id;
+	int			entry_idx;
+} MapInflightBarrier;
 
 extern void MapBackendInit(void);
 extern const ShmemCallbacks MapShmemCallbacks;
@@ -128,9 +139,33 @@ extern BlockNumber MapTryLookupPblkRun(UmbraFileContext *map_ctx,
 									   ForkNumber forknum,
 									   BlockNumber lblkno,
 									   BlockNumber maxblocks,
-									   BlockNumber *start_pblkno);/* Buffer management */
+									   BlockNumber *start_pblkno);
+extern bool MapReserveFreshPblkno(UmbraFileContext *map_ctx,
+								  RelFileLocator rnode,
+								  ForkNumber forknum,
+								  BlockNumber lblkno,
+								  BlockNumber *new_pblkno);
+extern bool MapInflightLookupOwnedPblk(RelFileLocator rnode, ForkNumber forknum,
+									   BlockNumber lblkno, BlockNumber *pblkno);
+extern bool MapInflightTryClaimBarrier(UmbraFileContext *map_ctx,
+									   RelFileLocator rnode,
+									   ForkNumber forknum,
+									   BlockNumber lblkno,
+									   MapInflightBarrier *barrier);
+extern void MapInflightReleaseBarrier(MapInflightBarrier *barrier);
+extern void MapInflightRelease(RelFileLocator rnode, ForkNumber forknum,
+							   BlockNumber lblkno);
+/* Buffer management used by direct mapping publication helpers. */
 extern int	MapReadBuffer(UmbraFileContext *map_ctx, RelFileLocator rnode,
 						  ForkNumber forknum, BlockNumber map_blkno);
+
+/* Mapping publication helpers. */
+extern void MapGetNewPbkno(UmbraFileContext *map_ctx, RelFileLocator rnode,
+						   ForkNumber forknum, BlockNumber lblkno,
+						   BlockNumber *new_pblkno, BlockNumber *old_pblkno);
+extern void MapSetMapping(UmbraFileContext *map_ctx, RelFileLocator rnode,
+						  ForkNumber forknum, BlockNumber lblkno,
+						  BlockNumber new_pblkno, XLogRecPtr map_lsn);
 
 /* MAP superblock helpers */
 extern void MapSBlockInit(UmbraFileContext *map_ctx, RelFileLocator rnode,

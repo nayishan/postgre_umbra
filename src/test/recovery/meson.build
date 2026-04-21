@@ -64,6 +64,7 @@ tests += {
       't/053_standby_login_event_trigger.pl',
       't/060_umbra_map_superblock_watermark.pl',
       't/061_umbra_map_fork_policy.pl',
+      't/068_umbra_fsm_vm_map_translation.pl',
       't/070_umbra_mainfork_head_unlink_checkpoint.pl',
     ],
   },
