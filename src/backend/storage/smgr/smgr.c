@@ -150,6 +150,10 @@ typedef struct f_smgr
 	void		(*smgr_invalidate_database_tablespaces) (Oid dbid,
 														 int ntablespaces,
 														 const Oid *tablespace_ids);
+	uint64		(*smgr_get_map_compactor_relocations) (void);
+	uint64		(*smgr_get_map_reclaim_enqueued) (void);
+	uint64		(*smgr_get_map_reclaim_processed) (void);
+	uint64		(*smgr_get_map_reclaim_failed) (void);
 	void		(*smgr_mark_skip_wal_pending) (SMgrRelation reln);
 	void		(*smgr_clear_skip_wal_pending) (SMgrRelation reln);
 	bool		(*smgr_prepare_pendingsync) (SMgrRelation reln);
@@ -194,6 +198,10 @@ static const f_smgr smgrsw[] = {
 		.smgr_redo_create_fork = umredocreatefork,
 		.smgr_checkpoint_database_tablespaces = umcheckpointdatabasetablespaces,
 		.smgr_invalidate_database_tablespaces = uminvalidatedatabasetablespaces,
+		.smgr_get_map_compactor_relocations = umgetmapcompactorrelocations,
+		.smgr_get_map_reclaim_enqueued = umgetmapreclaimenqueued,
+		.smgr_get_map_reclaim_processed = umgetmapreclaimprocessed,
+		.smgr_get_map_reclaim_failed = umgetmapreclaimfailed,
 		.smgr_mark_skip_wal_pending = ummarkskipwalpending,
 		.smgr_clear_skip_wal_pending = umclearskipwalpending,
 		.smgr_prepare_pendingsync = umpreparependingsync,
@@ -692,6 +700,42 @@ void
 smgrinvalidatedatabase(Oid dbid)
 {
 	smgrinvalidatedatabasetablespaces(dbid, 0, NULL);
+}
+
+uint64
+smgrgetmapcompactorrelocations(void)
+{
+	if (smgrsw[0].smgr_get_map_compactor_relocations)
+		return smgrsw[0].smgr_get_map_compactor_relocations();
+
+	return 0;
+}
+
+uint64
+smgrgetmapreclaimenqueued(void)
+{
+	if (smgrsw[0].smgr_get_map_reclaim_enqueued)
+		return smgrsw[0].smgr_get_map_reclaim_enqueued();
+
+	return 0;
+}
+
+uint64
+smgrgetmapreclaimprocessed(void)
+{
+	if (smgrsw[0].smgr_get_map_reclaim_processed)
+		return smgrsw[0].smgr_get_map_reclaim_processed();
+
+	return 0;
+}
+
+uint64
+smgrgetmapreclaimfailed(void)
+{
+	if (smgrsw[0].smgr_get_map_reclaim_failed)
+		return smgrsw[0].smgr_get_map_reclaim_failed();
+
+	return 0;
 }
 
 void

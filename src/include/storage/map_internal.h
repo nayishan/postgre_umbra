@@ -43,6 +43,7 @@ extern bool MapMaybePreallocateFork(UmbraFileContext *map_ctx,
 									RelFileLocator rnode,
 									ForkNumber forknum,
 									bool background_mode);
+extern void MapReclaimForgetRelation(RelFileLocator rnode);
 extern bool MapInflightTryClaim(UmbraFileContext *map_ctx,
 								RelFileLocator rnode,
 								ForkNumber forknum,

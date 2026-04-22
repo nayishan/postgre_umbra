@@ -669,6 +669,8 @@ MapTryReserveFreshPblknoInternal(UmbraFileContext *map_ctx, RelFileLocator rnode
 							rnode.spcOid, rnode.dbOid, rnode.relNumber, forknum)));
 		}
 
+		Assert(MapNormalizeForkBlockCount(forknum,
+										  MapSuperGetReclaimBoundary(entry, forknum)) <= next);
 		MapSuperSetReservedNextFree(entry, forknum, next + 1);
 		Assert(MapNormalizeForkBlockCount(forknum,
 										  MapSuperblockGetNextFreePhysBlock(&entry->super,
@@ -1197,6 +1199,13 @@ MapInvalidateRelation(RelFileLocator rnode)
 
 	/* Remove dedicated superblock cache entry for this relation. */
 	MapSuperDeleteEntry(rnode);
+
+	/*
+	 * Relation lifecycle ended (drop/unlink path). Purge queued reclaim tasks
+	 * so post-checkpoint workers cannot act on a future relation that reuses
+	 * the same relfilenode.
+	 */
+	MapReclaimForgetRelation(rnode);
 }
 
 static bool
@@ -1293,7 +1302,10 @@ MapInvalidateDatabaseTablespaces(Oid dbid, int ntablespaces,
 		}
 
 		for (i = 0; i < target_count; i++)
+		{
 			MapSuperDeleteEntry(targets[i]);
+			MapReclaimForgetRelation(targets[i]);
+		}
 
 		pfree(targets);
 	}

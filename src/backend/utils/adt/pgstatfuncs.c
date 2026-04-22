@@ -26,6 +26,7 @@
 #include "pgstat.h"
 #include "postmaster/bgworker.h"
 #include "replication/logicallauncher.h"
+#include "storage/smgr.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "utils/acl.h"
@@ -1334,6 +1335,30 @@ Datum
 pg_stat_get_buf_alloc(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_INT64(pgstat_fetch_stat_bgwriter()->buf_alloc);
+}
+
+Datum
+pg_stat_get_map_compactor_relocations(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64((int64) smgrgetmapcompactorrelocations());
+}
+
+Datum
+pg_stat_get_map_reclaim_enqueued(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64((int64) smgrgetmapreclaimenqueued());
+}
+
+Datum
+pg_stat_get_map_reclaim_processed(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64((int64) smgrgetmapreclaimprocessed());
+}
+
+Datum
+pg_stat_get_map_reclaim_failed(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64((int64) smgrgetmapreclaimfailed());
 }
 
 /*

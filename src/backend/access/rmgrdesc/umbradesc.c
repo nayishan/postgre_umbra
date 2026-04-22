@@ -78,6 +78,14 @@ umbra_desc(StringInfo buf, XLogReaderState *record)
 							 xlrec->entries[i].forknum,
 							 xlrec->entries[i].nblocks);
 	}
+	else if (info == XLOG_UMBRA_RECLAIM_UNLINK)
+	{
+		xl_umbra_reclaim_unlink *xlrec = (xl_umbra_reclaim_unlink *) rec;
+		RelPathStr	path = umbra_fork_relpath(xlrec->rlocator, xlrec->forknum);
+
+		appendStringInfo(buf, "%s seg %u reclaim_unlink",
+						 path.str, xlrec->segno);
+	}
 }
 
 const char *
@@ -98,6 +106,9 @@ umbra_identify(uint8 info)
 			break;
 		case XLOG_UMBRA_SKIP_WAL_DENSE_MAP:
 			id = "SKIP_WAL_DENSE_MAP";
+			break;
+		case XLOG_UMBRA_RECLAIM_UNLINK:
+			id = "RECLAIM_UNLINK";
 			break;
 	}
 

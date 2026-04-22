@@ -17,8 +17,12 @@ extern PGDLLIMPORT int MapWriterDelay;
 extern PGDLLIMPORT int MapWriterMaxPages;
 extern PGDLLIMPORT int MapWriterPreallocMaxRelations;
 extern PGDLLIMPORT double MapWriterLRUMultiplier;
+extern PGDLLIMPORT int MapCompactorDelay;
+extern PGDLLIMPORT int MapCompactorMaxRelations;
+extern PGDLLIMPORT int MapCompactorBusyAllocThreshold;
 
 extern void MapBackgroundWorkersRegister(void);
 extern void MapWriterMain(Datum arg);
+extern void MapCompactorMain(Datum arg);
 
 #endif							/* MAPWRITER_H */

@@ -8,6 +8,7 @@
  * - RANGE_REMAP: atomically establish a range of first-born mappings
  * - RANGE_REMAP_COMPACT: same semantics for contiguous lblk/pblk runs
  * - SKIP_WAL_DENSE_MAP: record non-empty skip-WAL dense lblk==pblk frontiers
+ * - RECLAIM_UNLINK: physically remove one reclaimed relation segment
  *
  *-------------------------------------------------------------------------
  */
@@ -22,6 +23,7 @@
 /* XLOG gives us high 4 bits */
 #define XLOG_UMBRA_MAP_SET			0x10
 #define XLOG_UMBRA_RANGE_REMAP		0x30
+#define XLOG_UMBRA_RECLAIM_UNLINK	0x40
 #define XLOG_UMBRA_RANGE_REMAP_COMPACT	0x50
 #define XLOG_UMBRA_SKIP_WAL_DENSE_MAP	0x60
 
@@ -74,6 +76,13 @@ typedef struct xl_umbra_skip_wal_dense_map
 	xl_umbra_skip_wal_dense_map_entry entries[FLEXIBLE_ARRAY_MEMBER];
 } xl_umbra_skip_wal_dense_map;
 
+typedef struct xl_umbra_reclaim_unlink
+{
+	RelFileLocator rlocator;
+	ForkNumber	forknum;
+	BlockNumber segno;
+} xl_umbra_reclaim_unlink;
+
 extern XLogRecPtr log_umbra_map_set(RelFileLocator rlocator, ForkNumber forknum,
 									BlockNumber lblkno, BlockNumber old_pblkno,
 									BlockNumber new_pblkno);
@@ -89,6 +98,9 @@ extern XLogRecPtr log_umbra_range_remap_compact(RelFileLocator rlocator,
 extern XLogRecPtr log_umbra_skip_wal_dense_map(RelFileLocator rlocator,
 											   uint16 count,
 											   const xl_umbra_skip_wal_dense_map_entry *entries);
+extern XLogRecPtr log_umbra_reclaim_unlink(RelFileLocator rlocator,
+										   ForkNumber forknum,
+										   BlockNumber segno);
 
 extern void umbra_redo(XLogReaderState *record);
 extern void umbra_desc(StringInfo buf, XLogReaderState *record);
