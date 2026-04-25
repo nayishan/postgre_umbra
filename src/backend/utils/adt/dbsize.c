@@ -22,6 +22,7 @@
 #include "commands/tablespace.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
+#include "storage/smgr.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -366,6 +367,8 @@ pg_relation_size(PG_FUNCTION_ARGS)
 	Oid			relOid = PG_GETARG_OID(0);
 	text	   *forkName = PG_GETARG_TEXT_PP(1);
 	Relation	rel;
+	SMgrRelation smgr;
+	ForkNumber	forknum;
 	int64		size;
 
 	rel = try_relation_open(relOid, AccessShareLock);
@@ -380,8 +383,15 @@ pg_relation_size(PG_FUNCTION_ARGS)
 	if (rel == NULL)
 		PG_RETURN_NULL();
 
-	size = calculate_relation_size(&(rel->rd_locator), rel->rd_backend,
-								   forkname_to_number(text_to_cstring(forkName)));
+	forknum = forkname_to_number(text_to_cstring(forkName));
+	smgr = RelationGetSmgr(rel);
+
+	/*
+	 * Umbra may remap a relation's logical blocks onto a sparse physical file.
+	 * SQL-visible relation size follows the storage manager's logical block
+	 * count, not raw stat(2) bytes.
+	 */
+	size = (int64) smgrnblocks(smgr, forknum) * BLCKSZ;
 
 	relation_close(rel, AccessShareLock);
 

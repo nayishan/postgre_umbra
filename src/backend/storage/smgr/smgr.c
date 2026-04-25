@@ -694,11 +694,6 @@ smgrinvalidatedatabase(Oid dbid)
 	smgrinvalidatedatabasetablespaces(dbid, 0, NULL);
 }
 
-
-
-
-
-
 void
 smgrmarkskipwalpending(RelFileLocator rlocator)
 {

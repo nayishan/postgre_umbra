@@ -94,6 +94,7 @@ static int64 sendDir(bbsink *sink, const char *path, int basepathlen, bool sizeo
 static bool sendFile(bbsink *sink, const char *readfilename, const char *tarfilename,
 					 struct stat *statbuf, bool missing_ok,
 					 Oid dboid, Oid spcoid, RelFileNumber relfilenumber,
+					 ForkNumber relForkNum,
 					 unsigned segno,
 					 backup_manifest_info *manifest,
 					 unsigned num_incremental_blocks,
@@ -364,7 +365,8 @@ perform_base_backup(basebackup_options *opt, bbsink *sink,
 									XLOG_CONTROL_FILE)));
 				sendFile(sink, XLOG_CONTROL_FILE, XLOG_CONTROL_FILE, &statbuf,
 						 false, InvalidOid, InvalidOid,
-						 InvalidRelFileNumber, 0, &manifest, 0, NULL, 0);
+						 InvalidRelFileNumber, InvalidForkNumber, 0, &manifest,
+						 0, NULL, 0);
 			}
 			else
 			{
@@ -630,7 +632,8 @@ perform_base_backup(basebackup_options *opt, bbsink *sink,
 						 errmsg("could not stat file \"%s\": %m", pathbuf)));
 
 			sendFile(sink, pathbuf, pathbuf, &statbuf, false,
-					 InvalidOid, InvalidOid, InvalidRelFileNumber, 0,
+					 InvalidOid, InvalidOid, InvalidRelFileNumber,
+					 InvalidForkNumber, 0,
 					 &manifest, 0, NULL, 0);
 
 			/* unconditionally mark file as archived */
@@ -1526,7 +1529,7 @@ sendDir(bbsink *sink, const char *path, int basepathlen, bool sizeonly,
 			if (!sizeonly)
 				sent = sendFile(sink, pathbuf, tarfilename, &statbuf,
 								true, dboid, spcoid,
-								relfilenumber, segno, manifest,
+								relfilenumber, relForkNum, segno, manifest,
 								num_blocks_required,
 								method == BACK_UP_FILE_INCREMENTALLY ? relative_block_numbers : NULL,
 								truncation_block_length);
@@ -1575,7 +1578,7 @@ sendDir(bbsink *sink, const char *path, int basepathlen, bool sizeonly,
 static bool
 sendFile(bbsink *sink, const char *readfilename, const char *tarfilename,
 		 struct stat *statbuf, bool missing_ok, Oid dboid, Oid spcoid,
-		 RelFileNumber relfilenumber, unsigned segno,
+		 RelFileNumber relfilenumber, ForkNumber relForkNum, unsigned segno,
 		 backup_manifest_info *manifest, unsigned num_incremental_blocks,
 		 BlockNumber *incremental_blocks, unsigned truncation_block_length)
 {
@@ -1617,7 +1620,16 @@ sendFile(bbsink *sink, const char *readfilename, const char *tarfilename,
 	 * or disabled as that might change, thus we check at each point where we
 	 * could be validating a checksum.
 	 */
-	if (!noverify_checksums && RelFileNumberIsValid(relfilenumber))
+	if (!noverify_checksums && RelFileNumberIsValid(relfilenumber)
+#ifdef USE_UMBRA
+		/*
+		 * Umbra mapped forks are copied in physical block order during base
+		 * backup, but page checksums stay keyed by logical block number.
+		 * INIT forks remain direct-mapped and can still be verified here.
+		 */
+		&& relForkNum == INIT_FORKNUM
+#endif
+		)
 		verify_checksum = true;
 
 	/*

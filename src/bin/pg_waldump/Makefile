@@ -24,6 +24,14 @@ override CPPFLAGS := -DFRONTEND -I$(libpq_srcdir) $(CPPFLAGS)
 LDFLAGS_INTERNAL += -L$(top_builddir)/src/fe_utils -lpgfeutils
 
 RMGRDESCSOURCES = $(sort $(notdir $(wildcard $(top_srcdir)/src/backend/access/rmgrdesc/*desc*.c)))
+
+# Umbra adds rmgrdesc/umbradesc.c, which should only be built when Umbra is
+# enabled.  pg_waldump uses a wildcard to compile all rmgrdesc sources, so we
+# must explicitly filter it out for md builds.
+ifneq ($(with_umbra), yes)
+RMGRDESCSOURCES := $(filter-out umbradesc.c,$(RMGRDESCSOURCES))
+endif
+
 RMGRDESCOBJS = $(patsubst %.c,%.o,$(RMGRDESCSOURCES))
 
 
@@ -52,6 +60,7 @@ uninstall:
 
 clean distclean:
 	rm -f pg_waldump$(X) $(OBJS) $(RMGRDESCSOURCES) xlogreader.c xlogstats.c
+	rm -f umbradesc.c umbradesc.o umbradesc.bc
 	rm -rf tmp_check
 
 check:

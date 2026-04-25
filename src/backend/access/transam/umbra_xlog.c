@@ -42,6 +42,54 @@ log_umbra_map_set(RelFileLocator rlocator, ForkNumber forknum,
 }
 
 XLogRecPtr
+log_umbra_range_remap(RelFileLocator rlocator, ForkNumber forknum,
+					  uint16 count,
+					  const xl_umbra_range_remap_entry *entries)
+{
+	xl_umbra_range_remap xlrec;
+
+	Assert(count > 0);
+	Assert(entries != NULL);
+
+	xlrec.rlocator = rlocator;
+	xlrec.forknum = forknum;
+	xlrec.count = count;
+	xlrec.padding = 0;
+	xlrec.end_lblkno = entries[count - 1].lblkno;
+
+	XLogBeginInsert();
+	XLogRegisterData((char *) &xlrec, offsetof(xl_umbra_range_remap, entries));
+	XLogRegisterData((char *) entries,
+					 sizeof(xl_umbra_range_remap_entry) * count);
+
+	return XLogInsert(RM_UMBRA_ID, XLOG_UMBRA_RANGE_REMAP | XLR_SPECIAL_REL_UPDATE);
+}
+
+XLogRecPtr
+log_umbra_range_remap_compact(RelFileLocator rlocator, ForkNumber forknum,
+							  BlockNumber first_lblkno,
+							  BlockNumber first_pblkno,
+							  uint16 count)
+{
+	xl_umbra_range_remap_compact xlrec;
+
+	Assert(count > 0);
+
+	xlrec.rlocator = rlocator;
+	xlrec.forknum = forknum;
+	xlrec.count = count;
+	xlrec.padding = 0;
+	xlrec.first_lblkno = first_lblkno;
+	xlrec.first_pblkno = first_pblkno;
+
+	XLogBeginInsert();
+	XLogRegisterData((char *) &xlrec, sizeof(xlrec));
+
+	return XLogInsert(RM_UMBRA_ID,
+					  XLOG_UMBRA_RANGE_REMAP_COMPACT | XLR_SPECIAL_REL_UPDATE);
+}
+
+XLogRecPtr
 log_umbra_skip_wal_dense_map(RelFileLocator rlocator,
 							 uint16 count,
 							 const xl_umbra_skip_wal_dense_map_entry *entries)
@@ -169,6 +217,54 @@ umbra_redo(XLogReaderState *record)
 												 xlrec->forknum,
 												 xlrec->new_pblkno + 1,
 												 record->EndRecPtr);
+			}
+			break;
+
+		case XLOG_UMBRA_RANGE_REMAP:
+			{
+				xl_umbra_range_remap *xlrec;
+				xl_umbra_range_remap_entry *entries;
+				SMgrRelation reln;
+				BlockNumber *pblknos;
+
+				xlrec = (xl_umbra_range_remap *) XLogRecGetData(record);
+				entries = xlrec->entries;
+				reln = smgropen(xlrec->rlocator, INVALID_PROC_NUMBER);
+
+				if (!UmMetadataExists(reln))
+					break;
+
+				pblknos = palloc(sizeof(BlockNumber) * xlrec->count);
+				for (int i = 0; i < xlrec->count; i++)
+					pblknos[i] = entries[i].new_pblkno;
+
+				UmApplyReservedRangeRemap(reln, xlrec->forknum,
+										  entries[0].lblkno, xlrec->count,
+										  pblknos, record->EndRecPtr, true);
+				pfree(pblknos);
+			}
+			break;
+
+		case XLOG_UMBRA_RANGE_REMAP_COMPACT:
+			{
+				xl_umbra_range_remap_compact *xlrec;
+				SMgrRelation reln;
+				BlockNumber *pblknos;
+
+				xlrec = (xl_umbra_range_remap_compact *) XLogRecGetData(record);
+				reln = smgropen(xlrec->rlocator, INVALID_PROC_NUMBER);
+
+				if (!UmMetadataExists(reln))
+					break;
+
+				pblknos = palloc(sizeof(BlockNumber) * xlrec->count);
+				for (int i = 0; i < xlrec->count; i++)
+					pblknos[i] = xlrec->first_pblkno + i;
+
+				UmApplyReservedRangeRemap(reln, xlrec->forknum,
+										  xlrec->first_lblkno, xlrec->count,
+										  pblknos, record->EndRecPtr, true);
+				pfree(pblknos);
 			}
 			break;
 

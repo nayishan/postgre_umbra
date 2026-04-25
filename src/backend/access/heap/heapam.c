@@ -2111,7 +2111,7 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 			PageGetMaxOffsetNumber(page) == FirstOffsetNumber)
 		{
 			info |= XLOG_HEAP_INIT_PAGE;
-			bufflags |= REGBUF_WILL_INIT;
+			bufflags |= REGBUF_WILL_INIT_BIRTH;
 		}
 
 		xlrec.offnum = ItemPointerGetOffsetNumber(&heaptup->t_self);
@@ -2561,7 +2561,7 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			if (init)
 			{
 				info |= XLOG_HEAP_INIT_PAGE;
-				bufflags |= REGBUF_WILL_INIT;
+				bufflags |= REGBUF_WILL_INIT_BIRTH;
 			}
 
 			/*
@@ -8897,7 +8897,7 @@ log_heap_update(Relation reln, Buffer oldbuf,
 
 	bufflags = REGBUF_STANDARD;
 	if (init)
-		bufflags |= REGBUF_WILL_INIT;
+		bufflags |= REGBUF_WILL_INIT_BIRTH;
 	if (need_tuple_data)
 		bufflags |= REGBUF_KEEP_DATA;
 

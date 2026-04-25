@@ -403,7 +403,7 @@ fill_seq_fork_with_data(Relation rel, HeapTuple tuple, ForkNumber forkNum)
 		XLogRecPtr	recptr;
 
 		XLogBeginInsert();
-		XLogRegisterBuffer(0, buf, REGBUF_WILL_INIT);
+		XLogRegisterBuffer(0, buf, REGBUF_WILL_INIT_BIRTH);
 
 		xlrec.locator = rel->rd_locator;
 
@@ -832,7 +832,7 @@ nextval_internal(Oid relid, bool check_permissions)
 		 * sequence values if we crash.
 		 */
 		XLogBeginInsert();
-		XLogRegisterBuffer(0, buf, REGBUF_WILL_INIT);
+		XLogRegisterBuffer(0, buf, REGBUF_WILL_INIT_BIRTH);
 
 		/* set values that will be saved in xlog */
 		seq->last_value = next;
@@ -1024,7 +1024,7 @@ SetSequence(Oid relid, int64 next, bool iscalled)
 		Page		page = BufferGetPage(buf);
 
 		XLogBeginInsert();
-		XLogRegisterBuffer(0, buf, REGBUF_WILL_INIT);
+		XLogRegisterBuffer(0, buf, REGBUF_WILL_INIT_BIRTH);
 
 		xlrec.locator = seqrel->rd_locator;
 		XLogRegisterData(&xlrec, sizeof(xl_seq_rec));

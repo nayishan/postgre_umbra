@@ -43,7 +43,6 @@
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/map.h"
-#include "storage/md.h"
 #include "storage/smgr.h"
 #include "storage/umbra.h"
 #include "storage/umfile.h"
@@ -221,6 +220,7 @@ static void um_reserve_fresh_pblkno_for_access(SMgrRelation reln,
 											   BlockNumber lblkno,
 											   BlockNumber *new_pblkno);
 static bool um_fork_uses_map_translation(ForkNumber forknum);
+static bool um_fork_uses_wal_owned_firstborn(ForkNumber forknum);
 static bool um_mapped_exists_from_super(SMgrRelation reln, ForkNumber forknum);
 static UmbraMapPolicy um_open_map_state(SMgrRelation reln);
 static bool um_state_uses_map(UmbraMapPolicy state);
@@ -393,6 +393,8 @@ UmApplyReservedRangeRemap(SMgrRelation reln, ForkNumber forknum,
 
 	if (max_pblkno != InvalidBlockNumber)
 	{
+		MapSBlockBumpNextFreePhysBlock(ctx, reln->smgr_rlocator.locator,
+									   forknum, max_pblkno + 1, lsn);
 		MapSBlockBumpPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
 									 forknum, max_pblkno + 1, lsn);
 		for (BlockNumber i = 0; i < nblocks; i++)
@@ -629,6 +631,13 @@ um_fork_uses_map_translation(ForkNumber forknum)
  * concentrated in a few helper paths, so we keep them on explicit mapping
  * publication rather than tying first-born ownership to arbitrary page WAL.
  */
+static bool
+um_fork_uses_wal_owned_firstborn(ForkNumber forknum)
+{
+	return UmbraForkUsesMapTranslation(forknum) &&
+		!UmbraForkIsAuxiliaryMapped(forknum);
+}
+
 static bool
 um_mapped_exists_from_super(SMgrRelation reln, ForkNumber forknum)
 {
@@ -1131,6 +1140,184 @@ um_resolve_mapped_read_run(SMgrRelation reln, ForkNumber forknum,
 	return 0;
 }
 
+static void
+um_materialize_pblk_zero_runs(UmbraFileContext *ctx, ForkNumber forknum,
+							  const BlockNumber *pblknos, BlockNumber nblocks,
+							  bool skipFsync)
+{
+	BlockNumber	run_start_pblk = InvalidBlockNumber;
+	BlockNumber	run_blocks = 0;
+
+	Assert(ctx != NULL);
+	Assert(pblknos != NULL);
+
+	for (BlockNumber i = 0; i < nblocks; i++)
+	{
+		BlockNumber pblk = pblknos[i];
+
+		if (run_blocks == 0)
+		{
+			run_start_pblk = pblk;
+			run_blocks = 1;
+		}
+		else if (pblk == run_start_pblk + run_blocks)
+		{
+			run_blocks++;
+		}
+		else
+		{
+			umfile_zeroextend(ctx, forknum, run_start_pblk,
+							  (int) run_blocks, skipFsync);
+			run_start_pblk = pblk;
+			run_blocks = 1;
+		}
+	}
+
+	if (run_blocks > 0)
+		umfile_zeroextend(ctx, forknum, run_start_pblk,
+						  (int) run_blocks, skipFsync);
+}
+
+static bool
+um_pblk_run_is_contiguous(const BlockNumber *pblknos, BlockNumber nblocks)
+{
+	Assert(pblknos != NULL);
+	Assert(nblocks > 0);
+
+	for (BlockNumber i = 1; i < nblocks; i++)
+	{
+		if (pblknos[i] != pblknos[0] + i)
+			return false;
+	}
+
+	return true;
+}
+
+static bool
+um_try_pure_firstborn_range_remap_zeroextend(SMgrRelation reln, ForkNumber forknum,
+											 const UmbraAccessState *access,
+											 BlockNumber blocknum,
+											 BlockNumber nblocks,
+											 bool skipFsync)
+{
+	UmbraFileContext *ctx = um_ctx_acquire(reln);
+	BlockNumber *pblknos;
+	xl_umbra_range_remap_entry *entries;
+	bool		wal_insert_enabled;
+	bool		applied = false;
+
+	Assert(access != NULL);
+	Assert(access->map_available);
+	Assert(nblocks > 0);
+
+	/*
+	 * Try to collapse an EOF zeroextend range into one or more RANGE_REMAP
+	 * records. RANGE_REMAP carries only new pblk ownership, so this helper is
+	 * deliberately all-or-nothing and only accepts pure first-born ranges.
+	 * Recovery consumes authoritative remap WAL instead of synthesizing new
+	 * range ownership locally.
+	 */
+	if (InRecovery || nblocks < 2)
+		return false;
+
+	pblknos = palloc(sizeof(BlockNumber) * nblocks);
+	entries = palloc(sizeof(xl_umbra_range_remap_entry) * nblocks);
+
+	for (BlockNumber i = 0; i < nblocks; i++)
+	{
+		BlockNumber lblk = blocknum + i;
+		BlockNumber pblk;
+
+		if (MapTryLookup(ctx, reln->smgr_rlocator.locator, forknum, lblk, &pblk) ||
+			MapInflightLookupOwnedPblk(reln->smgr_rlocator.locator,
+									   forknum, lblk, &pblk))
+		{
+			/*
+			 * Normal EOF extension should not get here.  Treat existing or
+			 * in-flight ownership as a compatibility fallback condition, not as
+			 * a mixed-range batching opportunity.
+			 */
+			pfree(entries);
+			pfree(pblknos);
+			return false;
+		}
+	}
+
+	for (BlockNumber i = 0; i < nblocks; i++)
+	{
+		BlockNumber lblk = blocknum + i;
+
+		if (!MapReserveFreshPblkno(ctx, reln->smgr_rlocator.locator,
+								   forknum, lblk, &pblknos[i]))
+		{
+			for (BlockNumber j = 0; j < i; j++)
+				MapInflightRelease(reln->smgr_rlocator.locator,
+								   forknum, blocknum + j);
+			pfree(entries);
+			pfree(pblknos);
+			return false;
+		}
+		entries[i].lblkno = lblk;
+		entries[i].new_pblkno = pblknos[i];
+	}
+
+	wal_insert_enabled =
+		XLogInsertAllowed() &&
+		!IsBootstrapProcessingMode() &&
+		!IsInitProcessingMode();
+
+	PG_TRY();
+	{
+		BlockNumber done = 0;
+
+		while (done < nblocks)
+		{
+			BlockNumber chunk_blocks = Min(nblocks - done,
+										   (BlockNumber) UINT16_MAX);
+			XLogRecPtr	map_lsn = InvalidXLogRecPtr;
+
+			if (wal_insert_enabled)
+			{
+				if (um_pblk_run_is_contiguous(pblknos + done, chunk_blocks))
+					map_lsn = log_umbra_range_remap_compact(
+						reln->smgr_rlocator.locator, forknum,
+						blocknum + done, pblknos[done], (uint16) chunk_blocks);
+				else
+					map_lsn = log_umbra_range_remap(
+						reln->smgr_rlocator.locator, forknum,
+						(uint16) chunk_blocks, entries + done);
+			}
+
+			um_materialize_pblk_zero_runs(ctx, forknum, pblknos + done,
+										  chunk_blocks, skipFsync);
+			UmApplyReservedRangeRemap(reln, forknum, blocknum + done,
+									  chunk_blocks, pblknos + done,
+									  map_lsn, skipFsync);
+			done += chunk_blocks;
+		}
+
+		applied = true;
+	}
+	PG_CATCH();
+	{
+		if (!applied)
+		{
+			for (BlockNumber i = 0; i < nblocks; i++)
+				MapInflightRelease(reln->smgr_rlocator.locator,
+								   forknum, blocknum + i);
+		}
+
+		pfree(entries);
+		pfree(pblknos);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	pfree(entries);
+	pfree(pblknos);
+	return true;
+}
+
 static UmbraMappedBirthResult
 um_publish_mapped_birth(SMgrRelation reln, ForkNumber forknum,
 						const UmbraAccessState *access,
@@ -1139,26 +1326,83 @@ um_publish_mapped_birth(SMgrRelation reln, ForkNumber forknum,
 	UmbraFileContext *ctx = um_ctx_acquire(reln);
 	UmbraMappedBirthResult result;
 	BlockNumber old_pblkno;
+	XLogRecPtr	map_lsn;
+	bool		wal_insert_enabled;
+	bool		wal_owns_firstborn;
+	bool		emit_map_set;
 
 	Assert(access->map_available);
-	(void) allow_wal_owned_firstborn;
 
 	result.mapping_published = false;
+
+	if (InRecovery && um_fork_uses_wal_owned_firstborn(forknum))
+		elog(PANIC,
+			 "missing WAL mapping during recovery for relation %u/%u/%u fork %d blk %u",
+			 reln->smgr_rlocator.locator.spcOid,
+			 reln->smgr_rlocator.locator.dbOid,
+			 reln->smgr_rlocator.locator.relNumber,
+			 forknum, lblkno);
 
 	MapGetNewPbkno(ctx, reln->smgr_rlocator.locator, forknum, lblkno,
 				   &result.pblkno, &old_pblkno);
 	Assert(old_pblkno == InvalidBlockNumber);
 
-	MapSetMapping(ctx, reln->smgr_rlocator.locator, forknum, lblkno,
-				  result.pblkno, InvalidXLogRecPtr);
-	result.mapping_published = true;
+	wal_owns_firstborn = false;
+
+	if (InRecovery)
+	{
+		map_lsn = GetXLogReplayRecPtr(NULL);
+		MapSetMapping(ctx, reln->smgr_rlocator.locator, forknum, lblkno,
+					  result.pblkno, map_lsn);
+		result.mapping_published = true;
+	}
+	else
+	{
+		/*
+		 * Birth ownership needs crash-recovery WAL even at wal_level=minimal.
+		 * XLogIsNeeded() is too weak here because it suppresses WAL that is
+		 * still required to recover eager MAP_SET publication after a crash.
+		 */
+		wal_insert_enabled =
+			XLogInsertAllowed() &&
+			!IsBootstrapProcessingMode() &&
+			!IsInitProcessingMode();
+
+		wal_owns_firstborn =
+			allow_wal_owned_firstborn &&
+			wal_insert_enabled &&
+			UmWalOwnedFirstbornAvailable(reln, forknum, lblkno);
+
+		emit_map_set = !wal_owns_firstborn;
+
+		if (emit_map_set && wal_insert_enabled)
+			map_lsn = log_umbra_map_set(reln->smgr_rlocator.locator, forknum,
+										lblkno, old_pblkno, result.pblkno);
+		else
+			map_lsn = InvalidXLogRecPtr;
+
+		if (emit_map_set)
+		{
+			MapSetMapping(ctx, reln->smgr_rlocator.locator, forknum, lblkno,
+						  result.pblkno, map_lsn);
+			result.mapping_published = true;
+		}
+	}
 
 	if (result.mapping_published)
 		MapSBlockBumpNextFreePhysBlock(ctx, reln->smgr_rlocator.locator,
 									   forknum, result.pblkno + 1,
-									   InvalidXLogRecPtr);
+									   map_lsn);
 
-	MapInflightRelease(reln->smgr_rlocator.locator, forknum, lblkno);
+	/*
+	 * WAL-owned first-born pages keep their in-flight claim private until WAL
+	 * insertion succeeds and XLogCommitBlockRemapsUmbra() publishes the mapping.
+	 * Advancing the physical frontier or releasing the claim here would
+	 * let xloginsert reserve a second pblk for the same logical birth, leaving
+	 * alternating holes in the initial physical layout.
+	 */
+	if (!wal_owns_firstborn)
+		MapInflightRelease(reln->smgr_rlocator.locator, forknum, lblkno);
 	return result;
 }
 
@@ -1346,6 +1590,30 @@ UmMapAccessAvailable(SMgrRelation reln, ForkNumber forknum)
 
 	access = um_classify_access(reln, forknum);
 	return access.map_available;
+}
+
+bool
+UmWalOwnedRemapAvailable(SMgrRelation reln, ForkNumber forknum)
+{
+	UmbraAccessState access;
+
+	access = um_classify_access(reln, forknum);
+	return access.policy == UMBRA_MAP_POLICY_REQUIRE_MAP;
+}
+
+bool
+UmWalOwnedFirstbornAvailable(SMgrRelation reln, ForkNumber forknum,
+							 BlockNumber lblkno)
+{
+	UmbraAccessState access;
+
+	(void) lblkno;
+	access = um_classify_access(reln, forknum);
+	return access.policy == UMBRA_MAP_POLICY_REQUIRE_MAP &&
+		XLogInsertAllowed() &&
+		!IsBootstrapProcessingMode() &&
+		!IsInitProcessingMode() &&
+		um_fork_uses_wal_owned_firstborn(forknum);
 }
 
 bool
@@ -1598,6 +1866,12 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		return;
 	}
 
+	if (um_try_pure_firstborn_range_remap_zeroextend(reln, forknum, &access,
+													blocknum,
+													(BlockNumber) nblocks,
+													skipFsync))
+		return;
+
 	/*
 	 * Per-block path for single-block, recovery, or callers that encountered
 	 * pre-existing/pending MAP ownership in the requested range.
@@ -1821,15 +2095,9 @@ um_startreadv_mapped_physical(PgAioHandle *ioh, SMgrRelation reln,
 {
 	if (aux_recovery_read)
 	{
-		uint64		ensured_bytes = 0;
-
 		if (!umfile_ctx_block_exists(ctx, forknum, pblk))
-		{
 			um_ensure_datafork_batch_ready_for_access(reln, forknum, access,
 													  pblk, true /* skipFsync */ );
-			ensured_bytes = BLCKSZ;
-		}
-		(void) ensured_bytes;
 	}
 
 	pgaio_io_set_target_smgr(ioh, reln, forknum,
@@ -1852,7 +2120,6 @@ umstartreadv(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknum,
 	UmbraFileContext *ctx = um_ctx_acquire(reln);
 	BlockNumber	pblk;
 	bool		aux_recovery_read;
-
 	access = um_classify_access(reln, forknum);
 
 	if (!access.map_available)
@@ -1878,7 +2145,9 @@ umstartreadv(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknum,
 												 &lookup_state,
 												 aux_recovery_read, &pblk);
 		if (run_blocks == 0)
+		{
 			return;
+		}
 
 		if (run_blocks < nblocks)
 			ioh->handle_data_len = run_blocks;
@@ -2001,8 +2270,8 @@ umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 			pending_barrier.entry_idx = -1;
 
 			/*
-			 * The barrier serializes physical writes with concurrent remap publication for
-			 * the same logical block.  Claim before lookup so a later relocation
+			 * The barrier serializes physical writes with any foreign in-flight
+			 * remap for the same logical block.  Claim before lookup so a later remap
 			 * cannot publish a new mapping while this write is still targeting the
 			 * old physical page.
 			 */

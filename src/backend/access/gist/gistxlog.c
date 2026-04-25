@@ -528,7 +528,7 @@ gistXLogSplit(bool page_is_leaf,
 	i = 1;
 	for (ptr = dist; ptr; ptr = ptr->next)
 	{
-		XLogRegisterBuffer(i, ptr->buffer, REGBUF_WILL_INIT);
+		XLogRegisterBuffer(i, ptr->buffer, REGBUF_WILL_INIT_BIRTH);
 		XLogRegisterBufData(i, &(ptr->block.num), sizeof(int));
 		XLogRegisterBufData(i, ptr->list, ptr->lenlist);
 		i++;

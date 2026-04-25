@@ -1377,7 +1377,7 @@ _bt_insertonpg(Relation rel,
 					xlmeta.allequalimage = metad->btm_allequalimage;
 
 					XLogRegisterBuffer(2, metabuf,
-									   REGBUF_WILL_INIT | REGBUF_STANDARD);
+									   REGBUF_WILL_INIT_BIRTH | REGBUF_STANDARD);
 					XLogRegisterBufData(2, &xlmeta,
 										sizeof(xl_btree_metadata));
 				}
@@ -2011,7 +2011,7 @@ _bt_split(Relation rel, Relation heaprel, BTScanInsert itup_key, Buffer buf,
 		XLogRegisterData(&xlrec, SizeOfBtreeSplit);
 
 		XLogRegisterBuffer(0, buf, REGBUF_STANDARD);
-		XLogRegisterBuffer(1, rbuf, REGBUF_WILL_INIT);
+		XLogRegisterBuffer(1, rbuf, REGBUF_WILL_INIT_BIRTH);
 		/* Log original right sibling, since we've changed its prev-pointer */
 		if (!isrightmost)
 			XLogRegisterBuffer(2, sbuf, REGBUF_STANDARD);
@@ -2612,9 +2612,9 @@ _bt_newlevel(Relation rel, Relation heaprel, Buffer lbuf, Buffer rbuf)
 		XLogBeginInsert();
 		XLogRegisterData(&xlrec, SizeOfBtreeNewroot);
 
-		XLogRegisterBuffer(0, rootbuf, REGBUF_WILL_INIT);
+		XLogRegisterBuffer(0, rootbuf, REGBUF_WILL_INIT_BIRTH);
 		XLogRegisterBuffer(1, lbuf, REGBUF_STANDARD);
-		XLogRegisterBuffer(2, metabuf, REGBUF_WILL_INIT | REGBUF_STANDARD);
+		XLogRegisterBuffer(2, metabuf, REGBUF_WILL_INIT_BIRTH | REGBUF_STANDARD);
 
 		Assert(metad->btm_version >= BTREE_NOVAC_VERSION);
 		md.version = metad->btm_version;

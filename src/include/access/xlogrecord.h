@@ -131,6 +131,27 @@ typedef struct XLogRecordBlockHeader
 #define SizeOfXLogRecordBlockHeader (offsetof(XLogRecordBlockHeader, data_length) + sizeof(uint16))
 
 /*
+ * Extra header information for UMBRA remap metadata.
+ *
+ * When BKPBLOCK_HAS_REMAP is set, this header follows
+ * XLogRecordBlockHeader and stores the physical remap transition for the
+ * referenced logical block.
+ */
+typedef struct XLogRecordBlockRemapHeader
+{
+	BlockNumber	old_pblkno;
+	BlockNumber	new_pblkno;
+	BlockNumber logical_nblocks;
+	BlockNumber next_free_pblkno;
+} XLogRecordBlockRemapHeader;
+
+#ifdef USE_UMBRA
+#define SizeOfXLogRecordBlockRemapHeader sizeof(XLogRecordBlockRemapHeader)
+#else
+#define SizeOfXLogRecordBlockRemapHeader 0
+#endif
+
+/*
  * Additional header information when a full-page image is included
  * (i.e. when BKPBLOCK_HAS_IMAGE is set).
  *
@@ -200,6 +221,7 @@ typedef struct XLogRecordBlockCompressHeader
  */
 #define MaxSizeOfXLogRecordBlockHeader \
 	(SizeOfXLogRecordBlockHeader + \
+	 SizeOfXLogRecordBlockRemapHeader + \
 	 SizeOfXLogRecordBlockImageHeader + \
 	 SizeOfXLogRecordBlockCompressHeader + \
 	 sizeof(RelFileLocator) + \
@@ -209,8 +231,19 @@ typedef struct XLogRecordBlockCompressHeader
  * The fork number fits in the lower 4 bits in the fork_flags field. The upper
  * bits are used for flags.
  */
+/*
+ * The fork number is stored in the low bits of fork_flags; the high bits are
+ * used for per-block flags.
+ */
+#ifdef USE_UMBRA
+#define BKPBLOCK_FORK_MASK	0x07
+#define BKPBLOCK_HAS_REMAP	0x08	/* has remap metadata in WAL header */
+#define BKPBLOCK_FLAG_MASK	0xF8
+#else
 #define BKPBLOCK_FORK_MASK	0x0F
+#define BKPBLOCK_HAS_REMAP	0x00
 #define BKPBLOCK_FLAG_MASK	0xF0
+#endif
 #define BKPBLOCK_HAS_IMAGE	0x10	/* block data is an XLogRecordBlockImage */
 #define BKPBLOCK_HAS_DATA	0x20
 #define BKPBLOCK_WILL_INIT	0x40	/* redo will re-init the page */

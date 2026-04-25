@@ -250,6 +250,51 @@ smgr_bulk_flush(BulkWriteState *bulkstate)
 	if (npending > 1)
 		qsort(pending_writes, npending, sizeof(PendingWrite), buffer_cmp);
 
+	/*
+	 * For Umbra mapped forks, WAL for new pages cannot be the first place that
+	 * introduces logical coverage for a whole bulk-written run.
+	 *
+	 * log_newpages() writes one WAL record for a batch of pages, but
+	 * wal-owned firstborn is only guaranteed for pages that are already
+	 * contiguous with the current logical EOF. If we WAL-log a whole pending
+	 * run before the relation is physically/logically extended, later
+	 * smgrextend() calls can see a stale logical EOF and mistakenly zeroextend
+	 * over earlier data pages in the same batch.
+	 *
+	 * Extend first so later pages in the run see a stable logical frontier
+	 * while the batch is being prepared.  Umbra may still leave holes in the
+	 * physical frontier for WAL-owned tail pages; that is acceptable as long
+	 * as page WAL publishes the final mapping before the real page images are
+	 * written below.
+	 *
+	 * The important ownership rule is:
+	 *   1. smgrextend() claims first-born ownership and reserves the pblk
+	 *      backend-locally
+	 *   2. the later page WAL record reuses that same in-flight claim and
+	 *      commits the mapping
+	 *
+	 * Do not reorder this to "log_newpages() first, smgrextend() later".
+	 * xloginsert's birth path is allowed to own commit only after the birth
+	 * claim already exists; otherwise a future refactor can reintroduce
+	 * duplicate pblk reservation or stale-EOF zeroextend bugs.
+	 */
+#ifdef USE_UMBRA
+	if (npending > 0)
+	{
+		BlockNumber maxblk;
+
+		maxblk = pending_writes[npending - 1].blkno;
+		while (bulkstate->relsize <= maxblk)
+		{
+			smgrextend(bulkstate->smgr, bulkstate->forknum,
+					   bulkstate->relsize,
+					   &zero_buffer,
+					   true);
+			bulkstate->relsize++;
+		}
+	}
+#endif
+
 	if (bulkstate->use_wal)
 	{
 		BlockNumber blknos[MAX_PENDING_WRITES];
@@ -261,9 +306,9 @@ smgr_bulk_flush(BulkWriteState *bulkstate)
 			blknos[i] = pending_writes[i].blkno;
 			pages[i] = pending_writes[i].buf->data;
 
-			/*
-			 * If any of the pages use !page_std, we log them all as such.
-			 * That's a bit wasteful, but in practice, a mix of standard and
+				/*
+				 * If any of the pages use !page_std, we log them all as such.
+				 * That's a bit wasteful, but in practice, a mix of standard and
 			 * non-standard page layout is rare.  None of the built-in AMs do
 			 * that.
 			 */
@@ -279,7 +324,7 @@ smgr_bulk_flush(BulkWriteState *bulkstate)
 		BlockNumber blkno = pending_writes[i].blkno;
 		Page		page = pending_writes[i].buf->data;
 
-		PageSetChecksum(page, blkno);
+			PageSetChecksum(page, blkno);
 
 		if (blkno >= bulkstate->relsize)
 		{

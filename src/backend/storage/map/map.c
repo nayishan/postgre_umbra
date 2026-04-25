@@ -1382,6 +1382,17 @@ void MapGetNewPbkno(UmbraFileContext *map_ctx, RelFileLocator rnode, ForkNumber 
 	Assert(new_pblkno != NULL);
 	Assert(old_pblkno != NULL);
 
+	/*
+	 * During recovery, MAIN fork physical choices must come from WAL records.
+	 * FSM/VM are hint forks and replay can touch them without dedicated remap
+	 * metadata (e.g. free space updates), so we allow local allocation for
+	 * them.
+	 */
+	if (InRecovery && forknum == MAIN_FORKNUM)
+		elog(PANIC,
+			 "MapGetNewPbkno called during recovery for rel %u/%u/%u fork %d blk %u",
+			 rnode.spcOid, rnode.dbOid, rnode.relNumber, forknum, lblkno);
+
 	for (;;)
 	{
 		if (!MapTryLookup(map_ctx, rnode, forknum, lblkno, &cur_pblkno))
