@@ -20,6 +20,9 @@
 #include "access/nbtxlog.h"
 #include "access/rmgr.h"
 #include "access/spgxlog.h"
+#ifdef USE_UMBRA
+#include "access/umbra_xlog.h"
+#endif
 #include "access/xact.h"
 #include "access/xlog_internal.h"
 #include "catalog/storage_xlog.h"

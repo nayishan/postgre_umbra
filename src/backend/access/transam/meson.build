@@ -27,6 +27,12 @@ backend_sources += files(
   'xlogwait.c',
 )
 
+if get_option('umbra').enabled()
+  backend_sources += files(
+    'umbra_xlog.c',
+  )
+endif
+
 # used by frontend programs to build a frontend xlogreader
 xlogreader_sources = files(
   'xlogreader.c',

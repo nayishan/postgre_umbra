@@ -324,6 +324,7 @@ XLogRecGetBlockRefInfo(XLogReaderState *record, bool pretty,
 		if (detailed_format)
 		{
 			/* Get block references in detailed format. */
+			DecodedBkpBlock *blkref = XLogRecGetBlock(record, block_id);
 
 			if (pretty)
 				appendStringInfoChar(buf, '\t');

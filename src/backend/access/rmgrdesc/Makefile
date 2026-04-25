@@ -32,4 +32,9 @@ OBJS = \
 	xactdesc.o \
 	xlogdesc.o
 
+ifeq ($(with_umbra), yes)
+OBJS += \
+	umbradesc.o
+endif
+
 include $(top_srcdir)/src/backend/common.mk
