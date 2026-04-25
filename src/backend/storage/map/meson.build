@@ -2,5 +2,9 @@
 
 backend_sources += files(
   'map.c',
+  'mapinit.c',
+  'mapbuf.c',
+  'mapflush.c',
+  'mapclock.c',
   'mapsuper.c',
 )

@@ -17,6 +17,7 @@
 #include "storage/block.h"
 #include "storage/relfilelocator.h"
 #include "storage/smgr.h"
+#include "storage/sync.h"
 #include "storage/um_defs.h"
 
 extern bool UmMetadataExists(SMgrRelation reln);
@@ -25,17 +26,25 @@ extern BlockNumber UmMetadataNblocks(SMgrRelation reln);
 extern void UmMetadataRead(SMgrRelation reln, BlockNumber blkno, void *buffer);
 extern void UmMetadataWrite(SMgrRelation reln, BlockNumber blkno,
 							const void *buffer, bool skipFsync);
+extern void UmMetadataWriteSuperblock(RelFileLocatorBackend rlocator,
+									  const void *sector, bool skipFsync);
 extern void UmMetadataExtend(SMgrRelation reln, BlockNumber blkno,
 							 const void *buffer, bool skipFsync);
 extern void UmMetadataImmediateSync(SMgrRelation reln);
 extern void UmMetadataUnlink(RelFileLocatorBackend rlocator, bool isRedo);
+extern void UmInvalidateDatabase(Oid dbid);
 
 extern void uminit(void);
 extern void umopen(SMgrRelation reln);
 extern void umclose(SMgrRelation reln, ForkNumber forknum);
 extern void umdestroy(SMgrRelation reln);
 extern bool umisinternalfork(ForkNumber forknum);
+extern bool umcreatedballowswallog(void);
 extern void umcreaterelationmetadata(SMgrRelation reln);
+extern void umcheckpointdatabasetablespaces(Oid dbid, int ntablespaces,
+											const Oid *tablespace_ids);
+extern void uminvalidatedatabasetablespaces(Oid dbid, int ntablespaces,
+											const Oid *tablespace_ids);
 extern void umcopyrelationmetadata(SMgrRelation src, SMgrRelation dst,
 								   char relpersistence);
 extern void umsyncrelationmetadata(SMgrRelation reln);
@@ -69,5 +78,8 @@ extern void umimmedsync(SMgrRelation reln, ForkNumber forknum);
 extern void umregistersync(SMgrRelation reln, ForkNumber forknum);
 extern int	umfd(SMgrRelation reln, ForkNumber forknum,
 				 BlockNumber blocknum, uint32 *off);
+extern int umsyncfiletag(const FileTag *ftag, char *path);
+extern int umunlinkfiletag(const FileTag *ftag, char *path);
+extern bool umfiletagmatches(const FileTag *ftag, const FileTag *candidate);
 
 #endif							/* UMBRA_H */

@@ -823,10 +823,10 @@ InitPostgres(const char *in_dbname, Oid dboid,
 		before_shmem_exit(ShutdownXLOG, 0);
 	}
 
-	/*
-	 * Initialize the relation cache and the system catalog caches.  Note that
-	 * no catalog access happens here; we only set up the hashtable structure.
-	 * We must do this before starting a transaction because transaction abort
+		/*
+		 * Initialize the relation cache and the system catalog caches.  Note that
+		 * no catalog access happens here; we only set up the hashtable structure.
+		 * We must do this before starting a transaction because transaction abort
 	 * would try to touch these hashtables.
 	 */
 	RelationCacheInitialize();

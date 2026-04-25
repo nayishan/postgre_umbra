@@ -98,6 +98,9 @@
 #include "storage/spin.h"
 #include "storage/subsystems.h"
 #include "storage/sync.h"
+#ifdef USE_UMBRA
+#include "storage/map.h"
+#endif
 #include "utils/guc_hooks.h"
 #include "utils/guc_tables.h"
 #include "utils/injection_point.h"
@@ -8062,6 +8065,9 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 	CheckPointSUBTRANS();
 	CheckPointMultiXact();
 	CheckPointPredicate();
+#ifdef USE_UMBRA
+	MapCheckpoint();
+#endif
 	CheckPointBuffers(flags);
 
 	/* Perform all queued up fsyncs */
