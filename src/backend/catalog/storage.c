@@ -74,8 +74,55 @@ typedef struct PendingRelSync
 	bool		is_truncated;	/* Has the file experienced truncation? */
 } PendingRelSync;
 
+typedef struct PendingRelTruncate
+{
+	RelFileLocator rlocator;
+	int			nestLevel;
+	struct PendingRelTruncate *next;
+} PendingRelTruncate;
+
 static PendingRelDelete *pendingDeletes = NULL; /* head of linked list */
 static HTAB *pendingSyncHash = NULL;
+static HTAB *pendingSkipWalStateHash = NULL;
+static PendingRelTruncate *pendingTruncates = NULL;
+
+static void
+AddPendingTruncate(const RelFileLocator *rlocator)
+{
+	PendingRelTruncate *pending;
+	int			nestLevel = GetCurrentTransactionNestLevel();
+
+	for (pending = pendingTruncates; pending != NULL; pending = pending->next)
+	{
+		if (RelFileLocatorEquals(pending->rlocator, *rlocator))
+		{
+			if (pending->nestLevel > nestLevel)
+				pending->nestLevel = nestLevel;
+			return;
+		}
+	}
+
+	pending = (PendingRelTruncate *)
+		MemoryContextAlloc(TopMemoryContext, sizeof(PendingRelTruncate));
+	pending->rlocator = *rlocator;
+	pending->nestLevel = nestLevel;
+	pending->next = pendingTruncates;
+	pendingTruncates = pending;
+}
+
+static void
+ClearPendingTruncates(void)
+{
+	PendingRelTruncate *pending;
+	PendingRelTruncate *next;
+
+	for (pending = pendingTruncates; pending != NULL; pending = next)
+	{
+		next = pending->next;
+		pfree(pending);
+	}
+	pendingTruncates = NULL;
+}
 
 
 /*
@@ -103,6 +150,21 @@ AddPendingSync(const RelFileLocator *rlocator)
 	pending = hash_search(pendingSyncHash, rlocator, HASH_ENTER, &found);
 	Assert(!found);
 	pending->is_truncated = false;
+
+	if (!pendingSkipWalStateHash)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(RelFileLocator);
+		ctl.entrysize = sizeof(RelFileLocator);
+		ctl.hcxt = TopTransactionContext;
+		pendingSkipWalStateHash = hash_create("pending skip-WAL state hash",
+											  16, &ctl,
+											  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+
+	(void) hash_search(pendingSkipWalStateHash, rlocator, HASH_ENTER, &found);
+	smgrmarkskipwalpending(*rlocator);
 }
 
 /*
@@ -149,9 +211,7 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 
 	srel = smgropen(rlocator, procNumber);
 	smgrcreate(srel, MAIN_FORKNUM, false);
-
-	if (needs_wal)
-		smgrcreaterelationmetadata(srel);
+	smgrinitnewrelation(srel, needs_wal);
 	if (needs_wal)
 		log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);
 
@@ -297,6 +357,7 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 	BlockNumber old_blocks[MAX_FORKNUM];
 	BlockNumber blocks[MAX_FORKNUM];
 	int			nforks = 0;
+	XLogRecPtr	truncate_lsn = InvalidXLogRecPtr;
 	SMgrRelation reln;
 
 	/*
@@ -385,14 +446,11 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 	 *
 	 * (See also visibilitymap.c if changing this code.)
 	 */
-	START_CRIT_SECTION();
-
 	if (RelationNeedsWAL(rel))
 	{
 		/*
 		 * Make an XLOG entry reporting the file truncation.
 		 */
-		XLogRecPtr	lsn;
 		xl_smgr_truncate xlrec;
 
 		xlrec.blkno = nblocks;
@@ -402,8 +460,8 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 		XLogBeginInsert();
 		XLogRegisterData(&xlrec, sizeof(xlrec));
 
-		lsn = XLogInsert(RM_SMGR_ID,
-						 XLOG_SMGR_TRUNCATE | XLR_SPECIAL_REL_UPDATE);
+		truncate_lsn = XLogInsert(RM_SMGR_ID,
+								  XLOG_SMGR_TRUNCATE | XLR_SPECIAL_REL_UPDATE);
 
 		/*
 		 * Flush, because otherwise the truncation of the main relation might
@@ -413,14 +471,23 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 		 * contain entries for the non-existent heap pages, and standbys would
 		 * also never replay the truncation.
 		 */
-		XLogFlush(lsn);
+		XLogFlush(truncate_lsn);
 	}
+
+	/*
+	 * Apply storage-manager-specific truncate metadata updates before entering
+	 * the critical section. Umbra uses this to rewrite MAP metadata with the
+	 * truncate WAL LSN while MAP buffer reads and flushes are still legal.
+	 */
+	smgrpretruncate(RelationGetSmgr(rel), forks, nforks, old_blocks, blocks,
+					truncate_lsn);
 
 	/*
 	 * This will first remove any buffers from the buffer pool that should no
 	 * longer exist after truncation is complete, and then truncate the
 	 * corresponding files on disk.
 	 */
+	START_CRIT_SECTION();
 	smgrtruncate(RelationGetSmgr(rel), forks, nforks, old_blocks, blocks);
 
 	END_CRIT_SECTION();
@@ -452,6 +519,8 @@ void
 RelationPreTruncate(Relation rel)
 {
 	PendingRelSync *pending;
+
+	AddPendingTruncate(&(RelationGetSmgr(rel)->smgr_rlocator.locator));
 
 	if (!pendingSyncHash)
 		return;
@@ -579,6 +648,30 @@ RelFileLocatorSkippingWAL(RelFileLocator rlocator)
 		return false;
 
 	return true;
+}
+
+/*
+ * RelFileLocatorWasTruncated
+ *		Check whether this transaction already marked the relfilenode truncated.
+ *
+ * A relfilenode can emit fresh page images for block 0 later in the same
+ * transaction after XLOG_SMGR_TRUNCATE has already been inserted. Recovery
+ * replays the truncate first and therefore sees no surviving old mapping, so
+ * producer-side first-born mapping logic must treat any still-visible local
+ * pre-truncate mapping as stale in that case.
+ */
+bool
+RelFileLocatorWasTruncated(RelFileLocator rlocator)
+{
+	PendingRelTruncate *pending;
+
+	for (pending = pendingTruncates; pending != NULL; pending = pending->next)
+	{
+		if (RelFileLocatorEquals(pending->rlocator, rlocator))
+			return true;
+	}
+
+	return false;
 }
 
 /*
@@ -752,12 +845,17 @@ smgrDoPendingSyncs(bool isCommit, bool isParallelWorker)
 	Assert(GetCurrentTransactionNestLevel() == 1);
 
 	if (!pendingSyncHash)
+	{
+		ClearPendingTruncates();
 		return;					/* no relation needs sync */
+	}
 
 	/* Abort -- just throw away all pending syncs */
 	if (!isCommit)
 	{
 		pendingSyncHash = NULL;
+		pendingSkipWalStateHash = NULL;
+		ClearPendingTruncates();
 		return;
 	}
 
@@ -767,6 +865,8 @@ smgrDoPendingSyncs(bool isCommit, bool isParallelWorker)
 	if (isParallelWorker)
 	{
 		pendingSyncHash = NULL;
+		pendingSkipWalStateHash = NULL;
+		ClearPendingTruncates();
 		return;
 	}
 
@@ -783,6 +883,7 @@ smgrDoPendingSyncs(bool isCommit, bool isParallelWorker)
 		BlockNumber nblocks[MAX_FORKNUM + 1];
 		uint64		total_blocks = 0;
 		SMgrRelation srel;
+		bool		require_storage_sync;
 
 		srel = smgropen(pendingsync->rlocator, INVALID_PROC_NUMBER);
 
@@ -798,6 +899,12 @@ smgrDoPendingSyncs(bool isCommit, bool isParallelWorker)
 		{
 			for (fork = 0; fork <= MAX_FORKNUM; fork++)
 			{
+				if (smgrisinternalfork(fork))
+				{
+					nblocks[fork] = InvalidBlockNumber;
+					continue;
+				}
+
 				if (smgrexists(srel, fork))
 				{
 					BlockNumber n = smgrnblocks(srel, fork);
@@ -812,6 +919,8 @@ smgrDoPendingSyncs(bool isCommit, bool isParallelWorker)
 			}
 		}
 
+		require_storage_sync = smgrpreparependingsync(srel);
+
 		/*
 		 * Sync file or emit WAL records for its contents.
 		 *
@@ -825,6 +934,18 @@ smgrDoPendingSyncs(bool isCommit, bool isParallelWorker)
 		 * main fork is longer than ever but FSM fork gets shorter.
 		 */
 		if (pendingsync->is_truncated ||
+			/*
+			 * New relfilenumbers that are still in PostgreSQL's mandatory
+			 * WAL-skipping state must reach disk via flush+sync, not via
+			 * log_newpage_range(). See "Skipping WAL for New RelFileLocator"
+			 * in src/backend/access/transam/README.
+			 */
+			RelFileLocatorSkippingWAL(pendingsync->rlocator) ||
+			/*
+			 * Some storage managers require flush+sync for their own durable
+			 * transition protocol even when the relation is small.
+			 */
+			require_storage_sync ||
 			total_blocks >= wal_skip_threshold * (uint64) 1024 / BLCKSZ)
 		{
 			/* allocate the initial array, or extend it, if needed */
@@ -866,12 +987,26 @@ smgrDoPendingSyncs(bool isCommit, bool isParallelWorker)
 	}
 
 	pendingSyncHash = NULL;
+	ClearPendingTruncates();
 
 	if (nrels > 0)
 	{
 		smgrdosyncall(srels, nrels);
+
+		if (pendingSkipWalStateHash)
+		{
+			HASH_SEQ_STATUS clear_scan;
+			RelFileLocator *rlocator;
+
+			hash_seq_init(&clear_scan, pendingSkipWalStateHash);
+			while ((rlocator = (RelFileLocator *) hash_seq_search(&clear_scan)) != NULL)
+				smgrclearskipwalpending(*rlocator);
+		}
+
 		pfree(srels);
 	}
+
+	pendingSkipWalStateHash = NULL;
 }
 
 /*
@@ -945,6 +1080,8 @@ PostPrepare_smgr(void)
 		/* must explicitly free the list entry */
 		pfree(pending);
 	}
+
+	ClearPendingTruncates();
 }
 
 
@@ -958,11 +1095,20 @@ AtSubCommit_smgr(void)
 {
 	int			nestLevel = GetCurrentTransactionNestLevel();
 	PendingRelDelete *pending;
+	PendingRelTruncate *pending_truncate;
 
 	for (pending = pendingDeletes; pending != NULL; pending = pending->next)
 	{
 		if (pending->nestLevel >= nestLevel)
 			pending->nestLevel = nestLevel - 1;
+	}
+
+	for (pending_truncate = pendingTruncates;
+		 pending_truncate != NULL;
+		 pending_truncate = pending_truncate->next)
+	{
+		if (pending_truncate->nestLevel >= nestLevel)
+			pending_truncate->nestLevel = nestLevel - 1;
 	}
 }
 
@@ -976,7 +1122,28 @@ AtSubCommit_smgr(void)
 void
 AtSubAbort_smgr(void)
 {
+	PendingRelTruncate *pending;
+	PendingRelTruncate *prev = NULL;
+	PendingRelTruncate *next;
+	int			nestLevel = GetCurrentTransactionNestLevel();
+
 	smgrDoPendingDeletes(false);
+
+	for (pending = pendingTruncates; pending != NULL; pending = next)
+	{
+		next = pending->next;
+
+		if (pending->nestLevel >= nestLevel)
+		{
+			if (prev)
+				prev->next = next;
+			else
+				pendingTruncates = next;
+			pfree(pending);
+		}
+		else
+			prev = pending;
+	}
 }
 
 void
@@ -993,11 +1160,12 @@ smgr_redo(XLogReaderState *record)
 		xl_smgr_create *xlrec = (xl_smgr_create *) XLogRecGetData(record);
 		SMgrRelation reln;
 
-		reln = smgropen(xlrec->rlocator, INVALID_PROC_NUMBER);
-		smgrcreate(reln, xlrec->forkNum, true);
-	}
-	else if (info == XLOG_SMGR_TRUNCATE)
-	{
+			reln = smgropen(xlrec->rlocator, INVALID_PROC_NUMBER);
+			smgrcreate(reln, xlrec->forkNum, true);
+			smgrredocreatefork(reln, xlrec->forkNum, lsn);
+		}
+		else if (info == XLOG_SMGR_TRUNCATE)
+		{
 		xl_smgr_truncate *xlrec = (xl_smgr_truncate *) XLogRecGetData(record);
 		SMgrRelation reln;
 		Relation	rel;
@@ -1016,7 +1184,7 @@ smgr_redo(XLogReaderState *record)
 		 * log as best we can until the drop is seen.
 		 */
 		smgrcreate(reln, MAIN_FORKNUM, true);
-		smgrcreaterelationmetadata(reln);
+		smgrredocreatefork(reln, MAIN_FORKNUM, lsn);
 
 		/*
 		 * Before we perform the truncation, update minimum recovery point to
@@ -1077,6 +1245,7 @@ smgr_redo(XLogReaderState *record)
 		/* Do the real work to truncate relation forks */
 		if (nforks > 0)
 		{
+			smgrpretruncate(reln, forks, nforks, old_blocks, blocks, lsn);
 			START_CRIT_SECTION();
 			smgrtruncate(reln, forks, nforks, old_blocks, blocks);
 			END_CRIT_SECTION();
@@ -1087,7 +1256,7 @@ smgr_redo(XLogReaderState *record)
 		 * important because the just-truncated pages were likely marked as
 		 * all-free, and would be preferentially selected.
 		 */
-		if (need_fsm_vacuum)
+		if (need_fsm_vacuum && smgrneedsrecoveryfsmvacuum(reln))
 			FreeSpaceMapVacuumRange(rel, xlrec->blkno,
 									InvalidBlockNumber);
 

@@ -63,6 +63,7 @@ tests += {
       't/052_checkpoint_segment_missing.pl',
       't/053_umbra_map_superblock_watermark.pl',
       't/054_umbra_map_fork_policy.pl',
+      't/061_umbra_fsm_vm_map_translation.pl',
       't/063_umbra_mainfork_head_unlink_checkpoint.pl',
     ],
   },

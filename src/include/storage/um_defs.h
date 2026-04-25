@@ -1,14 +1,14 @@
 /*-------------------------------------------------------------------------
  *
  * um_defs.h
- *	  Umbra low-level fork and metadata path definitions.
+ *    Umbra low-level fork and metadata path definitions.
  *
- * This header contains storage-layout facts shared by Umbra submodules.
- *
- * src/include/storage/um_defs.h
+ * This header intentionally contains only storage-layout facts shared by
+ * Umbra submodules. Higher-level MAP policy stays in umbra.h/umbra.c.
  *
  *-------------------------------------------------------------------------
  */
+
 #ifndef UM_DEFS_H
 #define UM_DEFS_H
 
@@ -16,13 +16,15 @@
 
 #include "common/relpath.h"
 #include "storage/relfilelocator.h"
+#include "storage/smgr.h"
 
 /*
- * Umbra reserves an extra fork slot for relation-local metadata.  This lives
- * outside PostgreSQL's built-in fork numbering so ordinary smgr loops do not
- * try to process it implicitly.
+ * Umbra internal metadata fork numbering.
+ *
+ * The numeric value still matches the historical MAP slot, but the definition
+ * lives here so low-level file/map code does not depend on umbra.h.
  */
-#define UMBRA_METADATA_FORKNUM	((ForkNumber) (INIT_FORKNUM + 1))
+#define UMBRA_METADATA_FORKNUM	((int) INIT_FORKNUM + 1)
 #define UMBRA_FORK_SLOTS		(UMBRA_METADATA_FORKNUM + 1)
 
 static inline RelPathStr

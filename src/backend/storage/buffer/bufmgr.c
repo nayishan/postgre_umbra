@@ -5491,7 +5491,8 @@ CreateAndCopyRelationData(RelFileLocator src_rlocator,
 	{
 		if (smgrexists(src_rel, forkNum))
 		{
-			smgrcreate(dst_rel, forkNum, false);
+			if (!smgrisinternalfork(forkNum))
+				smgrcreate(dst_rel, forkNum, false);
 
 			/*
 			 * WAL log creation if the relation is persistent, or this is the
@@ -5500,9 +5501,12 @@ CreateAndCopyRelationData(RelFileLocator src_rlocator,
 			if (permanent || forkNum == INIT_FORKNUM)
 				log_smgrcreate(&dst_rlocator, forkNum);
 
-			/* Copy a fork's data, block by block. */
-			RelationCopyStorageUsingBuffer(src_rlocator, dst_rlocator, forkNum,
-										   permanent);
+			if (!smgrisinternalfork(forkNum))
+			{
+				/* Copy a fork's data, block by block. */
+				RelationCopyStorageUsingBuffer(src_rlocator, dst_rlocator, forkNum,
+											   permanent);
+			}
 		}
 	}
 

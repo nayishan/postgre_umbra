@@ -1034,6 +1034,7 @@ mdstartreadv(PgAioHandle *ioh,
 							 reln,
 							 forknum,
 							 blocknum,
+							 blocknum,
 							 nblocks,
 							 false);
 	pgaio_io_register_callbacks(ioh, PGAIO_HCB_MD_READV, 0);

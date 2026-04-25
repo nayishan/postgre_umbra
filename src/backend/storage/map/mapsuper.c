@@ -838,7 +838,6 @@ MapSuperSetExtendingTarget(MapSuperEntry *entry, ForkNumber forknum,
 
 
 
-
 static bool
 MapSuperPrepareEntryForUpdate(UmbraFileContext *map_ctx, RelFileLocator rnode,
 							  XLogRecPtr map_lsn, const char *missing_errmsg,
@@ -871,12 +870,14 @@ MapSuperPrepareEntryForUpdate(UmbraFileContext *map_ctx, RelFileLocator rnode,
 				entry->super = disk_super;
 				entry->page_lsn = MapSuperblockGetLastUpdatedLSN(&disk_super);
 				entry->flags = MAPSUPER_FLAG_VALID;
+				MapSuperResetReservedNextFrees(entry);
 			}
 			else
 			{
 				MapSuperblockInit(&entry->super, 0);
 				entry->page_lsn = InvalidXLogRecPtr;
 				entry->flags = MAPSUPER_FLAG_VALID | MAPSUPER_FLAG_CORRUPT;
+				MapSuperResetReservedNextFrees(entry);
 			}
 		}
 	}
@@ -897,8 +898,21 @@ MapSuperPrepareEntryForUpdate(UmbraFileContext *map_ctx, RelFileLocator rnode,
 		 */
 		MapSuperblockInit(&entry->super, 0);
 		entry->flags = MAPSUPER_FLAG_VALID;
+		MapSuperResetReservedNextFrees(entry);
 	}
 
+	Assert(MapNormalizeForkBlockCount(MAIN_FORKNUM,
+									  MapSuperblockGetNextFreePhysBlock(&entry->super,
+																		MAIN_FORKNUM)) <=
+		   MapSuperGetReservedNextFree(entry, MAIN_FORKNUM));
+	Assert(MapNormalizeForkBlockCount(FSM_FORKNUM,
+									  MapSuperblockGetNextFreePhysBlock(&entry->super,
+																		FSM_FORKNUM)) <=
+		   MapSuperGetReservedNextFree(entry, FSM_FORKNUM));
+	Assert(MapNormalizeForkBlockCount(VISIBILITYMAP_FORKNUM,
+									  MapSuperblockGetNextFreePhysBlock(&entry->super,
+																		VISIBILITYMAP_FORKNUM)) <=
+		   MapSuperGetReservedNextFree(entry, VISIBILITYMAP_FORKNUM));
 	*entry_p = entry;
 	return true;
 }
@@ -1001,11 +1015,15 @@ MapSBlockBumpPhysicalState(UmbraFileContext *map_ctx, RelFileLocator rnode,
 	current_capacity = MapSuperblockGetPhysCapacity(&entry->super, forknum);
 	current_next = MapNormalizeForkBlockCount(forknum, current_next);
 	current_capacity = MapNormalizeForkBlockCount(forknum, current_capacity);
+	Assert(MapNormalizeForkBlockCount(forknum,
+									  MapSuperblockGetNextFreePhysBlock(&entry->super,
+																		forknum)) <=
+		   MapSuperGetReservedNextFree(entry, forknum));
 
 	if (bump_next_free && current_next < nblocks)
 	{
 		MapSuperblockSetNextFreePhysBlock(&entry->super, forknum, nblocks);
-		if (InRecovery)
+		MapSuperMaybeBumpReservedNextFree(entry, forknum, nblocks);
 		changed = true;
 	}
 	if (bump_capacity && current_capacity < nblocks)
@@ -1028,6 +1046,10 @@ MapSBlockBumpPhysicalState(UmbraFileContext *map_ctx, RelFileLocator rnode,
 		entry->flags |= MAPSUPER_FLAG_DIRTY;
 	}
 
+	Assert(MapNormalizeForkBlockCount(forknum,
+									  MapSuperblockGetNextFreePhysBlock(&entry->super,
+																		forknum)) <=
+		   MapSuperGetReservedNextFree(entry, forknum));
 	LWLockRelease(&entry->lock);
 }
 

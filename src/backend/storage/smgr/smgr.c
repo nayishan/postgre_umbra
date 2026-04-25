@@ -4,9 +4,8 @@
  *	  public interface routines to storage manager switch.
  *
  * All file system operations on relations dispatch through these routines.
- * An SMgrRelation represents storage-manager state for a relation.  The
- * selected storage manager implementation owns any implementation-specific
- * state needed to service those operations.
+ * An SMgrRelation represents physical on-disk relation files that are open
+ * for reading and writing.
  *
  * When a relation is first accessed through the relation cache, the
  * corresponding SMgrRelation entry is opened by calling smgropen(), and the
@@ -93,6 +92,7 @@ typedef struct f_smgr
 {
 	void		(*smgr_init) (void);	/* may be NULL */
 	void		(*smgr_shutdown) (void);	/* may be NULL */
+	void		(*smgr_before_shmem_exit_cleanup) (void);	/* may be NULL */
 	void		(*smgr_open) (SMgrRelation reln);
 	void		(*smgr_close) (SMgrRelation reln, ForkNumber forknum);
 	void		(*smgr_destroy) (SMgrRelation reln);	/* may be NULL */
@@ -123,10 +123,15 @@ typedef struct f_smgr
 	void		(*smgr_writeback) (SMgrRelation reln, ForkNumber forknum,
 								   BlockNumber blocknum, BlockNumber nblocks);
 	BlockNumber (*smgr_nblocks) (SMgrRelation reln, ForkNumber forknum);
+	void		(*smgr_pretruncate) (SMgrRelation reln, ForkNumber forknum,
+									 BlockNumber old_blocks, BlockNumber nblocks,
+									 XLogRecPtr truncate_lsn);
 	void		(*smgr_truncate) (SMgrRelation reln, ForkNumber forknum,
 								  BlockNumber old_blocks, BlockNumber nblocks);
 	void		(*smgr_immedsync) (SMgrRelation reln, ForkNumber forknum);
 	void		(*smgr_registersync) (SMgrRelation reln, ForkNumber forknum);
+	int			(*smgr_fd) (SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint32 *off);
+	bool		(*smgr_is_internal_fork) (ForkNumber forknum);
 	void		(*smgr_create_relation_metadata) (SMgrRelation reln);
 	void		(*smgr_copy_relation_metadata) (SMgrRelation src,
 												SMgrRelation dst,
@@ -134,61 +139,30 @@ typedef struct f_smgr
 	void		(*smgr_sync_relation_metadata) (SMgrRelation reln);
 	void		(*smgr_unlink_relation_metadata) (RelFileLocatorBackend rlocator,
 												  bool isRedo);
+	void		(*smgr_setmapstate) (SMgrRelation reln, uint8 map_state);
 	bool		(*smgr_createdb_allows_wal_log) (void);
+	void		(*smgr_init_new_relation) (SMgrRelation reln, bool needs_wal);
+	void		(*smgr_redo_create_fork) (SMgrRelation reln, ForkNumber forknum,
+										  XLogRecPtr lsn);
 	void		(*smgr_checkpoint_database_tablespaces) (Oid dbid,
 														 int ntablespaces,
 														 const Oid *tablespace_ids);
 	void		(*smgr_invalidate_database_tablespaces) (Oid dbid,
 														 int ntablespaces,
 														 const Oid *tablespace_ids);
-	int			(*smgr_fd) (SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint32 *off);
+	void		(*smgr_mark_skip_wal_pending) (SMgrRelation reln);
+	void		(*smgr_clear_skip_wal_pending) (SMgrRelation reln);
+	bool		(*smgr_prepare_pendingsync) (SMgrRelation reln);
+	bool		(*smgr_needs_recovery_fsm_vacuum) (SMgrRelation reln);
 } f_smgr;
 
-#define SMGR_MD		0
-#ifdef USE_UMBRA
-#define SMGR_UMBRA	1
-#define SMGR_DEFAULT	SMGR_UMBRA
-#else
-#define SMGR_DEFAULT	SMGR_MD
-#endif
-
 static const f_smgr smgrsw[] = {
-	/* magnetic disk */
-	{
-		.smgr_init = mdinit,
-		.smgr_shutdown = NULL,
-		.smgr_open = mdopen,
-		.smgr_close = mdclose,
-		.smgr_destroy = NULL,
-		.smgr_create = mdcreate,
-		.smgr_exists = mdexists,
-		.smgr_unlink = mdunlink,
-		.smgr_extend = mdextend,
-		.smgr_zeroextend = mdzeroextend,
-		.smgr_prefetch = mdprefetch,
-		.smgr_maxcombine = mdmaxcombine,
-		.smgr_readv = mdreadv,
-		.smgr_startreadv = mdstartreadv,
-		.smgr_writev = mdwritev,
-		.smgr_writeback = mdwriteback,
-		.smgr_nblocks = mdnblocks,
-		.smgr_truncate = mdtruncate,
-		.smgr_immedsync = mdimmedsync,
-		.smgr_registersync = mdregistersync,
-		.smgr_create_relation_metadata = NULL,
-		.smgr_copy_relation_metadata = NULL,
-		.smgr_sync_relation_metadata = NULL,
-		.smgr_unlink_relation_metadata = NULL,
-		.smgr_createdb_allows_wal_log = NULL,
-		.smgr_checkpoint_database_tablespaces = NULL,
-		.smgr_invalidate_database_tablespaces = NULL,
-		.smgr_fd = mdfd,
-	},
 #ifdef USE_UMBRA
 	/* Umbra storage manager */
 	{
 		.smgr_init = uminit,
 		.smgr_shutdown = NULL,
+		.smgr_before_shmem_exit_cleanup = umbeforeshmemexitcleanup,
 		.smgr_open = umopen,
 		.smgr_close = umclose,
 		.smgr_destroy = umdestroy,
@@ -204,18 +178,64 @@ static const f_smgr smgrsw[] = {
 		.smgr_writev = umwritev,
 		.smgr_writeback = umwriteback,
 		.smgr_nblocks = umnblocks,
+		.smgr_pretruncate = umpretruncate,
 		.smgr_truncate = umtruncate,
 		.smgr_immedsync = umimmedsync,
 		.smgr_registersync = umregistersync,
+		.smgr_fd = umfd,
+		.smgr_is_internal_fork = umisinternalfork,
 		.smgr_create_relation_metadata = umcreaterelationmetadata,
 		.smgr_copy_relation_metadata = umcopyrelationmetadata,
 		.smgr_sync_relation_metadata = umsyncrelationmetadata,
 		.smgr_unlink_relation_metadata = umunlinkrelationmetadata,
+		.smgr_setmapstate = umsetmapstate,
 		.smgr_createdb_allows_wal_log = umcreatedballowswallog,
+		.smgr_init_new_relation = uminitnewrelation,
+		.smgr_redo_create_fork = umredocreatefork,
 		.smgr_checkpoint_database_tablespaces = umcheckpointdatabasetablespaces,
 		.smgr_invalidate_database_tablespaces = uminvalidatedatabasetablespaces,
-		.smgr_fd = umfd,
+		.smgr_mark_skip_wal_pending = ummarkskipwalpending,
+		.smgr_clear_skip_wal_pending = umclearskipwalpending,
+		.smgr_prepare_pendingsync = umpreparependingsync,
+		.smgr_needs_recovery_fsm_vacuum = umneedsrecoveryfsmvacuum,
 	},
+#else
+	/* magnetic disk */
+	{
+		.smgr_init = mdinit,
+		.smgr_shutdown = NULL,
+		.smgr_before_shmem_exit_cleanup = NULL,
+		.smgr_open = mdopen,
+		.smgr_close = mdclose,
+		.smgr_destroy = NULL,
+		.smgr_create = mdcreate,
+		.smgr_exists = mdexists,
+		.smgr_unlink = mdunlink,
+		.smgr_extend = mdextend,
+		.smgr_zeroextend = mdzeroextend,
+		.smgr_prefetch = mdprefetch,
+		.smgr_maxcombine = mdmaxcombine,
+		.smgr_readv = mdreadv,
+		.smgr_startreadv = mdstartreadv,
+		.smgr_writev = mdwritev,
+		.smgr_writeback = mdwriteback,
+		.smgr_nblocks = mdnblocks,
+		.smgr_pretruncate = NULL,
+		.smgr_truncate = mdtruncate,
+		.smgr_immedsync = mdimmedsync,
+		.smgr_registersync = mdregistersync,
+		.smgr_fd = mdfd,
+		.smgr_is_internal_fork = NULL,
+		.smgr_create_relation_metadata = NULL,
+		.smgr_copy_relation_metadata = NULL,
+		.smgr_sync_relation_metadata = NULL,
+		.smgr_unlink_relation_metadata = NULL,
+		.smgr_setmapstate = NULL,
+		.smgr_mark_skip_wal_pending = NULL,
+		.smgr_clear_skip_wal_pending = NULL,
+		.smgr_prepare_pendingsync = NULL,
+		.smgr_needs_recovery_fsm_vacuum = NULL,
+	}
 #endif
 };
 
@@ -231,6 +251,7 @@ static dlist_head unpinned_relns;
 
 /* local function prototypes */
 static void smgrshutdown(int code, Datum arg);
+static void smgrbeforeshmemexit(int code, Datum arg);
 static void smgrdestroy(SMgrRelation reln);
 
 static void smgr_aio_reopen(PgAioHandle *ioh);
@@ -242,6 +263,15 @@ const PgAioTargetInfo aio_smgr_target_info = {
 	.reopen = smgr_aio_reopen,
 	.describe_identity = smgr_aio_describe_identity,
 };
+
+bool
+smgrisinternalfork(ForkNumber forknum)
+{
+	if (smgrsw[0].smgr_is_internal_fork == NULL)
+		return false;
+
+	return smgrsw[0].smgr_is_internal_fork(forknum);
+}
 
 
 /*
@@ -271,6 +301,21 @@ smgrinit(void)
 	on_proc_exit(smgrshutdown, 0);
 }
 
+void
+smgrregistershutdowncleanup(void)
+{
+	static bool registered = false;
+
+	if (registered)
+		return;
+
+	if (smgrsw[0].smgr_before_shmem_exit_cleanup == NULL)
+		return;
+
+	before_shmem_exit(smgrbeforeshmemexit, 0);
+	registered = true;
+}
+
 /*
  * on_proc_exit hook for smgr cleanup during backend shutdown
  */
@@ -288,6 +333,15 @@ smgrshutdown(int code, Datum arg)
 	}
 
 	RESUME_INTERRUPTS();
+}
+
+static void
+smgrbeforeshmemexit(int code, Datum arg)
+{
+	(void) code;
+	(void) arg;
+
+	smgrsw[0].smgr_before_shmem_exit_cleanup();
 }
 
 /*
@@ -341,7 +395,7 @@ smgropen(RelFileLocator rlocator, ProcNumber backend)
 		reln->smgr_targblock = InvalidBlockNumber;
 		for (int i = 0; i <= MAX_FORKNUM; ++i)
 			reln->smgr_cached_nblocks[i] = InvalidBlockNumber;
-		reln->smgr_which = SMGR_DEFAULT;
+		reln->smgr_which = 0;	/* we only have md.c at present */
 		reln->smgr_private = NULL;
 
 		/* it is not pinned yet */
@@ -582,37 +636,56 @@ smgrsyncrelationmetadata(SMgrRelation reln)
 void
 smgrunlinkrelationmetadata(RelFileLocatorBackend rlocator, bool isRedo)
 {
-	if (smgrsw[SMGR_DEFAULT].smgr_unlink_relation_metadata)
-		smgrsw[SMGR_DEFAULT].smgr_unlink_relation_metadata(rlocator, isRedo);
+	if (smgrsw[0].smgr_unlink_relation_metadata)
+		smgrsw[0].smgr_unlink_relation_metadata(rlocator, isRedo);
+}
+
+void
+smgrsetmapstate(SMgrRelation reln, uint8 map_state)
+{
+	if (smgrsw[reln->smgr_which].smgr_setmapstate)
+		smgrsw[reln->smgr_which].smgr_setmapstate(reln, map_state);
 }
 
 bool
 smgrcreatedballowswallog(void)
 {
-	if (smgrsw[SMGR_DEFAULT].smgr_createdb_allows_wal_log)
-		return smgrsw[SMGR_DEFAULT].smgr_createdb_allows_wal_log();
+	if (smgrsw[0].smgr_createdb_allows_wal_log)
+		return smgrsw[0].smgr_createdb_allows_wal_log();
 
 	return true;
+}
+
+void
+smgrinitnewrelation(SMgrRelation reln, bool needs_wal)
+{
+	if (smgrsw[reln->smgr_which].smgr_init_new_relation)
+		smgrsw[reln->smgr_which].smgr_init_new_relation(reln, needs_wal);
+}
+
+void
+smgrredocreatefork(SMgrRelation reln, ForkNumber forknum, XLogRecPtr lsn)
+{
+	if (smgrsw[reln->smgr_which].smgr_redo_create_fork)
+		smgrsw[reln->smgr_which].smgr_redo_create_fork(reln, forknum, lsn);
 }
 
 void
 smgrcheckpointdatabasetablespaces(Oid dbid, int ntablespaces,
 								  const Oid *tablespace_ids)
 {
-	if (smgrsw[SMGR_DEFAULT].smgr_checkpoint_database_tablespaces)
-		smgrsw[SMGR_DEFAULT].smgr_checkpoint_database_tablespaces(dbid,
-																  ntablespaces,
-																  tablespace_ids);
+	if (smgrsw[0].smgr_checkpoint_database_tablespaces)
+		smgrsw[0].smgr_checkpoint_database_tablespaces(dbid, ntablespaces,
+													   tablespace_ids);
 }
 
 void
 smgrinvalidatedatabasetablespaces(Oid dbid, int ntablespaces,
 								  const Oid *tablespace_ids)
 {
-	if (smgrsw[SMGR_DEFAULT].smgr_invalidate_database_tablespaces)
-		smgrsw[SMGR_DEFAULT].smgr_invalidate_database_tablespaces(dbid,
-																  ntablespaces,
-																  tablespace_ids);
+	if (smgrsw[0].smgr_invalidate_database_tablespaces)
+		smgrsw[0].smgr_invalidate_database_tablespaces(dbid, ntablespaces,
+													   tablespace_ids);
 }
 
 void
@@ -620,6 +693,50 @@ smgrinvalidatedatabase(Oid dbid)
 {
 	smgrinvalidatedatabasetablespaces(dbid, 0, NULL);
 }
+
+
+
+
+
+
+void
+smgrmarkskipwalpending(RelFileLocator rlocator)
+{
+	SMgrRelation reln;
+
+	reln = smgropen(rlocator, INVALID_PROC_NUMBER);
+	if (smgrsw[reln->smgr_which].smgr_mark_skip_wal_pending)
+		smgrsw[reln->smgr_which].smgr_mark_skip_wal_pending(reln);
+}
+
+void
+smgrclearskipwalpending(RelFileLocator rlocator)
+{
+	SMgrRelation reln;
+
+	reln = smgropen(rlocator, INVALID_PROC_NUMBER);
+	if (smgrsw[reln->smgr_which].smgr_clear_skip_wal_pending)
+		smgrsw[reln->smgr_which].smgr_clear_skip_wal_pending(reln);
+}
+
+bool
+smgrpreparependingsync(SMgrRelation reln)
+{
+	if (smgrsw[reln->smgr_which].smgr_prepare_pendingsync)
+		return smgrsw[reln->smgr_which].smgr_prepare_pendingsync(reln);
+
+	return false;
+}
+
+bool
+smgrneedsrecoveryfsmvacuum(SMgrRelation reln)
+{
+	if (smgrsw[reln->smgr_which].smgr_needs_recovery_fsm_vacuum)
+		return smgrsw[reln->smgr_which].smgr_needs_recovery_fsm_vacuum(reln);
+
+	return true;
+}
+
 /*
  * smgrdosyncall() -- Immediately sync all forks of all given relations
  *
@@ -651,6 +768,9 @@ smgrdosyncall(SMgrRelation *rels, int nrels)
 
 		for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
 		{
+			if (smgrisinternalfork(forknum))
+				continue;
+
 			if (smgrsw[which].smgr_exists(rels[i], forknum))
 				smgrsw[which].smgr_immedsync(rels[i], forknum);
 		}
@@ -708,7 +828,12 @@ smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo)
 
 		/* Close the forks at smgr level */
 		for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
+		{
+			if (smgrisinternalfork(forknum))
+				continue;
+
 			smgrsw[which].smgr_close(rels[i], forknum);
+		}
 	}
 
 	/*
@@ -735,7 +860,12 @@ smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo)
 		int			which = rels[i]->smgr_which;
 
 		for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
+		{
+			if (smgrisinternalfork(forknum))
+				continue;
+
 			smgrsw[which].smgr_unlink(rlocators[i], forknum, isRedo);
+		}
 
 		smgrunlinkrelationmetadata(rlocators[i], isRedo);
 	}
@@ -996,6 +1126,45 @@ smgrnblocks_cached(SMgrRelation reln, ForkNumber forknum)
 	return InvalidBlockNumber;
 }
 
+void
+smgrbumpcachednblocks(SMgrRelation reln, ForkNumber forknum, BlockNumber nblocks)
+{
+	if (InRecovery &&
+		reln->smgr_cached_nblocks[forknum] == InvalidBlockNumber)
+	{
+		BlockNumber authoritative;
+
+		HOLD_INTERRUPTS();
+		authoritative = smgrsw[reln->smgr_which].smgr_nblocks(reln, forknum);
+		RESUME_INTERRUPTS();
+
+		if (authoritative > nblocks)
+			nblocks = authoritative;
+	}
+
+	if (reln->smgr_cached_nblocks[forknum] == InvalidBlockNumber ||
+		reln->smgr_cached_nblocks[forknum] < nblocks)
+		reln->smgr_cached_nblocks[forknum] = nblocks;
+}
+
+void
+smgrpretruncate(SMgrRelation reln, ForkNumber *forknum, int nforks,
+				BlockNumber *old_nblocks, BlockNumber *nblocks,
+				XLogRecPtr truncate_lsn)
+{
+	int			i;
+
+	if (smgrsw[reln->smgr_which].smgr_pretruncate == NULL)
+		return;
+
+	for (i = 0; i < nforks; i++)
+	{
+		smgrsw[reln->smgr_which].smgr_pretruncate(reln, forknum[i],
+												  old_nblocks[i], nblocks[i],
+												  truncate_lsn);
+	}
+}
+
 /*
  * smgrtruncate() -- Truncate the given forks of supplied relation to
  *					 each specified numbers of blocks
@@ -1177,7 +1346,8 @@ void
 pgaio_io_set_target_smgr(PgAioHandle *ioh,
 						 SMgrRelationData *smgr,
 						 ForkNumber forknum,
-						 BlockNumber blocknum,
+						 BlockNumber logical_blocknum,
+						 BlockNumber physical_blocknum,
 						 int nblocks,
 						 bool skip_fsync)
 {
@@ -1188,7 +1358,8 @@ pgaio_io_set_target_smgr(PgAioHandle *ioh,
 	/* backend is implied via IO owner */
 	sd->smgr.rlocator = smgr->smgr_rlocator.locator;
 	sd->smgr.forkNum = forknum;
-	sd->smgr.blockNum = blocknum;
+	sd->smgr.blockNum = logical_blocknum;
+	sd->smgr.physBlockNum = physical_blocknum;
 	sd->smgr.nblocks = nblocks;
 	sd->smgr.is_temp = SmgrIsTemp(smgr);
 	/* Temp relations should never be fsync'd */
@@ -1226,11 +1397,13 @@ smgr_aio_reopen(PgAioHandle *ioh)
 			pg_unreachable();
 			break;
 		case PGAIO_OP_READV:
-			od->read.fd = smgrfd(reln, sd->smgr.forkNum, sd->smgr.blockNum, &off);
+			od->read.fd = smgrfd(reln, sd->smgr.forkNum,
+								 sd->smgr.physBlockNum, &off);
 			Assert(off == od->read.offset);
 			break;
 		case PGAIO_OP_WRITEV:
-			od->write.fd = smgrfd(reln, sd->smgr.forkNum, sd->smgr.blockNum, &off);
+			od->write.fd = smgrfd(reln, sd->smgr.forkNum,
+								  sd->smgr.physBlockNum, &off);
 			Assert(off == od->write.offset);
 			break;
 	}

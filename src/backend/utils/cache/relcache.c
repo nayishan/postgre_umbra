@@ -3873,7 +3873,17 @@ RelationSetNewRelfilenumber(Relation relation, char persistence)
 		SMgrRelation srel;
 
 		srel = RelationCreateStorage(newrlocator, persistence, true);
-		smgrclose(srel);
+
+		/*
+		 * Keep the newly created storage handle as the relation's default
+		 * smgr binding. The creator has already seeded the correct MAP policy
+		 * on this handle, and subsequent writes in the same command should not
+		 * fall back to shape-based reopening.
+		 */
+		if (relation->rd_smgr != NULL)
+			RelationCloseSmgr(relation);
+		relation->rd_smgr = srel;
+		smgrpin(srel);
 	}
 	else
 	{
