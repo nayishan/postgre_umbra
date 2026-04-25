@@ -127,6 +127,13 @@ typedef struct f_smgr
 								  BlockNumber old_blocks, BlockNumber nblocks);
 	void		(*smgr_immedsync) (SMgrRelation reln, ForkNumber forknum);
 	void		(*smgr_registersync) (SMgrRelation reln, ForkNumber forknum);
+	void		(*smgr_create_relation_metadata) (SMgrRelation reln);
+	void		(*smgr_copy_relation_metadata) (SMgrRelation src,
+												SMgrRelation dst,
+												char relpersistence);
+	void		(*smgr_sync_relation_metadata) (SMgrRelation reln);
+	void		(*smgr_unlink_relation_metadata) (RelFileLocatorBackend rlocator,
+												  bool isRedo);
 	int			(*smgr_fd) (SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint32 *off);
 } f_smgr;
 
@@ -161,6 +168,10 @@ static const f_smgr smgrsw[] = {
 		.smgr_truncate = mdtruncate,
 		.smgr_immedsync = mdimmedsync,
 		.smgr_registersync = mdregistersync,
+		.smgr_create_relation_metadata = NULL,
+		.smgr_copy_relation_metadata = NULL,
+		.smgr_sync_relation_metadata = NULL,
+		.smgr_unlink_relation_metadata = NULL,
 		.smgr_fd = mdfd,
 	},
 #ifdef USE_UMBRA
@@ -186,6 +197,10 @@ static const f_smgr smgrsw[] = {
 		.smgr_truncate = umtruncate,
 		.smgr_immedsync = umimmedsync,
 		.smgr_registersync = umregistersync,
+		.smgr_create_relation_metadata = umcreaterelationmetadata,
+		.smgr_copy_relation_metadata = umcopyrelationmetadata,
+		.smgr_sync_relation_metadata = umsyncrelationmetadata,
+		.smgr_unlink_relation_metadata = umunlinkrelationmetadata,
 		.smgr_fd = umfd,
 	},
 #endif
@@ -529,6 +544,34 @@ smgrcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 	RESUME_INTERRUPTS();
 }
 
+void
+smgrcreaterelationmetadata(SMgrRelation reln)
+{
+	if (smgrsw[reln->smgr_which].smgr_create_relation_metadata)
+		smgrsw[reln->smgr_which].smgr_create_relation_metadata(reln);
+}
+
+void
+smgrcopyrelationmetadata(SMgrRelation src, SMgrRelation dst, char relpersistence)
+{
+	if (smgrsw[dst->smgr_which].smgr_copy_relation_metadata)
+		smgrsw[dst->smgr_which].smgr_copy_relation_metadata(src, dst,
+															relpersistence);
+}
+
+void
+smgrsyncrelationmetadata(SMgrRelation reln)
+{
+	if (smgrsw[reln->smgr_which].smgr_sync_relation_metadata)
+		smgrsw[reln->smgr_which].smgr_sync_relation_metadata(reln);
+}
+
+void
+smgrunlinkrelationmetadata(RelFileLocatorBackend rlocator, bool isRedo)
+{
+	if (smgrsw[0].smgr_unlink_relation_metadata)
+		smgrsw[0].smgr_unlink_relation_metadata(rlocator, isRedo);
+}
 /*
  * smgrdosyncall() -- Immediately sync all forks of all given relations
  *
@@ -563,6 +606,8 @@ smgrdosyncall(SMgrRelation *rels, int nrels)
 			if (smgrsw[which].smgr_exists(rels[i], forknum))
 				smgrsw[which].smgr_immedsync(rels[i], forknum);
 		}
+
+		smgrsyncrelationmetadata(rels[i]);
 	}
 
 	RESUME_INTERRUPTS();
@@ -643,6 +688,8 @@ smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo)
 
 		for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
 			smgrsw[which].smgr_unlink(rlocators[i], forknum, isRedo);
+
+		smgrunlinkrelationmetadata(rlocators[i], isRedo);
 	}
 
 	pfree(rlocators);

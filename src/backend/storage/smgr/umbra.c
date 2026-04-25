@@ -4,8 +4,9 @@
  *	  Umbra storage manager skeleton.
  *
  * This file establishes Umbra as a separate smgr implementation from md.c.
- * Data-fork operations remain md-backed here, while relation-local metadata
- * file operations go through umfile.
+ * maintains identity mapping state (logical block number == physical block
+ * number) in the relation-local metadata file while using md.c for data-fork
+ * I/O and umfile for metadata-file I/O.
  *
  * src/backend/storage/smgr/umbra.c
  *
@@ -13,7 +14,9 @@
  */
 #include "postgres.h"
 
+#include "catalog/pg_class.h"
 #include "storage/md.h"
+#include "storage/mapsuper.h"
 #include "storage/smgr.h"
 #include "storage/umfile.h"
 #include "storage/umbra.h"
@@ -24,7 +27,11 @@ typedef struct UmbraSmgrRelationState
 	UmbraFileContext *filectx;
 } UmbraSmgrRelationState;
 
+static bool um_tracks_identity_metadata(ForkNumber forknum);
 static UmbraFileContext *um_relation_filectx(SMgrRelation reln);
+static void um_identity_update_metadata(SMgrRelation reln, ForkNumber forknum,
+										BlockNumber nblocks, bool fork_exists,
+										bool skipFsync);
 
 bool
 UmMetadataExists(SMgrRelation reln)
@@ -124,7 +131,7 @@ umdestroy(SMgrRelation reln)
 {
 	UmbraSmgrRelationState *state = reln->smgr_private;
 
-	umfile_ctx_forget(reln->smgr_rlocator);
+	umfile_ctx_release(reln->smgr_rlocator);
 
 	if (state != NULL)
 	{
@@ -133,15 +140,94 @@ umdestroy(SMgrRelation reln)
 	}
 }
 
+bool
+umisinternalfork(ForkNumber forknum)
+{
+	return forknum == UMBRA_METADATA_FORKNUM;
+}
+
+void
+umcreaterelationmetadata(SMgrRelation reln)
+{
+	bool		created = false;
+
+	if (!UmMetadataOpenOrCreate(reln, false, &created))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create Umbra metadata fork for relation %u/%u/%u",
+						reln->smgr_rlocator.locator.spcOid,
+						reln->smgr_rlocator.locator.dbOid,
+						reln->smgr_rlocator.locator.relNumber)));
+}
+
+void
+umcopyrelationmetadata(SMgrRelation src, SMgrRelation dst, char relpersistence)
+{
+	BlockNumber src_nblocks;
+	BlockNumber dst_nblocks;
+	PGIOAlignedBlock pagebuf;
+	bool		created = false;
+
+	if (relpersistence != RELPERSISTENCE_PERMANENT)
+		return;
+
+	if (!UmMetadataExists(src))
+		return;
+
+	if (!UmMetadataOpenOrCreate(dst, false, &created))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create Umbra metadata fork for relation %u/%u/%u",
+						dst->smgr_rlocator.locator.spcOid,
+						dst->smgr_rlocator.locator.dbOid,
+						dst->smgr_rlocator.locator.relNumber)));
+
+	src_nblocks = UmMetadataNblocks(src);
+	dst_nblocks = UmMetadataNblocks(dst);
+
+	for (BlockNumber blkno = 0; blkno < src_nblocks; blkno++)
+	{
+		UmMetadataRead(src, blkno, pagebuf.data);
+		if (blkno < dst_nblocks)
+			UmMetadataWrite(dst, blkno, pagebuf.data, true);
+		else
+			UmMetadataExtend(dst, blkno, pagebuf.data, true);
+	}
+
+	UmMetadataImmediateSync(dst);
+}
+
+void
+umsyncrelationmetadata(SMgrRelation reln)
+{
+	if (!UmMetadataExists(reln))
+		return;
+
+	UmMetadataImmediateSync(reln);
+}
+
+void
+umunlinkrelationmetadata(RelFileLocatorBackend rlocator, bool isRedo)
+{
+	umfile_ctx_forget(rlocator);
+	UmMetadataUnlink(rlocator, isRedo);
+}
+
 void
 umcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 {
 	mdcreate(reln, forknum, isRedo);
+
+	if (um_tracks_identity_metadata(forknum))
+		um_identity_update_metadata(reln, forknum, 0, true, true);
 }
 
 bool
 umexists(SMgrRelation reln, ForkNumber forknum)
 {
+	if (forknum == UMBRA_METADATA_FORKNUM)
+		return UmMetadataExists(reln);
+
 	return mdexists(reln, forknum);
 }
 
@@ -167,13 +253,30 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		 const void *buffer, bool skipFsync)
 {
 	mdextend(reln, forknum, blocknum, buffer, skipFsync);
+
+	if (um_tracks_identity_metadata(forknum))
+		um_identity_update_metadata(reln, forknum, blocknum + 1, true,
+									skipFsync);
 }
 
 void
 umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 			 int nblocks, bool skipFsync)
 {
+	BlockNumber	target_nblocks;
+
 	mdzeroextend(reln, forknum, blocknum, nblocks, skipFsync);
+
+	if (um_tracks_identity_metadata(forknum))
+	{
+		target_nblocks = blocknum + (BlockNumber) nblocks;
+		if (target_nblocks < blocknum)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("Umbra identity mapping block count overflow")));
+		um_identity_update_metadata(reln, forknum, target_nblocks, true,
+									skipFsync);
+	}
 }
 
 bool
@@ -220,6 +323,11 @@ umwriteback(SMgrRelation reln, ForkNumber forknum,
 BlockNumber
 umnblocks(SMgrRelation reln, ForkNumber forknum)
 {
+	/*
+	 * Keep md.c responsible for the physical fork size query. mdtruncate()
+	 * relies on a preceding mdnblocks() call to have opened all active
+	 * segments.
+	 */
 	return mdnblocks(reln, forknum);
 }
 
@@ -228,12 +336,18 @@ umtruncate(SMgrRelation reln, ForkNumber forknum,
 		   BlockNumber old_blocks, BlockNumber nblocks)
 {
 	mdtruncate(reln, forknum, old_blocks, nblocks);
+
+	if (um_tracks_identity_metadata(forknum))
+		um_identity_update_metadata(reln, forknum, nblocks, true, false);
 }
 
 void
 umimmedsync(SMgrRelation reln, ForkNumber forknum)
 {
 	mdimmedsync(reln, forknum);
+
+	if (um_tracks_identity_metadata(forknum) && UmMetadataExists(reln))
+		UmMetadataImmediateSync(reln);
 }
 
 void
@@ -260,4 +374,42 @@ um_relation_filectx(SMgrRelation reln)
 		state->filectx = umfile_ctx_acquire(reln->smgr_rlocator);
 
 	return state->filectx;
+}
+
+static bool
+um_tracks_identity_metadata(ForkNumber forknum)
+{
+	return forknum == MAIN_FORKNUM ||
+		forknum == FSM_FORKNUM ||
+		forknum == VISIBILITYMAP_FORKNUM;
+}
+
+static void
+um_identity_update_metadata(SMgrRelation reln, ForkNumber forknum,
+							BlockNumber nblocks, bool fork_exists,
+							bool skipFsync)
+{
+	MapSuperblock super;
+
+	Assert(reln != NULL);
+	Assert(um_tracks_identity_metadata(forknum));
+
+	if (!MapSBlockRead(reln, &super))
+		MapSuperblockInit(&super, 0);
+
+	if (!fork_exists && forknum != MAIN_FORKNUM)
+	{
+		MapSuperblockSetLogicalNblocks(&super, forknum, InvalidBlockNumber);
+		MapSuperblockSetNextFreePhysBlock(&super, forknum, InvalidBlockNumber);
+		MapSuperblockSetPhysCapacity(&super, forknum, InvalidBlockNumber);
+	}
+	else
+	{
+		MapSuperblockSetLogicalNblocks(&super, forknum, nblocks);
+		MapSuperblockSetNextFreePhysBlock(&super, forknum, nblocks);
+		MapSuperblockSetPhysCapacity(&super, forknum, nblocks);
+	}
+
+	MapSuperblockSetLastUpdatedLSN(&super, InvalidXLogRecPtr);
+	MapSBlockWrite(reln, &super, skipFsync);
 }

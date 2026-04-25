@@ -34,6 +34,13 @@ extern void uminit(void);
 extern void umopen(SMgrRelation reln);
 extern void umclose(SMgrRelation reln, ForkNumber forknum);
 extern void umdestroy(SMgrRelation reln);
+extern bool umisinternalfork(ForkNumber forknum);
+extern void umcreaterelationmetadata(SMgrRelation reln);
+extern void umcopyrelationmetadata(SMgrRelation src, SMgrRelation dst,
+								   char relpersistence);
+extern void umsyncrelationmetadata(SMgrRelation reln);
+extern void umunlinkrelationmetadata(RelFileLocatorBackend rlocator,
+									 bool isRedo);
 extern void umcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
 extern bool umexists(SMgrRelation reln, ForkNumber forknum);
 extern void umunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo);

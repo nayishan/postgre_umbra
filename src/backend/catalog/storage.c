@@ -151,6 +151,8 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 	smgrcreate(srel, MAIN_FORKNUM, false);
 
 	if (needs_wal)
+		smgrcreaterelationmetadata(srel);
+	if (needs_wal)
 		log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);
 
 	/*
@@ -1014,6 +1016,7 @@ smgr_redo(XLogReaderState *record)
 		 * log as best we can until the drop is seen.
 		 */
 		smgrcreate(reln, MAIN_FORKNUM, true);
+		smgrcreaterelationmetadata(reln);
 
 		/*
 		 * Before we perform the truncation, update minimum recovery point to
