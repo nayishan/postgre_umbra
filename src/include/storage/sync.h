@@ -24,6 +24,7 @@ typedef enum SyncRequestType
 {
 	SYNC_REQUEST,				/* schedule a call of sync function */
 	SYNC_UNLINK_REQUEST,		/* schedule a call of unlink function */
+	SYNC_RECLAIM_REQUEST,		/* schedule internal reclaim unlink */
 	SYNC_FORGET_REQUEST,		/* forget all calls for a tag */
 	SYNC_FILTER_REQUEST,		/* forget all calls satisfying match fn */
 } SyncRequestType;
@@ -39,9 +40,7 @@ typedef enum SyncRequestHandler
 	SYNC_HANDLER_COMMIT_TS,
 	SYNC_HANDLER_MULTIXACT_OFFSET,
 	SYNC_HANDLER_MULTIXACT_MEMBER,
-#ifdef USE_UMBRA
 	SYNC_HANDLER_UMBRA,
-#endif
 	SYNC_HANDLER_NONE,
 } SyncRequestHandler;
 

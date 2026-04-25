@@ -30,6 +30,8 @@
 #include "storage/latch.h"
 #include "storage/md.h"
 #ifdef USE_UMBRA
+#include "access/umbra_xlog.h"
+#include "storage/map.h"
 #include "storage/umbra.h"
 #endif
 #include "utils/hsearch.h"
@@ -69,6 +71,7 @@ typedef struct
 	FileTag		tag;			/* identifies handler and file */
 	CycleCtr	cycle_ctr;		/* checkpoint_cycle_ctr when request was made */
 	bool		canceled;		/* true if request has been canceled */
+	SyncRequestType request_type;	/* plain unlink vs reclaim unlink */
 } PendingUnlinkEntry;
 
 static HTAB *pendingOps = NULL;
@@ -127,6 +130,51 @@ static const SyncOps syncsw[] = {
 	},
 #endif
 };
+
+static inline const SyncOps *
+SyncOpsForHandler(int16 handler)
+{
+	if (handler < 0 || handler >= (int) lengthof(syncsw))
+		ereport(PANIC,
+				(errmsg("invalid sync request handler"),
+				 errdetail("handler=%d", handler),
+				 errbacktrace()));
+
+	return &syncsw[handler];
+}
+
+static inline void
+SyncPreUnlinkRequest(const PendingUnlinkEntry *entry)
+{
+#ifdef USE_UMBRA
+	if (entry->request_type == SYNC_RECLAIM_REQUEST &&
+		entry->tag.handler == SYNC_HANDLER_UMBRA)
+		log_umbra_reclaim_unlink(entry->tag.rlocator,
+								 entry->tag.forknum,
+								 (BlockNumber) entry->tag.segno);
+#else
+	(void) entry;
+#endif
+}
+
+static inline void
+SyncPostUnlinkRequest(const PendingUnlinkEntry *entry,
+					  int unlink_rc, int unlink_errno)
+{
+#ifdef USE_UMBRA
+	if (entry->request_type == SYNC_RECLAIM_REQUEST)
+	{
+		if (unlink_rc < 0 && unlink_errno != ENOENT)
+			MapStatsAddReclaimFailed(1);
+		else
+			MapStatsAddReclaimProcessed(1);
+	}
+#else
+	(void) entry;
+	(void) unlink_rc;
+	(void) unlink_errno;
+#endif
+}
 
 /*
  * Initialize data structures for the file sync tracking.
@@ -220,6 +268,8 @@ SyncPostCheckpoint(void)
 	{
 		PendingUnlinkEntry *entry = (PendingUnlinkEntry *) lfirst(lc);
 		char		path[MAXPGPATH];
+		int			unlink_rc;
+		int			unlink_errno;
 
 		/* Skip over any canceled entries */
 		if (entry->canceled)
@@ -238,8 +288,21 @@ SyncPostCheckpoint(void)
 			break;
 
 		/* Unlink the file */
-		if (syncsw[entry->tag.handler].sync_unlinkfiletag(&entry->tag,
-														  path) < 0)
+		{
+			const SyncOps *ops = SyncOpsForHandler(entry->tag.handler);
+
+			if (ops->sync_unlinkfiletag == NULL)
+				ereport(PANIC,
+						(errmsg("sync unlink request uses handler without unlink function"),
+						 errdetail("handler=%d", entry->tag.handler),
+						 errbacktrace()));
+
+			SyncPreUnlinkRequest(entry);
+			unlink_rc = ops->sync_unlinkfiletag(&entry->tag, path);
+			unlink_errno = errno;
+		}
+
+		if (unlink_rc < 0)
 		{
 			/*
 			 * There's a race condition, when the database is dropped at the
@@ -248,14 +311,18 @@ SyncPostCheckpoint(void)
 			 * here. rmtree() also has to ignore ENOENT errors, to deal with
 			 * the possibility that we delete the file first.
 			 */
-			if (errno != ENOENT)
-				ereport(WARNING,
+			if (unlink_errno != ENOENT)
+			{
+				errno = unlink_errno;
+				ereport(entry->request_type == SYNC_RECLAIM_REQUEST ? DEBUG1 : WARNING,
 						(errcode_for_file_access(),
 						 errmsg("could not remove file \"%s\": %m", path)));
+			}
 		}
 
-		/* Mark the list entry as canceled, just in case */
-		entry->canceled = true;
+			SyncPostUnlinkRequest(entry, unlink_rc, unlink_errno);
+			/* Mark the list entry as canceled, just in case */
+			entry->canceled = true;
 
 		/*
 		 * As in ProcessSyncRequests, we don't want to stop absorbing fsync
@@ -516,27 +583,38 @@ RememberSyncRequest(const FileTag *ftag, SyncRequestType type)
 		HASH_SEQ_STATUS hstat;
 		PendingFsyncEntry *pfe;
 		ListCell   *cell;
+		const SyncOps *ops = SyncOpsForHandler(ftag->handler);
+
+		if (ops->sync_filetagmatches == NULL)
+			ereport(PANIC,
+					(errmsg("sync filter request uses handler without match function"),
+					 errdetail("handler=%d", ftag->handler),
+					 errbacktrace()));
 
 		/* Cancel matching fsync requests */
 		hash_seq_init(&hstat, pendingOps);
 		while ((pfe = (PendingFsyncEntry *) hash_seq_search(&hstat)) != NULL)
 		{
 			if (pfe->tag.handler == ftag->handler &&
-				syncsw[ftag->handler].sync_filetagmatches(ftag, &pfe->tag))
+				ops->sync_filetagmatches(ftag, &pfe->tag))
 				pfe->canceled = true;
 		}
 
-		/* Cancel matching unlink requests */
+		/* Remove matching reclaim unlink requests only. */
 		foreach(cell, pendingUnlinks)
 		{
 			PendingUnlinkEntry *pue = (PendingUnlinkEntry *) lfirst(cell);
 
 			if (pue->tag.handler == ftag->handler &&
-				syncsw[ftag->handler].sync_filetagmatches(ftag, &pue->tag))
-				pue->canceled = true;
+				pue->request_type == SYNC_RECLAIM_REQUEST &&
+				ops->sync_filetagmatches(ftag, &pue->tag))
+			{
+				pendingUnlinks = foreach_delete_current(pendingUnlinks, cell);
+				pfree(pue);
+			}
 		}
 	}
-	else if (type == SYNC_UNLINK_REQUEST)
+	else if (type == SYNC_UNLINK_REQUEST || type == SYNC_RECLAIM_REQUEST)
 	{
 		/* Unlink request: put it in the linked list */
 		MemoryContext oldcxt = MemoryContextSwitchTo(pendingOpsCxt);
@@ -546,6 +624,7 @@ RememberSyncRequest(const FileTag *ftag, SyncRequestType type)
 		entry->tag = *ftag;
 		entry->cycle_ctr = checkpoint_cycle_ctr;
 		entry->canceled = false;
+		entry->request_type = type;
 
 		pendingUnlinks = lappend(pendingUnlinks, entry);
 

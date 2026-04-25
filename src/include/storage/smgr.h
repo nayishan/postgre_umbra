@@ -133,6 +133,10 @@ extern void smgrcheckpointdatabasetablespaces(Oid dbid, int ntablespaces,
 extern void smgrinvalidatedatabasetablespaces(Oid dbid, int ntablespaces,
 											  const Oid *tablespace_ids);
 extern void smgrinvalidatedatabase(Oid dbid);
+extern uint64 smgrgetmapcompactorrelocations(void);
+extern uint64 smgrgetmapreclaimenqueued(void);
+extern uint64 smgrgetmapreclaimprocessed(void);
+extern uint64 smgrgetmapreclaimfailed(void);
 extern void smgrregistershutdowncleanup(void);
 extern void smgrmarkskipwalpending(RelFileLocator rlocator);
 extern void smgrclearskipwalpending(RelFileLocator rlocator);

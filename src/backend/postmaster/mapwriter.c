@@ -32,6 +32,7 @@
 #include "storage/procnumber.h"
 #include "storage/procsignal.h"
 #include "storage/smgr.h"
+#include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/wait_event.h"
 
@@ -63,6 +64,19 @@ MapBackgroundWorkersRegister(void)
 	snprintf(bgw.bgw_function_name, BGW_MAXLEN, "MapWriterMain");
 	snprintf(bgw.bgw_name, BGW_MAXLEN, "Umbra mapwriter");
 	snprintf(bgw.bgw_type, BGW_MAXLEN, "map writer");
+	bgw.bgw_restart_time = 5;
+	bgw.bgw_notify_pid = 0;
+	bgw.bgw_main_arg = (Datum) 0;
+	RegisterBackgroundWorker(&bgw);
+
+	memset(&bgw, 0, sizeof(bgw));
+	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS |
+		BGWORKER_BACKEND_DATABASE_CONNECTION;
+	bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	snprintf(bgw.bgw_library_name, BGW_MAXLEN, "postgres");
+	snprintf(bgw.bgw_function_name, BGW_MAXLEN, "MapCompactorMain");
+	snprintf(bgw.bgw_name, BGW_MAXLEN, "Umbra mapcompactor");
+	snprintf(bgw.bgw_type, BGW_MAXLEN, "map compactor");
 	bgw.bgw_restart_time = 5;
 	bgw.bgw_notify_pid = 0;
 	bgw.bgw_main_arg = (Datum) 0;

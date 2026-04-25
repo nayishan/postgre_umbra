@@ -63,6 +63,8 @@ LOGICAL_LAUNCHER_MAIN	"Waiting in main loop of logical replication launcher proc
 LOGICAL_PARALLEL_APPLY_MAIN	"Waiting in main loop of logical replication parallel apply process."
 MAPWRITER_HIBERNATE	"Waiting in Umbra map writer process, hibernating."
 MAPWRITER_MAIN	"Waiting in main loop of Umbra map writer process."
+MAPCOMPACTOR_HIBERNATE	"Waiting in Umbra map compactor process, hibernating."
+MAPCOMPACTOR_MAIN	"Waiting in main loop of Umbra map compactor process."
 RECOVERY_WAL_STREAM	"Waiting in main loop of startup process for WAL to arrive, during streaming recovery."
 REPLICATION_SLOTSYNC_MAIN	"Waiting in main loop of slot synchronization."
 REPLICATION_SLOTSYNC_SHUTDOWN	"Waiting for slot sync worker to shut down."
