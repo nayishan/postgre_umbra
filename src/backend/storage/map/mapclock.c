@@ -274,6 +274,11 @@ MapClockGetBuffer(void)
 	int         num_slots = MapShared->num_slots;
 
 	/*
+	 * If mapwriter asked for allocation notification, wake it up.
+	 */
+	MapWakeWriter();
+
+	/*
 	 * First, check if there's a buffer on the free list.
 	 */
 	if (MapShared->first_free_buffer >= 0)

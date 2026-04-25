@@ -14,6 +14,9 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/uio.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
 
 #include "access/xlogutils.h"
 #include "catalog/pg_tablespace_d.h"
@@ -86,6 +89,8 @@ static BlockNumber umfile_nblocks_dense(UmbraFileContext *ctx,
 										RelFileLocatorBackend rlocator,
 										ForkNumber forknum);
 static BlockNumber umfile_nblocks_in_seg(File vfd);
+static bool umfile_preallocate_fd(File fd, off_t target_bytes);
+static bool umfile_preallocate_errno_is_unsupported(int err);
 static bool umfile_collect_existing_segnos_by_path(const char *seg0path,
 												   BlockNumber **segnos_out,
 												   int *nsegnos_out);
@@ -312,6 +317,69 @@ umfile_ctx_extend(UmbraFileContext *ctx, ForkNumber forknum, BlockNumber blkno,
 
 	/* Use the existing extension path but suppress fsync registration. */
 	umfile_extend(ctx, forknum, blkno, buffer, true /* skipFsync */ );
+}
+
+bool
+umfile_ctx_preallocate_blocks(UmbraFileContext *ctx, ForkNumber forknum,
+							  UmFileNblocksMode mode,
+							  BlockNumber target_nblocks)
+{
+	BlockNumber	nblocks;
+	BlockNumber	cur_nblocks;
+
+	if (ctx == NULL)
+		return false;
+
+	if (!umfile_exists(ctx, forknum,
+					   mode == UMFILE_NBLOCKS_SPARSE ?
+					   UMFILE_EXISTS_SPARSE :
+					   UMFILE_EXISTS_DENSE))
+		return false;
+
+	nblocks = umfile_nblocks(ctx, forknum, mode);
+	if (target_nblocks <= nblocks)
+		return true;
+
+	if (target_nblocks > (uint64) MaxBlockNumber + 1)
+		return false;
+
+	/*
+	 * Keep preallocation as a capacity operation: make the target segment
+	 * BLCKSZ-addressable up to target_nblocks, but do not write page content.
+	 * Later page writes may fill holes created by this step.
+	 */
+	cur_nblocks = nblocks;
+	while (cur_nblocks < target_nblocks)
+	{
+		BlockNumber	target_blkno;
+		BlockNumber	targetseg;
+		BlockNumber	targetseg_nblocks;
+		uint64		seg_start;
+		uint64		seg_end;
+		off_t		target_bytes;
+		UmfdVec	   *v;
+
+		targetseg = cur_nblocks / ((BlockNumber) RELSEG_SIZE);
+		seg_start = (uint64) targetseg * (uint64) RELSEG_SIZE;
+		seg_end = seg_start + (uint64) RELSEG_SIZE;
+		if (seg_end > (uint64) target_nblocks)
+			seg_end = (uint64) target_nblocks;
+
+		targetseg_nblocks = (BlockNumber) (seg_end - seg_start);
+		target_blkno = (BlockNumber) (seg_start + targetseg_nblocks - 1);
+		target_bytes = (off_t) targetseg_nblocks * BLCKSZ;
+
+		v = umfile_getseg(ctx, ctx->rlocator, forknum, target_blkno,
+						  true /* skipFsync */,
+						  UM_EXTENSION_CREATE,
+						  RelFileLocatorBackendIsTemp(ctx->rlocator));
+		if (!umfile_preallocate_fd(v->umfd_vfd, target_bytes))
+			return false;
+
+		cur_nblocks = (BlockNumber) seg_end;
+	}
+
+	return true;
 }
 
 void
@@ -1564,6 +1632,180 @@ umfile_extend(UmbraFileContext *ctx, ForkNumber forknum, BlockNumber blocknum,
 
 	if (!skipFsync && !isTempRelation)
 		umfile_register_dirty_seg(rlocator, false, forknum, v);
+}
+
+/*
+ * Reserve bytes for a relation segment without writing page contents.
+ *
+ * Return true only if the whole range up to target_bytes is backed by a real
+ * preallocation primitive. Unsupported filesystems return false so callers do
+ * not publish capacity that is only a logical EOF extension.
+ *
+ * Linux uses the fallocate syscall directly so we don't inherit glibc's
+ * posix_fallocate()->userspace zero-fill fallback. macOS uses F_PREALLOCATE,
+ * and other platforms may use posix_fallocate().
+ */
+static bool
+umfile_preallocate_fd(File fd, off_t target_bytes)
+{
+	off_t		current_bytes;
+	off_t		delta_bytes;
+	int			rawfd;
+
+	current_bytes = FileSize(fd);
+	if (current_bytes < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not determine file size for \"%s\": %m",
+						FilePathName(fd))));
+
+	if (current_bytes >= target_bytes)
+		return true;
+
+	delta_bytes = target_bytes - current_bytes;
+	rawfd = FileGetRawDesc(fd);
+
+#if defined(__linux__)
+#ifdef SYS_fallocate
+	{
+		long		rc;
+
+retry_fallocate:
+		errno = 0;
+		pgstat_report_wait_start(WAIT_EVENT_DATA_FILE_EXTEND);
+		rc = syscall(SYS_fallocate, rawfd, 0, current_bytes, delta_bytes);
+		pgstat_report_wait_end();
+
+		if (rc < 0)
+		{
+			if (errno == EINTR)
+				goto retry_fallocate;
+			if (umfile_preallocate_errno_is_unsupported(errno))
+				return false;
+
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not preallocate file \"%s\" to %llu bytes: %m",
+							FilePathName(fd),
+							(unsigned long long) target_bytes)));
+		}
+	}
+#else
+	return false;
+#endif
+#elif defined(__APPLE__) && defined(F_PREALLOCATE)
+	{
+		fstore_t	fst;
+		int			rc;
+
+		/*
+		 * F_PEOFPOSMODE interprets fst_length as newly allocated bytes beyond
+		 * current EOF, not the final file size. Passing target_bytes here would
+		 * over-reserve on repeated top-ups of the same segment.
+		 */
+		MemSet(&fst, 0, sizeof(fst));
+		fst.fst_flags = F_ALLOCATECONTIG | F_ALLOCATEALL;
+		fst.fst_posmode = F_PEOFPOSMODE;
+		fst.fst_offset = 0;
+		fst.fst_length = delta_bytes;
+
+retry_f_preallocate_contig:
+		errno = 0;
+		pgstat_report_wait_start(WAIT_EVENT_DATA_FILE_EXTEND);
+		rc = fcntl(rawfd, F_PREALLOCATE, &fst);
+		pgstat_report_wait_end();
+		if (rc < 0 && errno == EINTR)
+			goto retry_f_preallocate_contig;
+
+		if (rc < 0)
+		{
+			fst.fst_flags = F_ALLOCATEALL;
+			fst.fst_bytesalloc = 0;
+
+retry_f_preallocate_all:
+			errno = 0;
+			pgstat_report_wait_start(WAIT_EVENT_DATA_FILE_EXTEND);
+			rc = fcntl(rawfd, F_PREALLOCATE, &fst);
+			pgstat_report_wait_end();
+			if (rc < 0 && errno == EINTR)
+				goto retry_f_preallocate_all;
+
+			if (rc < 0)
+			{
+				if (umfile_preallocate_errno_is_unsupported(errno))
+					return false;
+
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not preallocate file \"%s\" to %llu bytes: %m",
+								FilePathName(fd),
+								(unsigned long long) target_bytes)));
+			}
+		}
+
+		if (fst.fst_bytesalloc < delta_bytes)
+			return false;
+	}
+#elif defined(HAVE_POSIX_FALLOCATE)
+	{
+		int			rc;
+
+retry_posix_fallocate:
+		pgstat_report_wait_start(WAIT_EVENT_DATA_FILE_EXTEND);
+		rc = posix_fallocate(rawfd, current_bytes, delta_bytes);
+		pgstat_report_wait_end();
+
+		if (rc == EINTR)
+			goto retry_posix_fallocate;
+
+		if (rc != 0)
+		{
+			errno = rc;
+			if (umfile_preallocate_errno_is_unsupported(errno))
+				return false;
+
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not preallocate file \"%s\" to %llu bytes: %m",
+							FilePathName(fd),
+							(unsigned long long) target_bytes)));
+		}
+	}
+#else
+	return false;
+#endif
+
+	current_bytes = FileSize(fd);
+	if (current_bytes < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not determine file size for \"%s\": %m",
+						FilePathName(fd))));
+	if (current_bytes < target_bytes &&
+		FileTruncate(fd, target_bytes, WAIT_EVENT_DATA_FILE_EXTEND) < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not extend preallocated file \"%s\" to %llu bytes: %m",
+						FilePathName(fd),
+						(unsigned long long) target_bytes)));
+
+	return true;
+}
+
+static bool
+umfile_preallocate_errno_is_unsupported(int err)
+{
+	if (err == EINVAL || err == EOPNOTSUPP)
+		return true;
+#ifdef ENOSYS
+	if (err == ENOSYS)
+		return true;
+#endif
+#ifdef ENOTSUP
+	if (err == ENOTSUP)
+		return true;
+#endif
+	return false;
 }
 
 void

@@ -309,7 +309,7 @@ UmMetadataImmediateSync(SMgrRelation reln)
 void
 UmMetadataRegisterSync(SMgrRelation reln)
 {
-	umimmedsync(reln, UMBRA_METADATA_FORKNUM);
+	umfile_registersync(um_ctx_acquire(reln), UMBRA_METADATA_FORKNUM);
 }
 
 void
@@ -2527,12 +2527,17 @@ umimmedsync(SMgrRelation reln, ForkNumber forknum)
 void
 umregistersync(SMgrRelation reln, ForkNumber forknum)
 {
-	umimmedsync(reln, forknum);
+	umfile_registersync(um_ctx_acquire(reln), forknum);
 }
 
 bool
 umpreparependingsync(SMgrRelation reln)
 {
+	/*
+	 * Skip-WAL relations write data directly first and publish Umbra MAP
+	 * metadata only at the durable transition boundary. Rebuild MAP and
+	 * superblock before the relation enters the fsync path.
+	 */
 	if (RelFileLocatorSkippingWAL(reln->smgr_rlocator.locator))
 		UmRebuildMapAndSuperblockForSkipWAL(reln);
 

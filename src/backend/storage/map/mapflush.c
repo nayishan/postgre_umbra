@@ -226,7 +226,7 @@ map_flush_buffer_target_comparator(const MapFlushBufferTarget *a,
 void
 MapPreCheckpoint(void)
 {
-	/* no-op: checkpoint work is handled by MapCheckpoint(). */
+	/* no-op: reclaim is handled by sync request queues. */
 }
 
 /*
@@ -346,7 +346,7 @@ MapCheckpointDatabaseTablespaces(Oid dbid, int ntablespaces,
 void
 MapPostCheckpoint(void)
 {
-	/* no-op: checkpoint work is handled by MapCheckpoint(). */
+	/* no-op: reclaim is handled by sync request queues. */
 }
 
 int
@@ -355,7 +355,7 @@ MapBgWriterFlush(int max_pages)
 	if (max_pages <= 0)
 		return 0;
 
-	/* Non-checkpoint flushes regular MAP pages only; superblock is checkpoint-owned. */
+	/* mapwriter flushes regular MAP pages only; superblock is checkpoint-owned. */
 	return MapFlushDirtyBuffers(max_pages, false);
 }
 
