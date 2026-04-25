@@ -105,6 +105,9 @@ static bool MapMapPageWithinLogicalRange(UmbraFileContext *map_ctx,
 										 RelFileLocator rnode,
 										 ForkNumber forknum,
 										 BlockNumber map_blkno);
+bool MapForkPreallocSettings(ForkNumber forknum, BlockNumber *soft_low,
+							 BlockNumber *hard_low,
+							 BlockNumber *batch_blocks);
 static MapCachedLookupResult MapTryLookupCachedEntry(RelFileLocator rnode,
 													 ForkNumber forknum,
 													 BlockNumber map_blkno,
@@ -142,6 +145,47 @@ MapResetAllTruncatePreloads(void)
 	}
 }
 
+bool
+MapForkPreallocSettings(ForkNumber forknum, BlockNumber *soft_low,
+						BlockNumber *hard_low, BlockNumber *batch_blocks)
+{
+	int			low;
+	int			hard;
+	int			batch;
+
+	switch (forknum)
+	{
+		case MAIN_FORKNUM:
+			low = map_prealloc_main_low;
+			hard = map_prealloc_main_hard;
+			batch = map_prealloc_main_batch;
+			break;
+		case FSM_FORKNUM:
+			low = map_prealloc_fsm_low;
+			hard = map_prealloc_fsm_hard;
+			batch = map_prealloc_fsm_batch;
+			break;
+		case VISIBILITYMAP_FORKNUM:
+			low = map_prealloc_vm_low;
+			hard = map_prealloc_vm_hard;
+			batch = map_prealloc_vm_batch;
+			break;
+		default:
+			return false;
+	}
+
+	if (low <= 0 || batch <= 0)
+		return false;
+	if (hard <= 0)
+		hard = 1;
+	if (hard > low)
+		hard = low;
+
+	*soft_low = (BlockNumber) low;
+	*hard_low = (BlockNumber) hard;
+	*batch_blocks = (BlockNumber) batch;
+	return true;
+}
 
 static bool
 MapTruncateEntryRange(ForkNumber forknum, BlockNumber n_lblknos,
@@ -728,6 +772,8 @@ MapReserveFreshPblkno(UmbraFileContext *map_ctx, RelFileLocator rnode,
 	if (MapReserveNextPblkno(map_ctx, rnode, forknum, lblkno,
 							 new_pblkno, false))
 	{
+		if (!InRecovery)
+			(void) MapMaybePreallocateFork(map_ctx, rnode, forknum, false);
 		return true;
 	}
 
@@ -1418,6 +1464,14 @@ void MapGetNewPbkno(UmbraFileContext *map_ctx, RelFileLocator rnode, ForkNumber 
 				 "failed to reserve physical block for relation %u/%u/%u fork %d blk %u",
 				 rnode.spcOid, rnode.dbOid, rnode.relNumber, forknum, lblkno);
 	}
+
+	/*
+	 * Frontend/backgound coordination:
+	 * - low-but-not-critical watermark: wake mapwriter
+	 * - critical watermark: foreground performs one-shot preallocation
+	 */
+	if (!InRecovery)
+		(void) MapMaybePreallocateFork(map_ctx, rnode, forknum, false);
 }
 
 /*

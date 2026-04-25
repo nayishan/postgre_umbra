@@ -841,6 +841,14 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	InitializeProcessXLogLogicalInfo();
 
 	/*
+	 * Let the active storage manager register backend-local shutdown cleanup
+	 * after ShutdownXLOG. That way, standalone shutdown runs this cleanup
+	 * before the shutdown checkpoint, without exposing storage-manager-specific
+	 * details here.
+	 */
+	smgrregistershutdowncleanup();
+
+	/*
 	 * Initialize the relation cache and the system catalog caches.  Note that
 	 * no catalog access happens here; we only set up the hashtable structure.
 	 * We must do this before starting a transaction because transaction abort

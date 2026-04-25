@@ -17,7 +17,7 @@ ifneq ($(subdir), src/backend)
 all: $(subsysfilename)
 endif
 
-objfiles.txt: Makefile $(SUBDIROBJS) $(OBJS)
+objfiles.txt: Makefile $(top_builddir)/src/Makefile.global $(SUBDIROBJS) $(OBJS)
 # Don't rebuild the list if only the OBJS have changed.
 	$(if $(filter-out $(OBJS),$?),( $(if $(SUBDIROBJS),cat $(SUBDIROBJS); )echo $(addprefix $(subdir)/,$(OBJS)) ) >$@,touch $@)
 

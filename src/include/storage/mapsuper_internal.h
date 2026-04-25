@@ -17,6 +17,9 @@
 #define MAPSUPER_FLAG_DIRTY		0x02
 #define MAPSUPER_FLAG_CORRUPT	0x04
 
+#define MAPSUPER_RUNTIME_FLAG_PREALLOC_MAIN	0x01
+#define MAPSUPER_RUNTIME_FLAG_PREALLOC_FSM	0x02
+#define MAPSUPER_RUNTIME_FLAG_PREALLOC_VM	0x04
 #define MAPSUPER_RUNTIME_FLAG_EXTENDING_MAIN	0x08
 #define MAPSUPER_RUNTIME_FLAG_EXTENDING_FSM	0x10
 #define MAPSUPER_RUNTIME_FLAG_EXTENDING_VM	0x20
@@ -143,6 +146,7 @@ extern MapSuperEntry *MapSuperEnsureEntryLocked(RelFileLocator rnode);
 extern void MapSuperDeleteEntry(RelFileLocator rnode);
 extern bool MapSuperForkExists(const MapSuperblock *super,
 							   ForkNumber forknum);
+extern uint32 MapSuperPreallocFlag(ForkNumber forknum);
 extern void MapSBlockBumpPhysicalState(UmbraFileContext *map_ctx,
 									   RelFileLocator rnode,
 									   ForkNumber forknum,

@@ -16,6 +16,7 @@ OBJS = \
 	map.o \
 	mapinit.o \
 	mapbuf.o \
+	mapbgproc.o \
 	mapflush.o \
 	mapclock.o \
 	mapinflight.o \

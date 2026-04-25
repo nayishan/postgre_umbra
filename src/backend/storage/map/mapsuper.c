@@ -838,6 +838,21 @@ MapSuperForkExists(const MapSuperblock *super, ForkNumber forknum)
 	return MapSuperblockGetLogicalNblocks(super, forknum) != InvalidBlockNumber;
 }
 
+uint32
+MapSuperPreallocFlag(ForkNumber forknum)
+{
+	switch (forknum)
+	{
+		case MAIN_FORKNUM:
+			return MAPSUPER_RUNTIME_FLAG_PREALLOC_MAIN;
+		case FSM_FORKNUM:
+			return MAPSUPER_RUNTIME_FLAG_PREALLOC_FSM;
+		case VISIBILITYMAP_FORKNUM:
+			return MAPSUPER_RUNTIME_FLAG_PREALLOC_VM;
+		default:
+			return 0;
+	}
+}
 
 static uint32
 MapSuperExtendingFlag(ForkNumber forknum)
@@ -1274,7 +1289,7 @@ MapSBlockInit(UmbraFileContext *map_ctx, RelFileLocator rnode, XLogRecPtr map_ls
 
 	/*
 	 * Persist superblock immediately so later backends in bootstrap/initdb can
-	 * read block 0 even before checkpoint gets a chance to flush.
+	 * read block 0 even before checkpoint/mapwriter gets a chance to flush.
 	 * This keeps create-time O(1): only one 512-byte sector is written.
 	 */
 	write_super = entry->super;
