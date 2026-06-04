@@ -43,6 +43,7 @@
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/map.h"
+#include "storage/proc.h"
 #include "storage/smgr.h"
 #include "storage/umbra.h"
 #include "storage/umfile.h"
@@ -809,6 +810,7 @@ UmRebuildMapAndSuperblockForSkipWAL(SMgrRelation reln)
 	uint16		wal_count = 0;
 	XLogRecPtr	map_lsn = InvalidXLogRecPtr;
 	bool		wal_insert_enabled;
+	bool		delay_chkp_start_set = false;
 
 	/*
 	 * Rebuild assumes the relation stayed on direct lblk==pblk access during
@@ -854,8 +856,17 @@ UmRebuildMapAndSuperblockForSkipWAL(SMgrRelation reln)
 		!IsInitProcessingMode();
 
 	if (wal_count > 0 && wal_insert_enabled)
+	{
+		START_CRIT_SECTION();
+		if ((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0)
+		{
+			MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+			delay_chkp_start_set = true;
+		}
+
 		map_lsn = log_umbra_skip_wal_dense_map(reln->smgr_rlocator.locator,
 											   wal_count, wal_entries);
+	}
 
 	for (uint16 i = 0; i < apply_count; i++)
 	{
@@ -876,6 +887,13 @@ UmRebuildMapAndSuperblockForSkipWAL(SMgrRelation reln)
 		}
 		MapSBlockSetLogicalNblocks(ctx, reln->smgr_rlocator.locator,
 								   forknum, nblocks, fork_lsn);
+	}
+
+	if (wal_count > 0 && wal_insert_enabled)
+	{
+		if (delay_chkp_start_set)
+			MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+		END_CRIT_SECTION();
 	}
 }
 
@@ -1274,10 +1292,18 @@ um_try_pure_firstborn_range_remap_zeroextend(SMgrRelation reln, ForkNumber forkn
 		{
 			BlockNumber chunk_blocks = Min(nblocks - done,
 										   (BlockNumber) UINT16_MAX);
+			bool		delay_chkp_start_set = false;
 			XLogRecPtr	map_lsn = InvalidXLogRecPtr;
 
 			if (wal_insert_enabled)
 			{
+				START_CRIT_SECTION();
+				if ((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0)
+				{
+					MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+					delay_chkp_start_set = true;
+				}
+
 				if (um_pblk_run_is_contiguous(pblknos + done, chunk_blocks))
 					map_lsn = log_umbra_range_remap_compact(
 						reln->smgr_rlocator.locator, forknum,
@@ -1293,6 +1319,14 @@ um_try_pure_firstborn_range_remap_zeroextend(SMgrRelation reln, ForkNumber forkn
 			UmApplyReservedRangeRemap(reln, forknum, blocknum + done,
 									  chunk_blocks, pblknos + done,
 									  map_lsn, skipFsync);
+
+			if (wal_insert_enabled)
+			{
+				if (delay_chkp_start_set)
+					MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+				END_CRIT_SECTION();
+			}
+
 			done += chunk_blocks;
 		}
 
@@ -1327,9 +1361,11 @@ um_publish_mapped_birth(SMgrRelation reln, ForkNumber forknum,
 	UmbraMappedBirthResult result;
 	BlockNumber old_pblkno;
 	XLogRecPtr	map_lsn;
-	bool		wal_insert_enabled;
-	bool		wal_owns_firstborn;
-	bool		emit_map_set;
+	bool		wal_insert_enabled = false;
+	bool		wal_owns_firstborn = false;
+	bool		emit_map_set = false;
+	bool		delay_chkp_started = false;
+	bool		delay_chkp_start_set = false;
 
 	Assert(access->map_available);
 
@@ -1376,8 +1412,18 @@ um_publish_mapped_birth(SMgrRelation reln, ForkNumber forknum,
 		emit_map_set = !wal_owns_firstborn;
 
 		if (emit_map_set && wal_insert_enabled)
+		{
+			START_CRIT_SECTION();
+			delay_chkp_started = true;
+			if ((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0)
+			{
+				MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+				delay_chkp_start_set = true;
+			}
+
 			map_lsn = log_umbra_map_set(reln->smgr_rlocator.locator, forknum,
 										lblkno, old_pblkno, result.pblkno);
+		}
 		else
 			map_lsn = InvalidXLogRecPtr;
 
@@ -1393,6 +1439,13 @@ um_publish_mapped_birth(SMgrRelation reln, ForkNumber forknum,
 		MapSBlockBumpNextFreePhysBlock(ctx, reln->smgr_rlocator.locator,
 									   forknum, result.pblkno + 1,
 									   map_lsn);
+
+	if (delay_chkp_started)
+	{
+		if (delay_chkp_start_set)
+			MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+		END_CRIT_SECTION();
+	}
 
 	/*
 	 * WAL-owned first-born pages keep their in-flight claim private until WAL

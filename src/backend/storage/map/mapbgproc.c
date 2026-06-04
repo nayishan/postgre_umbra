@@ -603,6 +603,7 @@ MapCompactorRelocateEntry(UmbraFileContext *map_ctx, RelFileLocator rnode,
 	BlockNumber	cur_pblkno;
 	BlockNumber	new_pblkno;
 	XLogRecPtr	map_lsn;
+	bool		delay_chkp_start_set = false;
 	char		pagebuf[BLCKSZ];
 
 	if (!MapTryReserveFreshPblkno(map_ctx, rnode, forknum, lblkno,
@@ -651,6 +652,13 @@ MapCompactorRelocateEntry(UmbraFileContext *map_ctx, RelFileLocator rnode,
 		return false;
 	}
 
+	START_CRIT_SECTION();
+	if ((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0)
+	{
+		MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+		delay_chkp_start_set = true;
+	}
+
 	map_lsn = log_umbra_map_set(rnode, forknum, lblkno, old_pblkno, new_pblkno);
 	page->pblknos[entry_idx] = new_pblkno;
 	MapMarkBufferDirty(map_ctx, buf, map_lsn);
@@ -659,6 +667,11 @@ MapCompactorRelocateEntry(UmbraFileContext *map_ctx, RelFileLocator rnode,
 	MapUnpinBuffer(slot_id);
 	MapSBlockBumpPhysicalState(map_ctx, rnode, forknum, new_pblkno + 1,
 							   true, true, map_lsn);
+
+	if (delay_chkp_start_set)
+		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+	END_CRIT_SECTION();
+
 	MapInflightRelease(rnode, forknum, lblkno);
 	MapStatsAddCompactorRelocations(1);
 
