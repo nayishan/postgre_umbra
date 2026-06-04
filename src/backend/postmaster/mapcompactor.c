@@ -15,6 +15,7 @@
 #include <signal.h>
 #include <unistd.h>
 
+#include "access/xact.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -86,6 +87,7 @@ MapCompactorMain(Datum arg)
 		HOLD_INTERRUPTS();
 		EmitErrorReport();
 
+		AbortOutOfAnyTransaction();
 		LWLockReleaseAll();
 		ConditionVariableCancelSleep();
 		pgstat_report_wait_end();
@@ -120,7 +122,28 @@ MapCompactorMain(Datum arg)
 					  alloc_pressure >= (uint32) MapCompactorBusyAllocThreshold);
 
 		if (!busy_round && MapCompactorMaxRelations > 0)
-			compact_moves = MapCompactorStep(MapCompactorMaxRelations);
+		{
+			PG_TRY();
+			{
+				StartTransactionCommand();
+				compact_moves = MapCompactorStep(MapCompactorMaxRelations);
+				CommitTransactionCommand();
+				MemoryContextSwitchTo(mapcompactor_context);
+			}
+			PG_CATCH();
+			{
+				HOLD_INTERRUPTS();
+				EmitErrorReport();
+				AbortOutOfAnyTransaction();
+				pgstat_report_wait_end();
+				MapBackendExitCleanup();
+				FlushErrorState();
+				MemoryContextSwitchTo(mapcompactor_context);
+				MemoryContextReset(mapcompactor_context);
+				RESUME_INTERRUPTS();
+			}
+			PG_END_TRY();
+		}
 
 		if (FirstCallSinceLastCheckpoint())
 			smgrreleaseall();
