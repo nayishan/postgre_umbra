@@ -151,6 +151,7 @@ static int	num_rdatas;			/* entries currently used */
 static int	max_rdatas;			/* allocated size */
 
 static bool begininsert_called = false;
+static bool curinsert_has_block_remap = false;
 
 /* Memory context to hold the registered buffer and data references. */
 static MemoryContext xloginsert_cxt;
@@ -415,6 +416,7 @@ XLogResetInsertion(void)
 	mainrdata_len = 0;
 	mainrdata_last = (XLogRecData *) &mainrdata_head;
 	curinsert_flags = 0;
+	curinsert_has_block_remap = false;
 	begininsert_called = false;
 }
 
@@ -713,6 +715,8 @@ XLogInsert(RmgrId rmid, uint8 info)
 
 	PG_TRY();
 	{
+		bool		delay_chkp_start_set = false;
+
 		do
 		{
 			XLogRecPtr	RedoRecPtr;
@@ -723,6 +727,7 @@ XLogInsert(RmgrId rmid, uint8 info)
 			int			num_fpi = 0;
 			uint64		fpi_bytes = 0;
 
+			delay_chkp_start_set = false;
 			GetFullPageWriteInfo(&RedoRecPtr, &doPageWrites);
 
 			rdt = xlog_storage_mgr_f.xlog_record_assemble(rmid, info, RedoRecPtr,
@@ -730,11 +735,35 @@ XLogInsert(RmgrId rmid, uint8 info)
 														  &num_fpi, &fpi_bytes,
 														  &topxid_included);
 
+			if (curinsert_has_block_remap)
+			{
+				START_CRIT_SECTION();
+				if ((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0)
+				{
+					MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+					delay_chkp_start_set = true;
+				}
+			}
+
 			EndPos = XLogInsertRecord(rdt, fpw_lsn, curinsert_flags, num_fpi,
 									  fpi_bytes, topxid_included);
+
+			if (!XLogRecPtrIsValid(EndPos) && curinsert_has_block_remap)
+			{
+				if (delay_chkp_start_set)
+					MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+				END_CRIT_SECTION();
+			}
 		} while (!XLogRecPtrIsValid(EndPos));
 
 		xlog_storage_mgr_f.xlog_insert_finish(EndPos);
+
+		if (curinsert_has_block_remap)
+		{
+			if (delay_chkp_start_set)
+				MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+			END_CRIT_SECTION();
+		}
 	}
 	PG_CATCH();
 	{
@@ -1248,6 +1277,7 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 	hdr_rdt.next = NULL;
 	rdt_datas_last = &hdr_rdt;
 	hdr_rdt.data = hdr_scratch;
+	curinsert_has_block_remap = false;
 
 	if (wal_consistency_checking[rmid])
 		info |= XLR_CHECK_CONSISTENCY;
@@ -1446,6 +1476,7 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 		{
 			bkpb.fork_flags |= BKPBLOCK_HAS_REMAP;
 			regbuf->remap_in_record = true;
+			curinsert_has_block_remap = true;
 		}
 
 		if (include_image)
