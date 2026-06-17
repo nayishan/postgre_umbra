@@ -272,6 +272,26 @@ Umbra 里的文件删除不是普通的 unlink 问题，而是 segment 生命周
 - 真正的物理 unlink 通过 PostgreSQL 的 sync-request / checkpointer 路径延后执行
 - redo 侧要能接受这套生命周期边界，而不是只看“文件现在是不是空的”
 
+sync-request 延后执行还有一条 checkpoint epoch 规则。
+`SyncPreCheckpoint()` 会先吸收 checkpoint 开始前已经到达的 request，然后推进
+checkpoint cycle counter。checkpoint A start 之后注册的 reclaim unlink request
+会被标记为 A 的 cycle。A 自己的 `SyncPostCheckpoint()` 不能删除这个 request，
+因为 A 还没有为它提供一个已经完成的 checkpoint 边界。只有后续 checkpoint B
+完成并进入 `SyncPostCheckpoint()` 之后，这个 request 才进入可删除状态。
+
+按时间线看就是：
+
+```text
+A start: cycle 5 -> 6
+request 注册为 cycle 6
+A end/post: request cycle 仍然是当前 cycle，所以不 unlink
+B start: cycle 6 -> 7
+B end/post: request cycle 6 已经旧于当前 cycle 7，所以可以执行 unlink
+```
+
+因此，正确性判断点不是 B start 时 counter 递增的瞬间，而是 B 已经完成
+checkpoint 并进入 post-checkpoint unlink 处理之后。
+
 inflight / pending 状态当然仍然影响内部正确性，但它们更适合被看作实现细节，而不是对社区信件里要展开的主判据。对外最重要的点仍然是：
 
 - unlink 不是“看空即删”

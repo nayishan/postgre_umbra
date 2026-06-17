@@ -349,6 +349,9 @@ The current code relies on these invariants:
 - redo owns redo-only metadata bootstrap and remap interpretation
 - skip-WAL dense-map WAL describes exact mapping/frontier facts, but does not
   replace the existing data-file sync protocol
+- reclaim unlink requests are not removed at the checkpoint start that advances
+  the cycle counter; physical unlink is eligible only in the later
+  `SyncPostCheckpoint()` after a following checkpoint has completed
 - full-page images are still kept for explicit image owners and WAL
   consistency checking
 

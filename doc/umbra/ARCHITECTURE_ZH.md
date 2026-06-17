@@ -246,6 +246,11 @@ redo 端必须理解 remap，因为普通的 block-read helper 并不知道：
 - 当前优先级是正确性和更简单的所有权边界；
 - reclaim 确实存在，但它被刻意放在后台，而不是前台分配主路径上。
 
+后台 reclaim 注册的物理 unlink 仍然受 checkpoint epoch 约束：checkpoint start
+推进 cycle counter 只负责把新 request 分到当前 checkpoint 窗口里；真正的
+物理 unlink 只能在后续 checkpoint 已经完成并进入 `SyncPostCheckpoint()` 后
+执行。
+
 ### 10.2 双层 buffer 边界
 
 Umbra 还刻意保留了一层内部缓冲复杂度，而不是一开始就试图把所有东西直接压进
