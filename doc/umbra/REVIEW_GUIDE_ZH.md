@@ -52,6 +52,9 @@ patch 序列时，先看什么、重点看什么。
 - 已提交的 `next_free_pblkno <= reservation frontier`；
 - 逻辑 EOF、物理容量、分配前沿是不同事实；
 - checkpoint / mapwriter 只写已经存在的 MAP 元数据块；
+- 在一个 checkpoint cycle 中注册的 reclaim unlink request，不能在同一个
+  checkpoint 的 post 阶段被物理删除；只有后续 checkpoint 已经完成并进入
+  `SyncPostCheckpoint()` 后才可以删除；
 - redo 拥有只在恢复阶段需要的 metadata bootstrap。
 
 ## 4. Full-Page Image 的边界

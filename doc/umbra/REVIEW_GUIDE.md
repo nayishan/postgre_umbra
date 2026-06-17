@@ -80,6 +80,9 @@ Review these invariants before focusing on micro-optimizations:
   frontier are separate facts.
 - Checkpoint and mapwriter write existing MAP metadata blocks; they do not
   materialize missing MAP blocks during flush.
+- Reclaim unlink requests registered in one checkpoint cycle must not be
+  physically removed at that checkpoint's post phase; they are eligible only
+  after a following checkpoint has completed and reaches `SyncPostCheckpoint()`.
 - Redo owns redo-only metadata bootstrap for mapped forks.
 
 ## 5. WAL Review Checklist

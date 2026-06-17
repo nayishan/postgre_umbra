@@ -382,6 +382,28 @@ the following boundary:
 - redo must accept this lifecycle boundary instead of deciding only from "is the
   file empty now"
 
+The sync-request deferral has a checkpoint-epoch rule.  `SyncPreCheckpoint()`
+absorbs requests that arrived before the checkpoint and then advances the
+checkpoint cycle counter.  A reclaim unlink request registered after checkpoint
+A starts is therefore tagged with A's cycle.  Checkpoint A's
+`SyncPostCheckpoint()` must not remove that request, because A has not provided
+a completed checkpoint boundary for it.  The request becomes eligible only after
+the next checkpoint B has completed and entered `SyncPostCheckpoint()`.
+
+In timeline form:
+
+```text
+A start: cycle 5 -> 6
+request registers with cycle 6
+A end/post: request cycle is still current, so it is not unlinked
+B start: cycle 6 -> 7
+B end/post: request cycle 6 is older than current cycle 7, so unlink may run
+```
+
+This means the correctness point is not the moment B starts and the counter
+advances.  It is B's completed checkpoint followed by post-checkpoint unlink
+processing.
+
 Inflight / pending state still affects internal correctness, but it is better
 treated as an implementation detail rather than the main criterion to explain in
 community-facing text.  The key external points are:
