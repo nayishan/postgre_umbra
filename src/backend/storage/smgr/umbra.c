@@ -1782,55 +1782,74 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	max_pblkno = InvalidBlockNumber;
 	run_len = 0;
 
-	for (int i = 0; i < nblocks; i++)
 	{
-		BlockNumber lblk = blocknum + (BlockNumber) i;
-		BlockNumber pblk;
+		BlockNumber logical_nblocks;
+		BlockNumber logical_end = blocknum + (BlockNumber) nblocks;
+		bool		extends_logical;
 
-		if (um_lblk_precedes_logical_eof_for_access(reln, forknum,
-													&access, NULL, lblk))
-			pblk = um_chunk_active_pblk_checked(reln, forknum, lblk);
-		else
-			pblk = um_prepare_mapped_birth(reln, forknum, &access, lblk);
+		if (logical_end < blocknum)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("logical block range overflow for relation %u/%u/%u fork %d",
+							reln->smgr_rlocator.locator.spcOid,
+							reln->smgr_rlocator.locator.dbOid,
+							reln->smgr_rlocator.locator.relNumber,
+							forknum)));
 
-		if (max_pblkno == InvalidBlockNumber || pblk > max_pblkno)
-			max_pblkno = pblk;
+		logical_nblocks = umnblocks_for_access(reln, forknum, &access);
+		extends_logical = logical_end > logical_nblocks;
+		if (extends_logical)
+			um_ensure_chunk_physical_capacity(reln, forknum, ctx,
+											  logical_end,
+											  true /* skipFsync */);
 
-		if (run_len == 0)
+		for (int i = 0; i < nblocks; i++)
 		{
-			run_start_pblk = pblk;
-			run_len = 1;
-		}
-		else if (pblk == run_start_pblk + (BlockNumber) run_len)
-		{
-			run_len++;
-		}
-		else
-		{
-			umfile_zeroextend(ctx, forknum, run_start_pblk,
-							  run_len, skipFsync);
-			run_start_pblk = pblk;
-			run_len = 1;
-		}
-	}
+			BlockNumber lblk = blocknum + (BlockNumber) i;
+			BlockNumber pblk;
 
-	if (run_len > 0)
-		umfile_zeroextend(ctx, forknum, run_start_pblk, run_len,
-						  skipFsync);
+			if (lblk < logical_nblocks)
+				pblk = um_chunk_active_pblk_checked(reln, forknum, lblk);
+			else
+				pblk = um_chunk_base_pblk_checked(reln, forknum, lblk);
 
-	if (max_pblkno != InvalidBlockNumber)
-	{
-		if (um_state_uses_chunk_base(access.policy))
+			if (max_pblkno == InvalidBlockNumber || pblk > max_pblkno)
+				max_pblkno = pblk;
+
+			if (run_len == 0)
+			{
+				run_start_pblk = pblk;
+				run_len = 1;
+			}
+			else if (pblk == run_start_pblk + (BlockNumber) run_len)
+			{
+				run_len++;
+			}
+			else
+			{
+				umfile_zeroextend(ctx, forknum, run_start_pblk,
+								  run_len, skipFsync);
+				run_start_pblk = pblk;
+				run_len = 1;
+			}
+		}
+
+		if (run_len > 0)
+			umfile_zeroextend(ctx, forknum, run_start_pblk, run_len,
+							  skipFsync);
+
+		if (max_pblkno != InvalidBlockNumber)
 			MapSBlockBumpPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
 										 forknum,
 										 um_chunk_physical_capacity_checked(reln,
 																			forknum,
 																			blocknum + (BlockNumber) nblocks),
 										 InvalidXLogRecPtr);
-		else
-			MapSBlockBumpPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
-										 forknum, max_pblkno + 1,
-										 InvalidXLogRecPtr);
+
+		if (extends_logical)
+			MapSBlockBumpLogicalNblocks(ctx, reln->smgr_rlocator.locator,
+										forknum, logical_end,
+										InvalidXLogRecPtr);
 	}
 }
 

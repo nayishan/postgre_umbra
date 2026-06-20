@@ -931,11 +931,13 @@ MapSuperPrepareEntryForUpdate(UmbraFileContext *map_ctx, RelFileLocator rnode,
 		status = MapSuperLoadFromDisk(map_ctx, rnode, &disk_super);
 		if (status == MAP_SBLOCK_READ_MISSING)
 		{
+#ifdef USE_UMBRA
 			if (InRecovery)
 			{
 				XLogLogMissingRelationMetadata(rnode);
 				return false;
 			}
+#endif
 			elog(ERROR, "%s", missing_errmsg);
 		}
 
@@ -1192,12 +1194,18 @@ retry:
 
 		for (;;)
 		{
-			BlockNumber blk;
-
-			for (blk = current; blk < desired; blk++)
+			if (!umfile_ctx_block_exists(map_ctx, forknum, desired - 1))
 			{
-				if (!umfile_ctx_block_exists(map_ctx, forknum, blk))
-					umfile_zeroextend(map_ctx, forknum, blk, 1, skipFsync);
+				PGIOAlignedBlock zero_buffer = {0};
+
+				/*
+				 * Ensure the file EOF covers the published physical capacity.
+				 * Sparse holes read back as zeroes, so writing the final block
+				 * is enough to avoid later EOF/short reads without forcing
+				 * every intervening page through the foreground extension path.
+				 */
+				umfile_extend(map_ctx, forknum, desired - 1,
+							  zero_buffer.data, skipFsync);
 			}
 
 			if (!MapSuperPrepareEntryForUpdate(map_ctx, rnode, InvalidXLogRecPtr,
