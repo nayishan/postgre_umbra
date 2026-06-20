@@ -204,13 +204,6 @@ This is a research prototype with important limits:
 - Only `MAIN`, `FSM`, and `VM` forks are covered.
 - Each managed block keeps two fixed physical copies, so space usage is close
   to twice the managed fork size, plus `pg_shadow` metadata.
-- The two-copy model is a known correctness gap across checkpoint boundaries.
-  A page version created in checkpoint cycle A may still be required until the
-  following checkpoint cycle B has completed its post-checkpoint cleanup.  With
-  only an active side and a base side, Shadow can switch back to the old base at
-  B start and overwrite a page version that should remain protected until B
-  end.  The required lifecycle has three roles: current active page,
-  checkpoint-protected base page, and the next writable/reusable page.
 - Database and relation capacity uses small hard-coded limits.
 - There is no MAP compaction, physical-space reclaim, background mapwriter, or
   preallocation mechanism.

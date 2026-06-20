@@ -189,12 +189,6 @@ make install
 - 只覆盖 `MAIN`、`FSM`、`VM` 三类 fork。
 - 每个 managed block 固定保留两份物理页，因此空间开销接近 managed fork 的
   两倍，再加上 `pg_shadow` metadata。
-- 两份物理页模型在 checkpoint 边界上存在已知正确性缺口。checkpoint A 周期
-  创建的某个页面版本，可能必须一直保留到后续 checkpoint B 完成
-  post-checkpoint cleanup 之后。Shadow 只有 active side 和 base side，因此
-  B start 后再次切换时可能直接切回旧 base，提前覆盖仍应受保护的页面版本。
-  正确生命周期需要三个角色：当前 active page、受 checkpoint 保护的 base
-  page、以及下一份可写或可复用 page。
 - database 和 relation 容量是硬编码的小上限。
 - 没有 MAP compaction、空间回收、后台 mapwriter 或预分配机制。
 - WAL 只记录 shadow 状态切换，不记录通用 `logical block -> physical block`
