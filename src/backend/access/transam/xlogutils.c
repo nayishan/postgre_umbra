@@ -807,18 +807,20 @@ XLogReadBufferForRedoExtendedUmbra(XLogReaderState *record,
 			else
 				LockBuffer(*buf, BUFFER_LOCK_EXCLUSIVE);
 		}
-		if (set_shift_after_read)
-			UmShiftSetActiveSide(shift_smgr, forknum, blkno,
-								  blk->shifted_to_shadow, lsn);
 		if (has_shift)
 		{
 			/*
-			 * Match shadow redo: after reading the old side, publish the new
-			 * bit and materialize that page in the new side before replay.
+			 * Match shadow redo: materialize the source page while the old
+			 * side is still active.  The redo routine will apply this record's
+			 * delta after we return, and that later dirty flush belongs on the
+			 * new active side.
 			 */
 			MarkBufferDirty(*buf);
 			FlushOneBuffer(*buf);
 		}
+		if (set_shift_after_read)
+			UmShiftSetActiveSide(shift_smgr, forknum, blkno,
+								  blk->shifted_to_shadow, lsn);
 		if (lsn <= PageGetLSN(BufferGetPage(*buf)))
 			return BLK_DONE;
 		return BLK_NEEDS_REDO;
