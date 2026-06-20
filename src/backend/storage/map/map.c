@@ -401,6 +401,67 @@ UmbraShiftGet(UmbraFileContext *map_ctx, RelFileLocator rnode,
 	return true;
 }
 
+BlockNumber
+UmbraShiftGetRun(UmbraFileContext *map_ctx, RelFileLocator rnode,
+				 ForkNumber forknum, BlockNumber lblkno,
+				 BlockNumber maxblocks, bool *shifted_to_shadow)
+{
+	BlockNumber	shift_blkno;
+	BlockNumber	bits_this_page;
+	BlockNumber	run_blocks;
+	int			bit_idx;
+	int			slot_id;
+	MapPage    *page;
+	MapBufferDesc *buf;
+	uint8	   *bytes;
+	bool		first_bit;
+
+	Assert(shifted_to_shadow != NULL);
+	Assert(maxblocks > 0);
+
+	if (forknum == UMBRA_METADATA_FORKNUM)
+		elog(ERROR, "UmbraShiftGetRun does not accept Umbra metadata fork");
+
+	if (!umfile_ctx_fork_exists(map_ctx, UMBRA_METADATA_FORKNUM))
+	{
+		*shifted_to_shadow = false;
+		return maxblocks;
+	}
+
+	UmbraShiftLocation(forknum, lblkno, &shift_blkno, &bit_idx);
+	bits_this_page = Min((BlockNumber) (UMBRA_SHIFT_BITS_PER_PAGE - bit_idx),
+						 maxblocks);
+
+	slot_id = MapReadBuffer(map_ctx, rnode, forknum, shift_blkno);
+	buf = &MapBuffers[slot_id];
+	page = MapGetPage(slot_id);
+	bytes = (uint8 *) page;
+
+	LWLockAcquire(&buf->buffer_lock, LW_SHARED);
+	first_bit =
+		(bytes[bit_idx / BITS_PER_BYTE] &
+		 (1U << (bit_idx % BITS_PER_BYTE))) != 0;
+	*shifted_to_shadow = first_bit;
+	run_blocks = 1;
+
+	for (BlockNumber i = 1; i < bits_this_page; i++)
+	{
+		int			current_bit_idx = bit_idx + (int) i;
+		bool		current_bit;
+
+		current_bit =
+			(bytes[current_bit_idx / BITS_PER_BYTE] &
+			 (1U << (current_bit_idx % BITS_PER_BYTE))) != 0;
+		if (current_bit != first_bit)
+			break;
+		run_blocks++;
+	}
+	LWLockRelease(&buf->buffer_lock);
+
+	MapUnpinBuffer(slot_id);
+	return run_blocks;
+}
+
 void
 UmbraShiftSet(UmbraFileContext *map_ctx, RelFileLocator rnode,
 			  ForkNumber forknum, BlockNumber lblkno,

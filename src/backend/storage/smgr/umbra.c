@@ -236,6 +236,11 @@ static BlockNumber um_chunk_shadow_pblk_checked(SMgrRelation reln,
 static BlockNumber um_chunk_active_pblk_checked(SMgrRelation reln,
 												ForkNumber forknum,
 												BlockNumber lblkno);
+static BlockNumber um_chunk_active_pblk_run_checked(SMgrRelation reln,
+													ForkNumber forknum,
+													BlockNumber lblkno,
+													BlockNumber maxblocks,
+													BlockNumber *start_pblk);
 static BlockNumber um_chunk_physical_capacity_checked(SMgrRelation reln,
 													  ForkNumber forknum,
 													  BlockNumber logical_nblocks);
@@ -724,6 +729,37 @@ um_chunk_active_pblk_checked(SMgrRelation reln, ForkNumber forknum,
 	return um_chunk_base_pblk_checked(reln, forknum, lblkno);
 }
 
+static BlockNumber
+um_chunk_active_pblk_run_checked(SMgrRelation reln, ForkNumber forknum,
+								 BlockNumber lblkno, BlockNumber maxblocks,
+								 BlockNumber *start_pblk)
+{
+	UmbraFileContext *ctx = um_ctx_acquire(reln);
+	BlockNumber	chunk_blocks;
+	BlockNumber	run_blocks;
+	bool		shifted_to_shadow = false;
+
+	Assert(maxblocks > 0);
+	Assert(start_pblk != NULL);
+
+	chunk_blocks = Min(maxblocks,
+					   (BlockNumber) UMBRA_CHUNK_PAIRED_PAGES -
+					   (lblkno % (BlockNumber) UMBRA_CHUNK_PAIRED_PAGES));
+	run_blocks = UmbraShiftGetRun(ctx, reln->smgr_rlocator.locator,
+								  forknum, lblkno, chunk_blocks,
+								  &shifted_to_shadow);
+
+	Assert(run_blocks > 0);
+	Assert(run_blocks <= chunk_blocks);
+
+	if (shifted_to_shadow)
+		*start_pblk = um_chunk_shadow_pblk_checked(reln, forknum, lblkno);
+	else
+		*start_pblk = um_chunk_base_pblk_checked(reln, forknum, lblkno);
+
+	return run_blocks;
+}
+
 static bool
 um_redo_shift_source_pblk(SMgrRelation reln, ForkNumber forknum,
 						  BlockNumber lblkno, BlockNumber *pblkno)
@@ -1191,21 +1227,9 @@ um_resolve_mapped_read_run(SMgrRelation reln, ForkNumber forknum,
 		if (um_redo_shift_source_pblk(reln, forknum, blocknum, start_pblk))
 			return 1;
 
-		*start_pblk = um_chunk_active_pblk_checked(reln, forknum, blocknum);
-		run_blocks = Min(maxblocks,
-						 (BlockNumber) UMBRA_CHUNK_PAIRED_PAGES -
-						 (blocknum % (BlockNumber) UMBRA_CHUNK_PAIRED_PAGES));
-		for (BlockNumber i = 1; i < run_blocks; i++)
-		{
-			BlockNumber pblk =
-				um_chunk_active_pblk_checked(reln, forknum, blocknum + i);
-
-			if (pblk != *start_pblk + i)
-			{
-				run_blocks = i;
-				break;
-			}
-		}
+		run_blocks = um_chunk_active_pblk_run_checked(reln, forknum,
+													  blocknum, maxblocks,
+													  start_pblk);
 		if (logical_nblocks != InvalidBlockNumber)
 			run_blocks = Min(run_blocks, logical_nblocks - blocknum);
 		return run_blocks;
@@ -1830,21 +1854,35 @@ umprefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, int nblo
 	UmbraAccessState access;
 	UmbraAccessLookupState lookup_state = {0};
 	UmbraFileContext *ctx = um_ctx_acquire(reln);
+	BlockNumber	total_blocks;
 
 	access = um_classify_access(reln, forknum);
 
-	for (int i = 0; i < nblocks; i++)
+	if (nblocks <= 0)
+		return true;
+
+	if (!access.map_available &&
+		!um_state_uses_chunk_base(access.policy))
+		return umfile_prefetch(ctx, forknum, blocknum, nblocks);
+
+	total_blocks = (BlockNumber) nblocks;
+	for (BlockNumber i = 0; i < total_blocks;)
 	{
-		BlockNumber lblk = blocknum + (BlockNumber) i;
 		BlockNumber pblk;
+		BlockNumber run_blocks;
 
-		if (um_resolve_lblk_for_access(reln, forknum, &access, &lookup_state,
-									   lblk, UMBRA_ACCESS_RESOLVE_READ,
-									   &pblk) != UMBRA_ACCESS_RESOLVED_PBLK)
+		run_blocks = um_resolve_mapped_read_run(reln, forknum, &access,
+												&lookup_state, blocknum + i,
+												total_blocks - i, &pblk);
+		if (run_blocks == 0)
+		{
+			i++;
 			continue;
+		}
 
-		if (!umfile_prefetch(ctx, forknum, pblk, 1))
+		if (!umfile_prefetch(ctx, forknum, pblk, (int) run_blocks))
 			return false;
+		i += run_blocks;
 	}
 	return true;
 }
@@ -2131,6 +2169,84 @@ umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		(void) MapSBlockTryGetPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
 											  forknum, &materialized_nblocks);
 
+	if (um_state_uses_chunk_base(access.policy))
+	{
+		for (BlockNumber i = 0; i < nblocks;)
+		{
+			BlockNumber lblk = blocknum + i;
+			BlockNumber pblk;
+			BlockNumber max_run = nblocks - i;
+			BlockNumber active_run;
+			BlockNumber segment_run;
+			BlockNumber write_run;
+
+			if (!um_lblk_precedes_logical_eof_for_access(reln, forknum,
+														 &access,
+														 &lookup_state,
+														 lblk))
+			{
+				BlockNumber logical_nblocks = InvalidBlockNumber;
+
+				if (lookup_state.have_logical_nblocks)
+					logical_nblocks = lookup_state.logical_nblocks;
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("cannot write Umbra relation %u/%u/%u fork %d block %u beyond logical EOF %u",
+								reln->smgr_rlocator.locator.spcOid,
+								reln->smgr_rlocator.locator.dbOid,
+								reln->smgr_rlocator.locator.relNumber,
+								forknum, lblk, logical_nblocks),
+						 errdetail("New logical pages must be born through smgrextend or smgrzeroextend before ordinary writes.")));
+			}
+
+			if (lookup_state.have_logical_nblocks &&
+				lookup_state.logical_nblocks != InvalidBlockNumber)
+				max_run = Min(max_run, lookup_state.logical_nblocks - lblk);
+
+			active_run = um_chunk_active_pblk_run_checked(reln, forknum, lblk,
+														 max_run, &pblk);
+			segment_run = Min(active_run,
+							  (BlockNumber) RELSEG_SIZE -
+							  (pblk % (BlockNumber) RELSEG_SIZE));
+
+			if (pblk < materialized_nblocks)
+			{
+				write_run = Min(segment_run, materialized_nblocks - pblk);
+				write_run = Min(write_run, (BlockNumber) PG_IOV_MAX);
+				umfile_writev(ctx, forknum, pblk, &buffers[i], write_run,
+							  skipFsync);
+				i += write_run;
+				continue;
+			}
+
+			umfile_extend(ctx, forknum, pblk, buffers[i], skipFsync);
+
+			if (max_extended_pblk == InvalidBlockNumber ||
+				pblk > max_extended_pblk)
+				max_extended_pblk = pblk;
+			if (materialized_nblocks < pblk + 1)
+				materialized_nblocks = pblk + 1;
+			i++;
+		}
+
+		if (max_extended_pblk != InvalidBlockNumber)
+			MapSBlockBumpPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
+										 forknum,
+										 um_chunk_physical_capacity_checked(reln,
+																			forknum,
+																			blocknum + nblocks),
+										 InvalidXLogRecPtr);
+
+		if (nblocks > 0)
+		{
+			BlockNumber logical_nblocks;
+
+			logical_nblocks = umnblocks_for_access(reln, forknum, &access);
+			Assert(logical_nblocks >= blocknum + nblocks);
+		}
+		return;
+	}
+
 	for (BlockNumber i = 0; i < nblocks; i++)
 	{
 		BlockNumber lblk = blocknum + i;
@@ -2251,6 +2367,50 @@ umwriteback(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	if (!access.map_available)
 	{
 		umfile_writeback(ctx, forknum, blocknum, nblocks);
+		return;
+	}
+
+	if (um_state_uses_chunk_base(access.policy))
+	{
+		for (BlockNumber i = 0; i < nblocks;)
+		{
+			BlockNumber lblk = blocknum + i;
+			BlockNumber pblk;
+			BlockNumber max_run = nblocks - i;
+			BlockNumber active_run;
+			BlockNumber writeback_run;
+
+			if (!um_lblk_precedes_logical_eof_for_access(reln, forknum,
+														 &access,
+														 &lookup_state,
+														 lblk))
+			{
+				if (um_is_stale_post_truncate_lblk_for_access(reln, forknum,
+															  &access,
+															  &lookup_state,
+															  lblk))
+				{
+					i++;
+					continue;
+				}
+				um_report_legacy_entry_map_path(reln, forknum, &access, lblk);
+				pg_unreachable();
+			}
+
+			if (lookup_state.have_logical_nblocks &&
+				lookup_state.logical_nblocks != InvalidBlockNumber)
+				max_run = Min(max_run, lookup_state.logical_nblocks - lblk);
+
+			active_run = um_chunk_active_pblk_run_checked(reln, forknum,
+														 lblk, max_run,
+														 &pblk);
+			writeback_run = Min(active_run,
+								(BlockNumber) RELSEG_SIZE -
+								(pblk % (BlockNumber) RELSEG_SIZE));
+
+			umfile_writeback(ctx, forknum, pblk, writeback_run);
+			i += writeback_run;
+		}
 		return;
 	}
 

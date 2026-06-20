@@ -126,6 +126,12 @@ extern int	MapReadBuffer(UmbraFileContext *map_ctx, RelFileLocator rnode,
 extern bool UmbraShiftGet(UmbraFileContext *map_ctx, RelFileLocator rnode,
 						  ForkNumber forknum, BlockNumber lblkno,
 						  bool *shifted_to_shadow);
+extern BlockNumber UmbraShiftGetRun(UmbraFileContext *map_ctx,
+									RelFileLocator rnode,
+									ForkNumber forknum,
+									BlockNumber lblkno,
+									BlockNumber maxblocks,
+									bool *shifted_to_shadow);
 extern void UmbraShiftSet(UmbraFileContext *map_ctx, RelFileLocator rnode,
 						  ForkNumber forknum, BlockNumber lblkno,
 						  bool shifted_to_shadow, XLogRecPtr map_lsn);
