@@ -70,6 +70,15 @@ typedef struct UmbraAccessLookupState
 	BlockNumber logical_nblocks;
 } UmbraAccessLookupState;
 
+typedef struct UmbraRedoShiftSourceState
+{
+	bool		active;
+	RelFileLocator rlocator;
+	ForkNumber	forknum;
+	BlockNumber lblkno;
+	bool		shifted_to_shadow;
+} UmbraRedoShiftSourceState;
+
 typedef enum UmbraAccessResolveMode
 {
 	UMBRA_ACCESS_RESOLVE_READ,
@@ -171,6 +180,8 @@ static bool um_lblk_precedes_logical_eof_for_access(SMgrRelation reln,
 													const UmbraAccessState *access,
 													UmbraAccessLookupState *lookup_state,
 													BlockNumber lblkno);
+static bool um_redo_shift_source_pblk(SMgrRelation reln, ForkNumber forknum,
+									  BlockNumber lblkno, BlockNumber *pblkno);
 static UmbraAccessResolveResult um_resolve_lblk_for_access(SMgrRelation reln,
 														   ForkNumber forknum,
 														   const UmbraAccessState *access,
@@ -225,10 +236,6 @@ static BlockNumber um_chunk_shadow_pblk_checked(SMgrRelation reln,
 static BlockNumber um_chunk_active_pblk_checked(SMgrRelation reln,
 												ForkNumber forknum,
 												BlockNumber lblkno);
-static BlockNumber um_chunk_inactive_pblk_checked(SMgrRelation reln,
-												  ForkNumber forknum,
-												  BlockNumber lblkno,
-												  BlockNumber *active_pblkno);
 static BlockNumber um_chunk_physical_capacity_checked(SMgrRelation reln,
 													  ForkNumber forknum,
 													  BlockNumber logical_nblocks);
@@ -237,6 +244,8 @@ static void um_ensure_chunk_physical_capacity(SMgrRelation reln,
 											  UmbraFileContext *ctx,
 											  BlockNumber logical_nblocks,
 											  bool skipFsync);
+
+static UmbraRedoShiftSourceState um_redo_shift_source_state = {0};
 
 bool
 UmMetadataExists(SMgrRelation reln)
@@ -715,32 +724,26 @@ um_chunk_active_pblk_checked(SMgrRelation reln, ForkNumber forknum,
 	return um_chunk_base_pblk_checked(reln, forknum, lblkno);
 }
 
-static BlockNumber
-um_chunk_inactive_pblk_checked(SMgrRelation reln, ForkNumber forknum,
-							   BlockNumber lblkno, BlockNumber *active_pblkno)
+static bool
+um_redo_shift_source_pblk(SMgrRelation reln, ForkNumber forknum,
+						  BlockNumber lblkno, BlockNumber *pblkno)
 {
-	UmbraFileContext *ctx = um_ctx_acquire(reln);
-	bool		shifted_to_shadow = false;
-	BlockNumber active_pblk;
-	BlockNumber inactive_pblk;
+	UmbraRedoShiftSourceState *state = &um_redo_shift_source_state;
 
-	(void) UmbraShiftGet(ctx, reln->smgr_rlocator.locator,
-							  forknum, lblkno, &shifted_to_shadow);
+	Assert(pblkno != NULL);
 
-	if (shifted_to_shadow)
-	{
-		active_pblk = um_chunk_shadow_pblk_checked(reln, forknum, lblkno);
-		inactive_pblk = um_chunk_base_pblk_checked(reln, forknum, lblkno);
-	}
+	if (!state->active)
+		return false;
+	if (forknum != state->forknum || lblkno != state->lblkno)
+		return false;
+	if (!RelFileLocatorEquals(state->rlocator, reln->smgr_rlocator.locator))
+		return false;
+
+	if (state->shifted_to_shadow)
+		*pblkno = um_chunk_shadow_pblk_checked(reln, forknum, lblkno);
 	else
-	{
-		active_pblk = um_chunk_base_pblk_checked(reln, forknum, lblkno);
-		inactive_pblk = um_chunk_shadow_pblk_checked(reln, forknum, lblkno);
-	}
-
-	if (active_pblkno != NULL)
-		*active_pblkno = active_pblk;
-	return inactive_pblk;
+		*pblkno = um_chunk_base_pblk_checked(reln, forknum, lblkno);
+	return true;
 }
 
 static BlockNumber
@@ -901,7 +904,7 @@ UmRebuildMapAndSuperblockForSkipWAL(SMgrRelation reln)
 		 * Chunk-paired base slots are formula-derived.  Dense skip-WAL
 		 * transition records only need to make the frontiers durable; the
 		 * shift bitmap's all-zero default means every logical block remains
-		 * on its base slot until a later remap flips the bit.
+		 * on its base side until a later shift flips the bit.
 		 */
 		physical_nblocks =
 			um_chunk_physical_capacity_checked(reln, forknum, nblocks);
@@ -1115,6 +1118,10 @@ um_resolve_lblk_for_access(SMgrRelation reln, ForkNumber forknum,
 					 errdetail("New logical pages must be born through smgrextend or smgrzeroextend before ordinary writes.")));
 		}
 
+		if (mode == UMBRA_ACCESS_RESOLVE_READ &&
+			um_redo_shift_source_pblk(reln, forknum, lblkno, pblkno))
+			return UMBRA_ACCESS_RESOLVED_PBLK;
+
 		*pblkno = um_chunk_active_pblk_checked(reln, forknum, lblkno);
 		return UMBRA_ACCESS_RESOLVED_PBLK;
 	}
@@ -1180,6 +1187,9 @@ um_resolve_mapped_read_run(SMgrRelation reln, ForkNumber forknum,
 		if (logical_nblocks != InvalidBlockNumber &&
 			blocknum >= logical_nblocks)
 			return 0;
+
+		if (um_redo_shift_source_pblk(reln, forknum, blocknum, start_pblk))
+			return 1;
 
 		*start_pblk = um_chunk_active_pblk_checked(reln, forknum, blocknum);
 		run_blocks = Min(maxblocks,
@@ -1379,53 +1389,8 @@ umphysicalblock(SMgrRelation reln, ForkNumber forknum, BlockNumber lblkno)
 	pg_unreachable();
 }
 
-void
-UmRemapGetTargetPblkno(SMgrRelation reln, ForkNumber forknum,
-					   BlockNumber lblkno, BlockNumber *new_pblkno,
-					   BlockNumber *old_pblkno)
-{
-	UmbraAccessState access;
-
-	Assert(new_pblkno != NULL);
-	Assert(old_pblkno != NULL);
-
-	access = um_classify_access(reln, forknum);
-	if (um_state_uses_chunk_base(access.policy))
-	{
-		BlockNumber logical_nblocks;
-
-		logical_nblocks = umnblocks_for_access(reln, forknum, &access);
-		if (lblkno >= logical_nblocks)
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("cannot remap Umbra relation %u/%u/%u fork %d block %u beyond logical EOF %u",
-							reln->smgr_rlocator.locator.spcOid,
-							reln->smgr_rlocator.locator.dbOid,
-							reln->smgr_rlocator.locator.relNumber,
-							forknum, lblkno, logical_nblocks),
-					 errdetail("New logical pages are born on their base slot and are not represented by remap records.")));
-		*new_pblkno = um_chunk_inactive_pblk_checked(reln, forknum,
-													 lblkno, old_pblkno);
-		return;
-	}
-
-	if (!access.map_available)
-	{
-		*old_pblkno = lblkno;
-		*new_pblkno = lblkno;
-		return;
-	}
-
-	elog(ERROR,
-		 "legacy entry-map remap is not supported for relation %u/%u/%u fork %d blk %u",
-		 reln->smgr_rlocator.locator.spcOid,
-		 reln->smgr_rlocator.locator.dbOid,
-		 reln->smgr_rlocator.locator.relNumber,
-		 forknum, lblkno);
-}
-
 bool
-UmRemapWalOwnerAvailable(SMgrRelation reln, ForkNumber forknum)
+UmShiftWalOwnerAvailable(SMgrRelation reln, ForkNumber forknum)
 {
 	UmbraAccessState access;
 
@@ -1472,10 +1437,34 @@ UmTranslationTryLookupPblkno(SMgrRelation reln, ForkNumber forknum,
 	return false;
 }
 
+bool
+UmShiftGetInactiveSide(SMgrRelation reln, ForkNumber forknum, BlockNumber lblkno)
+{
+	UmbraAccessState access;
+	UmbraFileContext *ctx = um_ctx_acquire(reln);
+	bool		shifted_to_shadow = false;
+
+	access = um_classify_access(reln, forknum);
+	if (!um_state_uses_chunk_base(access.policy))
+		return false;
+
+	if (lblkno >= umnblocks_for_access(reln, forknum, &access))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("cannot shift Umbra relation %u/%u/%u fork %d block %u beyond logical EOF",
+						reln->smgr_rlocator.locator.spcOid,
+						reln->smgr_rlocator.locator.dbOid,
+						reln->smgr_rlocator.locator.relNumber,
+						forknum, lblkno)));
+
+	(void) UmbraShiftGet(ctx, reln->smgr_rlocator.locator,
+						 forknum, lblkno, &shifted_to_shadow);
+	return !shifted_to_shadow;
+}
+
 void
-UmShiftSetActivePblkno(SMgrRelation reln, ForkNumber forknum,
-					   BlockNumber lblkno, BlockNumber new_pblkno,
-					   XLogRecPtr map_lsn)
+UmShiftSetActiveSide(SMgrRelation reln, ForkNumber forknum, BlockNumber lblkno,
+					 bool shifted_to_shadow, XLogRecPtr map_lsn)
 {
 	UmbraAccessState access;
 	UmbraFileContext *ctx = um_ctx_acquire(reln);
@@ -1483,29 +1472,8 @@ UmShiftSetActivePblkno(SMgrRelation reln, ForkNumber forknum,
 	access = um_classify_access(reln, forknum);
 	if (um_state_uses_chunk_base(access.policy))
 	{
-		BlockNumber base_pblk;
-		BlockNumber shadow_pblk;
-		bool		shifted_to_shadow;
-
-		base_pblk = um_chunk_base_pblk_checked(reln, forknum, lblkno);
-		shadow_pblk = um_chunk_shadow_pblk_checked(reln, forknum, lblkno);
-
-		if (new_pblkno == base_pblk)
-			shifted_to_shadow = false;
-		else if (new_pblkno == shadow_pblk)
-			shifted_to_shadow = true;
-		else
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("chunk-paired mapping target %u is not a valid slot for relation %u/%u/%u fork %d logical block %u",
-							new_pblkno,
-							reln->smgr_rlocator.locator.spcOid,
-							reln->smgr_rlocator.locator.dbOid,
-							reln->smgr_rlocator.locator.relNumber,
-							forknum, lblkno)));
-
 		UmbraShiftSet(ctx, reln->smgr_rlocator.locator,
-						   forknum, lblkno, shifted_to_shadow, map_lsn);
+							   forknum, lblkno, shifted_to_shadow, map_lsn);
 		return;
 	}
 
@@ -1518,6 +1486,25 @@ UmShiftSetActivePblkno(SMgrRelation reln, ForkNumber forknum,
 		 reln->smgr_rlocator.locator.dbOid,
 		 reln->smgr_rlocator.locator.relNumber,
 		 forknum, lblkno);
+}
+
+void
+UmRedoBeginShiftSourceSide(SMgrRelation reln, ForkNumber forknum,
+						   BlockNumber lblkno, bool shifted_to_shadow)
+{
+	Assert(InRecovery);
+
+	um_redo_shift_source_state.active = true;
+	um_redo_shift_source_state.rlocator = reln->smgr_rlocator.locator;
+	um_redo_shift_source_state.forknum = forknum;
+	um_redo_shift_source_state.lblkno = lblkno;
+	um_redo_shift_source_state.shifted_to_shadow = shifted_to_shadow;
+}
+
+void
+UmRedoEndShiftSourceSide(void)
+{
+	um_redo_shift_source_state.active = false;
 }
 
 static void
@@ -1665,7 +1652,7 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	 * For mapped data forks, smgrextend is the point where an unmapped logical
 	 * block gets its first physical block. New pages always start on the
 	 * formula-derived base side; the shift bitmap remains at its default
-	 * false value until a later remap switches the active side.
+	 * false value until a later shift switches the active side.
 	 */
 	if (blocknum < logical_nblocks)
 		pblkno = um_chunk_active_pblk_checked(reln, forknum, blocknum);
@@ -2160,15 +2147,15 @@ umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		UmbraAccessResolveResult resolve;
 		bool		can_extend_run;
 
-		resolve = um_resolve_lblk_for_access(reln, forknum, &access,
-											 &lookup_state,
-											 lblk,
-											 UMBRA_ACCESS_RESOLVE_WRITE,
-											 &pblk);
-		Assert(resolve == UMBRA_ACCESS_RESOLVED_PBLK);
+			resolve = um_resolve_lblk_for_access(reln, forknum, &access,
+												 &lookup_state,
+												 lblk,
+												 UMBRA_ACCESS_RESOLVE_WRITE,
+												 &pblk);
+			Assert(resolve == UMBRA_ACCESS_RESOLVED_PBLK);
 
-		/*
-		 * Checksum identity stays logical (lblk); callers reaching smgrwritev()
+			/*
+			 * Checksum identity stays logical (lblk); callers reaching smgrwritev()
 		 * have already set it before Umbra translates to physical blocks.
 		 */
 

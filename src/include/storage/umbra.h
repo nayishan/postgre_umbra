@@ -243,15 +243,18 @@ extern BlockNumber umnblocks_cached(SMgrRelation reln, ForkNumber forknum);
  * These expose chunk-paired translation and shift-bit updates only. Runtime
  * read-miss interpretation stays in umbra.c.
  */
-extern void UmRemapGetTargetPblkno(SMgrRelation reln, ForkNumber forknum,
-								   BlockNumber lblkno, BlockNumber *new_pblkno,
-								   BlockNumber *old_pblkno);
-extern bool UmRemapWalOwnerAvailable(SMgrRelation reln, ForkNumber forknum);
 extern bool UmUsesChunkPairedTranslation(SMgrRelation reln, ForkNumber forknum);
 extern bool UmTranslationTryLookupPblkno(SMgrRelation reln, ForkNumber forknum,
 										BlockNumber lblkno, BlockNumber *pblkno);
-extern void UmShiftSetActivePblkno(SMgrRelation reln, ForkNumber forknum,
-								   BlockNumber lblkno, BlockNumber new_pblkno,
-								   XLogRecPtr map_lsn);
+extern bool UmShiftWalOwnerAvailable(SMgrRelation reln, ForkNumber forknum);
+extern bool UmShiftGetInactiveSide(SMgrRelation reln, ForkNumber forknum,
+								   BlockNumber lblkno);
+extern void UmShiftSetActiveSide(SMgrRelation reln, ForkNumber forknum,
+								 BlockNumber lblkno, bool shifted_to_shadow,
+								 XLogRecPtr map_lsn);
+extern void UmRedoBeginShiftSourceSide(SMgrRelation reln, ForkNumber forknum,
+									   BlockNumber lblkno,
+									   bool shifted_to_shadow);
+extern void UmRedoEndShiftSourceSide(void);
 
 #endif							/* UMBRA_H */

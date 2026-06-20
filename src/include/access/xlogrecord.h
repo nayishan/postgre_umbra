@@ -91,22 +91,6 @@ typedef struct XLogRecord
 #define XLR_CHECK_CONSISTENCY	0x02
 
 /*
- * Legacy Umbra-only record flags formerly used for compact remap encodings.
- *
- * New WAL records always use the full remap header. Reader-side code keeps
- * these bits only to reject unsupported old-format records explicitly.
- */
-#ifdef USE_UMBRA
-#define XLR_UMBRA_REMAP_FORMAT_MASK		0x0C
-#define XLR_UMBRA_COMPACT_BIRTH_REMAP	0x04
-#define XLR_UMBRA_ORDINARY_SLIM_REMAP	0x08
-#else
-#define XLR_UMBRA_REMAP_FORMAT_MASK		0x00
-#define XLR_UMBRA_COMPACT_BIRTH_REMAP	0x00
-#define XLR_UMBRA_ORDINARY_SLIM_REMAP	0x00
-#endif
-
-/*
  * Header info for block data appended to an XLOG record.
  *
  * 'data_length' is the length of the rmgr-specific payload data associated
@@ -131,24 +115,21 @@ typedef struct XLogRecordBlockHeader
 #define SizeOfXLogRecordBlockHeader (offsetof(XLogRecordBlockHeader, data_length) + sizeof(uint16))
 
 /*
- * Extra header information for UMBRA remap metadata.
+ * Extra header information for Umbra chunk-paired shift metadata.
  *
- * When BKPBLOCK_HAS_REMAP is set, this header follows
- * XLogRecordBlockHeader and stores the physical remap transition for the
- * referenced logical block.
+ * When BKPBLOCK_HAS_SHIFT is set, this header follows XLogRecordBlockHeader
+ * and stores the target active side for the referenced logical block.
  */
-typedef struct XLogRecordBlockRemapHeader
+typedef struct XLogRecordBlockShiftHeader
 {
-	BlockNumber	old_pblkno;
-	BlockNumber	new_pblkno;
+	uint8		shifted_to_shadow;
 	BlockNumber logical_nblocks;
-	BlockNumber next_free_pblkno;
-} XLogRecordBlockRemapHeader;
+} XLogRecordBlockShiftHeader;
 
 #ifdef USE_UMBRA
-#define SizeOfXLogRecordBlockRemapHeader sizeof(XLogRecordBlockRemapHeader)
+#define SizeOfXLogRecordBlockShiftHeader (sizeof(uint8) + sizeof(BlockNumber))
 #else
-#define SizeOfXLogRecordBlockRemapHeader 0
+#define SizeOfXLogRecordBlockShiftHeader 0
 #endif
 
 /*
@@ -221,7 +202,7 @@ typedef struct XLogRecordBlockCompressHeader
  */
 #define MaxSizeOfXLogRecordBlockHeader \
 	(SizeOfXLogRecordBlockHeader + \
-	 SizeOfXLogRecordBlockRemapHeader + \
+	 SizeOfXLogRecordBlockShiftHeader + \
 	 SizeOfXLogRecordBlockImageHeader + \
 	 SizeOfXLogRecordBlockCompressHeader + \
 	 sizeof(RelFileLocator) + \
@@ -237,11 +218,11 @@ typedef struct XLogRecordBlockCompressHeader
  */
 #ifdef USE_UMBRA
 #define BKPBLOCK_FORK_MASK	0x07
-#define BKPBLOCK_HAS_REMAP	0x08	/* has remap metadata in WAL header */
+#define BKPBLOCK_HAS_SHIFT	0x08	/* has Umbra shift metadata in WAL header */
 #define BKPBLOCK_FLAG_MASK	0xF8
 #else
 #define BKPBLOCK_FORK_MASK	0x0F
-#define BKPBLOCK_HAS_REMAP	0x00
+#define BKPBLOCK_HAS_SHIFT	0x00
 #define BKPBLOCK_FLAG_MASK	0xF0
 #endif
 #define BKPBLOCK_HAS_IMAGE	0x10	/* block data is an XLogRecordBlockImage */

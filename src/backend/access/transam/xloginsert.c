@@ -92,14 +92,12 @@ typedef struct
 								 * backup block data in XLogRecordAssemble() */
 
 #ifdef USE_UMBRA
-	bool		has_remap;		/* true if remap metadata is prepared */
-	bool		remap_in_record; /* true if current assembled record includes remap */
-	bool		remap_committed; /* true if mapping switch was committed after insert */
-	SMgrRelation remap_reln;	/* cached relation handle for remap commit */
-	BlockNumber old_pblkno;		/* remap: old physical block number */
-	BlockNumber new_pblkno;		/* remap: new physical block number */
-	BlockNumber remap_logical_nblocks; /* assembled logical frontier payload */
-	BlockNumber remap_next_free_pblkno; /* assembled allocator frontier payload */
+	bool		has_shift;		/* true if shift metadata is prepared */
+	bool		shift_in_record;	/* current record includes shift */
+	bool		shift_committed;	/* shift bit was committed after insert */
+	SMgrRelation shift_reln;	/* cached relation handle for shift commit */
+	bool		shifted_to_shadow; /* target active side */
+	BlockNumber shift_logical_nblocks;	/* assembled logical frontier payload */
 #endif
 
 	/* buffer to store a compressed version of backup block image */
@@ -150,7 +148,7 @@ static int	num_rdatas;			/* entries currently used */
 static int	max_rdatas;			/* allocated size */
 
 static bool begininsert_called = false;
-static bool curinsert_has_block_remap = false;
+static bool curinsert_has_block_shift = false;
 
 /* Memory context to hold the registered buffer and data references. */
 static MemoryContext xloginsert_cxt;
@@ -168,12 +166,12 @@ static XLogRecData *XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 											XLogRecPtr *fpw_lsn, int *num_fpi,
 											uint64 *fpi_bytes,
 											bool *topxid_included);
-static void XLogCommitBlockRemapsUmbra(XLogRecPtr record_endptr);
-static void XLogAbortBlockRemapsUmbra(void);
-static void XLogFillBlockRemapFrontierUmbra(registered_buffer *regbuf,
-											XLogRecordBlockRemapHeader *rbmh);
+static void XLogCommitBlockShiftsUmbra(XLogRecPtr record_endptr);
+static void XLogAbortBlockShiftsUmbra(void);
+static void XLogFillBlockShiftFrontierUmbra(registered_buffer *regbuf,
+											XLogRecordBlockShiftHeader *rbsh);
 #else
-static void XLogCommitBlockRemapsMd(XLogRecPtr record_endptr);
+	static void XLogInsertFinishMd(XLogRecPtr record_endptr);
 #endif
 static bool XLogCompressBackupBlock(const PageData *page, uint16 hole_offset,
 									uint16 hole_length, void *dest, uint16 *dlen);
@@ -192,54 +190,41 @@ typedef struct xlog_storage_mgr
 static const xlog_storage_mgr xlog_storage_mgr_f = {
 #ifdef USE_UMBRA
 	.xlog_record_assemble = XLogRecordAssembleUmbra,
-	.xlog_insert_finish = XLogCommitBlockRemapsUmbra,
+	.xlog_insert_finish = XLogCommitBlockShiftsUmbra,
 #else
 	.xlog_record_assemble = XLogRecordAssembleMd,
-	.xlog_insert_finish = XLogCommitBlockRemapsMd,
+	.xlog_insert_finish = XLogInsertFinishMd,
 #endif
 };
 
 #ifdef USE_UMBRA
 static void
-XLogFillBlockRemapFrontierUmbra(registered_buffer *regbuf,
-								XLogRecordBlockRemapHeader *rbmh)
+XLogFillBlockShiftFrontierUmbra(registered_buffer *regbuf,
+								XLogRecordBlockShiftHeader *rbsh)
 {
-	SMgrRelation	reln = regbuf->remap_reln;
+	SMgrRelation	reln = regbuf->shift_reln;
 	UmbraFileContext *ctx;
 	BlockNumber		logical_nblocks = InvalidBlockNumber;
-	BlockNumber		next_free_pblk = InvalidBlockNumber;
-	BlockNumber		chunk_capacity = InvalidBlockNumber;
-	bool			chunk_paired;
 
-	Assert(rbmh != NULL);
+	Assert(rbsh != NULL);
 
 	if (reln == NULL)
 		reln = smgropen(regbuf->rlocator, INVALID_PROC_NUMBER);
 
 	ctx = umfile_ctx_acquire(reln->smgr_rlocator);
-	chunk_paired = UmUsesChunkPairedTranslation(reln, regbuf->forkno);
 
 	if (MapSBlockTryGetLogicalNblocks(ctx, regbuf->rlocator,
 									  regbuf->forkno, &logical_nblocks))
-		rbmh->logical_nblocks = Max(logical_nblocks, regbuf->block + 1);
+		rbsh->logical_nblocks = Max(logical_nblocks, regbuf->block + 1);
 	else
-		rbmh->logical_nblocks = regbuf->block + 1;
+		rbsh->logical_nblocks = regbuf->block + 1;
 
-	if (chunk_paired &&
-		UmbraChunkPairedCapacityForPblk(regbuf->new_pblkno, &chunk_capacity))
-		rbmh->next_free_pblkno = chunk_capacity;
-	else if (MapSBlockTryGetNextFreePhysBlock(ctx, regbuf->rlocator,
-											  regbuf->forkno, &next_free_pblk))
-		rbmh->next_free_pblkno = Max(next_free_pblk, regbuf->new_pblkno + 1);
-	else
-		rbmh->next_free_pblkno = regbuf->new_pblkno + 1;
-
-	regbuf->remap_logical_nblocks = rbmh->logical_nblocks;
-	regbuf->remap_next_free_pblkno = rbmh->next_free_pblkno;
+	rbsh->shifted_to_shadow = regbuf->shifted_to_shadow;
+	regbuf->shift_logical_nblocks = rbsh->logical_nblocks;
 }
 
 static void
-XLogCommitBlockRemapsUmbra(XLogRecPtr record_endptr)
+XLogCommitBlockShiftsUmbra(XLogRecPtr record_endptr)
 {
 	int			block_id;
 
@@ -247,42 +232,35 @@ XLogCommitBlockRemapsUmbra(XLogRecPtr record_endptr)
 	{
 		registered_buffer *regbuf = &registered_buffers[block_id];
 		UmbraFileContext *ctx;
-		bool			chunk_paired;
+		BlockNumber	physical_nblocks;
 
-		if (!regbuf->in_use || !regbuf->has_remap || !regbuf->remap_in_record)
+		if (!regbuf->in_use || !regbuf->has_shift || !regbuf->shift_in_record)
 			continue;
-		if (regbuf->remap_reln == NULL)
+		if (regbuf->shift_reln == NULL)
 			continue;
 
-		ctx = umfile_ctx_acquire(regbuf->remap_reln->smgr_rlocator);
-		chunk_paired = UmUsesChunkPairedTranslation(regbuf->remap_reln,
-											regbuf->forkno);
+		ctx = umfile_ctx_acquire(regbuf->shift_reln->smgr_rlocator);
 
-		UmShiftSetActivePblkno(regbuf->remap_reln, regbuf->forkno, regbuf->block,
-						regbuf->new_pblkno, record_endptr);
-
-		if (chunk_paired &&
-			UmbraChunkPairedCapacityForPblk(regbuf->new_pblkno,
-											&regbuf->remap_next_free_pblkno))
+		UmShiftSetActiveSide(regbuf->shift_reln, regbuf->forkno, regbuf->block,
+							  regbuf->shifted_to_shadow, record_endptr);
+		if (UmbraChunkPairedPhysicalCapacity(regbuf->shift_logical_nblocks,
+											 &physical_nblocks) &&
+			physical_nblocks > 0)
 			MapSBlockBumpPhysicalNblocks(ctx,
 										 regbuf->rlocator,
 										 regbuf->forkno,
-										 regbuf->remap_next_free_pblkno,
+										 physical_nblocks,
 										 record_endptr);
-		else
-			MapSBlockBumpNextFreePhysBlock(ctx,
-										   regbuf->rlocator,
-										   regbuf->forkno,
-										   regbuf->remap_next_free_pblkno != InvalidBlockNumber ?
-										   regbuf->remap_next_free_pblkno :
-										   regbuf->new_pblkno + 1,
-										   record_endptr);
-		regbuf->remap_committed = true;
+		MapSBlockBumpLogicalNblocks(ctx, regbuf->rlocator,
+									regbuf->forkno,
+									regbuf->shift_logical_nblocks,
+									record_endptr);
+		regbuf->shift_committed = true;
 	}
 }
 
 static void
-XLogAbortBlockRemapsUmbra(void)
+XLogAbortBlockShiftsUmbra(void)
 {
 	int			block_id;
 
@@ -290,17 +268,17 @@ XLogAbortBlockRemapsUmbra(void)
 	{
 		registered_buffer *regbuf = &registered_buffers[block_id];
 
-		if (!regbuf->in_use || !regbuf->has_remap)
+		if (!regbuf->in_use || !regbuf->has_shift)
 			continue;
-		if (regbuf->remap_committed)
+		if (regbuf->shift_committed)
 			continue;
 
-		regbuf->remap_in_record = false;
+		regbuf->shift_in_record = false;
 	}
 }
 #else
 static void
-XLogCommitBlockRemapsMd(XLogRecPtr record_endptr)
+XLogInsertFinishMd(XLogRecPtr record_endptr)
 {
 	(void) record_endptr;
 }
@@ -389,21 +367,19 @@ XLogResetInsertion(void)
 	int			i;
 
 #ifdef USE_UMBRA
-	XLogAbortBlockRemapsUmbra();
+	XLogAbortBlockShiftsUmbra();
 #endif
 
 	for (i = 0; i < max_registered_block_id; i++)
 	{
 		registered_buffers[i].in_use = false;
 #ifdef USE_UMBRA
-		registered_buffers[i].has_remap = false;
-		registered_buffers[i].remap_in_record = false;
-		registered_buffers[i].remap_committed = false;
-		registered_buffers[i].remap_reln = NULL;
-		registered_buffers[i].old_pblkno = InvalidBlockNumber;
-		registered_buffers[i].new_pblkno = InvalidBlockNumber;
-		registered_buffers[i].remap_logical_nblocks = InvalidBlockNumber;
-		registered_buffers[i].remap_next_free_pblkno = InvalidBlockNumber;
+		registered_buffers[i].has_shift = false;
+		registered_buffers[i].shift_in_record = false;
+		registered_buffers[i].shift_committed = false;
+		registered_buffers[i].shift_reln = NULL;
+		registered_buffers[i].shifted_to_shadow = false;
+		registered_buffers[i].shift_logical_nblocks = InvalidBlockNumber;
 #endif
 	}
 
@@ -412,7 +388,7 @@ XLogResetInsertion(void)
 	mainrdata_len = 0;
 	mainrdata_last = (XLogRecData *) &mainrdata_head;
 	curinsert_flags = 0;
-	curinsert_has_block_remap = false;
+	curinsert_has_block_shift = false;
 	begininsert_called = false;
 }
 
@@ -462,14 +438,12 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
 	regbuf->rdata_tail = (XLogRecData *) &regbuf->rdata_head;
 	regbuf->rdata_len = 0;
 #ifdef USE_UMBRA
-	regbuf->has_remap = false;
-	regbuf->remap_in_record = false;
-	regbuf->remap_committed = false;
-	regbuf->remap_reln = NULL;
-	regbuf->old_pblkno = InvalidBlockNumber;
-	regbuf->new_pblkno = InvalidBlockNumber;
-	regbuf->remap_logical_nblocks = InvalidBlockNumber;
-	regbuf->remap_next_free_pblkno = InvalidBlockNumber;
+	regbuf->has_shift = false;
+	regbuf->shift_in_record = false;
+	regbuf->shift_committed = false;
+	regbuf->shift_reln = NULL;
+	regbuf->shifted_to_shadow = false;
+	regbuf->shift_logical_nblocks = InvalidBlockNumber;
 #endif
 
 	/*
@@ -525,14 +499,12 @@ XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator, ForkNumber forknum,
 	regbuf->rdata_tail = (XLogRecData *) &regbuf->rdata_head;
 	regbuf->rdata_len = 0;
 #ifdef USE_UMBRA
-	regbuf->has_remap = false;
-	regbuf->remap_in_record = false;
-	regbuf->remap_committed = false;
-	regbuf->remap_reln = NULL;
-	regbuf->old_pblkno = InvalidBlockNumber;
-	regbuf->new_pblkno = InvalidBlockNumber;
-	regbuf->remap_logical_nblocks = InvalidBlockNumber;
-	regbuf->remap_next_free_pblkno = InvalidBlockNumber;
+	regbuf->has_shift = false;
+	regbuf->shift_in_record = false;
+	regbuf->shift_committed = false;
+	regbuf->shift_reln = NULL;
+	regbuf->shifted_to_shadow = false;
+	regbuf->shift_logical_nblocks = InvalidBlockNumber;
 #endif
 
 	/*
@@ -729,7 +701,7 @@ XLogInsert(RmgrId rmid, uint8 info)
 														  &num_fpi, &fpi_bytes,
 														  &topxid_included);
 
-			if (curinsert_has_block_remap)
+			if (curinsert_has_block_shift)
 			{
 				START_CRIT_SECTION();
 				if ((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0)
@@ -742,7 +714,7 @@ XLogInsert(RmgrId rmid, uint8 info)
 			EndPos = XLogInsertRecord(rdt, fpw_lsn, curinsert_flags, num_fpi,
 									  fpi_bytes, topxid_included);
 
-			if (!XLogRecPtrIsValid(EndPos) && curinsert_has_block_remap)
+			if (!XLogRecPtrIsValid(EndPos) && curinsert_has_block_shift)
 			{
 				if (delay_chkp_start_set)
 					MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
@@ -752,7 +724,7 @@ XLogInsert(RmgrId rmid, uint8 info)
 
 		xlog_storage_mgr_f.xlog_insert_finish(EndPos);
 
-		if (curinsert_has_block_remap)
+		if (curinsert_has_block_shift)
 		{
 			if (delay_chkp_start_set)
 				MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
@@ -1259,7 +1231,7 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 	bool		needs_backup_by_block[XLR_MAX_BLOCK_ID + 1] = {0};
 	bool		needs_data_by_block[XLR_MAX_BLOCK_ID + 1] = {0};
 	bool		include_image_by_block[XLR_MAX_BLOCK_ID + 1] = {0};
-	bool		include_remap_by_block[XLR_MAX_BLOCK_ID + 1] = {0};
+	bool		include_shift_by_block[XLR_MAX_BLOCK_ID + 1] = {0};
 	registered_buffer *prev_regbuf = NULL;
 	XLogRecData *rdt_datas_last;
 	XLogRecord *rechdr;
@@ -1271,7 +1243,7 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 	hdr_rdt.next = NULL;
 	rdt_datas_last = &hdr_rdt;
 	hdr_rdt.data = hdr_scratch;
-	curinsert_has_block_remap = false;
+	curinsert_has_block_shift = false;
 
 	if (wal_consistency_checking[rmid])
 		info |= XLR_CHECK_CONSISTENCY;
@@ -1281,32 +1253,32 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 	{
 		registered_buffer *regbuf = &registered_buffers[block_id];
 		bool		needs_backup;
-		bool		needs_remap;
-		XLogRecordBlockRemapHeader rbmh;
+		bool		needs_shift;
+		XLogRecordBlockShiftHeader rbsh;
 		bool		include_image;
-		bool		include_remap = false;
-		bool		wal_owned_remap_available = false;
+		bool		include_shift = false;
+		bool		wal_owned_shift_available = false;
 		SMgrRelation reln = NULL;
 
 		if (!regbuf->in_use)
 			continue;
 
-		regbuf->remap_in_record = false;
+		regbuf->shift_in_record = false;
 
 		if (regbuf->flags & REGBUF_FORCE_IMAGE)
 		{
 			needs_backup = true;
-			needs_remap = false;
+			needs_shift = false;
 		}
 		else if (regbuf->flags & REGBUF_NO_IMAGE)
 		{
 			needs_backup = false;
-			needs_remap = false;
+			needs_shift = false;
 		}
 		else if (!doPageWrites)
 		{
 			needs_backup = false;
-			needs_remap = false;
+			needs_shift = false;
 		}
 		else
 		{
@@ -1315,65 +1287,53 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 			if (rmid != RM_XLOG_ID || info != XLOG_FPI_FOR_HINT)
 			{
 				reln = smgropen(regbuf->rlocator, INVALID_PROC_NUMBER);
-				regbuf->remap_reln = reln;
-				wal_owned_remap_available =
-					UmRemapWalOwnerAvailable(reln, regbuf->forkno);
+				regbuf->shift_reln = reln;
+				wal_owned_shift_available =
+					UmShiftWalOwnerAvailable(reln, regbuf->forkno);
 			}
 
-			if (!wal_owned_remap_available ||
+			if (!wal_owned_shift_available ||
 				(rmid == RM_XLOG_ID && info == XLOG_FPI_FOR_HINT))
 			{
 				needs_backup = (page_lsn <= RedoRecPtr);
-				needs_remap = false;
+				needs_shift = false;
 			}
 			else
 			{
 				needs_backup = false;
-				needs_remap = (page_lsn <= RedoRecPtr);
+				needs_shift = (page_lsn <= RedoRecPtr);
 			}
-			if (!needs_backup && !needs_remap)
+			if (!needs_backup && !needs_shift)
 			{
 				if (!XLogRecPtrIsValid(*fpw_lsn) || page_lsn < *fpw_lsn)
 					*fpw_lsn = page_lsn;
 			}
 		}
 
-		Assert(!(needs_backup && needs_remap));
+		Assert(!(needs_backup && needs_shift));
 
 		include_image = needs_backup || (info & XLR_CHECK_CONSISTENCY) != 0;
-		if (regbuf->has_remap)
-			include_remap = regbuf->has_remap;
-		else if (needs_remap)
+		if (regbuf->has_shift)
+			include_shift = regbuf->has_shift;
+		else if (needs_shift)
 		{
 			if (reln == NULL)
 			{
 				reln = smgropen(regbuf->rlocator, INVALID_PROC_NUMBER);
-				regbuf->remap_reln = reln;
+				regbuf->shift_reln = reln;
 			}
-			UmRemapGetTargetPblkno(reln, regbuf->forkno, regbuf->block,
-							 &regbuf->new_pblkno,
-							 &regbuf->old_pblkno);
+			regbuf->shifted_to_shadow =
+				UmShiftGetInactiveSide(reln, regbuf->forkno, regbuf->block);
 
-			regbuf->has_remap = true;
-			regbuf->remap_committed = false;
-			include_remap = true;
-
-			if (include_remap &&
-				regbuf->new_pblkno == regbuf->old_pblkno)
-				elog(PANIC,
-					 "remap decision produced unchanged pblk for %u/%u/%u fork %u block %u",
-					 regbuf->rlocator.spcOid,
-					 regbuf->rlocator.dbOid,
-					 regbuf->rlocator.relNumber,
-					 regbuf->forkno,
-					 regbuf->block);
+			regbuf->has_shift = true;
+			regbuf->shift_committed = false;
+			include_shift = true;
 		}
 
-		if (include_remap)
+		if (include_shift)
 		{
-			rbmh.old_pblkno = regbuf->old_pblkno;
-			rbmh.new_pblkno = regbuf->new_pblkno;
-			XLogFillBlockRemapFrontierUmbra(regbuf, &rbmh);
+			rbsh.shifted_to_shadow = regbuf->shifted_to_shadow;
+			XLogFillBlockShiftFrontierUmbra(regbuf, &rbsh);
 
 			if ((regbuf->flags & REGBUF_FORCE_IMAGE) == 0 &&
 				(info & XLR_CHECK_CONSISTENCY) == 0)
@@ -1385,11 +1345,11 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 		else if ((regbuf->flags & REGBUF_KEEP_DATA) != 0)
 			needs_data_by_block[block_id] = true;
 		else
-			needs_data_by_block[block_id] = (!needs_backup || include_remap);
+			needs_data_by_block[block_id] = (!needs_backup || include_shift);
 
 		needs_backup_by_block[block_id] = needs_backup;
 		include_image_by_block[block_id] = include_image;
-		include_remap_by_block[block_id] = include_remap;
+		include_shift_by_block[block_id] = include_shift;
 	}
 
 	for (block_id = 0; block_id < max_registered_block_id; block_id++)
@@ -1398,13 +1358,13 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 		bool		needs_backup;
 		bool		needs_data;
 		XLogRecordBlockHeader bkpb;
-		XLogRecordBlockRemapHeader rbmh;
+		XLogRecordBlockShiftHeader rbsh;
 		XLogRecordBlockImageHeader bimg;
 		XLogRecordBlockCompressHeader cbimg = {0};
 		bool		samerel;
 		bool		is_compressed = false;
 		bool		include_image;
-		bool		include_remap;
+		bool		include_shift;
 
 		if (!regbuf->in_use)
 			continue;
@@ -1412,9 +1372,9 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 		needs_backup = needs_backup_by_block[block_id];
 		needs_data = needs_data_by_block[block_id];
 		include_image = include_image_by_block[block_id];
-		include_remap = include_remap_by_block[block_id];
+		include_shift = include_shift_by_block[block_id];
 
-		regbuf->remap_in_record = false;
+		regbuf->shift_in_record = false;
 
 		bkpb.id = block_id;
 		bkpb.fork_flags = regbuf->forkno;
@@ -1423,11 +1383,11 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 		if ((regbuf->flags & REGBUF_WILL_INIT) == REGBUF_WILL_INIT)
 			bkpb.fork_flags |= BKPBLOCK_WILL_INIT;
 
-		if (include_remap)
+		if (include_shift)
 		{
-			bkpb.fork_flags |= BKPBLOCK_HAS_REMAP;
-			regbuf->remap_in_record = true;
-			curinsert_has_block_remap = true;
+			bkpb.fork_flags |= BKPBLOCK_HAS_SHIFT;
+			regbuf->shift_in_record = true;
+			curinsert_has_block_shift = true;
 		}
 
 		if (include_image)
@@ -1564,14 +1524,14 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 
 		memcpy(scratch, &bkpb, SizeOfXLogRecordBlockHeader);
 		scratch += SizeOfXLogRecordBlockHeader;
-		if (include_remap)
+		if (include_shift)
 		{
-			rbmh.old_pblkno = regbuf->old_pblkno;
-			rbmh.new_pblkno = regbuf->new_pblkno;
-			rbmh.logical_nblocks = regbuf->remap_logical_nblocks;
-			rbmh.next_free_pblkno = regbuf->remap_next_free_pblkno;
-			memcpy(scratch, &rbmh, SizeOfXLogRecordBlockRemapHeader);
-			scratch += SizeOfXLogRecordBlockRemapHeader;
+			rbsh.shifted_to_shadow = regbuf->shifted_to_shadow ? 1 : 0;
+			rbsh.logical_nblocks = regbuf->shift_logical_nblocks;
+			memcpy(scratch, &rbsh.shifted_to_shadow, sizeof(uint8));
+			scratch += sizeof(uint8);
+			memcpy(scratch, &rbsh.logical_nblocks, sizeof(BlockNumber));
+			scratch += sizeof(BlockNumber);
 		}
 		if (include_image)
 		{

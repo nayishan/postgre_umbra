@@ -383,27 +383,11 @@ XLogRecGetBlockRefInfo(XLogReaderState *record, bool pretty,
 			}
 
 #ifdef USE_UMBRA
-			if (blkref->has_remap)
-			{
-				uint8		remap_format =
-					XLogRecGetInfo(record) & XLR_UMBRA_REMAP_FORMAT_MASK;
-
-				if (remap_format != 0)
-				{
-					appendStringInfo(buf,
-									 "; remap: unsupported format bits 0x%02X",
-									 remap_format);
-				}
-				else
-				{
-					appendStringInfo(buf,
-									 "; remap: old_pblk %u new_pblk %u logical_nblocks %u next_free_pblk %u",
-									 blkref->old_pblkno,
-									 blkref->new_pblkno,
-									 blkref->logical_nblocks,
-									 blkref->next_free_pblkno);
-				}
-			}
+			if (blkref->has_shift)
+				appendStringInfo(buf,
+								 "; shift: shifted_to_shadow %s logical_nblocks %u",
+								 blkref->shifted_to_shadow ? "true" : "false",
+								 blkref->logical_nblocks);
 #endif
 
 			if (pretty)

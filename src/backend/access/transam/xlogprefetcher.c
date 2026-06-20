@@ -657,6 +657,15 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 			if (!block->in_use)
 				continue;
 
+#ifdef USE_UMBRA
+			if (block->has_shift)
+			{
+				block->prefetch_buffer = InvalidBuffer;
+				*lsn = record->lsn;
+				return LRQ_NEXT_NO_IO;
+			}
+#endif
+
 			Assert(!BufferIsValid(block->prefetch_buffer));
 
 			/*

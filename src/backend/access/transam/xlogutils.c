@@ -113,19 +113,12 @@ static XLogRedoAction XLogReadBufferForRedoExtendedUmbra(XLogReaderState *record
 														bool get_cleanup_lock,
 														Buffer *buf);
 static uint8 XLogUmbraMapStateForRedo(SMgrRelation smgr, ForkNumber forknum);
-static bool XLogUmbraEnsureMappedBlockForRedo(RelFileLocator rlocator,
-											  ForkNumber forknum,
-											  BlockNumber blkno);
 static bool XLogUmbraEnsureMetadataForRedo(RelFileLocator rlocator,
 										   ForkNumber forknum);
 static bool XLogUmbraPrepareLogicalBirthForRedo(RelFileLocator rlocator,
 												ForkNumber forknum,
 												BlockNumber blkno,
 												XLogRecPtr lsn);
-static void XLogUmbraLockRedoBuffer(Buffer buf, ReadBufferMode mode,
-									bool get_cleanup_lock);
-static inline bool XLogBlockRemapRedoImageEnabled(void);
-static inline bool XLogBlockRemapRedoNoImageEnabled(void);
 #endif
 
 /* Report a reference to an invalid page */
@@ -429,25 +422,6 @@ XLogCheckInvalidPages(void)
 }
 
 #ifdef USE_UMBRA
-static inline bool
-XLogBlockRemapRedoImageEnabled(void)
-{
-	/*
-	 * Phase-1: close remap+image redo first.
-	 * This path is deterministic and does not require old->new baseline switch.
-	 */
-	return true;
-}
-
-static inline bool
-XLogBlockRemapRedoNoImageEnabled(void)
-{
-	/*
-	 * No-image remap redo uses deterministic old->new baseline handoff.
-	 */
-	return true;
-}
-
 /*
  * Redo is an owner point for handle-local Umbra MAP state.
  *
@@ -472,37 +446,6 @@ XLogUmbraMapStateForRedo(SMgrRelation smgr, ForkNumber forknum)
 		return UMBRA_MAP_POLICY_SKIP_WAL_PENDING_MAP;
 
 	return UMBRA_MAP_POLICY_REQUIRE_MAP;
-}
-
-/*
- * For mapped forks, redo must not silently invent local mappings.
- * Missing mapping source is treated as an invalid-page reference.
- */
-static bool
-XLogUmbraEnsureMappedBlockForRedo(RelFileLocator rlocator, ForkNumber forknum,
-								  BlockNumber blkno)
-{
-	SMgrRelation smgr;
-	BlockNumber	pblkno;
-
-	if (forknum == INIT_FORKNUM || smgrisinternalfork(forknum))
-		return true;
-
-	smgr = smgropen(rlocator, INVALID_PROC_NUMBER);
-
-	if (!UmMetadataExists(smgr))
-	{
-		XLogLogMissingRelationMetadata(rlocator);
-		return false;
-	}
-
-	if (!UmTranslationTryLookupPblkno(smgr, forknum, blkno, &pblkno))
-	{
-		log_invalid_page(rlocator, forknum, blkno, false);
-		return false;
-	}
-
-	return true;
 }
 
 static bool
@@ -541,6 +484,7 @@ XLogUmbraPrepareLogicalBirthForRedo(RelFileLocator rlocator, ForkNumber forknum,
 	smgr = smgropen(rlocator, INVALID_PROC_NUMBER);
 	if (!UmUsesChunkPairedTranslation(smgr, forknum))
 		return true;
+	smgrcreate(smgr, forknum, true);
 
 	ctx = umfile_ctx_acquire(smgr->smgr_rlocator);
 	if (MapSBlockTryGetLogicalNblocks(ctx, rlocator, forknum,
@@ -572,17 +516,6 @@ XLogUmbraPrepareLogicalBirthForRedo(RelFileLocator rlocator, ForkNumber forknum,
 	return true;
 }
 
-static void
-XLogUmbraLockRedoBuffer(Buffer buf, ReadBufferMode mode, bool get_cleanup_lock)
-{
-	if (mode == RBM_ZERO_AND_LOCK || mode == RBM_ZERO_AND_CLEANUP_LOCK)
-		return;
-
-	if (get_cleanup_lock)
-		LockBufferForCleanup(buf);
-	else
-		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-}
 #endif
 
 
@@ -728,11 +661,11 @@ XLogReadBufferForRedoExtendedMd(XLogReaderState *record,
 	}
 
 	*buf = XLogReadBufferExtended(rlocator, forknum, blkno, mode, prefetch_buffer);
-	if (BufferIsValid(*buf))
-	{
-		if (mode != RBM_ZERO_AND_LOCK && mode != RBM_ZERO_AND_CLEANUP_LOCK)
+		if (BufferIsValid(*buf))
 		{
-			if (get_cleanup_lock)
+			if (mode != RBM_ZERO_AND_LOCK && mode != RBM_ZERO_AND_CLEANUP_LOCK)
+			{
+				if (get_cleanup_lock)
 				LockBufferForCleanup(*buf);
 			else
 				LockBuffer(*buf, BUFFER_LOCK_EXCLUSIVE);
@@ -761,10 +694,12 @@ XLogReadBufferForRedoExtendedUmbra(XLogReaderState *record,
 	Page		page;
 	bool		zeromode;
 	bool		willinit;
-	bool		has_remap;
+	bool		has_shift;
 	bool		has_image;
+	bool		set_shift_after_read = false;
+	bool		redo_source_override = false;
 	DecodedBkpBlock *blk;
-	SMgrRelation remap_smgr = NULL;
+	SMgrRelation shift_smgr = NULL;
 
 	if (!XLogRecGetBlockTagExtended(record, block_id, &rlocator, &forknum, &blkno,
 									&prefetch_buffer))
@@ -783,100 +718,63 @@ XLogReadBufferForRedoExtendedUmbra(XLogReaderState *record,
 		elog(PANIC, "block to be initialized in redo routine must be marked with WILL_INIT flag in the WAL record");
 
 	blk = XLogRecGetBlock(record, block_id);
-	has_remap = XLogRecBlockHasRemap(record, block_id);
+	has_shift = XLogRecBlockHasShift(record, block_id);
 	has_image = XLogRecBlockImageApply(record, block_id);
-
-	if (!has_remap)
-	{
-		if (!XLogUmbraEnsureMetadataForRedo(rlocator, forknum))
-			return BLK_NOTFOUND;
-		if ((has_image || zeromode) &&
-			!XLogUmbraPrepareLogicalBirthForRedo(rlocator, forknum,
-												 blkno, lsn))
-			return BLK_NOTFOUND;
-
-		if (has_image)
-		{
-			Assert(XLogRecHasBlockImage(record, block_id));
-			*buf = XLogReadBufferExtended(rlocator, forknum, blkno,
-										  get_cleanup_lock ? RBM_ZERO_AND_CLEANUP_LOCK : RBM_ZERO_AND_LOCK,
-										  prefetch_buffer);
-			page = BufferGetPage(*buf);
-			if (!RestoreBlockImage(record, block_id, page))
-				ereport(ERROR,
-						(errcode(ERRCODE_INTERNAL_ERROR),
-						 errmsg_internal("%s", record->errormsg_buf)));
-
-			if (!PageIsNew(page))
-				PageSetLSN(page, lsn);
-
-			MarkBufferDirty(*buf);
-			if (forknum == INIT_FORKNUM)
-				FlushOneBuffer(*buf);
-
-			return BLK_RESTORED;
-		}
-
-		*buf = XLogReadBufferExtended(rlocator, forknum, blkno, mode,
-									  prefetch_buffer);
-		if (BufferIsValid(*buf))
-		{
-			if (mode != RBM_ZERO_AND_LOCK && mode != RBM_ZERO_AND_CLEANUP_LOCK)
-			{
-				if (get_cleanup_lock)
-					LockBufferForCleanup(*buf);
-				else
-					LockBuffer(*buf, BUFFER_LOCK_EXCLUSIVE);
-			}
-			if (lsn <= PageGetLSN(BufferGetPage(*buf)))
-				return BLK_DONE;
-			return BLK_NEEDS_REDO;
-		}
-		return BLK_NOTFOUND;
-	}
 
 	if (!XLogUmbraEnsureMetadataForRedo(rlocator, forknum))
 		return BLK_NOTFOUND;
-	remap_smgr = smgropen(rlocator, INVALID_PROC_NUMBER);
-	if (blk->old_pblkno == InvalidBlockNumber)
-		elog(PANIC,
-			 "remap WAL record has invalid old pblk for %u/%u/%u fork %d block %u",
-			 rlocator.spcOid, rlocator.dbOid, rlocator.relNumber,
-			 forknum, blkno);
+
+	if (has_shift)
+	{
+		SMgrRelation smgr = smgropen(rlocator, INVALID_PROC_NUMBER);
+		UmbraFileContext *ctx = umfile_ctx_acquire(smgr->smgr_rlocator);
+		BlockNumber physical_nblocks;
+
+		smgrcreate(smgr, forknum, true);
+		if (!UmbraChunkPairedPhysicalCapacity(blk->logical_nblocks,
+											 &physical_nblocks))
+			elog(PANIC,
+				 "chunk-paired physical capacity overflow during redo for relation %u/%u/%u fork %d logical blocks %u",
+				 rlocator.spcOid, rlocator.dbOid, rlocator.relNumber,
+				 forknum, blk->logical_nblocks);
+		if (physical_nblocks > 0 &&
+			!MapSBlockEnsurePhysicalNblocks(ctx, rlocator, forknum,
+											physical_nblocks,
+											true /* skipFsync */))
+			return BLK_NOTFOUND;
+		MapSBlockBumpLogicalNblocks(ctx, rlocator, forknum,
+									blk->logical_nblocks, lsn);
+		smgrbumpcachednblocks(smgr, forknum, blk->logical_nblocks);
+
+		if (has_image || zeromode)
+			UmShiftSetActiveSide(smgr, forknum, blkno,
+								  blk->shifted_to_shadow, lsn);
+		else
+		{
+			/*
+			 * WAL stores the new active bit.  Redo without an FPI must read
+			 * the old page from the opposite side before publishing it.
+			 */
+			shift_smgr = smgr;
+			set_shift_after_read = true;
+			UmRedoBeginShiftSourceSide(smgr, forknum, blkno,
+									   !blk->shifted_to_shadow);
+			redo_source_override = true;
+		}
+	}
+	else if ((has_image || zeromode ||
+			  (mode == RBM_ZERO_ON_ERROR &&
+			   UmbraForkIsAuxiliaryMapped(forknum))) &&
+			 !XLogUmbraPrepareLogicalBirthForRedo(rlocator, forknum,
+												  blkno, lsn))
+		return BLK_NOTFOUND;
 
 	if (has_image)
 	{
-		UmbraFileContext *ctx = umfile_ctx_acquire(remap_smgr->smgr_rlocator);
-		BlockNumber redo_next_free_pblkno;
-
-		if (!XLogBlockRemapRedoImageEnabled())
-			elog(PANIC,
-				 "encountered remap-with-image WAL record before phase-1 redo is enabled for %u/%u/%u fork %d block %u",
-				 rlocator.spcOid, rlocator.dbOid, rlocator.relNumber,
-				 forknum, blkno);
-
-		redo_next_free_pblkno =
-			(blk->next_free_pblkno != InvalidBlockNumber) ?
-			blk->next_free_pblkno : blk->new_pblkno + 1;
-
-		UmShiftSetActivePblkno(remap_smgr, forknum, blkno, blk->new_pblkno, lsn);
-		if (UmUsesChunkPairedTranslation(remap_smgr, forknum) &&
-			UmbraChunkPairedCapacityForPblk(blk->new_pblkno,
-											&redo_next_free_pblkno))
-			MapSBlockBumpPhysicalNblocks(ctx, rlocator,
-										 forknum, redo_next_free_pblkno,
-										 lsn);
-		else
-			MapSBlockBumpNextFreePhysBlock(ctx, rlocator,
-										   forknum, redo_next_free_pblkno,
-										   lsn);
-		if (!XLogUmbraEnsureMappedBlockForRedo(rlocator, forknum, blkno))
-			return BLK_NOTFOUND;
-
 		Assert(XLogRecHasBlockImage(record, block_id));
 		*buf = XLogReadBufferExtended(rlocator, forknum, blkno,
 									  get_cleanup_lock ? RBM_ZERO_AND_CLEANUP_LOCK : RBM_ZERO_AND_LOCK,
-									  prefetch_buffer);
+										  prefetch_buffer);
 		page = BufferGetPage(*buf);
 		if (!RestoreBlockImage(record, block_id, page))
 			ereport(ERROR,
@@ -893,79 +791,42 @@ XLogReadBufferForRedoExtendedUmbra(XLogReaderState *record,
 		return BLK_RESTORED;
 	}
 
-	if (!XLogBlockRemapRedoNoImageEnabled())
-		elog(PANIC,
-			 "encountered remap-without-image WAL record before phase-2 redo is enabled for %u/%u/%u fork %d block %u",
-			 rlocator.spcOid, rlocator.dbOid, rlocator.relNumber,
-			 forknum, blkno);
-
-	if (zeromode)
-	{
-		UmbraFileContext *ctx = umfile_ctx_acquire(remap_smgr->smgr_rlocator);
-		BlockNumber redo_next_free_pblkno;
-
-		Assert(willinit);
-
-		redo_next_free_pblkno =
-			(blk->next_free_pblkno != InvalidBlockNumber) ?
-			blk->next_free_pblkno : blk->new_pblkno + 1;
-
-		UmShiftSetActivePblkno(remap_smgr, forknum, blkno, blk->new_pblkno, lsn);
-		if (UmUsesChunkPairedTranslation(remap_smgr, forknum) &&
-			UmbraChunkPairedCapacityForPblk(blk->new_pblkno,
-											&redo_next_free_pblkno))
-			MapSBlockBumpPhysicalNblocks(ctx, rlocator,
-										 forknum, redo_next_free_pblkno,
-										 lsn);
-		else
-			MapSBlockBumpNextFreePhysBlock(ctx, rlocator,
-										   forknum, redo_next_free_pblkno,
-										   lsn);
-		if (!XLogUmbraEnsureMappedBlockForRedo(rlocator, forknum, blkno))
-			return BLK_NOTFOUND;
-
-		*buf = XLogReadBufferExtended(rlocator, forknum, blkno, mode,
-									  prefetch_buffer);
-		if (BufferIsValid(*buf))
-			return BLK_NEEDS_REDO;
-		return BLK_NOTFOUND;
-	}
-
-	Assert(!willinit);
-	UmShiftSetActivePblkno(remap_smgr, forknum, blkno, blk->old_pblkno, lsn);
-	if (!XLogUmbraEnsureMappedBlockForRedo(rlocator, forknum, blkno))
-		return BLK_NOTFOUND;
-
 	*buf = XLogReadBufferExtended(rlocator, forknum, blkno, mode,
 								  prefetch_buffer);
-	if (!BufferIsValid(*buf))
-		return BLK_NOTFOUND;
-
-	XLogUmbraLockRedoBuffer(*buf, mode, get_cleanup_lock);
-	MarkBufferDirty(*buf);
-	FlushOneBuffer(*buf);
-
-	UmShiftSetActivePblkno(remap_smgr, forknum, blkno, blk->new_pblkno, lsn);
-	if (blk->next_free_pblkno != InvalidBlockNumber)
+	if (redo_source_override)
 	{
-		UmbraFileContext *ctx = umfile_ctx_acquire(remap_smgr->smgr_rlocator);
-		BlockNumber redo_phys_capacity;
-
-		if (UmUsesChunkPairedTranslation(remap_smgr, forknum) &&
-			UmbraChunkPairedCapacityForPblk(blk->new_pblkno,
-											&redo_phys_capacity))
-			MapSBlockBumpPhysicalNblocks(ctx, rlocator,
-										 forknum, redo_phys_capacity,
-										 lsn);
-		else
-			MapSBlockBumpNextFreePhysBlock(ctx, rlocator,
-										   forknum, blk->next_free_pblkno,
-										   lsn);
+		UmRedoEndShiftSourceSide();
+		redo_source_override = false;
+	}
+	if (BufferIsValid(*buf))
+	{
+		if (mode != RBM_ZERO_AND_LOCK && mode != RBM_ZERO_AND_CLEANUP_LOCK)
+		{
+			if (get_cleanup_lock)
+				LockBufferForCleanup(*buf);
+			else
+				LockBuffer(*buf, BUFFER_LOCK_EXCLUSIVE);
+		}
+		if (set_shift_after_read)
+			UmShiftSetActiveSide(shift_smgr, forknum, blkno,
+								  blk->shifted_to_shadow, lsn);
+		if (has_shift)
+		{
+			/*
+			 * Match shadow redo: after reading the old side, publish the new
+			 * bit and materialize that page in the new side before replay.
+			 */
+			MarkBufferDirty(*buf);
+			FlushOneBuffer(*buf);
+		}
+		if (lsn <= PageGetLSN(BufferGetPage(*buf)))
+			return BLK_DONE;
+		return BLK_NEEDS_REDO;
 	}
 
-	if (lsn <= PageGetLSN(BufferGetPage(*buf)))
-		return BLK_DONE;
-	return BLK_NEEDS_REDO;
+	if (redo_source_override)
+		UmRedoEndShiftSourceSide();
+	return BLK_NOTFOUND;
 }
 #endif
 

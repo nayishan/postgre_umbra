@@ -1163,7 +1163,7 @@ umfile_unlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 
 	/*
 	 * Keep all MAP segments physically intact until checkpoint-time unlink, so
-	 * remap-related lookup state is preserved throughout the checkpoint window.
+	 * shift-bitmap state is preserved throughout the checkpoint window.
 	 */
 	if (!isRedo &&
 		!RelFileLocatorBackendIsTemp(rlocator) &&
