@@ -48,7 +48,8 @@ extern void umfile_ctx_write(UmbraFileContext *ctx, ForkNumber forknum, BlockNum
 extern void umfile_ctx_extend(UmbraFileContext *ctx, ForkNumber forknum, BlockNumber blkno,
 							  const char *buffer);
 extern bool umfile_ctx_preallocate_blocks(UmbraFileContext *ctx, ForkNumber forknum,
-										  BlockNumber target_nblocks);
+										  BlockNumber target_nblocks,
+										  bool skipFsync);
 extern void umfile_ctx_prefetch(UmbraFileContext *ctx, ForkNumber forknum, BlockNumber blkno);
 extern bool umfile_ctx_block_exists(UmbraFileContext *ctx, ForkNumber forknum,
 									BlockNumber blkno);

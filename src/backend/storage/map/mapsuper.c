@@ -1194,15 +1194,18 @@ retry:
 
 		for (;;)
 		{
-			if (!umfile_ctx_block_exists(map_ctx, forknum, desired - 1))
+			if (!umfile_ctx_preallocate_blocks(map_ctx, forknum, desired,
+											   skipFsync) &&
+				!umfile_ctx_block_exists(map_ctx, forknum, desired - 1))
 			{
 				PGIOAlignedBlock zero_buffer = {0};
 
 				/*
-				 * Ensure the file EOF covers the published physical capacity.
-				 * Sparse holes read back as zeroes, so writing the final block
-				 * is enough to avoid later EOF/short reads without forcing
-				 * every intervening page through the foreground extension path.
+				 * Fall back to making EOF cover the published physical capacity
+				 * when the platform cannot preallocate the range. Sparse holes
+				 * read back as zeroes, so writing the final block is enough to
+				 * avoid later EOF/short reads without forcing every intervening
+				 * page through the foreground extension path.
 				 */
 				umfile_extend(map_ctx, forknum, desired - 1,
 							  zero_buffer.data, skipFsync);
