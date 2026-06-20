@@ -118,6 +118,10 @@ static bool XLogUmbraEnsureMappedBlockForRedo(RelFileLocator rlocator,
 											  BlockNumber blkno);
 static bool XLogUmbraEnsureMetadataForRedo(RelFileLocator rlocator,
 										   ForkNumber forknum);
+static bool XLogUmbraPrepareLogicalBirthForRedo(RelFileLocator rlocator,
+												ForkNumber forknum,
+												BlockNumber blkno,
+												XLogRecPtr lsn);
 static void XLogUmbraLockRedoBuffer(Buffer buf, ReadBufferMode mode,
 									bool get_cleanup_lock);
 static inline bool XLogBlockRemapRedoImageEnabled(void);
@@ -492,10 +496,8 @@ XLogUmbraEnsureMappedBlockForRedo(RelFileLocator rlocator, ForkNumber forknum,
 		return false;
 	}
 
-	if (!UmMapTryLookupPblkno(smgr, forknum, blkno, &pblkno))
+	if (!UmTranslationTryLookupPblkno(smgr, forknum, blkno, &pblkno))
 	{
-		if (UmMapIsLogicalUnmaterialized(smgr, forknum, blkno))
-			return true;
 		log_invalid_page(rlocator, forknum, blkno, false);
 		return false;
 	}
@@ -521,6 +523,52 @@ XLogUmbraEnsureMetadataForRedo(RelFileLocator rlocator, ForkNumber forknum)
 	if (!UmMetadataExists(smgr))
 		smgrcreaterelationmetadata(smgr);
 
+	return true;
+}
+
+static bool
+XLogUmbraPrepareLogicalBirthForRedo(RelFileLocator rlocator, ForkNumber forknum,
+									BlockNumber blkno, XLogRecPtr lsn)
+{
+	SMgrRelation smgr;
+	UmbraFileContext *ctx;
+	BlockNumber logical_nblocks;
+	BlockNumber physical_nblocks;
+
+	if (forknum == INIT_FORKNUM || smgrisinternalfork(forknum))
+		return true;
+
+	smgr = smgropen(rlocator, INVALID_PROC_NUMBER);
+	if (!UmUsesChunkPairedTranslation(smgr, forknum))
+		return true;
+
+	ctx = umfile_ctx_acquire(smgr->smgr_rlocator);
+	if (MapSBlockTryGetLogicalNblocks(ctx, rlocator, forknum,
+									  &logical_nblocks) &&
+		blkno < logical_nblocks)
+		return true;
+
+	if (blkno == MaxBlockNumber)
+		elog(PANIC,
+			 "logical block overflow during redo for relation %u/%u/%u fork %d block %u",
+			 rlocator.spcOid, rlocator.dbOid, rlocator.relNumber,
+			 forknum, blkno);
+
+	logical_nblocks = blkno + 1;
+	if (!UmbraChunkPairedPhysicalCapacity(logical_nblocks, &physical_nblocks))
+		elog(PANIC,
+			 "chunk-paired physical capacity overflow during redo for relation %u/%u/%u fork %d block %u",
+			 rlocator.spcOid, rlocator.dbOid, rlocator.relNumber,
+			 forknum, blkno);
+
+	if (!MapSBlockEnsurePhysicalNblocks(ctx, rlocator, forknum,
+										physical_nblocks,
+										true /* skipFsync */))
+		return false;
+
+	MapSBlockBumpLogicalNblocks(ctx, rlocator, forknum,
+								logical_nblocks, lsn);
+	smgrbumpcachednblocks(smgr, forknum, logical_nblocks);
 	return true;
 }
 
@@ -742,6 +790,10 @@ XLogReadBufferForRedoExtendedUmbra(XLogReaderState *record,
 	{
 		if (!XLogUmbraEnsureMetadataForRedo(rlocator, forknum))
 			return BLK_NOTFOUND;
+		if ((has_image || zeromode) &&
+			!XLogUmbraPrepareLogicalBirthForRedo(rlocator, forknum,
+												 blkno, lsn))
+			return BLK_NOTFOUND;
 
 		if (has_image)
 		{
@@ -786,11 +838,15 @@ XLogReadBufferForRedoExtendedUmbra(XLogReaderState *record,
 	if (!XLogUmbraEnsureMetadataForRedo(rlocator, forknum))
 		return BLK_NOTFOUND;
 	remap_smgr = smgropen(rlocator, INVALID_PROC_NUMBER);
+	if (blk->old_pblkno == InvalidBlockNumber)
+		elog(PANIC,
+			 "remap WAL record has invalid old pblk for %u/%u/%u fork %d block %u",
+			 rlocator.spcOid, rlocator.dbOid, rlocator.relNumber,
+			 forknum, blkno);
 
 	if (has_image)
 	{
 		UmbraFileContext *ctx = umfile_ctx_acquire(remap_smgr->smgr_rlocator);
-		BlockNumber redo_logical_nblocks;
 		BlockNumber redo_next_free_pblkno;
 
 		if (!XLogBlockRemapRedoImageEnabled())
@@ -799,15 +855,12 @@ XLogReadBufferForRedoExtendedUmbra(XLogReaderState *record,
 				 rlocator.spcOid, rlocator.dbOid, rlocator.relNumber,
 				 forknum, blkno);
 
-		redo_logical_nblocks =
-			(blk->logical_nblocks != InvalidBlockNumber) ?
-			blk->logical_nblocks : blkno + 1;
 		redo_next_free_pblkno =
 			(blk->next_free_pblkno != InvalidBlockNumber) ?
 			blk->next_free_pblkno : blk->new_pblkno + 1;
 
-		UmMapSetMapping(remap_smgr, forknum, blkno, blk->new_pblkno, lsn);
-		if (UmMapUsesChunkPaired(remap_smgr, forknum) &&
+		UmShiftSetActivePblkno(remap_smgr, forknum, blkno, blk->new_pblkno, lsn);
+		if (UmUsesChunkPairedTranslation(remap_smgr, forknum) &&
 			UmbraChunkPairedCapacityForPblk(blk->new_pblkno,
 											&redo_next_free_pblkno))
 			MapSBlockBumpPhysicalNblocks(ctx, rlocator,
@@ -817,13 +870,6 @@ XLogReadBufferForRedoExtendedUmbra(XLogReaderState *record,
 			MapSBlockBumpNextFreePhysBlock(ctx, rlocator,
 										   forknum, redo_next_free_pblkno,
 										   lsn);
-		if (blk->old_pblkno == InvalidBlockNumber)
-		{
-			MapSBlockBumpLogicalNblocks(ctx, rlocator,
-										forknum, redo_logical_nblocks,
-										lsn);
-			smgrbumpcachednblocks(remap_smgr, forknum, blkno + 1);
-		}
 		if (!XLogUmbraEnsureMappedBlockForRedo(rlocator, forknum, blkno))
 			return BLK_NOTFOUND;
 
@@ -856,20 +902,16 @@ XLogReadBufferForRedoExtendedUmbra(XLogReaderState *record,
 	if (zeromode)
 	{
 		UmbraFileContext *ctx = umfile_ctx_acquire(remap_smgr->smgr_rlocator);
-		BlockNumber redo_logical_nblocks;
 		BlockNumber redo_next_free_pblkno;
 
 		Assert(willinit);
 
-		redo_logical_nblocks =
-			(blk->logical_nblocks != InvalidBlockNumber) ?
-			blk->logical_nblocks : blkno + 1;
 		redo_next_free_pblkno =
 			(blk->next_free_pblkno != InvalidBlockNumber) ?
 			blk->next_free_pblkno : blk->new_pblkno + 1;
 
-		UmMapSetMapping(remap_smgr, forknum, blkno, blk->new_pblkno, lsn);
-		if (UmMapUsesChunkPaired(remap_smgr, forknum) &&
+		UmShiftSetActivePblkno(remap_smgr, forknum, blkno, blk->new_pblkno, lsn);
+		if (UmUsesChunkPairedTranslation(remap_smgr, forknum) &&
 			UmbraChunkPairedCapacityForPblk(blk->new_pblkno,
 											&redo_next_free_pblkno))
 			MapSBlockBumpPhysicalNblocks(ctx, rlocator,
@@ -879,13 +921,6 @@ XLogReadBufferForRedoExtendedUmbra(XLogReaderState *record,
 			MapSBlockBumpNextFreePhysBlock(ctx, rlocator,
 										   forknum, redo_next_free_pblkno,
 										   lsn);
-		if (blk->old_pblkno == InvalidBlockNumber)
-		{
-			MapSBlockBumpLogicalNblocks(ctx, rlocator,
-										forknum, redo_logical_nblocks,
-										lsn);
-			smgrbumpcachednblocks(remap_smgr, forknum, blkno + 1);
-		}
 		if (!XLogUmbraEnsureMappedBlockForRedo(rlocator, forknum, blkno))
 			return BLK_NOTFOUND;
 
@@ -897,13 +932,7 @@ XLogReadBufferForRedoExtendedUmbra(XLogReaderState *record,
 	}
 
 	Assert(!willinit);
-	if (blk->old_pblkno == InvalidBlockNumber)
-		elog(PANIC,
-			 "remap-without-image record has invalid old pblk for %u/%u/%u fork %d block %u",
-			 rlocator.spcOid, rlocator.dbOid, rlocator.relNumber,
-			 forknum, blkno);
-
-	UmMapSetMapping(remap_smgr, forknum, blkno, blk->old_pblkno, lsn);
+	UmShiftSetActivePblkno(remap_smgr, forknum, blkno, blk->old_pblkno, lsn);
 	if (!XLogUmbraEnsureMappedBlockForRedo(rlocator, forknum, blkno))
 		return BLK_NOTFOUND;
 
@@ -916,13 +945,13 @@ XLogReadBufferForRedoExtendedUmbra(XLogReaderState *record,
 	MarkBufferDirty(*buf);
 	FlushOneBuffer(*buf);
 
-	UmMapSetMapping(remap_smgr, forknum, blkno, blk->new_pblkno, lsn);
+	UmShiftSetActivePblkno(remap_smgr, forknum, blkno, blk->new_pblkno, lsn);
 	if (blk->next_free_pblkno != InvalidBlockNumber)
 	{
 		UmbraFileContext *ctx = umfile_ctx_acquire(remap_smgr->smgr_rlocator);
 		BlockNumber redo_phys_capacity;
 
-		if (UmMapUsesChunkPaired(remap_smgr, forknum) &&
+		if (UmUsesChunkPairedTranslation(remap_smgr, forknum) &&
 			UmbraChunkPairedCapacityForPblk(blk->new_pblkno,
 											&redo_phys_capacity))
 			MapSBlockBumpPhysicalNblocks(ctx, rlocator,

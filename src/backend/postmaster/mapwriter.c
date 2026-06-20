@@ -40,7 +40,6 @@
 
 int			MapWriterDelay = 200;
 int			MapWriterMaxPages = 100;
-int			MapWriterPreallocMaxRelations = 32;
 double		MapWriterLRUMultiplier = 2.0;
 
 static void
@@ -131,15 +130,12 @@ MapWriterMain(Datum arg)
 		uint32		recent_alloc = 0;
 		int			target_pages = 0;
 		int			cleaned = 0;
-		int			prealloc_ops = 0;
 		bool		can_hibernate = false;
 
 		ResetLatch(MyLatch);
 		ProcessMainLoopInterrupts();
 
 		(void) MapSyncStart(NULL, &recent_alloc);
-		if (recent_alloc > 0 && MapWriterPreallocMaxRelations > 0)
-			prealloc_ops = MapPreallocStep(MapWriterPreallocMaxRelations);
 
 		if (MapWriterMaxPages > 0)
 		{
@@ -160,8 +156,7 @@ MapWriterMain(Datum arg)
 		}
 
 		can_hibernate = (recent_alloc == 0 &&
-						 cleaned == 0 &&
-						 prealloc_ops == 0);
+						 cleaned == 0);
 
 		if (FirstCallSinceLastCheckpoint())
 			smgrreleaseall();

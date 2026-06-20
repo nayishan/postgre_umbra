@@ -95,7 +95,6 @@ typedef struct
 	bool		has_remap;		/* true if remap metadata is prepared */
 	bool		remap_in_record; /* true if current assembled record includes remap */
 	bool		remap_committed; /* true if mapping switch was committed after insert */
-	bool		wal_owns_firstborn; /* this WAL block owns first-born mapping */
 	SMgrRelation remap_reln;	/* cached relation handle for remap commit */
 	BlockNumber old_pblkno;		/* remap: old physical block number */
 	BlockNumber new_pblkno;		/* remap: new physical block number */
@@ -218,7 +217,7 @@ XLogFillBlockRemapFrontierUmbra(registered_buffer *regbuf,
 		reln = smgropen(regbuf->rlocator, INVALID_PROC_NUMBER);
 
 	ctx = umfile_ctx_acquire(reln->smgr_rlocator);
-	chunk_paired = UmMapUsesChunkPaired(reln, regbuf->forkno);
+	chunk_paired = UmUsesChunkPairedTranslation(reln, regbuf->forkno);
 
 	if (MapSBlockTryGetLogicalNblocks(ctx, regbuf->rlocator,
 									  regbuf->forkno, &logical_nblocks))
@@ -256,24 +255,11 @@ XLogCommitBlockRemapsUmbra(XLogRecPtr record_endptr)
 			continue;
 
 		ctx = umfile_ctx_acquire(regbuf->remap_reln->smgr_rlocator);
-		chunk_paired = UmMapUsesChunkPaired(regbuf->remap_reln,
+		chunk_paired = UmUsesChunkPairedTranslation(regbuf->remap_reln,
 											regbuf->forkno);
 
-		UmMapSetMapping(regbuf->remap_reln, regbuf->forkno, regbuf->block,
+		UmShiftSetActivePblkno(regbuf->remap_reln, regbuf->forkno, regbuf->block,
 						regbuf->new_pblkno, record_endptr);
-		if (regbuf->old_pblkno == InvalidBlockNumber)
-		{
-			MapSBlockBumpLogicalNblocks(ctx,
-										regbuf->rlocator,
-										regbuf->forkno,
-										regbuf->remap_logical_nblocks != InvalidBlockNumber ?
-										regbuf->remap_logical_nblocks :
-										regbuf->block + 1,
-										record_endptr);
-			smgrbumpcachednblocks(regbuf->remap_reln,
-								  regbuf->forkno,
-								  regbuf->block + 1);
-		}
 
 		if (chunk_paired &&
 			UmbraChunkPairedCapacityForPblk(regbuf->new_pblkno,
@@ -291,9 +277,6 @@ XLogCommitBlockRemapsUmbra(XLogRecPtr record_endptr)
 										   regbuf->remap_next_free_pblkno :
 										   regbuf->new_pblkno + 1,
 										   record_endptr);
-		MapInflightRelease(regbuf->rlocator, regbuf->forkno,
-						   regbuf->block);
-		regbuf->wal_owns_firstborn = false;
 		regbuf->remap_committed = true;
 	}
 }
@@ -312,9 +295,6 @@ XLogAbortBlockRemapsUmbra(void)
 		if (regbuf->remap_committed)
 			continue;
 
-		MapInflightRelease(regbuf->rlocator, regbuf->forkno,
-						   regbuf->block);
-		regbuf->wal_owns_firstborn = false;
 		regbuf->remap_in_record = false;
 	}
 }
@@ -419,7 +399,6 @@ XLogResetInsertion(void)
 		registered_buffers[i].has_remap = false;
 		registered_buffers[i].remap_in_record = false;
 		registered_buffers[i].remap_committed = false;
-		registered_buffers[i].wal_owns_firstborn = false;
 		registered_buffers[i].remap_reln = NULL;
 		registered_buffers[i].old_pblkno = InvalidBlockNumber;
 		registered_buffers[i].new_pblkno = InvalidBlockNumber;
@@ -486,7 +465,6 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
 	regbuf->has_remap = false;
 	regbuf->remap_in_record = false;
 	regbuf->remap_committed = false;
-	regbuf->wal_owns_firstborn = false;
 	regbuf->remap_reln = NULL;
 	regbuf->old_pblkno = InvalidBlockNumber;
 	regbuf->new_pblkno = InvalidBlockNumber;
@@ -550,7 +528,6 @@ XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator, ForkNumber forknum,
 	regbuf->has_remap = false;
 	regbuf->remap_in_record = false;
 	regbuf->remap_committed = false;
-	regbuf->wal_owns_firstborn = false;
 	regbuf->remap_reln = NULL;
 	regbuf->old_pblkno = InvalidBlockNumber;
 	regbuf->new_pblkno = InvalidBlockNumber;
@@ -1315,7 +1292,6 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 			continue;
 
 		regbuf->remap_in_record = false;
-		regbuf->wal_owns_firstborn = false;
 
 		if (regbuf->flags & REGBUF_FORCE_IMAGE)
 		{
@@ -1341,7 +1317,7 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 				reln = smgropen(regbuf->rlocator, INVALID_PROC_NUMBER);
 				regbuf->remap_reln = reln;
 				wal_owned_remap_available =
-					UmWalOwnedRemapAvailable(reln, regbuf->forkno);
+					UmRemapWalOwnerAvailable(reln, regbuf->forkno);
 			}
 
 			if (!wal_owned_remap_available ||
@@ -1364,47 +1340,6 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 
 		Assert(!(needs_backup && needs_remap));
 
-		if (!regbuf->has_remap &&
-			(regbuf->flags & REGBUF_LOGICAL_BIRTH) != 0)
-		{
-			bool		got_mapping;
-
-			if (reln == NULL)
-			{
-				reln = smgropen(regbuf->rlocator, INVALID_PROC_NUMBER);
-				regbuf->remap_reln = reln;
-			}
-			if (!UmWalOwnedFirstbornAvailable(reln, regbuf->forkno,
-											 regbuf->block))
-				goto remap_birth_done;
-
-			/*
-			 * For WAL-owned first-born, the producer must have already created
-			 * any needed birth claim through smgrextend()/smgrzeroextend().
-			 *
-			 * We first probe committed MAP state. If the mapping is still
-			 * private to this backend, UmMapReserveFreshPbkno() must reuse the
-			 * owner-local in-flight claim instead of reserving a second pblk.
-			 *
-			 * Keep this order aligned with bulk_write.c: claim birth first,
-			 * then let page WAL own the final commit of that same claim.
-			 */
-			got_mapping = UmMapTryLookupPblkno(reln, regbuf->forkno,
-											  regbuf->block,
-											  &regbuf->new_pblkno);
-			if (!got_mapping)
-			{
-				UmMapReserveFreshPbkno(reln, regbuf->forkno,
-									   regbuf->block,
-									   &regbuf->new_pblkno);
-				regbuf->old_pblkno = InvalidBlockNumber;
-				regbuf->has_remap = true;
-				regbuf->remap_committed = false;
-			}
-	remap_birth_done:
-			;
-		}
-
 		include_image = needs_backup || (info & XLR_CHECK_CONSISTENCY) != 0;
 		if (regbuf->has_remap)
 			include_remap = regbuf->has_remap;
@@ -1415,7 +1350,7 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 				reln = smgropen(regbuf->rlocator, INVALID_PROC_NUMBER);
 				regbuf->remap_reln = reln;
 			}
-			UmMapGetNewPbkno(reln, regbuf->forkno, regbuf->block,
+			UmRemapGetTargetPblkno(reln, regbuf->forkno, regbuf->block,
 							 &regbuf->new_pblkno,
 							 &regbuf->old_pblkno);
 
@@ -1480,7 +1415,6 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 		include_remap = include_remap_by_block[block_id];
 
 		regbuf->remap_in_record = false;
-		regbuf->wal_owns_firstborn = false;
 
 		bkpb.id = block_id;
 		bkpb.fork_flags = regbuf->forkno;
@@ -1916,7 +1850,7 @@ log_newpage(RelFileLocator *rlocator, ForkNumber forknum, BlockNumber blkno,
 	int			flags;
 	XLogRecPtr	recptr;
 
-	flags = REGBUF_FORCE_IMAGE | REGBUF_LOGICAL_BIRTH;
+	flags = REGBUF_FORCE_IMAGE;
 	if (page_std)
 		flags |= REGBUF_STANDARD;
 
@@ -1950,7 +1884,7 @@ log_newpages(RelFileLocator *rlocator, ForkNumber forknum, int num_pages,
 	int			i;
 	int			j;
 
-	flags = REGBUF_FORCE_IMAGE | REGBUF_LOGICAL_BIRTH;
+	flags = REGBUF_FORCE_IMAGE;
 	if (page_std)
 		flags |= REGBUF_STANDARD;
 
@@ -2044,7 +1978,7 @@ log_newpage_range(Relation rel, ForkNumber forknum,
 	int			flags;
 	BlockNumber blkno;
 
-	flags = REGBUF_FORCE_IMAGE | REGBUF_LOGICAL_BIRTH;
+	flags = REGBUF_FORCE_IMAGE;
 	if (page_std)
 		flags |= REGBUF_STANDARD;
 

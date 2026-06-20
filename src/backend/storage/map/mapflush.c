@@ -229,7 +229,7 @@ MapPreCheckpoint(void)
 }
 
 /*
- * MapCheckpoint - sync dirty map pages during checkpoint
+ * MapCheckpoint - sync dirty metadata buffer pages during checkpoint
  *
  * Scans all buffer slots and writes dirty pages to disk.
  * Must handle concurrent access from other backends.
@@ -238,9 +238,9 @@ void
 MapCheckpoint(void)
 {
 	/*
-	 * Checkpoint ordering: persist regular MAP pages first, then superblocks.
+	 * Checkpoint ordering: persist shift bitmap pages first, then superblocks.
 	 * This keeps on-disk superblock as a checkpoint-boundary snapshot and
-	 * avoids it getting ahead of mapping-page durability.
+	 * avoids it getting ahead of shift-page durability.
 	 */
 	(void) MapFlushDirtyBuffers(-1, true);
 	(void) MapFlushDirtySuperblocks();
@@ -354,7 +354,7 @@ MapBgWriterFlush(int max_pages)
 	if (max_pages <= 0)
 		return 0;
 
-	/* mapwriter flushes regular MAP pages only; superblock is checkpoint-owned. */
+	/* mapwriter flushes shift bitmap pages only; superblock is checkpoint-owned. */
 	return MapFlushDirtyBuffers(max_pages, false);
 }
 

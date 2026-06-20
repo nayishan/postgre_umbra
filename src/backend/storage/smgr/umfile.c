@@ -189,7 +189,7 @@ umfile_ctx_ensure_fork(UmbraFileContext *ctx, ForkNumber forknum)
 		umfile_create(ctx, forknum, false /* isRedo */ );
 }
 
-static void
+void
 umfile_ctx_ensure_block_exists(UmbraFileContext *ctx, ForkNumber forknum,
 							   BlockNumber blkno)
 {
@@ -1506,6 +1506,7 @@ umfile_zeroextend(UmbraFileContext *ctx, ForkNumber forknum, BlockNumber blocknu
 	Assert(ctx != NULL);
 	rlocator = ctx->rlocator;
 	isTempRelation = RelFileLocatorBackendIsTemp(rlocator);
+	umfile_ctx_ensure_fork(ctx, forknum);
 
 	while (nblocks > 0)
 	{

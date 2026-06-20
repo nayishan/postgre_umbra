@@ -33,17 +33,13 @@
 #define REGBUF_NO_IMAGE		0x02	/* don't take a full-page image */
 #define REGBUF_WILL_INIT	(0x04 | 0x02)	/* page will be re-initialized at
 											 * replay (implies NO_IMAGE) */
-#define REGBUF_WILL_INIT_BIRTH \
-	(REGBUF_WILL_INIT | REGBUF_LOGICAL_BIRTH)
+#define REGBUF_WILL_INIT_BIRTH REGBUF_WILL_INIT
 #define REGBUF_STANDARD		0x08	/* page follows "standard" page layout,
 									 * (data between pd_lower and pd_upper
 									 * will be skipped) */
 #define REGBUF_KEEP_DATA	0x10	/* include data even if a full-page image
 									 * is taken */
 #define REGBUF_NO_CHANGE	0x20	/* intentionally register clean buffer */
-#define REGBUF_LOGICAL_BIRTH 0x40 /* this record publishes a logical page
-									 * birth/rebirth mapping */
-
 /* prototypes for public functions in xloginsert.c: */
 extern void XLogBeginInsert(void);
 extern void XLogSetRecordFlags(uint8 flags);

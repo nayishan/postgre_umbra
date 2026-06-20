@@ -656,9 +656,8 @@ RelFileLocatorSkippingWAL(RelFileLocator rlocator)
  *
  * A relfilenode can emit fresh page images for block 0 later in the same
  * transaction after XLOG_SMGR_TRUNCATE has already been inserted. Recovery
- * replays the truncate first and therefore sees no surviving old mapping, so
- * producer-side first-born mapping logic must treat any still-visible local
- * pre-truncate mapping as stale in that case.
+ * replays the truncate first, so producer-side storage logic must treat any
+ * still-visible local pre-truncate state as stale in that case.
  */
 bool
 RelFileLocatorWasTruncated(RelFileLocator rlocator)

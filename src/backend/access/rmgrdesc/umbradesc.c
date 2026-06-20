@@ -23,49 +23,13 @@ umbra_metadata_relpath(RelFileLocator rlocator)
 	return path;
 }
 
-static RelPathStr
-umbra_fork_relpath(RelFileLocator rlocator, ForkNumber forknum)
-{
-	if (forknum == UMBRA_METADATA_FORKNUM)
-		return umbra_metadata_relpath(rlocator);
-
-	return relpathperm(rlocator, forknum);
-}
-
 void
 umbra_desc(StringInfo buf, XLogReaderState *record)
 {
 	char	   *rec = XLogRecGetData(record);
 	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
 
-	if (info == XLOG_UMBRA_MAP_SET)
-	{
-		xl_umbra_map_set *xlrec = (xl_umbra_map_set *) rec;
-		RelPathStr	path = umbra_fork_relpath(xlrec->rlocator, xlrec->forknum);
-
-		appendStringInfo(buf, "%s lblk %u old %u new %u",
-						 path.str, xlrec->lblkno, xlrec->old_pblkno,
-						 xlrec->new_pblkno);
-	}
-	else if (info == XLOG_UMBRA_RANGE_REMAP)
-	{
-		xl_umbra_range_remap *xlrec = (xl_umbra_range_remap *) rec;
-		RelPathStr	path = umbra_fork_relpath(xlrec->rlocator, xlrec->forknum);
-
-		appendStringInfo(buf, "%s count %u end_lblk %u",
-						 path.str, xlrec->count, xlrec->end_lblkno);
-	}
-	else if (info == XLOG_UMBRA_RANGE_REMAP_COMPACT)
-	{
-		xl_umbra_range_remap_compact *xlrec =
-			(xl_umbra_range_remap_compact *) rec;
-		RelPathStr	path = umbra_fork_relpath(xlrec->rlocator, xlrec->forknum);
-
-		appendStringInfo(buf, "%s compact first_lblk %u first_pblk %u count %u",
-						 path.str, xlrec->first_lblkno, xlrec->first_pblkno,
-						 xlrec->count);
-	}
-	else if (info == XLOG_UMBRA_SKIP_WAL_DENSE_MAP)
+	if (info == XLOG_UMBRA_SKIP_WAL_DENSE_MAP)
 	{
 		xl_umbra_skip_wal_dense_map *xlrec =
 			(xl_umbra_skip_wal_dense_map *) rec;
@@ -87,15 +51,6 @@ umbra_identify(uint8 info)
 
 	switch (info & ~XLR_INFO_MASK)
 	{
-		case XLOG_UMBRA_MAP_SET:
-			id = "MAP_SET";
-			break;
-		case XLOG_UMBRA_RANGE_REMAP:
-			id = "RANGE_REMAP";
-			break;
-		case XLOG_UMBRA_RANGE_REMAP_COMPACT:
-			id = "RANGE_REMAP_COMPACT";
-			break;
 		case XLOG_UMBRA_SKIP_WAL_DENSE_MAP:
 			id = "SKIP_WAL_CHUNK_BASE";
 			break;

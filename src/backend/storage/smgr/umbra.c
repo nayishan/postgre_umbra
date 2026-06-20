@@ -84,15 +84,6 @@ typedef enum UmbraAccessResolveResult
 	UMBRA_ACCESS_RESOLVED_SKIP
 } UmbraAccessResolveResult;
 
-typedef struct UmbraMappedBirthResult
-{
-	BlockNumber pblkno;
-	bool		mapping_published;
-} UmbraMappedBirthResult;
-
-#define UMBRA_WRITE_BARRIER_WAIT_RETRIES 10000
-#define UMBRA_WRITE_BARRIER_WAIT_USEC 1000
-
 static inline UmbraRelationState *
 um_state_lookup(SMgrRelation reln)
 {
@@ -169,20 +160,16 @@ static UmbraMapPolicy um_map_policy_for_access(SMgrRelation reln,
 												   ForkNumber forknum);
 static UmbraAccessState um_classify_access(SMgrRelation reln,
 										   ForkNumber forknum);
-static void um_report_unmapped_map_entry(SMgrRelation reln,
-										 ForkNumber forknum,
-										 const UmbraAccessState *access,
-										 BlockNumber lblkno);
+static void um_report_legacy_entry_map_path(SMgrRelation reln,
+											ForkNumber forknum,
+											const UmbraAccessState *access,
+											BlockNumber lblkno);
 static BlockNumber umnblocks_for_access(SMgrRelation reln, ForkNumber forknum,
 										const UmbraAccessState *access);
 static bool um_lblk_precedes_logical_eof_for_access(SMgrRelation reln,
 													ForkNumber forknum,
 													const UmbraAccessState *access,
 													UmbraAccessLookupState *lookup_state,
-													BlockNumber lblkno);
-static bool um_is_logical_unmaterialized_for_access(SMgrRelation reln,
-													ForkNumber forknum,
-													const UmbraAccessState *access,
 													BlockNumber lblkno);
 static UmbraAccessResolveResult um_resolve_lblk_for_access(SMgrRelation reln,
 														   ForkNumber forknum,
@@ -216,13 +203,7 @@ static void um_ensure_datafork_batch_ready_for_access(SMgrRelation reln,
 													  const UmbraAccessState *access,
 													  BlockNumber pblkno,
 													  bool skipFsync);
-static void um_reserve_fresh_pblkno_for_access(SMgrRelation reln,
-											   ForkNumber forknum,
-											   const UmbraAccessState *access,
-											   BlockNumber lblkno,
-											   BlockNumber *new_pblkno);
 static bool um_fork_uses_map_translation(ForkNumber forknum);
-static bool um_fork_uses_wal_owned_firstborn(ForkNumber forknum);
 static bool um_mapped_exists_from_super(SMgrRelation reln, ForkNumber forknum);
 static UmbraMapPolicy um_open_map_state(SMgrRelation reln);
 static bool um_state_uses_map(UmbraMapPolicy state);
@@ -230,11 +211,10 @@ static bool um_state_uses_chunk_base(UmbraMapPolicy state);
 static bool um_state_uses_chunk_direct_base(UmbraMapPolicy state);
 static bool um_state_requires_durable_sync(UmbraMapPolicy state);
 static bool um_relation_requires_durable_sync(SMgrRelation reln);
-static UmbraMappedBirthResult um_publish_mapped_birth(SMgrRelation reln,
-													  ForkNumber forknum,
-													  const UmbraAccessState *access,
-													  BlockNumber lblkno,
-													  bool allow_wal_owned_firstborn);
+static BlockNumber um_prepare_mapped_birth(SMgrRelation reln,
+										   ForkNumber forknum,
+										   const UmbraAccessState *access,
+										   BlockNumber lblkno);
 static void um_filetag_path(const FileTag *ftag, char *path);
 static BlockNumber um_chunk_base_pblk_checked(SMgrRelation reln,
 											  ForkNumber forknum,
@@ -365,9 +345,8 @@ um_ensure_datafork_batch_ready_for_access(SMgrRelation reln,
 						reln->smgr_rlocator.locator.relNumber,
 						forknum)));
 
-	if (um_state_uses_chunk_base(access->policy) &&
-		!umfile_ctx_block_exists(ctx, forknum, pblkno))
-		umfile_zeroextend(ctx, forknum, pblkno, 1, skipFsync);
+	if (um_state_uses_chunk_base(access->policy))
+		umfile_ctx_ensure_block_exists(ctx, forknum, pblkno);
 	else
 		(void) MapSBlockEnsurePhysicalNblocks(ctx,
 											  reln->smgr_rlocator.locator,
@@ -375,82 +354,12 @@ um_ensure_datafork_batch_ready_for_access(SMgrRelation reln,
 											  skipFsync);
 }
 
-void
-UmApplyReservedRangeRemap(SMgrRelation reln, ForkNumber forknum,
-						  BlockNumber firstblock, BlockNumber nblocks,
-						  const BlockNumber *pblknos,
-						  XLogRecPtr lsn, bool skipFsync)
-{
-	UmbraFileContext *ctx = um_ctx_acquire(reln);
-	BlockNumber max_lblkno;
-	BlockNumber max_pblkno = InvalidBlockNumber;
-
-	Assert(nblocks > 0);
-	Assert(pblknos != NULL);
-
-	max_lblkno = firstblock + nblocks - 1;
-	if (max_lblkno < firstblock)
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("logical range overflow for relation %u/%u/%u fork %d",
-						reln->smgr_rlocator.locator.spcOid,
-						reln->smgr_rlocator.locator.dbOid,
-						reln->smgr_rlocator.locator.relNumber,
-						forknum)));
-
-	for (BlockNumber i = 0; i < nblocks; i++)
-	{
-		BlockNumber pblk = pblknos[i];
-
-		if (max_pblkno == InvalidBlockNumber || pblk > max_pblkno)
-			max_pblkno = pblk;
-	}
-
-	if (max_pblkno != InvalidBlockNumber)
-	{
-		(void) MapSBlockEnsurePhysicalNblocks(ctx, reln->smgr_rlocator.locator,
-											  forknum, max_pblkno + 1, skipFsync);
-	}
-
-	for (BlockNumber i = 0; i < nblocks; i++)
-	{
-		BlockNumber lblk = firstblock + i;
-		BlockNumber pblk = pblknos[i];
-
-		MapSetMapping(ctx, reln->smgr_rlocator.locator, forknum, lblk, pblk, lsn);
-	}
-
-	if (max_pblkno != InvalidBlockNumber)
-	{
-		MapSBlockBumpNextFreePhysBlock(ctx, reln->smgr_rlocator.locator,
-									   forknum, max_pblkno + 1, lsn);
-		MapSBlockBumpPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
-									 forknum, max_pblkno + 1, lsn);
-		for (BlockNumber i = 0; i < nblocks; i++)
-			MapInflightRelease(reln->smgr_rlocator.locator, forknum,
-							   firstblock + i);
-	}
-	MapSBlockBumpLogicalNblocks(ctx, reln->smgr_rlocator.locator,
-									forknum, max_lblkno + 1, lsn);
-}
-
-bool
-umapplyreservedrange(SMgrRelation reln, ForkNumber forknum,
-					 BlockNumber firstblock, BlockNumber nblocks,
-					 const BlockNumber *pblknos,
-					 XLogRecPtr lsn, bool skipFsync)
-{
-	UmApplyReservedRangeRemap(reln, forknum, firstblock, nblocks,
-							  pblknos, lsn, skipFsync);
-	return true;
-}
-
 /*
- * Create and initialize MAP fork for a relation.
+ * Create and initialize the Umbra metadata fork for a relation.
  *
- * Keep creation O(1): create/open the MAP fork and write only the superblock
- * sector. Regular MAP pages are synthesized on first access and written
- * lazily by the MAP layer.
+ * Keep creation O(1): create/open the metadata fork and write only the
+ * superblock sector. Shift bitmap pages are synthesized on first access and
+ * written lazily by the MAP layer.
  */
 
 static void
@@ -460,12 +369,12 @@ ummapcreate(SMgrRelation reln)
 	bool		newly_created;
 
 	/*
-	 * Open existing MAP fork or create new one. During redo, EEXIST is
+	 * Open existing metadata fork or create a new one. During redo, EEXIST is
 	 * acceptable and we reuse the existing file.
 	 */
 	UmMetadataOpenOrCreate(reln, true /* isRedo */, &newly_created);
 
-	/* Existing MAP fork does not need re-initialization. */
+	/* Existing metadata fork does not need re-initialization. */
 	if (!newly_created)
 		return;
 
@@ -653,20 +562,6 @@ um_fork_uses_map_translation(ForkNumber forknum)
 	return UmbraForkUsesMapTranslation(forknum);
 }
 
-/*
- * MAIN fork is the only one that uses page-WAL-owned first-born remap.
- *
- * FSM/VM growth is much more structured: their extend/truncate producers are
- * concentrated in a few helper paths, so we keep them on explicit mapping
- * publication rather than tying first-born ownership to arbitrary page WAL.
- */
-static bool
-um_fork_uses_wal_owned_firstborn(ForkNumber forknum)
-{
-	return UmbraForkUsesMapTranslation(forknum) &&
-		!UmbraForkIsAuxiliaryMapped(forknum);
-}
-
 static bool
 um_mapped_exists_from_super(SMgrRelation reln, ForkNumber forknum)
 {
@@ -810,12 +705,12 @@ um_chunk_active_pblk_checked(SMgrRelation reln, ForkNumber forknum,
 							 BlockNumber lblkno)
 {
 	UmbraFileContext *ctx = um_ctx_acquire(reln);
-	bool		shadow_active = false;
+	bool		shifted_to_shadow = false;
 
-	(void) MapActiveBitmapGet(ctx, reln->smgr_rlocator.locator,
-							  forknum, lblkno, &shadow_active);
+	(void) UmbraShiftGet(ctx, reln->smgr_rlocator.locator,
+							  forknum, lblkno, &shifted_to_shadow);
 
-	if (shadow_active)
+	if (shifted_to_shadow)
 		return um_chunk_shadow_pblk_checked(reln, forknum, lblkno);
 	return um_chunk_base_pblk_checked(reln, forknum, lblkno);
 }
@@ -825,14 +720,14 @@ um_chunk_inactive_pblk_checked(SMgrRelation reln, ForkNumber forknum,
 							   BlockNumber lblkno, BlockNumber *active_pblkno)
 {
 	UmbraFileContext *ctx = um_ctx_acquire(reln);
-	bool		shadow_active = false;
+	bool		shifted_to_shadow = false;
 	BlockNumber active_pblk;
 	BlockNumber inactive_pblk;
 
-	(void) MapActiveBitmapGet(ctx, reln->smgr_rlocator.locator,
-							  forknum, lblkno, &shadow_active);
+	(void) UmbraShiftGet(ctx, reln->smgr_rlocator.locator,
+							  forknum, lblkno, &shifted_to_shadow);
 
-	if (shadow_active)
+	if (shifted_to_shadow)
 	{
 		active_pblk = um_chunk_shadow_pblk_checked(reln, forknum, lblkno);
 		inactive_pblk = um_chunk_base_pblk_checked(reln, forknum, lblkno);
@@ -892,16 +787,12 @@ um_ensure_chunk_physical_capacity(SMgrRelation reln, ForkNumber forknum,
 }
 
 static void
-um_report_unmapped_map_entry(SMgrRelation reln, ForkNumber forknum,
-							 const UmbraAccessState *access,
-							 BlockNumber lblkno)
+um_report_legacy_entry_map_path(SMgrRelation reln, ForkNumber forknum,
+								const UmbraAccessState *access,
+								BlockNumber lblkno)
 {
 	UmbraFileContext *ctx = um_ctx_acquire(reln);
 	BlockNumber logical_nblocks = InvalidBlockNumber;
-	BlockNumber map_blkno;
-	BlockNumber fork_page_idx;
-	int			entry_idx;
-	uint64		blkno64;
 
 	Assert(access->map_available);
 
@@ -909,54 +800,18 @@ um_report_unmapped_map_entry(SMgrRelation reln, ForkNumber forknum,
 										 reln->smgr_rlocator.locator,
 										 forknum, &logical_nblocks);
 
-	fork_page_idx = lblkno / MAP_ENTRIES_PER_PAGE;
-	entry_idx = lblkno % MAP_ENTRIES_PER_PAGE;
-
-	switch (forknum)
-	{
-		case FSM_FORKNUM:
-			blkno64 = (uint64) MAP_BLOCK_FIRST_GROUP +
-				(uint64) fork_page_idx * (uint64) MAP_GROUP_TOTAL_PAGES;
-			break;
-
-		case VISIBILITYMAP_FORKNUM:
-			blkno64 = (uint64) MAP_BLOCK_FIRST_GROUP +
-				(uint64) fork_page_idx * (uint64) MAP_GROUP_TOTAL_PAGES +
-				(uint64) MAP_GROUP_FSM_PAGES;
-			break;
-
-		case MAIN_FORKNUM:
-		{
-			uint64 group_page_idx = (uint64) fork_page_idx;
-			uint64 group_no = group_page_idx / (uint64) MAP_GROUP_MAIN_PAGES;
-
-			blkno64 = (uint64) MAP_BLOCK_FIRST_GROUP +
-				group_no * (uint64) MAP_GROUP_TOTAL_PAGES +
-				(uint64) MAP_GROUP_FSM_PAGES +
-				(uint64) MAP_GROUP_VM_PAGES +
-				(group_page_idx % (uint64) MAP_GROUP_MAIN_PAGES);
-			break;
-		}
-
-		default:
-			elog(ERROR, "unsupported fork number %d in map miss report",
-				 (int) forknum);
-			pg_unreachable();
-	}
-
-	map_blkno = (BlockNumber) blkno64;
-
 	ereport(ERROR,
 			(errcode(ERRCODE_DATA_CORRUPTED),
-			 errmsg("MAP entry is unmapped: rel=%u/%u/%u fork=%d lblk=%u logical_nblocks=%u map_page=%u entry_idx=%d",
+			 errmsg("legacy entry-map path reached in chunk-paired Umbra relation %u/%u/%u fork %d block %u",
 					reln->smgr_rlocator.locator.spcOid,
 					reln->smgr_rlocator.locator.dbOid,
 					reln->smgr_rlocator.locator.relNumber,
 					forknum,
-					lblkno,
-					logical_nblocks,
-					map_blkno,
-					entry_idx)));
+					lblkno),
+			 errdetail("policy=%d map_available=%s logical_nblocks=%u",
+					   (int) access->policy,
+					   access->map_available ? "true" : "false",
+					   logical_nblocks)));
 }
 
 /*
@@ -982,7 +837,6 @@ UmRebuildMapAndSuperblockForSkipWAL(SMgrRelation reln)
 	 */
 	Assert(RelFileLocatorSkippingWAL(reln->smgr_rlocator.locator));
 
-	MapInvalidateRelation(reln->smgr_rlocator.locator);
 	Assert(UmMetadataExists(reln));
 
 	for (ForkNumber forknum = MAIN_FORKNUM; forknum <= VISIBILITYMAP_FORKNUM; forknum++)
@@ -1011,6 +865,13 @@ UmRebuildMapAndSuperblockForSkipWAL(SMgrRelation reln)
 		}
 	}
 
+	/*
+	 * Capture skip-WAL frontiers before invalidating relation metadata.  During
+	 * the skip-WAL window, logical EOF exists only in the shared superblock entry
+	 * until this durable-transition rebuild persists it.
+	 */
+	MapInvalidateRelation(reln->smgr_rlocator.locator);
+
 	wal_insert_enabled =
 		XLogInsertAllowed() &&
 		!IsBootstrapProcessingMode() &&
@@ -1036,14 +897,12 @@ UmRebuildMapAndSuperblockForSkipWAL(SMgrRelation reln)
 		XLogRecPtr	fork_lsn = nblocks > 0 ? map_lsn : InvalidXLogRecPtr;
 		BlockNumber physical_nblocks;
 
-		for (BlockNumber lblk = 0; lblk < nblocks; lblk++)
-		{
-			BlockNumber pblk = um_chunk_base_pblk_checked(reln, forknum, lblk);
-
-			MapSetMapping(ctx, reln->smgr_rlocator.locator, forknum,
-						  lblk, pblk, fork_lsn);
-		}
-
+		/*
+		 * Chunk-paired base slots are formula-derived.  Dense skip-WAL
+		 * transition records only need to make the frontiers durable; the
+		 * shift bitmap's all-zero default means every logical block remains
+		 * on its base slot until a later remap flips the bit.
+		 */
 		physical_nblocks =
 			um_chunk_physical_capacity_checked(reln, forknum, nblocks);
 
@@ -1064,6 +923,13 @@ UmRebuildMapAndSuperblockForSkipWAL(SMgrRelation reln)
 			MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 		END_CRIT_SECTION();
 	}
+
+	/*
+	 * The durable transition publishes metadata just like the old entry-map
+	 * path did: after rebuild, relation-local metadata must be visible through
+	 * the _map fork, not only through shared MAP caches.
+	 */
+	MapCheckpointRelation(reln->smgr_rlocator.locator);
 }
 
 void
@@ -1128,83 +994,6 @@ um_lblk_precedes_logical_eof_for_access(SMgrRelation reln, ForkNumber forknum,
 	return lblkno < logical_nblocks;
 }
 
-static bool
-um_is_logical_unmaterialized_for_access(SMgrRelation reln, ForkNumber forknum,
-										const UmbraAccessState *access,
-										BlockNumber lblkno)
-{
-	UmbraFileContext *ctx = um_ctx_acquire(reln);
-	BlockNumber pblkno;
-
-	if (!um_lblk_precedes_logical_eof_for_access(reln, forknum, access, NULL,
-												 lblkno))
-		return false;
-
-	if (um_state_uses_chunk_base(access->policy))
-		return false;
-
-	return !MapTryLookup(ctx, reln->smgr_rlocator.locator,
-						 forknum, lblkno, &pblkno);
-}
-
-static void
-um_reserve_fresh_pblkno_for_access(SMgrRelation reln, ForkNumber forknum,
-								   const UmbraAccessState *access,
-								   BlockNumber lblkno,
-								   BlockNumber *new_pblkno)
-{
-	UmbraFileContext *ctx = um_ctx_acquire(reln);
-
-	Assert(new_pblkno != NULL);
-
-	if (um_state_uses_chunk_direct_base(access->policy))
-	{
-		*new_pblkno = um_chunk_base_pblk_checked(reln, forknum, lblkno);
-		return;
-	}
-
-	if (um_state_uses_chunk_base(access->policy))
-	{
-		if (MapInflightLookupOwnedPblk(reln->smgr_rlocator.locator,
-									   forknum, lblkno, new_pblkno))
-			return;
-
-		if (!MapInflightTryClaim(ctx, reln->smgr_rlocator.locator,
-								 forknum, lblkno))
-		{
-			if (MapInflightLookupOwnedPblk(reln->smgr_rlocator.locator,
-										   forknum, lblkno, new_pblkno))
-				return;
-			elog(ERROR,
-				 "failed to claim chunk-paired first-born block for relation %u/%u/%u fork %d blk %u",
-				 reln->smgr_rlocator.locator.spcOid,
-				 reln->smgr_rlocator.locator.dbOid,
-				 reln->smgr_rlocator.locator.relNumber,
-				 forknum, lblkno);
-		}
-
-		*new_pblkno = um_chunk_base_pblk_checked(reln, forknum, lblkno);
-		MapInflightFinishClaim(reln->smgr_rlocator.locator, forknum,
-							   lblkno, *new_pblkno);
-		return;
-	}
-
-	if (!access->map_available)
-	{
-		*new_pblkno = lblkno;
-		return;
-	}
-
-	if (!MapReserveFreshPblkno(ctx, reln->smgr_rlocator.locator,
-							   forknum, lblkno, new_pblkno))
-		elog(ERROR,
-			 "failed to reserve fresh physical block for relation %u/%u/%u fork %d blk %u",
-			 reln->smgr_rlocator.locator.spcOid,
-			 reln->smgr_rlocator.locator.dbOid,
-			 reln->smgr_rlocator.locator.relNumber,
-				 forknum, lblkno);
-}
-
 static UmbraAccessResolveResult
 um_resolve_lblk_for_read(SMgrRelation reln, ForkNumber forknum,
 						 const UmbraAccessState *access,
@@ -1236,7 +1025,7 @@ um_resolve_lblk_for_read(SMgrRelation reln, ForkNumber forknum,
 	}
 
 	{
-		um_report_unmapped_map_entry(reln, forknum, access, lblkno);
+		um_report_legacy_entry_map_path(reln, forknum, access, lblkno);
 	}
 	pg_unreachable();
 }
@@ -1250,7 +1039,7 @@ um_resolve_lblk_for_write(SMgrRelation reln, ForkNumber forknum,
 	(void) lookup_state;
 	(void) pblkno;
 
-	um_report_unmapped_map_entry(reln, forknum, access, lblkno);
+	um_report_legacy_entry_map_path(reln, forknum, access, lblkno);
 	pg_unreachable();
 }
 
@@ -1263,9 +1052,6 @@ um_resolve_lblk_for_writeback(SMgrRelation reln, ForkNumber forknum,
 	if (um_lblk_precedes_logical_eof_for_access(reln, forknum, access,
 												lookup_state, lblkno))
 	{
-		if (MapInflightLookupOwnedPblk(reln->smgr_rlocator.locator,
-									   forknum, lblkno, pblkno))
-			return UMBRA_ACCESS_RESOLVED_PBLK;
 		return UMBRA_ACCESS_RESOLVED_SKIP;
 	}
 
@@ -1273,7 +1059,7 @@ um_resolve_lblk_for_writeback(SMgrRelation reln, ForkNumber forknum,
 												  lookup_state, lblkno))
 		return UMBRA_ACCESS_RESOLVED_SKIP;
 
-	um_report_unmapped_map_entry(reln, forknum, access, lblkno);
+	um_report_legacy_entry_map_path(reln, forknum, access, lblkno);
 	pg_unreachable();
 }
 
@@ -1285,9 +1071,6 @@ um_resolve_lblk_for_access(SMgrRelation reln, ForkNumber forknum,
 						   UmbraAccessResolveMode mode,
 						   BlockNumber *pblkno)
 {
-	UmbraFileContext *ctx = um_ctx_acquire(reln);
-	bool		found;
-
 	Assert(pblkno != NULL);
 
 	if (um_state_uses_chunk_base(access->policy))
@@ -1309,8 +1092,27 @@ um_resolve_lblk_for_access(SMgrRelation reln, ForkNumber forknum,
 														  lookup_state,
 														  lblkno))
 				return UMBRA_ACCESS_RESOLVED_SKIP;
-			um_report_unmapped_map_entry(reln, forknum, access, lblkno);
+			um_report_legacy_entry_map_path(reln, forknum, access, lblkno);
 			pg_unreachable();
+		}
+
+		if (mode == UMBRA_ACCESS_RESOLVE_WRITE &&
+			!um_lblk_precedes_logical_eof_for_access(reln, forknum,
+													 access, lookup_state,
+													 lblkno))
+		{
+			BlockNumber logical_nblocks = InvalidBlockNumber;
+
+			if (lookup_state != NULL && lookup_state->have_logical_nblocks)
+				logical_nblocks = lookup_state->logical_nblocks;
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("cannot write Umbra relation %u/%u/%u fork %d block %u beyond logical EOF %u",
+							reln->smgr_rlocator.locator.spcOid,
+							reln->smgr_rlocator.locator.dbOid,
+							reln->smgr_rlocator.locator.relNumber,
+							forknum, lblkno, logical_nblocks),
+					 errdetail("New logical pages must be born through smgrextend or smgrzeroextend before ordinary writes.")));
 		}
 
 		*pblkno = um_chunk_active_pblk_checked(reln, forknum, lblkno);
@@ -1322,20 +1124,6 @@ um_resolve_lblk_for_access(SMgrRelation reln, ForkNumber forknum,
 		*pblkno = lblkno;
 		return UMBRA_ACCESS_RESOLVED_PBLK;
 	}
-
-	if (mode == UMBRA_ACCESS_RESOLVE_READ)
-	{
-		found = MapTryLookup(ctx, reln->smgr_rlocator.locator,
-							 forknum, lblkno, pblkno);
-	}
-	else
-	{
-		found = MapTryLookup(ctx, reln->smgr_rlocator.locator,
-							 forknum, lblkno, pblkno);
-	}
-
-	if (found)
-		return UMBRA_ACCESS_RESOLVED_PBLK;
 
 	switch (mode)
 	{
@@ -1364,7 +1152,6 @@ um_resolve_mapped_read_run(SMgrRelation reln, ForkNumber forknum,
 						   BlockNumber blocknum, BlockNumber maxblocks,
 						   BlockNumber *start_pblk)
 {
-	UmbraFileContext *ctx = um_ctx_acquire(reln);
 	BlockNumber	run_blocks;
 	BlockNumber	pblk;
 
@@ -1414,12 +1201,6 @@ um_resolve_mapped_read_run(SMgrRelation reln, ForkNumber forknum,
 		return run_blocks;
 	}
 
-	run_blocks = MapTryLookupPblkRun(ctx, reln->smgr_rlocator.locator,
-									 forknum, blocknum, maxblocks,
-									 start_pblk);
-	if (run_blocks > 0)
-		return run_blocks;
-
 	if (um_resolve_lblk_for_access(reln, forknum, access, lookup_state,
 								   blocknum, UMBRA_ACCESS_RESOLVE_READ,
 								   &pblk) == UMBRA_ACCESS_RESOLVED_PBLK)
@@ -1431,326 +1212,33 @@ um_resolve_mapped_read_run(SMgrRelation reln, ForkNumber forknum,
 	return 0;
 }
 
-static void
-um_materialize_pblk_zero_runs(UmbraFileContext *ctx, ForkNumber forknum,
-							  const BlockNumber *pblknos, BlockNumber nblocks,
-							  bool skipFsync)
-{
-	BlockNumber	run_start_pblk = InvalidBlockNumber;
-	BlockNumber	run_blocks = 0;
-
-	Assert(ctx != NULL);
-	Assert(pblknos != NULL);
-
-	for (BlockNumber i = 0; i < nblocks; i++)
-	{
-		BlockNumber pblk = pblknos[i];
-
-		if (run_blocks == 0)
-		{
-			run_start_pblk = pblk;
-			run_blocks = 1;
-		}
-		else if (pblk == run_start_pblk + run_blocks)
-		{
-			run_blocks++;
-		}
-		else
-		{
-			umfile_zeroextend(ctx, forknum, run_start_pblk,
-							  (int) run_blocks, skipFsync);
-			run_start_pblk = pblk;
-			run_blocks = 1;
-		}
-	}
-
-	if (run_blocks > 0)
-		umfile_zeroextend(ctx, forknum, run_start_pblk,
-						  (int) run_blocks, skipFsync);
-}
-
-static bool
-um_pblk_run_is_contiguous(const BlockNumber *pblknos, BlockNumber nblocks)
-{
-	Assert(pblknos != NULL);
-	Assert(nblocks > 0);
-
-	for (BlockNumber i = 1; i < nblocks; i++)
-	{
-		if (pblknos[i] != pblknos[0] + i)
-			return false;
-	}
-
-	return true;
-}
-
-static bool
-um_try_pure_firstborn_range_remap_zeroextend(SMgrRelation reln, ForkNumber forknum,
-											 const UmbraAccessState *access,
-											 BlockNumber blocknum,
-											 BlockNumber nblocks,
-											 bool skipFsync)
+static BlockNumber
+um_prepare_mapped_birth(SMgrRelation reln, ForkNumber forknum,
+						const UmbraAccessState *access, BlockNumber lblkno)
 {
 	UmbraFileContext *ctx = um_ctx_acquire(reln);
-	BlockNumber *pblknos;
-	xl_umbra_range_remap_entry *entries;
-	bool		wal_insert_enabled;
-	bool		applied = false;
-
-	Assert(access != NULL);
-	Assert(access->map_available);
-	Assert(nblocks > 0);
-
-	if (um_state_uses_chunk_base(access->policy))
-		return false;
-
-	/*
-	 * Try to collapse an EOF zeroextend range into one or more RANGE_REMAP
-	 * records. RANGE_REMAP carries only new pblk ownership, so this helper is
-	 * deliberately all-or-nothing and only accepts pure first-born ranges.
-	 * Recovery consumes authoritative remap WAL instead of synthesizing new
-	 * range ownership locally.
-	 */
-	if (InRecovery || nblocks < 2)
-		return false;
-
-	pblknos = palloc(sizeof(BlockNumber) * nblocks);
-	entries = palloc(sizeof(xl_umbra_range_remap_entry) * nblocks);
-
-	for (BlockNumber i = 0; i < nblocks; i++)
-	{
-		BlockNumber lblk = blocknum + i;
-		BlockNumber pblk;
-
-		if (MapTryLookup(ctx, reln->smgr_rlocator.locator, forknum, lblk, &pblk) ||
-			MapInflightLookupOwnedPblk(reln->smgr_rlocator.locator,
-									   forknum, lblk, &pblk))
-		{
-			/*
-			 * Normal EOF extension should not get here.  Treat existing or
-			 * in-flight ownership as a compatibility fallback condition, not as
-			 * a mixed-range batching opportunity.
-			 */
-			pfree(entries);
-			pfree(pblknos);
-			return false;
-		}
-	}
-
-	for (BlockNumber i = 0; i < nblocks; i++)
-	{
-		BlockNumber lblk = blocknum + i;
-
-		if (!MapReserveFreshPblkno(ctx, reln->smgr_rlocator.locator,
-								   forknum, lblk, &pblknos[i]))
-		{
-			for (BlockNumber j = 0; j < i; j++)
-				MapInflightRelease(reln->smgr_rlocator.locator,
-								   forknum, blocknum + j);
-			pfree(entries);
-			pfree(pblknos);
-			return false;
-		}
-		entries[i].lblkno = lblk;
-		entries[i].new_pblkno = pblknos[i];
-	}
-
-	wal_insert_enabled =
-		XLogInsertAllowed() &&
-		!IsBootstrapProcessingMode() &&
-		!IsInitProcessingMode();
-
-	PG_TRY();
-	{
-		BlockNumber done = 0;
-
-		while (done < nblocks)
-		{
-			BlockNumber chunk_blocks = Min(nblocks - done,
-										   (BlockNumber) UINT16_MAX);
-			bool		delay_chkp_start_set = false;
-			XLogRecPtr	map_lsn = InvalidXLogRecPtr;
-
-			if (wal_insert_enabled)
-			{
-				START_CRIT_SECTION();
-				if ((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0)
-				{
-					MyProc->delayChkptFlags |= DELAY_CHKPT_START;
-					delay_chkp_start_set = true;
-				}
-
-				if (um_pblk_run_is_contiguous(pblknos + done, chunk_blocks))
-					map_lsn = log_umbra_range_remap_compact(
-						reln->smgr_rlocator.locator, forknum,
-						blocknum + done, pblknos[done], (uint16) chunk_blocks);
-				else
-					map_lsn = log_umbra_range_remap(
-						reln->smgr_rlocator.locator, forknum,
-						(uint16) chunk_blocks, entries + done);
-			}
-
-			um_materialize_pblk_zero_runs(ctx, forknum, pblknos + done,
-										  chunk_blocks, skipFsync);
-			UmApplyReservedRangeRemap(reln, forknum, blocknum + done,
-									  chunk_blocks, pblknos + done,
-									  map_lsn, skipFsync);
-
-			if (wal_insert_enabled)
-			{
-				if (delay_chkp_start_set)
-					MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
-				END_CRIT_SECTION();
-			}
-
-			done += chunk_blocks;
-		}
-
-		applied = true;
-	}
-	PG_CATCH();
-	{
-		if (!applied)
-		{
-			for (BlockNumber i = 0; i < nblocks; i++)
-				MapInflightRelease(reln->smgr_rlocator.locator,
-								   forknum, blocknum + i);
-		}
-
-		pfree(entries);
-		pfree(pblknos);
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-
-	pfree(entries);
-	pfree(pblknos);
-	return true;
-}
-
-static UmbraMappedBirthResult
-um_publish_mapped_birth(SMgrRelation reln, ForkNumber forknum,
-						const UmbraAccessState *access,
-						BlockNumber lblkno, bool allow_wal_owned_firstborn)
-{
-	UmbraFileContext *ctx = um_ctx_acquire(reln);
-	UmbraMappedBirthResult result;
-	BlockNumber old_pblkno;
-	XLogRecPtr	map_lsn;
-	bool		wal_insert_enabled = false;
-	bool		wal_owns_firstborn = false;
-	bool		emit_map_set = false;
-	bool		delay_chkp_started = false;
-	bool		delay_chkp_start_set = false;
+	BlockNumber pblkno;
+	BlockNumber logical_nblocks;
 
 	Assert(access->map_available);
 
-	result.mapping_published = false;
+	if (lblkno == MaxBlockNumber)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("logical block overflow for relation %u/%u/%u fork %d block %u",
+						reln->smgr_rlocator.locator.spcOid,
+						reln->smgr_rlocator.locator.dbOid,
+						reln->smgr_rlocator.locator.relNumber,
+						forknum, lblkno)));
 
-	if (InRecovery && um_fork_uses_wal_owned_firstborn(forknum))
-		elog(PANIC,
-			 "missing WAL mapping during recovery for relation %u/%u/%u fork %d blk %u",
-			 reln->smgr_rlocator.locator.spcOid,
-			 reln->smgr_rlocator.locator.dbOid,
-			 reln->smgr_rlocator.locator.relNumber,
-			 forknum, lblkno);
-
-	if (um_state_uses_chunk_base(access->policy))
-	{
-		result.pblkno = um_chunk_base_pblk_checked(reln, forknum, lblkno);
-		old_pblkno = InvalidBlockNumber;
-	}
-	else
-	{
-		MapGetNewPbkno(ctx, reln->smgr_rlocator.locator, forknum, lblkno,
-					   &result.pblkno, &old_pblkno);
-		Assert(old_pblkno == InvalidBlockNumber);
-	}
-
-	wal_owns_firstborn = false;
-
-	if (InRecovery)
-	{
-		map_lsn = GetXLogReplayRecPtr(NULL);
-		UmMapSetMapping(reln, forknum, lblkno, result.pblkno, map_lsn);
-		result.mapping_published = true;
-	}
-	else
-	{
-		/*
-		 * Birth ownership needs crash-recovery WAL even at wal_level=minimal.
-		 * XLogIsNeeded() is too weak here because it suppresses WAL that is
-		 * still required to recover eager MAP_SET publication after a crash.
-		 */
-		wal_insert_enabled =
-			XLogInsertAllowed() &&
-			!IsBootstrapProcessingMode() &&
-			!IsInitProcessingMode();
-
-		wal_owns_firstborn =
-			allow_wal_owned_firstborn &&
-			wal_insert_enabled &&
-			UmWalOwnedFirstbornAvailable(reln, forknum, lblkno);
-
-		emit_map_set = !wal_owns_firstborn;
-
-		if (emit_map_set && wal_insert_enabled)
-		{
-			START_CRIT_SECTION();
-			delay_chkp_started = true;
-			if ((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0)
-			{
-				MyProc->delayChkptFlags |= DELAY_CHKPT_START;
-				delay_chkp_start_set = true;
-			}
-
-			map_lsn = log_umbra_map_set(reln->smgr_rlocator.locator, forknum,
-										lblkno, old_pblkno, result.pblkno);
-		}
-		else
-			map_lsn = InvalidXLogRecPtr;
-
-		if (emit_map_set)
-		{
-			UmMapSetMapping(reln, forknum, lblkno, result.pblkno, map_lsn);
-			result.mapping_published = true;
-		}
-	}
-
-	if (result.mapping_published)
-	{
-		if (um_state_uses_chunk_base(access->policy))
-		{
-			MapSBlockBumpPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
-										 forknum,
-										 um_chunk_physical_capacity_checked(reln,
-																			forknum,
-																			lblkno + 1),
-										 map_lsn);
-		}
-		else
-			MapSBlockBumpNextFreePhysBlock(ctx, reln->smgr_rlocator.locator,
-										   forknum, result.pblkno + 1,
-										   map_lsn);
-	}
-
-	if (delay_chkp_started)
-	{
-		if (delay_chkp_start_set)
-			MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
-		END_CRIT_SECTION();
-	}
-
-	/*
-	 * WAL-owned first-born pages keep their in-flight claim private until WAL
-	 * insertion succeeds and XLogCommitBlockRemapsUmbra() publishes the mapping.
-	 * Advancing the physical frontier or releasing the claim here would
-	 * let xloginsert reserve a second pblk for the same logical birth, leaving
-	 * alternating holes in the initial physical layout.
-	 */
-	if (!wal_owns_firstborn)
-		MapInflightRelease(reln->smgr_rlocator.locator, forknum, lblkno);
-	return result;
+	logical_nblocks = lblkno + 1;
+	pblkno = um_chunk_base_pblk_checked(reln, forknum, lblkno);
+	um_ensure_chunk_physical_capacity(reln, forknum, ctx, logical_nblocks,
+									  true /* skipFsync */);
+	MapSBlockBumpLogicalNblocks(ctx, reln->smgr_rlocator.locator,
+								forknum, logical_nblocks,
+								InvalidXLogRecPtr);
+	return pblkno;
 }
 
 /*
@@ -1806,8 +1294,7 @@ um_complete_zero_readv(PgAioHandle *ioh, SMgrRelation reln,
 /*
  * PG18 truncation order is:
  *   1. RelationTruncate() emits truncate WAL
- *   2. smgrpretruncate() lets Umbra preload MAP pages before entering the
- *      critical section
+ *   2. smgrpretruncate() runs before entering the critical section
  *   3. smgrtruncate() later drops old shared buffers and performs the
  *      truncate-time metadata update
  *
@@ -1843,8 +1330,7 @@ um_is_stale_post_truncate_lblk_for_access(SMgrRelation reln,
 
 	/*
 	 * Use the same authoritative logical EOF that the rest of the system sees.
-	 * Umbra should have only one logical-size source of truth; this stale
-	 * post-truncate path must not invent a second one by scanning MAP pages.
+	 * Umbra should have only one logical-size source of truth.
 	 */
 	if (lookup_state != NULL && lookup_state->have_logical_nblocks)
 		logical_nblocks = lookup_state->logical_nblocks;
@@ -1881,8 +1367,6 @@ BlockNumber
 umphysicalblock(SMgrRelation reln, ForkNumber forknum, BlockNumber lblkno)
 {
 	UmbraAccessState access;
-	UmbraFileContext *ctx = um_ctx_acquire(reln);
-	BlockNumber pblkno;
 
 	access = um_classify_access(reln, forknum);
 	if (um_state_uses_chunk_base(access.policy))
@@ -1891,21 +1375,16 @@ umphysicalblock(SMgrRelation reln, ForkNumber forknum, BlockNumber lblkno)
 	if (!access.map_available)
 		return lblkno;
 
-	if (MapTryLookup(ctx, reln->smgr_rlocator.locator,
-					 forknum, lblkno, &pblkno))
-		return pblkno;
-
-	um_report_unmapped_map_entry(reln, forknum, &access, lblkno);
+	um_report_legacy_entry_map_path(reln, forknum, &access, lblkno);
 	pg_unreachable();
 }
 
 void
-UmMapGetNewPbkno(SMgrRelation reln, ForkNumber forknum,
-				 BlockNumber lblkno, BlockNumber *new_pblkno,
-				 BlockNumber *old_pblkno)
+UmRemapGetTargetPblkno(SMgrRelation reln, ForkNumber forknum,
+					   BlockNumber lblkno, BlockNumber *new_pblkno,
+					   BlockNumber *old_pblkno)
 {
 	UmbraAccessState access;
-	UmbraFileContext *ctx = um_ctx_acquire(reln);
 
 	Assert(new_pblkno != NULL);
 	Assert(old_pblkno != NULL);
@@ -1913,6 +1392,18 @@ UmMapGetNewPbkno(SMgrRelation reln, ForkNumber forknum,
 	access = um_classify_access(reln, forknum);
 	if (um_state_uses_chunk_base(access.policy))
 	{
+		BlockNumber logical_nblocks;
+
+		logical_nblocks = umnblocks_for_access(reln, forknum, &access);
+		if (lblkno >= logical_nblocks)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("cannot remap Umbra relation %u/%u/%u fork %d block %u beyond logical EOF %u",
+							reln->smgr_rlocator.locator.spcOid,
+							reln->smgr_rlocator.locator.dbOid,
+							reln->smgr_rlocator.locator.relNumber,
+							forknum, lblkno, logical_nblocks),
+					 errdetail("New logical pages are born on their base slot and are not represented by remap records.")));
 		*new_pblkno = um_chunk_inactive_pblk_checked(reln, forknum,
 													 lblkno, old_pblkno);
 		return;
@@ -1925,32 +1416,16 @@ UmMapGetNewPbkno(SMgrRelation reln, ForkNumber forknum,
 		return;
 	}
 
-	MapGetNewPbkno(ctx, reln->smgr_rlocator.locator, forknum,
-				   lblkno, new_pblkno, old_pblkno);
-}
-
-void
-UmMapReserveFreshPbkno(SMgrRelation reln, ForkNumber forknum,
-					   BlockNumber lblkno, BlockNumber *new_pblkno)
-{
-	UmbraAccessState access;
-
-	access = um_classify_access(reln, forknum);
-	um_reserve_fresh_pblkno_for_access(reln, forknum, &access,
-									   lblkno, new_pblkno);
+	elog(ERROR,
+		 "legacy entry-map remap is not supported for relation %u/%u/%u fork %d blk %u",
+		 reln->smgr_rlocator.locator.spcOid,
+		 reln->smgr_rlocator.locator.dbOid,
+		 reln->smgr_rlocator.locator.relNumber,
+		 forknum, lblkno);
 }
 
 bool
-UmMapAccessAvailable(SMgrRelation reln, ForkNumber forknum)
-{
-	UmbraAccessState access;
-
-	access = um_classify_access(reln, forknum);
-	return access.map_available;
-}
-
-bool
-UmWalOwnedRemapAvailable(SMgrRelation reln, ForkNumber forknum)
+UmRemapWalOwnerAvailable(SMgrRelation reln, ForkNumber forknum)
 {
 	UmbraAccessState access;
 
@@ -1959,22 +1434,7 @@ UmWalOwnedRemapAvailable(SMgrRelation reln, ForkNumber forknum)
 }
 
 bool
-UmWalOwnedFirstbornAvailable(SMgrRelation reln, ForkNumber forknum,
-							 BlockNumber lblkno)
-{
-	UmbraAccessState access;
-
-	(void) lblkno;
-	access = um_classify_access(reln, forknum);
-	return access.policy == UMBRA_MAP_POLICY_REQUIRE_MAP &&
-		XLogInsertAllowed() &&
-		!IsBootstrapProcessingMode() &&
-		!IsInitProcessingMode() &&
-		um_fork_uses_wal_owned_firstborn(forknum);
-}
-
-bool
-UmMapUsesChunkPaired(SMgrRelation reln, ForkNumber forknum)
+UmUsesChunkPairedTranslation(SMgrRelation reln, ForkNumber forknum)
 {
 	UmbraAccessState access;
 
@@ -1983,8 +1443,8 @@ UmMapUsesChunkPaired(SMgrRelation reln, ForkNumber forknum)
 }
 
 bool
-UmMapTryLookupPblkno(SMgrRelation reln, ForkNumber forknum,
-					 BlockNumber lblkno, BlockNumber *pblkno)
+UmTranslationTryLookupPblkno(SMgrRelation reln, ForkNumber forknum,
+							 BlockNumber lblkno, BlockNumber *pblkno)
 {
 	UmbraAccessState access;
 	UmbraFileContext *ctx = um_ctx_acquire(reln);
@@ -2009,25 +1469,13 @@ UmMapTryLookupPblkno(SMgrRelation reln, ForkNumber forknum,
 		return true;
 	}
 
-	return MapTryLookup(ctx, reln->smgr_rlocator.locator,
-						forknum, lblkno, pblkno);
-}
-
-bool
-UmMapIsLogicalUnmaterialized(SMgrRelation reln, ForkNumber forknum,
-							 BlockNumber lblkno)
-{
-	UmbraAccessState access;
-
-	access = um_classify_access(reln, forknum);
-	return um_is_logical_unmaterialized_for_access(reln, forknum, &access,
-												   lblkno);
+	return false;
 }
 
 void
-UmMapSetMapping(SMgrRelation reln, ForkNumber forknum,
-				BlockNumber lblkno, BlockNumber new_pblkno,
-				XLogRecPtr map_lsn)
+UmShiftSetActivePblkno(SMgrRelation reln, ForkNumber forknum,
+					   BlockNumber lblkno, BlockNumber new_pblkno,
+					   XLogRecPtr map_lsn)
 {
 	UmbraAccessState access;
 	UmbraFileContext *ctx = um_ctx_acquire(reln);
@@ -2037,15 +1485,15 @@ UmMapSetMapping(SMgrRelation reln, ForkNumber forknum,
 	{
 		BlockNumber base_pblk;
 		BlockNumber shadow_pblk;
-		bool		shadow_active;
+		bool		shifted_to_shadow;
 
 		base_pblk = um_chunk_base_pblk_checked(reln, forknum, lblkno);
 		shadow_pblk = um_chunk_shadow_pblk_checked(reln, forknum, lblkno);
 
 		if (new_pblkno == base_pblk)
-			shadow_active = false;
+			shifted_to_shadow = false;
 		else if (new_pblkno == shadow_pblk)
-			shadow_active = true;
+			shifted_to_shadow = true;
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
@@ -2056,16 +1504,20 @@ UmMapSetMapping(SMgrRelation reln, ForkNumber forknum,
 							reln->smgr_rlocator.locator.relNumber,
 							forknum, lblkno)));
 
-		MapActiveBitmapSet(ctx, reln->smgr_rlocator.locator,
-						   forknum, lblkno, shadow_active, map_lsn);
+		UmbraShiftSet(ctx, reln->smgr_rlocator.locator,
+						   forknum, lblkno, shifted_to_shadow, map_lsn);
 		return;
 	}
 
 	if (!access.map_available)
 		return;
 
-	MapSetMapping(ctx, reln->smgr_rlocator.locator,
-				  forknum, lblkno, new_pblkno, map_lsn);
+	elog(ERROR,
+		 "legacy entry-map publication is not supported for relation %u/%u/%u fork %d blk %u",
+		 reln->smgr_rlocator.locator.spcOid,
+		 reln->smgr_rlocator.locator.dbOid,
+		 reln->smgr_rlocator.locator.relNumber,
+		 forknum, lblkno);
 }
 
 static void
@@ -2162,7 +1614,6 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	BlockNumber	logical_nblocks;
 	BlockNumber materialized_nblocks = 0;
 	BlockNumber	max_pblkno = InvalidBlockNumber;
-	bool		mapping_committed = false;
 
 	access = um_classify_access(reln, forknum);
 
@@ -2212,34 +1663,18 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 	/*
 	 * For mapped data forks, smgrextend is the point where an unmapped logical
-	 * block gets its first physical block. Existing mappings can appear during
-	 * redo/replay and should be reused.
+	 * block gets its first physical block. New pages always start on the
+	 * formula-derived base side; the shift bitmap remains at its default
+	 * false value until a later remap switches the active side.
 	 */
-	if (um_state_uses_chunk_base(access.policy) &&
-		blocknum < logical_nblocks)
-	{
+	if (blocknum < logical_nblocks)
 		pblkno = um_chunk_active_pblk_checked(reln, forknum, blocknum);
-	}
-	else if (!um_state_uses_chunk_base(access.policy) &&
-			 MapTryLookup(ctx, reln->smgr_rlocator.locator,
-						  forknum, blocknum, &pblkno))
-	{
-		/* Existing mapping found. */
-	}
 	else
-	{
-		UmbraMappedBirthResult birth;
-
-		birth = um_publish_mapped_birth(reln, forknum, &access, blocknum, true);
-		pblkno = birth.pblkno;
-		mapping_committed = birth.mapping_published;
-
-	}
+		pblkno = um_prepare_mapped_birth(reln, forknum, &access, blocknum);
 
 	/*
-	 * Reservation/publication can make the mapping visible before the data
-	 * fork is physically materialized. Extend when the chosen pblk is still
-	 * beyond the materialized physical EOF; otherwise just write the page.
+	 * Extend when the chosen pblk is still beyond the materialized physical
+	 * EOF; otherwise just write the page.
 	 *
 	 * Page checksum stays keyed by the logical block identity; callers
 	 * reaching smgrextend() have already set it using the logical blkno.
@@ -2257,10 +1692,6 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		umfile_writev(ctx, forknum, pblkno, single_buffer, 1, skipFsync);
 	}
 
-	if (mapping_committed)
-		MapSBlockBumpLogicalNblocks(ctx, reln->smgr_rlocator.locator,
-										forknum, blocknum + 1,
-										InvalidXLogRecPtr);
 	if (max_pblkno != InvalidBlockNumber)
 	{
 		if (um_state_uses_chunk_base(access.policy))
@@ -2351,21 +1782,13 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		return;
 	}
 
-	if (um_try_pure_firstborn_range_remap_zeroextend(reln, forknum, &access,
-													blocknum,
-													(BlockNumber) nblocks,
-													skipFsync))
-		return;
-
 	/*
-	 * Per-block path for single-block, recovery, or callers that encountered
-	 * pre-existing/pending MAP ownership in the requested range.
-	 *
 	 * For mapped forks we must materialize each newly-mapped physical page as
-	 * a zero page, otherwise a later read through MAP would hit EOF/short read.
+	 * a zero page, otherwise a later translated read would hit EOF/short read.
 	 *
-	 * Map allocator hands out sequential pblknos, so we can batch contiguous
-	 * physical ranges with umfile_zeroextend().
+	 * Chunk-paired placement is contiguous inside each base or shadow half, so
+	 * batch physical zero-extension until the formula crosses a non-contiguous
+	 * boundary.
 	 */
 	run_start_pblk = InvalidBlockNumber;
 	max_pblkno = InvalidBlockNumber;
@@ -2376,25 +1799,11 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		BlockNumber lblk = blocknum + (BlockNumber) i;
 		BlockNumber pblk;
 
-		if (um_state_uses_chunk_base(access.policy) &&
-			um_lblk_precedes_logical_eof_for_access(reln, forknum,
+		if (um_lblk_precedes_logical_eof_for_access(reln, forknum,
 													&access, NULL, lblk))
-		{
 			pblk = um_chunk_active_pblk_checked(reln, forknum, lblk);
-		}
-		else if (!um_state_uses_chunk_base(access.policy) &&
-				 MapTryLookup(ctx, reln->smgr_rlocator.locator,
-							  forknum, lblk, &pblk))
-		{
-			/* Existing mapping found. */
-		}
 		else
-		{
-			UmbraMappedBirthResult birth;
-
-			birth = um_publish_mapped_birth(reln, forknum, &access, lblk, false);
-			pblk = birth.pblkno;
-		}
+			pblk = um_prepare_mapped_birth(reln, forknum, &access, lblk);
 
 		if (max_pblkno == InvalidBlockNumber || pblk > max_pblkno)
 			max_pblkno = pblk;
@@ -2435,10 +1844,6 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 										 forknum, max_pblkno + 1,
 										 InvalidXLogRecPtr);
 	}
-
-	MapSBlockBumpLogicalNblocks(ctx, reln->smgr_rlocator.locator,
-								forknum, blocknum + (BlockNumber) nblocks,
-								InvalidXLogRecPtr);
 }
 
 bool
@@ -2514,11 +1919,11 @@ umreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	UmbraAccessState access;
 	UmbraAccessLookupState lookup_state = {0};
 	UmbraFileContext *ctx = um_ctx_acquire(reln);
-	bool		aux_recovery_read;
+	bool		aux_zero_on_error_read;
 
 	access = um_classify_access(reln, forknum);
 
-	aux_recovery_read = InRecovery && UmbraForkIsAuxiliaryMapped(forknum);
+	aux_zero_on_error_read = UmbraForkIsAuxiliaryMapped(forknum);
 
 	for (BlockNumber i = 0; i < nblocks;)
 	{
@@ -2526,8 +1931,8 @@ umreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		BlockNumber	run_blocks;
 
 		run_blocks = um_resolve_mapped_read_run(reln, forknum, &access,
-												 &lookup_state, blocknum + i,
-												 aux_recovery_read ? 1 :
+											 &lookup_state, blocknum + i,
+												 aux_zero_on_error_read ? 1 :
 												 (nblocks - i),
 												 &pblk);
 		if (run_blocks == 0)
@@ -2541,12 +1946,11 @@ umreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		 * Preserve md-style sync-read semantics for mapped forks by routing the
 		 * translated physical block through umfile_readv().
 		 *
-		 * Callers such as VM/FSM redo use RBM_ZERO_ON_ERROR and expect
-		 * InRecovery/zero_damaged_pages handling on short reads.  A direct
-		 * physical read would bypass that behavior and fail before bufmgr gets a
-		 * chance to zero the page.
+		 * FSM/VM callers use RBM_ZERO_ON_ERROR semantics.  A direct physical
+		 * read of a missing chunk-paired auxiliary fork would fail before
+		 * bufmgr gets a chance to zero the page.
 		 */
-		if (aux_recovery_read)
+		if (aux_zero_on_error_read)
 			um_ensure_datafork_batch_ready_for_access(reln, forknum, &access,
 													  pblk, true /* skipFsync */ );
 
@@ -2603,11 +2007,8 @@ um_startreadv_mapped_physical(PgAioHandle *ioh, SMgrRelation reln,
 							  const UmbraAccessState *access)
 {
 	if (aux_recovery_read)
-	{
-		if (!umfile_ctx_block_exists(ctx, forknum, pblk))
-			um_ensure_datafork_batch_ready_for_access(reln, forknum, access,
-													  pblk, true /* skipFsync */ );
-	}
+		um_ensure_datafork_batch_ready_for_access(reln, forknum, access,
+												  pblk, true /* skipFsync */ );
 
 	pgaio_io_set_target_smgr(ioh, reln, forknum,
 							 blocknum /* logical */,
@@ -2674,69 +2075,18 @@ umstartreadv(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknum,
 }
 
 static void
-um_claim_write_barrier(SMgrRelation reln, ForkNumber forknum,
-					   UmbraFileContext *ctx, BlockNumber lblkno,
-					   MapInflightBarrier *barrier)
-{
-	int			wait_retries = 0;
-
-	Assert(barrier != NULL);
-	Assert(!barrier->valid);
-
-	for (;;)
-	{
-		if (MapInflightTryClaimBarrier(ctx, reln->smgr_rlocator.locator,
-									   forknum, lblkno, barrier))
-		{
-			if (wait_retries > 0)
-				elog(LOG,
-					 "storage write waited for in-flight remap on relation %u/%u/%u fork %d block %u (%d retries, %d usec)",
-					 reln->smgr_rlocator.locator.spcOid,
-					 reln->smgr_rlocator.locator.dbOid,
-					 reln->smgr_rlocator.locator.relNumber,
-					 forknum, lblkno,
-					 wait_retries,
-					 wait_retries * UMBRA_WRITE_BARRIER_WAIT_USEC);
-			return;
-		}
-
-		CHECK_FOR_INTERRUPTS();
-		pg_usleep(UMBRA_WRITE_BARRIER_WAIT_USEC);
-		wait_retries++;
-
-		if (wait_retries >= UMBRA_WRITE_BARRIER_WAIT_RETRIES)
-			ereport(ERROR,
-					(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
-					 errmsg("timed out waiting for in-flight remap of relation %u/%u/%u fork %d block %u",
-							reln->smgr_rlocator.locator.spcOid,
-							reln->smgr_rlocator.locator.dbOid,
-							reln->smgr_rlocator.locator.relNumber,
-							forknum, lblkno)));
-	}
-}
-
-static void
-um_release_write_barriers(MapInflightBarrier *barriers, BlockNumber nbarriers)
-{
-	for (BlockNumber i = 0; i < nbarriers; i++)
-		MapInflightReleaseBarrier(&barriers[i]);
-}
-
-static void
-um_flush_write_barrier_run(UmbraFileContext *ctx, ForkNumber forknum,
-						   BlockNumber run_start_pblk,
-						   const void **buffers,
-						   BlockNumber run_start_idx,
-						   BlockNumber *run_blocks,
-						   bool skipFsync,
-						   MapInflightBarrier *barriers)
+um_flush_write_run(UmbraFileContext *ctx, ForkNumber forknum,
+				   BlockNumber run_start_pblk,
+				   const void **buffers,
+				   BlockNumber run_start_idx,
+				   BlockNumber *run_blocks,
+				   bool skipFsync)
 {
 	if (*run_blocks == 0)
 		return;
 
 	umfile_writev(ctx, forknum, run_start_pblk, &buffers[run_start_idx],
 				  *run_blocks, skipFsync);
-	um_release_write_barriers(barriers, *run_blocks);
 	*run_blocks = 0;
 }
 
@@ -2752,8 +2102,6 @@ umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	BlockNumber		run_start_pblk = InvalidBlockNumber;
 	BlockNumber		run_start_idx = 0;
 	BlockNumber		run_blocks = 0;
-	MapInflightBarrier run_barriers[PG_IOV_MAX];
-	MapInflightBarrier pending_barrier = {0};
 
 	access = um_classify_access(reln, forknum);
 
@@ -2805,95 +2153,69 @@ umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		(void) MapSBlockTryGetPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
 											  forknum, &materialized_nblocks);
 
-	PG_TRY();
+	for (BlockNumber i = 0; i < nblocks; i++)
 	{
-		for (BlockNumber i = 0; i < nblocks; i++)
+		BlockNumber lblk = blocknum + i;
+		BlockNumber pblk;
+		UmbraAccessResolveResult resolve;
+		bool		can_extend_run;
+
+		resolve = um_resolve_lblk_for_access(reln, forknum, &access,
+											 &lookup_state,
+											 lblk,
+											 UMBRA_ACCESS_RESOLVE_WRITE,
+											 &pblk);
+		Assert(resolve == UMBRA_ACCESS_RESOLVED_PBLK);
+
+		/*
+		 * Checksum identity stays logical (lblk); callers reaching smgrwritev()
+		 * have already set it before Umbra translates to physical blocks.
+		 */
+
+		can_extend_run =
+			(run_blocks > 0) &&
+			(pblk == run_start_pblk + run_blocks) &&
+			(run_blocks < (BlockNumber) PG_IOV_MAX) &&
+			((run_start_pblk % ((BlockNumber) RELSEG_SIZE)) + run_blocks <
+			 ((BlockNumber) RELSEG_SIZE));
+
+		if (pblk < materialized_nblocks)
 		{
-			BlockNumber lblk = blocknum + i;
-			BlockNumber pblk;
-			UmbraAccessResolveResult resolve;
-			bool		can_extend_run;
-
-			pending_barrier.valid = false;
-			pending_barrier.slot_id = -1;
-			pending_barrier.entry_idx = -1;
-
-			/*
-			 * The barrier serializes physical writes with any foreign in-flight
-			 * remap for the same logical block.  Claim before lookup so a later remap
-			 * cannot publish a new mapping while this write is still targeting the
-			 * old physical page.
-			 */
-			um_claim_write_barrier(reln, forknum, ctx, lblk, &pending_barrier);
-
-			resolve = um_resolve_lblk_for_access(reln, forknum, &access,
-												 &lookup_state,
-												 lblk,
-												 UMBRA_ACCESS_RESOLVE_WRITE,
-												 &pblk);
-			Assert(resolve == UMBRA_ACCESS_RESOLVED_PBLK);
-
-			/*
-			 * Checksum identity stays logical (lblk); callers reaching smgrwritev()
-			 * have already set it before Umbra translates to physical blocks.
-			 */
-
-			can_extend_run =
-				(run_blocks > 0) &&
-				(pblk == run_start_pblk + run_blocks) &&
-				(run_blocks < (BlockNumber) lengthof(run_barriers)) &&
-				((run_start_pblk % ((BlockNumber) RELSEG_SIZE)) + run_blocks <
-				 ((BlockNumber) RELSEG_SIZE));
-
-			if (pblk < materialized_nblocks)
+			if (run_blocks == 0)
 			{
-				if (run_blocks == 0)
-				{
-					run_start_pblk = pblk;
-					run_start_idx = i;
-				}
-				else if (!can_extend_run)
-				{
-					um_flush_write_barrier_run(ctx, forknum, run_start_pblk,
-											   buffers, run_start_idx,
-											   &run_blocks, skipFsync,
-											   run_barriers);
-					run_start_pblk = pblk;
-					run_start_idx = i;
-				}
-
-				Assert(run_blocks < (BlockNumber) lengthof(run_barriers));
-				run_barriers[run_blocks] = pending_barrier;
-				pending_barrier.valid = false;
-				run_blocks++;
-				continue;
+				run_start_pblk = pblk;
+				run_start_idx = i;
+			}
+			else if (!can_extend_run)
+			{
+				um_flush_write_run(ctx, forknum, run_start_pblk,
+								   buffers, run_start_idx,
+								   &run_blocks, skipFsync);
+				run_start_pblk = pblk;
+				run_start_idx = i;
 			}
 
-			um_flush_write_barrier_run(ctx, forknum, run_start_pblk,
-									   buffers, run_start_idx,
-									   &run_blocks, skipFsync, run_barriers);
-			run_start_pblk = InvalidBlockNumber;
-
-			umfile_extend(ctx, forknum, pblk, buffers[i], skipFsync);
-			MapInflightReleaseBarrier(&pending_barrier);
-
-			if (max_extended_pblk == InvalidBlockNumber || pblk > max_extended_pblk)
-				max_extended_pblk = pblk;
-			if (materialized_nblocks < pblk + 1)
-				materialized_nblocks = pblk + 1;
+			Assert(run_blocks < (BlockNumber) PG_IOV_MAX);
+			run_blocks++;
+			continue;
 		}
 
-		um_flush_write_barrier_run(ctx, forknum, run_start_pblk,
-								   buffers, run_start_idx,
-								   &run_blocks, skipFsync, run_barriers);
+		um_flush_write_run(ctx, forknum, run_start_pblk,
+						   buffers, run_start_idx,
+						   &run_blocks, skipFsync);
+		run_start_pblk = InvalidBlockNumber;
+
+		umfile_extend(ctx, forknum, pblk, buffers[i], skipFsync);
+
+		if (max_extended_pblk == InvalidBlockNumber || pblk > max_extended_pblk)
+			max_extended_pblk = pblk;
+		if (materialized_nblocks < pblk + 1)
+			materialized_nblocks = pblk + 1;
 	}
-	PG_CATCH();
-	{
-		MapInflightReleaseBarrier(&pending_barrier);
-		um_release_write_barriers(run_barriers, run_blocks);
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
+
+	um_flush_write_run(ctx, forknum, run_start_pblk,
+					   buffers, run_start_idx,
+					   &run_blocks, skipFsync);
 
 	if (max_extended_pblk != InvalidBlockNumber)
 	{
@@ -3055,18 +2377,11 @@ umpretruncate(SMgrRelation reln, ForkNumber forknum,
 			  BlockNumber old_blocks, BlockNumber nblocks,
 			  XLogRecPtr truncate_lsn)
 {
-	UmbraAccessState access;
-	UmbraFileContext *ctx = um_ctx_acquire(reln);
-
+	(void) reln;
+	(void) forknum;
 	(void) old_blocks;
+	(void) nblocks;
 	(void) truncate_lsn;
-	access = um_classify_access(reln, forknum);
-
-	if (um_fork_uses_map_translation(forknum) &&
-		(access.policy == UMBRA_MAP_POLICY_REQUIRE_MAP ||
-		 access.map_available))
-		MapPreloadTruncatePages(ctx, reln->smgr_rlocator.locator,
-								forknum, nblocks);
 }
 
 void
@@ -3086,13 +2401,10 @@ umtruncate(SMgrRelation reln, ForkNumber forknum,
 		map_lsn = InRecovery ?
 			GetXLogReplayRecPtr(NULL) : GetXLogWriteRecPtr();
 
-		MapTruncate(ctx, reln->smgr_rlocator.locator,
-					forknum, nblocks, map_lsn);
-		MapActiveBitmapTruncate(ctx, reln->smgr_rlocator.locator,
-								forknum, nblocks, map_lsn);
+		UmbraShiftTruncate(ctx, reln->smgr_rlocator.locator,
+						   forknum, nblocks, map_lsn);
 		MapSBlockSetLogicalNblocks(ctx, reln->smgr_rlocator.locator,
 								   forknum, nblocks, map_lsn);
-		MapReleasePreloadedTruncatePages(reln->smgr_rlocator.locator, forknum);
 		return;
 	}
 

@@ -312,9 +312,8 @@ MapClockGetBuffer(void)
 			 */
 			local_buf_state = pg_atomic_read_u32(&buf->state);
 
-			if (MAPBUF_GET_REFCOUNT(local_buf_state) == 0 &&
-				MAPBUF_GET_USAGECOUNT(local_buf_state) == 0 &&
-				buf->pending_count == 0)
+				if (MAPBUF_GET_REFCOUNT(local_buf_state) == 0 &&
+					MAPBUF_GET_USAGECOUNT(local_buf_state) == 0)
 			{
 				/* Found a usable buffer */
 				pg_atomic_fetch_add_u32(&MapShared->num_allocs, 1);
@@ -350,8 +349,7 @@ MapClockGetBuffer(void)
 		 * If the buffer is pinned, we cannot use it.
 		 * If it has a non-zero usage_count, decrement it and continue.
 		 */
-		if (MAPBUF_GET_REFCOUNT(local_buf_state) == 0 &&
-			buf->pending_count == 0)
+			if (MAPBUF_GET_REFCOUNT(local_buf_state) == 0)
 		{
 			if (MAPBUF_GET_USAGECOUNT(local_buf_state) != 0)
 			{

@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * map.h
- *	  physical map layer: logical block number to physical block number mapping
+ *	  Umbra metadata fork cache and chunk-paired shift bitmap support
  *
  * This header defines MAP metadata page layout, shared cache APIs, and address
  * translation helpers for Umbra relation-local metadata.
@@ -30,40 +30,30 @@ typedef struct MapSharedData MapSharedData;
 typedef struct MapBufferDesc MapBufferDesc;
 
 /* Map buffer configuration */
-#define MAP_ENTRIES_PER_PAGE (BLCKSZ / sizeof(uint32))
 #define MAP_SUPERBLOCK_MIN_ENTRIES 50000
 
 /*
  * Umbra metadata fork page layout:
  * - block 0: superblock (512-byte payload)
- * - blocks 1..: repeated proportional groups
+ * - blocks 1..: repeated proportional groups of chunk-shift bitmap pages
  *
  * Each proportional group contains:
- * - 1 FSM map page
- * - 1 FSM chunk-active bitmap page
- * - 1 VM map page
- * - 1 VM chunk-active bitmap page
- * - 8192 MAIN map pages
- * - 256 MAIN chunk-active bitmap pages
+ * - 1 FSM chunk-shift bitmap page
+ * - 1 VM chunk-shift bitmap page
+ * - 256 MAIN chunk-shift bitmap pages
  *
- * This keeps MAIN close to the front of the file while preserving a stable
- * formula-based layout and reserving room for auxiliary forks as MAIN grows.
+ * The shift bit selects the active side of each formula-derived base/shadow
+ * pair.  There is no logical-block to arbitrary-physical-block entry map.
  */
 #define MAP_BLOCK_SUPER        0
 #define MAP_BLOCK_FIRST_GROUP  1
-#define MAP_GROUP_FSM_PAGES    1
-#define MAP_GROUP_FSM_ACTIVE_PAGES 1
-#define MAP_GROUP_VM_PAGES     1
-#define MAP_GROUP_VM_ACTIVE_PAGES 1
-#define MAP_GROUP_MAIN_PAGES   8192
-#define MAP_ACTIVE_BITS_PER_PAGE (BLCKSZ * BITS_PER_BYTE)
-#define MAP_GROUP_MAIN_ACTIVE_PAGES \
-	(((MAP_GROUP_MAIN_PAGES * MAP_ENTRIES_PER_PAGE) + \
-	  MAP_ACTIVE_BITS_PER_PAGE - 1) / MAP_ACTIVE_BITS_PER_PAGE)
+#define UMBRA_SHIFT_FSM_PAGES 1
+#define UMBRA_SHIFT_VM_PAGES 1
+#define UMBRA_SHIFT_BITS_PER_PAGE (BLCKSZ * BITS_PER_BYTE)
+#define UMBRA_SHIFT_MAIN_PAGES 256
 #define MAP_GROUP_TOTAL_PAGES \
-	(MAP_GROUP_FSM_PAGES + MAP_GROUP_FSM_ACTIVE_PAGES + \
-	 MAP_GROUP_VM_PAGES + MAP_GROUP_VM_ACTIVE_PAGES + \
-	 MAP_GROUP_MAIN_PAGES + MAP_GROUP_MAIN_ACTIVE_PAGES)
+	(UMBRA_SHIFT_FSM_PAGES + UMBRA_SHIFT_VM_PAGES + \
+	 UMBRA_SHIFT_MAIN_PAGES)
 
 /* Map buffer state bits */
 #define MAPBUF_VALID_MASK  0x000001FF	/* refcount (max 511) */
@@ -82,15 +72,10 @@ typedef struct MapBufferDesc MapBufferDesc;
 	(((state) & MAPBUF_USAGE_COUNT_MASK) >> MAPBUF_USAGE_COUNT_SHIFT)
 #define MAPBUF_USAGECOUNT_ONE  0x00000200
 
-/* Map page: a pure array of pblkno values */
 typedef struct MapPage
 {
-	uint32		pblknos[MAP_ENTRIES_PER_PAGE];
+	char		data[BLCKSZ];
 } MapPage;
-
-#define MAP_PENDING_BITS_PER_WORD 64
-#define MAP_PENDING_BITMAP_WORDS \
-	((MAP_ENTRIES_PER_PAGE + MAP_PENDING_BITS_PER_WORD - 1) / MAP_PENDING_BITS_PER_WORD)
 
 /* Shared memory control structure */
 typedef struct MapSharedData
@@ -124,71 +109,31 @@ typedef struct MapBufferDesc
 	XLogRecPtr	page_lsn;	/* LSN of last modification */
 	int			id;			/* slot ID */
 	pg_atomic_uint32 state; /* state flags */
-	uint32		pending_count;	/* in-flight remaps protected by pending_bits */
-	uint64		pending_bits[MAP_PENDING_BITMAP_WORDS];
 	int			freeNext;	/* next buffer in free list */
 	int			wait_backend_pid;	/* backend PID of pin-count waiter */
 	LWLock		buffer_lock;		/* lock for buffer content access */
 	LWLock		io_in_progress_lock; /* lock for buffer I/O state */
 } MapBufferDesc;
 
-typedef struct MapInflightBarrier
-{
-	bool		valid;
-	int			slot_id;
-	int			entry_idx;
-} MapInflightBarrier;
-
 extern void MapBackendInit(void);
 extern const ShmemCallbacks MapShmemCallbacks;
 
-/* Lookup/modification */
-extern bool MapTryLookup(UmbraFileContext *map_ctx, RelFileLocator rnode,
-						 ForkNumber forknum, BlockNumber lblkno,
-						 BlockNumber *pblkno);
-extern BlockNumber MapTryLookupPblkRun(UmbraFileContext *map_ctx,
-									   RelFileLocator rnode,
-									   ForkNumber forknum,
-									   BlockNumber lblkno,
-									   BlockNumber maxblocks,
-									   BlockNumber *start_pblkno);
-extern bool MapReserveFreshPblkno(UmbraFileContext *map_ctx,
-								  RelFileLocator rnode,
-								  ForkNumber forknum,
-								  BlockNumber lblkno,
-								  BlockNumber *new_pblkno);
-extern bool MapInflightLookupOwnedPblk(RelFileLocator rnode, ForkNumber forknum,
-									   BlockNumber lblkno, BlockNumber *pblkno);
-extern bool MapInflightTryClaimBarrier(UmbraFileContext *map_ctx,
-									   RelFileLocator rnode,
-									   ForkNumber forknum,
-									   BlockNumber lblkno,
-									   MapInflightBarrier *barrier);
-extern void MapInflightReleaseBarrier(MapInflightBarrier *barrier);
-extern void MapInflightRelease(RelFileLocator rnode, ForkNumber forknum,
-							   BlockNumber lblkno);
-/* Buffer management used by direct mapping publication helpers. */
+/* Buffer management used by shift bitmap helpers. */
 extern int	MapReadBuffer(UmbraFileContext *map_ctx, RelFileLocator rnode,
 						  ForkNumber forknum, BlockNumber map_blkno);
 
-/* Mapping publication helpers. */
-extern void MapGetNewPbkno(UmbraFileContext *map_ctx, RelFileLocator rnode,
-						   ForkNumber forknum, BlockNumber lblkno,
-						   BlockNumber *new_pblkno, BlockNumber *old_pblkno);
-extern void MapSetMapping(UmbraFileContext *map_ctx, RelFileLocator rnode,
+/* Chunk-paired shift bitmap helpers. */
+extern bool UmbraShiftGet(UmbraFileContext *map_ctx, RelFileLocator rnode,
 						  ForkNumber forknum, BlockNumber lblkno,
-						  BlockNumber new_pblkno, XLogRecPtr map_lsn);
-extern bool MapActiveBitmapGet(UmbraFileContext *map_ctx, RelFileLocator rnode,
-							   ForkNumber forknum, BlockNumber lblkno,
-							   bool *shadow_active);
-extern void MapActiveBitmapSet(UmbraFileContext *map_ctx, RelFileLocator rnode,
-							   ForkNumber forknum, BlockNumber lblkno,
-							   bool shadow_active, XLogRecPtr map_lsn);
-extern void MapActiveBitmapTruncate(UmbraFileContext *map_ctx,
-									RelFileLocator rnode,
-									ForkNumber forknum,
-									BlockNumber n_lblknos,
-									XLogRecPtr map_lsn);
+						  bool *shifted_to_shadow);
+extern void UmbraShiftSet(UmbraFileContext *map_ctx, RelFileLocator rnode,
+						  ForkNumber forknum, BlockNumber lblkno,
+						  bool shifted_to_shadow, XLogRecPtr map_lsn);
+extern void UmbraShiftTruncate(UmbraFileContext *map_ctx,
+							   RelFileLocator rnode,
+							   ForkNumber forknum,
+							   BlockNumber n_lblknos,
+							   XLogRecPtr map_lsn);
 
 /* MAP superblock helpers */
 extern void MapSBlockInit(UmbraFileContext *map_ctx, RelFileLocator rnode,
@@ -254,15 +199,6 @@ extern void MapBackendExitCleanup(void);
 
 /* Relation lifecycle */
 extern void MapDrop(RelFileLocator rnode);
-extern void MapTruncate(UmbraFileContext *map_ctx, RelFileLocator rnode,
-						ForkNumber forknum, BlockNumber n_lblknos,
-						XLogRecPtr map_lsn);
-extern void MapPreloadTruncatePages(UmbraFileContext *map_ctx,
-									RelFileLocator rnode,
-									ForkNumber forknum,
-									BlockNumber n_lblknos);
-extern void MapReleasePreloadedTruncatePages(RelFileLocator rnode,
-											 ForkNumber forknum);
 extern void MapInvalidateRelation(RelFileLocator rnode);
 extern void MapInvalidateDatabaseTablespaces(Oid dbid, int ntablespaces,
 											 const Oid *tablespace_ids);
@@ -272,10 +208,6 @@ extern void MapInvalidateDatabase(Oid dbid);
 extern BlockNumber MapGetLogicalBlockCount(UmbraFileContext *map_ctx,
 										   RelFileLocator rnode,
 										   ForkNumber forknum);
-extern BlockNumber MapGetPhysicalBlockCount(UmbraFileContext *map_ctx,
-											RelFileLocator rnode,
-											ForkNumber forknum,
-											BlockNumber n_lblknos);
 
 /* Clock algorithm */
 extern int	MapClockGetBuffer(void);
@@ -283,7 +215,6 @@ extern void MapClockFreeBuffer(int slot_id);
 extern int	MapSyncStart(uint32 *complete_passes, uint32 *num_allocs);
 extern void MapStrategyNotifyWriter(int mapwriter_procno);
 extern void MapWakeWriter(void);
-extern int	MapPreallocStep(int max_relations);
 
 /* Map cache hash table (in mapclock.c) */
 extern int	MapCacheLookup(RelFileLocator rnode, ForkNumber forknum,
@@ -303,15 +234,6 @@ extern void MapInvalidateBuffer(int slot_id, RelFileLocator expected_rnode,
 /* GUCs */
 extern int	map_buffers;
 extern int	map_superblocks;
-extern int	map_prealloc_main_low;
-extern int	map_prealloc_main_hard;
-extern int	map_prealloc_main_batch;
-extern int	map_prealloc_fsm_low;
-extern int	map_prealloc_fsm_hard;
-extern int	map_prealloc_fsm_batch;
-extern int	map_prealloc_vm_low;
-extern int	map_prealloc_vm_hard;
-extern int	map_prealloc_vm_batch;
 
 /* Global data (defined in map.c) */
 extern MapSharedData *MapShared;

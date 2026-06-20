@@ -15,7 +15,6 @@
 
 extern PGDLLIMPORT int MapWriterDelay;
 extern PGDLLIMPORT int MapWriterMaxPages;
-extern PGDLLIMPORT int MapWriterPreallocMaxRelations;
 extern PGDLLIMPORT double MapWriterLRUMultiplier;
 
 extern void MapBackgroundWorkersRegister(void);

@@ -52,6 +52,9 @@ extern bool umfile_ctx_preallocate_blocks(UmbraFileContext *ctx, ForkNumber fork
 extern void umfile_ctx_prefetch(UmbraFileContext *ctx, ForkNumber forknum, BlockNumber blkno);
 extern bool umfile_ctx_block_exists(UmbraFileContext *ctx, ForkNumber forknum,
 									BlockNumber blkno);
+extern void umfile_ctx_ensure_block_exists(UmbraFileContext *ctx,
+										   ForkNumber forknum,
+										   BlockNumber blkno);
 extern bool umfile_ctx_segment_exists(UmbraFileContext *ctx, ForkNumber forknum,
 									  BlockNumber segno);
 extern void umfile_ctx_register_dirty(UmbraFileContext *ctx, ForkNumber forknum,

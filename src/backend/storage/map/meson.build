@@ -7,6 +7,5 @@ backend_sources += files(
   'mapbgproc.c',
   'mapflush.c',
   'mapclock.c',
-  'mapinflight.c',
   'mapsuper.c',
 )

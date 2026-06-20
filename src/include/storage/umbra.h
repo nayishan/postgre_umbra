@@ -36,10 +36,9 @@ typedef enum UmbraMapPolicy
 } UmbraMapPolicy;
 
 /*
- * Umbra keeps MAIN/FSM/VM under mapping translation, but only MAIN uses the
- * more involved page-WAL-owned first-born protocol. FSM/VM are auxiliary
- * mapped forks with a more explicit producer set and a simpler traced-extend
- * model.
+ * Umbra keeps MAIN/FSM/VM under chunk-paired translation. New logical pages are
+ * born on their formula-derived base slot; later rewrites can switch the active
+ * side through the shift bitmap.
  */
 static inline bool
 UmbraForkUsesMapTranslation(ForkNumber forknum)
@@ -63,8 +62,8 @@ UmbraForkIsAuxiliaryMapped(ForkNumber forknum)
  *
  *   [base chunk][shadow chunk]
  *
- * The current transition keeps using MAP entries, but all first materialization
- * in skip-WAL/base state must use this formula instead of lblk == pblk.
+ * Each logical page is born on its base slot.  Later rewrites switch the active
+ * slot by flipping a shift bit for that logical block.
  */
 #define UMBRA_CHUNK_PAIRED_PAGES 32U
 
@@ -197,16 +196,8 @@ extern bool umexists(SMgrRelation reln, ForkNumber forknum);
 extern void umunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo);
 extern void umextend(SMgrRelation reln, ForkNumber forknum,
 					 BlockNumber blocknum, const void *buffer, bool skipFsync);
-extern bool umapplyreservedrange(SMgrRelation reln, ForkNumber forknum,
-								 BlockNumber firstblock, BlockNumber nblocks,
-								 const BlockNumber *pblknos,
-								 XLogRecPtr lsn, bool skipFsync);
 extern void umzeroextend(SMgrRelation reln, ForkNumber forknum,
 						 BlockNumber blocknum, int nblocks, bool skipFsync);
-extern void UmApplyReservedRangeRemap(SMgrRelation reln, ForkNumber forknum,
-									  BlockNumber firstblock, BlockNumber nblocks,
-									  const BlockNumber *pblknos,
-									  XLogRecPtr lsn, bool skipFsync);
 extern void UmRebuildMapAndSuperblockForSkipWAL(SMgrRelation reln);
 extern bool umprefetch(SMgrRelation reln, ForkNumber forknum,
 					   BlockNumber blocknum, int nblocks);
@@ -247,28 +238,20 @@ extern BlockNumber umnblocks(SMgrRelation reln, ForkNumber forknum);
 extern BlockNumber umnblocks_cached(SMgrRelation reln, ForkNumber forknum);
 
 /*
- * MAP fact / mutation helpers used by WAL and replay code.
+ * Translation helpers used by WAL and replay code.
  *
- * These expose mapping facts and mapping-state updates only. Runtime read-miss
- * interpretation stays in umbra.c.
+ * These expose chunk-paired translation and shift-bit updates only. Runtime
+ * read-miss interpretation stays in umbra.c.
  */
-extern void UmMapGetNewPbkno(SMgrRelation reln, ForkNumber forknum,
-							 BlockNumber lblkno, BlockNumber *new_pblkno,
-							 BlockNumber *old_pblkno);
-extern void UmMapReserveFreshPbkno(SMgrRelation reln, ForkNumber forknum,
-								   BlockNumber lblkno,
-								   BlockNumber *new_pblkno);
-extern bool UmMapAccessAvailable(SMgrRelation reln, ForkNumber forknum);
-extern bool UmWalOwnedRemapAvailable(SMgrRelation reln, ForkNumber forknum);
-extern bool UmWalOwnedFirstbornAvailable(SMgrRelation reln, ForkNumber forknum,
-										 BlockNumber lblkno);
-extern bool UmMapUsesChunkPaired(SMgrRelation reln, ForkNumber forknum);
-extern bool UmMapTryLookupPblkno(SMgrRelation reln, ForkNumber forknum,
-								 BlockNumber lblkno, BlockNumber *pblkno);
-extern bool UmMapIsLogicalUnmaterialized(SMgrRelation reln, ForkNumber forknum,
-										 BlockNumber lblkno);
-extern void UmMapSetMapping(SMgrRelation reln, ForkNumber forknum,
-							BlockNumber lblkno, BlockNumber new_pblkno,
-							XLogRecPtr map_lsn);
+extern void UmRemapGetTargetPblkno(SMgrRelation reln, ForkNumber forknum,
+								   BlockNumber lblkno, BlockNumber *new_pblkno,
+								   BlockNumber *old_pblkno);
+extern bool UmRemapWalOwnerAvailable(SMgrRelation reln, ForkNumber forknum);
+extern bool UmUsesChunkPairedTranslation(SMgrRelation reln, ForkNumber forknum);
+extern bool UmTranslationTryLookupPblkno(SMgrRelation reln, ForkNumber forknum,
+										BlockNumber lblkno, BlockNumber *pblkno);
+extern void UmShiftSetActivePblkno(SMgrRelation reln, ForkNumber forknum,
+								   BlockNumber lblkno, BlockNumber new_pblkno,
+								   XLogRecPtr map_lsn);
 
 #endif							/* UMBRA_H */
