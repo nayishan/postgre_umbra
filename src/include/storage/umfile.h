@@ -20,18 +20,6 @@
 
 typedef struct UmbraFileContext UmbraFileContext;
 
-typedef enum UmFileNblocksMode
-{
-	UMFILE_NBLOCKS_DENSE,
-	UMFILE_NBLOCKS_SPARSE
-} UmFileNblocksMode;
-
-typedef enum UmFileExistsMode
-{
-	UMFILE_EXISTS_DENSE,
-	UMFILE_EXISTS_SPARSE
-} UmFileExistsMode;
-
 /*
  * Backend-local context registry.
  *
@@ -51,10 +39,8 @@ extern void umfile_ctx_destroy_temporary(UmbraFileContext *ctx);
  * These provide direct physical addressing against fork files without going
  * through smgr mapping translation.
  */
-extern bool umfile_ctx_fork_exists(UmbraFileContext *ctx, ForkNumber forknum,
-								   UmFileExistsMode mode);
-extern BlockNumber umfile_ctx_get_nblocks(UmbraFileContext *ctx, ForkNumber forknum,
-										  UmFileNblocksMode mode);
+extern bool umfile_ctx_fork_exists(UmbraFileContext *ctx, ForkNumber forknum);
+extern BlockNumber umfile_ctx_get_nblocks(UmbraFileContext *ctx, ForkNumber forknum);
 extern void umfile_ctx_read(UmbraFileContext *ctx, ForkNumber forknum, BlockNumber blkno,
 							char *buffer, int nbytes);
 extern void umfile_ctx_write(UmbraFileContext *ctx, ForkNumber forknum, BlockNumber blkno,
@@ -62,7 +48,6 @@ extern void umfile_ctx_write(UmbraFileContext *ctx, ForkNumber forknum, BlockNum
 extern void umfile_ctx_extend(UmbraFileContext *ctx, ForkNumber forknum, BlockNumber blkno,
 							  const char *buffer);
 extern bool umfile_ctx_preallocate_blocks(UmbraFileContext *ctx, ForkNumber forknum,
-										  UmFileNblocksMode mode,
 										  BlockNumber target_nblocks);
 extern void umfile_ctx_prefetch(UmbraFileContext *ctx, ForkNumber forknum, BlockNumber blkno);
 extern bool umfile_ctx_block_exists(UmbraFileContext *ctx, ForkNumber forknum,
@@ -80,8 +65,7 @@ extern void umfile_init(void);
 
 /* smgr-equivalent operations (physical file semantics) */
 extern void umfile_create(UmbraFileContext *ctx, ForkNumber forknum, bool isRedo);
-extern bool umfile_exists(UmbraFileContext *ctx, ForkNumber forknum,
-						  UmFileExistsMode mode);
+extern bool umfile_exists(UmbraFileContext *ctx, ForkNumber forknum);
 extern bool umfile_open_or_create(UmbraFileContext *ctx, ForkNumber forknum,
 								  bool isRedo, bool *created);
 extern void umfile_unlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo);
@@ -111,8 +95,7 @@ extern void umfile_writev(UmbraFileContext *ctx, ForkNumber forknum, BlockNumber
 						  const void **buffers, BlockNumber nblocks, bool skipFsync);
 extern void umfile_writeback(UmbraFileContext *ctx, ForkNumber forknum,
 							 BlockNumber blocknum, BlockNumber nblocks);
-extern BlockNumber umfile_nblocks(UmbraFileContext *ctx, ForkNumber forknum,
-								  UmFileNblocksMode mode);
+extern BlockNumber umfile_nblocks(UmbraFileContext *ctx, ForkNumber forknum);
 extern void umfile_truncate(UmbraFileContext *ctx, ForkNumber forknum,
 							BlockNumber old_blocks, BlockNumber nblocks);
 extern void umfile_immedsync(UmbraFileContext *ctx, ForkNumber forknum);

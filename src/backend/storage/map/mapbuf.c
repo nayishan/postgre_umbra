@@ -70,8 +70,7 @@ MapEnsureBufferMaterialized(UmbraFileContext *map_ctx, MapBufferDesc *buf)
 	if ((state & MAPBUF_NOT_MATERIALIZED) == 0)
 		return;
 
-	if (!umfile_ctx_fork_exists(map_ctx, UMBRA_METADATA_FORKNUM,
-								UMFILE_EXISTS_DENSE))
+	if (!umfile_ctx_fork_exists(map_ctx, UMBRA_METADATA_FORKNUM))
 		elog(PANIC,
 			 "cannot materialize MAP page %d for relation %u/%u/%u without MAP fork",
 			 buf->page_number,
@@ -79,8 +78,7 @@ MapEnsureBufferMaterialized(UmbraFileContext *map_ctx, MapBufferDesc *buf)
 			 buf->rnode.dbOid,
 			 buf->rnode.relNumber);
 
-	map_nblocks = umfile_ctx_get_nblocks(map_ctx, UMBRA_METADATA_FORKNUM,
-										 UMFILE_NBLOCKS_DENSE);
+	map_nblocks = umfile_ctx_get_nblocks(map_ctx, UMBRA_METADATA_FORKNUM);
 	map_blkno = (BlockNumber) buf->page_number;
 
 	if (map_blkno >= map_nblocks)

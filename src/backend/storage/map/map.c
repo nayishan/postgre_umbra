@@ -336,8 +336,8 @@ MapDecodeMapBlkno(BlockNumber map_blkno, ForkNumber *forknum,
  * MapMapPageWithinLogicalRange - whether a MAP page intersects current logical
  * mapping domain of the target fork.
  *
- * This check is superblock-driven and keeps sparse holes outside logical range
- * from being interpreted as real MAP pages.
+ * This check is superblock-driven and keeps pages outside logical range from
+ * being interpreted as real MAP pages.
  */
 static bool
 MapMapPageWithinLogicalRange(UmbraFileContext *map_ctx, RelFileLocator rnode,
@@ -512,8 +512,7 @@ MapTryLookupPblkRun(UmbraFileContext *map_ctx, RelFileLocator rnode,
 	if (forknum == UMBRA_METADATA_FORKNUM)
 		elog(ERROR, "MapTryLookupPblkRun does not accept Umbra metadata fork");
 
-	if (!umfile_ctx_fork_exists(map_ctx, UMBRA_METADATA_FORKNUM,
-								UMFILE_EXISTS_DENSE))
+	if (!umfile_ctx_fork_exists(map_ctx, UMBRA_METADATA_FORKNUM))
 		return 0;
 
 	while (remaining > 0)
@@ -919,11 +918,9 @@ MapReadBuffer(UmbraFileContext *map_ctx, RelFileLocator rnode,
 		MapBufferUpdateStateBits(buf, MAPBUF_USAGECOUNT_ONE, 0);
 
 		page = MapGetPage(slot_id);
-		if (umfile_ctx_fork_exists(map_ctx, UMBRA_METADATA_FORKNUM,
-								   UMFILE_EXISTS_DENSE))
+		if (umfile_ctx_fork_exists(map_ctx, UMBRA_METADATA_FORKNUM))
 		{
-			map_nblocks = umfile_ctx_get_nblocks(map_ctx, UMBRA_METADATA_FORKNUM,
-												 UMFILE_NBLOCKS_DENSE);
+			map_nblocks = umfile_ctx_get_nblocks(map_ctx, UMBRA_METADATA_FORKNUM);
 			if (map_blkno < map_nblocks &&
 				MapMapPageWithinLogicalRange(map_ctx, rnode, forknum, map_blkno))
 			{
@@ -1022,8 +1019,7 @@ MapTruncate(UmbraFileContext *map_ctx, RelFileLocator rnode,
 						rnode.spcOid, rnode.dbOid, rnode.relNumber, forknum),
 				 errdetail("truncate target logical block count: %u", n_lblknos)));
 
-	if (!umfile_ctx_fork_exists(map_ctx, UMBRA_METADATA_FORKNUM,
-								UMFILE_EXISTS_DENSE))
+	if (!umfile_ctx_fork_exists(map_ctx, UMBRA_METADATA_FORKNUM))
 	{
 		Assert(false);
 		ereport(ERROR,
@@ -1052,8 +1048,7 @@ MapTruncate(UmbraFileContext *map_ctx, RelFileLocator rnode,
 		MapBufferDesc *buf;
 
 		map_blkno = MapForkPageIndexToMapBlkno(forknum, page_idx);
-		if (map_blkno >= umfile_ctx_get_nblocks(map_ctx, UMBRA_METADATA_FORKNUM,
-												UMFILE_NBLOCKS_DENSE))
+		if (map_blkno >= umfile_ctx_get_nblocks(map_ctx, UMBRA_METADATA_FORKNUM))
 			break;
 
 		slot_id = MapReadBuffer(map_ctx, rnode, forknum, map_blkno);
@@ -1103,8 +1098,7 @@ MapPreloadTruncatePages(UmbraFileContext *map_ctx, RelFileLocator rnode,
 	BlockNumber page_idx;
 
 	if (forknum == UMBRA_METADATA_FORKNUM ||
-		!umfile_ctx_fork_exists(map_ctx, UMBRA_METADATA_FORKNUM,
-								UMFILE_EXISTS_DENSE))
+		!umfile_ctx_fork_exists(map_ctx, UMBRA_METADATA_FORKNUM))
 		return;
 
 	if (!MapSBlockTryGetLogicalNblocks(map_ctx, rnode, forknum, &old_n_lblknos))
@@ -1140,8 +1134,7 @@ MapPreloadTruncatePages(UmbraFileContext *map_ctx, RelFileLocator rnode,
 		}
 
 		map_blkno = MapForkPageIndexToMapBlkno(forknum, page_idx);
-		if (map_blkno >= umfile_ctx_get_nblocks(map_ctx, UMBRA_METADATA_FORKNUM,
-												UMFILE_NBLOCKS_DENSE))
+		if (map_blkno >= umfile_ctx_get_nblocks(map_ctx, UMBRA_METADATA_FORKNUM))
 			break;
 
 		slot_id = MapReadBuffer(map_ctx, rnode, forknum, map_blkno);
@@ -1344,12 +1337,10 @@ MapGetPhysicalBlockCount(UmbraFileContext *map_ctx, RelFileLocator rnode,
 	if (n_lblknos == 0)
 		return 0;
 
-	if (!umfile_ctx_fork_exists(map_ctx, UMBRA_METADATA_FORKNUM,
-								UMFILE_EXISTS_DENSE))
+	if (!umfile_ctx_fork_exists(map_ctx, UMBRA_METADATA_FORKNUM))
 		return n_lblknos;
 
-	n_map_pages = umfile_ctx_get_nblocks(map_ctx, UMBRA_METADATA_FORKNUM,
-										 UMFILE_NBLOCKS_DENSE);
+	n_map_pages = umfile_ctx_get_nblocks(map_ctx, UMBRA_METADATA_FORKNUM);
 	if (n_map_pages == 0)
 		return 0;
 	page_count = (n_lblknos + MAP_ENTRIES_PER_PAGE - 1) / MAP_ENTRIES_PER_PAGE;

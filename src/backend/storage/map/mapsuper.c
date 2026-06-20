@@ -360,8 +360,7 @@ MapSuperLoadFromDisk(UmbraFileContext *map_ctx, RelFileLocator rnode,
 {
 	char		sector[MAP_SUPERBLOCK_SIZE];
 
-	if (!umfile_ctx_fork_exists(map_ctx, UMBRA_METADATA_FORKNUM,
-								UMFILE_EXISTS_DENSE))
+	if (!umfile_ctx_fork_exists(map_ctx, UMBRA_METADATA_FORKNUM))
 		return MAP_SBLOCK_READ_MISSING;
 
 	umfile_ctx_read(map_ctx, UMBRA_METADATA_FORKNUM, MAP_BLOCK_SUPER,
@@ -1260,8 +1259,7 @@ MapSBlockInit(UmbraFileContext *map_ctx, RelFileLocator rnode, XLogRecPtr map_ls
 	XLogRecPtr	write_lsn;
 
 	Assert(map_ctx != NULL);
-	if (!umfile_ctx_fork_exists(map_ctx, UMBRA_METADATA_FORKNUM,
-								UMFILE_EXISTS_DENSE))
+	if (!umfile_ctx_fork_exists(map_ctx, UMBRA_METADATA_FORKNUM))
 		elog(ERROR, "MAP fork is missing while initializing superblock");
 
 	entry = MapSuperEnsureEntryLocked(rnode);
@@ -1314,8 +1312,7 @@ MapSBlockEnsureLoaded(UmbraFileContext *map_ctx, RelFileLocator rnode)
 
 	Assert(map_ctx != NULL);
 
-	if (!umfile_ctx_fork_exists(map_ctx, UMBRA_METADATA_FORKNUM,
-								UMFILE_EXISTS_DENSE))
+	if (!umfile_ctx_fork_exists(map_ctx, UMBRA_METADATA_FORKNUM))
 		return false;
 
 	if (!MapSuperFindEntryLocked(rnode, LW_SHARED, &entry))

@@ -150,9 +150,8 @@ MapMaybePreallocateFork(UmbraFileContext *map_ctx, RelFileLocator rnode,
 
 	PG_TRY();
 	{
-		if (umfile_ctx_fork_exists(map_ctx, forknum, UMFILE_EXISTS_SPARSE))
+		if (umfile_ctx_fork_exists(map_ctx, forknum))
 			prealloc_ok = umfile_ctx_preallocate_blocks(map_ctx, forknum,
-														UMFILE_NBLOCKS_SPARSE,
 														target_nblocks);
 	}
 	PG_CATCH();

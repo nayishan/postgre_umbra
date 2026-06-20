@@ -35,7 +35,8 @@
 #include "utils/wait_event.h"
 
 /*
- * Like md.c, we split relation storage into segments of RELSEG_SIZE blocks.
+ * Like md.c, we split relation storage into in-order segments of RELSEG_SIZE
+ * blocks. Higher layers own any logical-to-physical placement policy.
  */
 
 /* Behavior flags for segment open helpers. */
@@ -43,7 +44,6 @@
 #define UM_EXTENSION_RETURN_NULL		(1 << 1)
 #define UM_EXTENSION_CREATE				(1 << 2)
 #define UM_EXTENSION_CREATE_RECOVERY	(1 << 3)
-#define UM_EXTENSION_DONT_OPEN			(1 << 5)
 
 /* local state */
 static MemoryContext UmCxt = NULL;
@@ -81,20 +81,12 @@ static UmfdVec *umfile_getseg(UmbraFileContext *ctx, RelFileLocatorBackend rloca
 static void umfile_register_dirty_seg(RelFileLocatorBackend rlocator,
 									  bool isTempRelation,
 									  ForkNumber forknum, UmfdVec *seg);
-static bool umfile_fork_allows_sparse_segments(ForkNumber forknum);
-static BlockNumber umfile_nblocks_sparse(UmbraFileContext *ctx,
-										 RelFileLocatorBackend rlocator,
-										 ForkNumber forknum);
-static BlockNumber umfile_nblocks_dense(UmbraFileContext *ctx,
-										RelFileLocatorBackend rlocator,
-										ForkNumber forknum);
+static BlockNumber umfile_nblocks_physical(UmbraFileContext *ctx,
+										   RelFileLocatorBackend rlocator,
+										   ForkNumber forknum);
 static BlockNumber umfile_nblocks_in_seg(File vfd);
 static bool umfile_preallocate_fd(File fd, off_t target_bytes);
 static bool umfile_preallocate_errno_is_unsupported(int err);
-static bool umfile_collect_existing_segnos_by_path(const char *seg0path,
-												   BlockNumber **segnos_out,
-												   int *nsegnos_out);
-static bool umfile_any_segment_exists_by_path(const char *seg0path);
 static inline UmfdVec *umfile_v_get(UmbraFileContext *ctx, ForkNumber forknum,
 									int segindex);
 static bool umfile_fork_has_open_segment(UmbraFileContext *ctx, ForkNumber forknum);
@@ -175,30 +167,25 @@ umfile_ctx_destroy_temporary(UmbraFileContext *ctx)
  */
 
 bool
-umfile_ctx_fork_exists(UmbraFileContext *ctx, ForkNumber forknum,
-					   UmFileExistsMode mode)
+umfile_ctx_fork_exists(UmbraFileContext *ctx, ForkNumber forknum)
 {
 	if (ctx == NULL)
 		return false;
-	return umfile_exists(ctx, forknum, mode);
+	return umfile_exists(ctx, forknum);
 }
 
 BlockNumber
-umfile_ctx_get_nblocks(UmbraFileContext *ctx, ForkNumber forknum,
-					   UmFileNblocksMode mode)
+umfile_ctx_get_nblocks(UmbraFileContext *ctx, ForkNumber forknum)
 {
 	Assert(ctx != NULL);
-	return umfile_nblocks(ctx, forknum, mode);
+	return umfile_nblocks(ctx, forknum);
 }
 
 static void
 umfile_ctx_ensure_fork(UmbraFileContext *ctx, ForkNumber forknum)
 {
 	Assert(ctx != NULL);
-	if (!umfile_exists(ctx, forknum,
-					   umfile_fork_allows_sparse_segments(forknum) ?
-					   UMFILE_EXISTS_SPARSE :
-					   UMFILE_EXISTS_DENSE))
+	if (!umfile_exists(ctx, forknum))
 		umfile_create(ctx, forknum, false /* isRedo */ );
 }
 
@@ -211,11 +198,7 @@ umfile_ctx_ensure_block_exists(UmbraFileContext *ctx, ForkNumber forknum,
 	if (umfile_ctx_block_exists(ctx, forknum, blkno))
 		return;
 
-	/*
-	 * Materialize just the requested block. For sparse mapped forks we do not
-	 * need an authoritative current EOF here; FileZero() can create the target
-	 * segment and make blkno BLCKSZ-addressable directly.
-	 */
+	/* Materialize just the requested block through the extension path. */
 	Assert(blkno < MaxBlockNumber);
 	umfile_zeroextend(ctx, forknum, blkno, 1, true /* skipFsync */ );
 }
@@ -321,7 +304,6 @@ umfile_ctx_extend(UmbraFileContext *ctx, ForkNumber forknum, BlockNumber blkno,
 
 bool
 umfile_ctx_preallocate_blocks(UmbraFileContext *ctx, ForkNumber forknum,
-							  UmFileNblocksMode mode,
 							  BlockNumber target_nblocks)
 {
 	BlockNumber	nblocks;
@@ -330,13 +312,10 @@ umfile_ctx_preallocate_blocks(UmbraFileContext *ctx, ForkNumber forknum,
 	if (ctx == NULL)
 		return false;
 
-	if (!umfile_exists(ctx, forknum,
-					   mode == UMFILE_NBLOCKS_SPARSE ?
-					   UMFILE_EXISTS_SPARSE :
-					   UMFILE_EXISTS_DENSE))
+	if (!umfile_exists(ctx, forknum))
 		return false;
 
-	nblocks = umfile_nblocks(ctx, forknum, mode);
+	nblocks = umfile_nblocks(ctx, forknum);
 	if (target_nblocks <= nblocks)
 		return true;
 
@@ -411,12 +390,7 @@ umfile_ctx_block_exists(UmbraFileContext *ctx, ForkNumber forknum,
 	}
 	else
 	{
-		/*
-		 * Dense forks can only materialize the next segment in order. Sparse
-		 * forks may legitimately skip lower segments.
-		 */
-		if (!umfile_fork_allows_sparse_segments(forknum) &&
-			segno > (BlockNumber) ctx->num_open_segs[forknum])
+		if (segno > (BlockNumber) ctx->num_open_segs[forknum])
 			return false;
 
 		v = umfile_openseg(ctx, ctx->rlocator, forknum, segno,
@@ -584,7 +558,6 @@ umfile_openseg(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 	RelPathStr	fullpath;
 	File		fd;
 	int			old_nseg;
-	int			i;
 
 	fullpath = umfile_segpath(rlocator, forknum, segno);
 
@@ -594,27 +567,14 @@ umfile_openseg(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 		return NULL;
 
 	old_nseg = ctx->num_open_segs[forknum];
-	if (umfile_fork_allows_sparse_segments(forknum))
-	{
-		if (segno >= (BlockNumber) old_nseg)
-		{
-			umfile_fdvec_resize(ctx, forknum, segno + 1);
-			for (i = old_nseg; i < ctx->num_open_segs[forknum]; i++)
-				umfile_seg_entry_reset(umfile_v_get(ctx, forknum, i));
-		}
-		v = umfile_v_get(ctx, forknum, (int) segno);
-		Assert(!umfile_seg_entry_is_open(v));
-	}
-	else
-	{
-		/*
-		 * Segments are opened in increasing order, so we must be adding a new
-		 * one at the end.
-		 */
-		Assert(segno == (BlockNumber) old_nseg);
-		umfile_fdvec_resize(ctx, forknum, segno + 1);
-		v = umfile_v_get(ctx, forknum, (int) segno);
-	}
+
+	/*
+	 * Segments are opened in increasing order, so we must be adding a new one
+	 * at the end.
+	 */
+	Assert(segno == (BlockNumber) old_nseg);
+	umfile_fdvec_resize(ctx, forknum, segno + 1);
+	v = umfile_v_get(ctx, forknum, (int) segno);
 
 	v->umfd_vfd = fd;
 	v->umfd_segno = segno;
@@ -658,112 +618,6 @@ umfile_openfork(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 	Assert(umfile_nblocks_in_seg(v->umfd_vfd) <= (BlockNumber) RELSEG_SIZE);
 
 	return v;
-}
-
-static bool
-umfile_fork_allows_sparse_segments(ForkNumber forknum)
-{
-	switch (forknum)
-	{
-		case MAIN_FORKNUM:
-		case FSM_FORKNUM:
-		case VISIBILITYMAP_FORKNUM:
-			return true;
-		default:
-			return false;
-	}
-}
-
-static bool umfile_collect_existing_segnos_by_path(const char *seg0path,
-												   BlockNumber **segnos_out,
-												   int *nsegnos_out);
-
-static bool
-umfile_sparse_fork_scan_segments(UmbraFileContext *ctx,
-								 ForkNumber forknum,
-								 BlockNumber *minsegno,
-								 BlockNumber *maxsegno)
-{
-	char		seg0path[MAXPGPATH];
-	BlockNumber *segnos = NULL;
-	int			nsegnos = 0;
-
-	Assert(umfile_fork_allows_sparse_segments(forknum));
-
-	umfile_build_segpath(ctx, forknum, 0, seg0path, sizeof(seg0path));
-	if (!umfile_collect_existing_segnos_by_path(seg0path, &segnos, &nsegnos))
-		return false;
-	if (nsegnos == 0)
-		return false;
-
-	if (minsegno != NULL)
-		*minsegno = segnos[0];
-	if (maxsegno != NULL)
-		*maxsegno = segnos[nsegnos - 1];
-	pfree(segnos);
-	return true;
-}
-
-static bool
-umfile_any_segment_exists_by_path(const char *seg0path)
-{
-	char		dirpath[MAXPGPATH];
-	char	   *slash;
-	const char *basename;
-	size_t		baselen;
-	DIR		   *dir;
-	struct dirent *de;
-
-	Assert(seg0path != NULL);
-
-	strlcpy(dirpath, seg0path, sizeof(dirpath));
-	slash = strrchr(dirpath, '/');
-	if (slash == NULL)
-		return false;
-
-	*slash = '\0';
-	basename = slash + 1;
-	baselen = strlen(basename);
-
-	dir = AllocateDir(dirpath);
-	if (dir == NULL)
-	{
-		if (errno == ENOENT)
-			return false;
-		return false;
-	}
-
-	while ((de = ReadDir(dir, dirpath)) != NULL)
-	{
-		const char *name = de->d_name;
-
-		if (strcmp(name, basename) == 0)
-		{
-			FreeDir(dir);
-			return true;
-		}
-
-		if (strncmp(name, basename, baselen) == 0 &&
-			name[baselen] == '.')
-		{
-			char	   *endptr = NULL;
-			unsigned long parsed;
-
-			errno = 0;
-			parsed = strtoul(name + baselen + 1, &endptr, 10);
-			if (errno == 0 &&
-				endptr != name + baselen + 1 &&
-				*endptr == '\0' &&
-				parsed <= MaxBlockNumber)
-			{
-				FreeDir(dir);
-				return true;
-			}
-		}
-	}
-
-	FreeDir(dir);
-	return false;
 }
 
 static inline bool
@@ -823,123 +677,6 @@ umfile_seg_entry_reset(UmfdVec *seg)
 	seg->umfd_segno = InvalidBlockNumber;
 }
 
-static int
-umfile_compare_blocknumbers(const void *a, const void *b)
-{
-	BlockNumber	va = *(const BlockNumber *) a;
-	BlockNumber	vb = *(const BlockNumber *) b;
-
-	if (va < vb)
-		return -1;
-	if (va > vb)
-		return 1;
-	return 0;
-}
-
-static bool
-umfile_collect_existing_segnos_by_path(const char *seg0path,
-									   BlockNumber **segnos_out,
-									   int *nsegnos_out)
-{
-	char		dirpath[MAXPGPATH];
-	char	   *slash;
-	const char *basename;
-	size_t		baselen;
-	DIR		   *dir;
-	struct dirent *de;
-	BlockNumber *segnos = NULL;
-	int			nsegnos = 0;
-	int			capacity = 0;
-	int			i;
-	int			uniq;
-
-	Assert(seg0path != NULL);
-	Assert(segnos_out != NULL);
-	Assert(nsegnos_out != NULL);
-
-	*segnos_out = NULL;
-	*nsegnos_out = 0;
-
-	strlcpy(dirpath, seg0path, sizeof(dirpath));
-	slash = strrchr(dirpath, '/');
-	if (slash == NULL)
-		return false;
-
-	*slash = '\0';
-	basename = slash + 1;
-	baselen = strlen(basename);
-
-	dir = AllocateDir(dirpath);
-	if (dir == NULL)
-	{
-		if (errno == ENOENT)
-			return true;
-		return false;
-	}
-
-	while ((de = ReadDir(dir, dirpath)) != NULL)
-	{
-		const char *name = de->d_name;
-		BlockNumber	segno;
-
-		if (strcmp(name, basename) == 0)
-			segno = 0;
-		else if (strncmp(name, basename, baselen) == 0 &&
-				 name[baselen] == '.')
-		{
-			char	   *endptr = NULL;
-			unsigned long parsed;
-
-			errno = 0;
-			parsed = strtoul(name + baselen + 1, &endptr, 10);
-			if (errno != 0 ||
-				endptr == name + baselen + 1 ||
-				*endptr != '\0' ||
-				parsed > MaxBlockNumber)
-				continue;
-			segno = (BlockNumber) parsed;
-		}
-		else
-			continue;
-
-		if (nsegnos == capacity)
-		{
-			int new_capacity = (capacity == 0) ? 16 : capacity * 2;
-
-			if (segnos == NULL)
-				segnos = (BlockNumber *) MemoryContextAlloc(UmCxt,
-															sizeof(BlockNumber) * new_capacity);
-			else
-				segnos = (BlockNumber *) repalloc(segnos,
-												  sizeof(BlockNumber) * new_capacity);
-			capacity = new_capacity;
-		}
-		segnos[nsegnos++] = segno;
-	}
-
-	FreeDir(dir);
-
-	if (nsegnos == 0)
-	{
-		if (segnos != NULL)
-			pfree(segnos);
-		return true;
-	}
-
-	qsort(segnos, nsegnos, sizeof(BlockNumber), umfile_compare_blocknumbers);
-
-	uniq = 1;
-	for (i = 1; i < nsegnos; i++)
-	{
-		if (segnos[i] != segnos[uniq - 1])
-			segnos[uniq++] = segnos[i];
-	}
-
-	*segnos_out = segnos;
-	*nsegnos_out = uniq;
-	return true;
-}
-
 /*
  * umfile_build_segpath() -- Build segment path in caller-provided buffer.
  *
@@ -987,8 +724,7 @@ umfile_getseg(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 	BlockNumber nextsegno;
 
 	Assert(behavior &
-		   (UM_EXTENSION_FAIL | UM_EXTENSION_CREATE | UM_EXTENSION_RETURN_NULL |
-			UM_EXTENSION_DONT_OPEN));
+		   (UM_EXTENSION_FAIL | UM_EXTENSION_CREATE | UM_EXTENSION_RETURN_NULL));
 
 	targetseg = blkno / ((BlockNumber) RELSEG_SIZE);
 
@@ -996,41 +732,8 @@ umfile_getseg(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 	if (targetseg < (BlockNumber) ctx->num_open_segs[forknum])
 	{
 		v = umfile_v_get(ctx, forknum, (int) targetseg);
-		if (!umfile_fork_allows_sparse_segments(forknum) ||
-			umfile_seg_entry_is_open(v))
+		if (umfile_seg_entry_is_open(v))
 			return v;
-	}
-
-	/* The caller only wants the segment if we already had it open. */
-	if (behavior & UM_EXTENSION_DONT_OPEN)
-		return NULL;
-
-	/*
-	 * Mapped data forks can use sparse physical segment numbering. Open/create
-	 * the target segment directly without checking continuity of previous
-	 * segments.
-	 */
-	if (umfile_fork_allows_sparse_segments(forknum))
-	{
-		int flags = 0;
-
-		if ((behavior & UM_EXTENSION_CREATE) ||
-			(InRecovery && (behavior & UM_EXTENSION_CREATE_RECOVERY)))
-			flags = O_CREAT;
-
-		v = umfile_openseg(ctx, rlocator, forknum, targetseg, flags);
-		if (v == NULL)
-		{
-			if ((behavior & UM_EXTENSION_RETURN_NULL) &&
-				FILE_POSSIBLY_DELETED(errno))
-				return NULL;
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not open file \"%s\" (target block %u): %m",
-							umfile_segpath(rlocator, forknum, targetseg).str,
-							blkno)));
-		}
-		return v;
 	}
 
 	/*
@@ -1174,9 +877,9 @@ umfile_register_forget_seg(RelFileLocatorBackend rlocator, ForkNumber forknum,
 }
 
 static void
-umfile_register_dense_existing_segs_for_unlink(RelFileLocatorBackend rlocator,
-											   ForkNumber forknum,
-											   const char *seg0path)
+umfile_register_existing_segs_for_unlink(RelFileLocatorBackend rlocator,
+										 ForkNumber forknum,
+										 const char *seg0path)
 {
 	char		segpath[MAXPGPATH];
 	BlockNumber segno;
@@ -1362,7 +1065,7 @@ umfile_ctx_close_fork(UmbraFileContext *ctx, ForkNumber forknum)
 }
 
 bool
-umfile_exists(UmbraFileContext *ctx, ForkNumber forknum, UmFileExistsMode mode)
+umfile_exists(UmbraFileContext *ctx, ForkNumber forknum)
 {
 	RelFileLocatorBackend rlocator;
 
@@ -1388,21 +1091,6 @@ umfile_exists(UmbraFileContext *ctx, ForkNumber forknum, UmFileExistsMode mode)
 				FileClose(v->umfd_vfd);
 			umfile_fdvec_resize(ctx, forknum, ctx->num_open_segs[forknum] - 1);
 		}
-	}
-
-	if (mode == UMFILE_EXISTS_SPARSE)
-	{
-		/*
-		 * Most sparse forks still keep seg0 around. Probe that first so the
-		 * common case stays as cheap as the legacy exists() path. Only fall
-		 * back to a directory scan when seg0 is absent and the fork may still
-		 * exist solely via higher sparse segments.
-		 */
-		if (umfile_openfork(ctx, rlocator, forknum, UM_EXTENSION_RETURN_NULL) != NULL)
-			return true;
-
-		return umfile_any_segment_exists_by_path(
-			umfile_segpath(rlocator, forknum, 0).str);
 	}
 
 	return (umfile_openfork(ctx, rlocator, forknum, UM_EXTENSION_RETURN_NULL) != NULL);
@@ -1481,8 +1169,8 @@ umfile_unlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 		!RelFileLocatorBackendIsTemp(rlocator) &&
 		forknum == UMBRA_METADATA_FORKNUM)
 	{
-		umfile_register_dense_existing_segs_for_unlink(rlocator, forknum,
-														   path.str);
+			umfile_register_existing_segs_for_unlink(rlocator, forknum,
+													 path.str);
 		return;
 	}
 
@@ -2294,41 +1982,8 @@ umfile_writeback(UmbraFileContext *ctx, ForkNumber forknum, BlockNumber blocknum
 }
 
 static BlockNumber
-umfile_nblocks_sparse(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
-					  ForkNumber forknum)
-{
-	UmfdVec    *v;
-	BlockNumber nblocks;
-	BlockNumber	minsegno;
-	BlockNumber	maxsegno;
-
-	Assert(umfile_fork_allows_sparse_segments(forknum));
-
-	if (!umfile_sparse_fork_scan_segments(ctx, forknum, &minsegno, &maxsegno))
-		return 0;
-
-	if (maxsegno >= (BlockNumber) ctx->num_open_segs[forknum] ||
-		!umfile_seg_entry_is_open(umfile_v_get(ctx, forknum, (int) maxsegno)))
-	{
-		v = umfile_openseg(ctx, rlocator, forknum, maxsegno, 0);
-		if (v == NULL)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not open file \"%s\": %m",
-							umfile_segpath(rlocator, forknum, maxsegno).str)));
-	}
-	else
-		v = umfile_v_get(ctx, forknum, (int) maxsegno);
-
-	nblocks = umfile_nblocks_in_seg(v->umfd_vfd);
-	if (nblocks > (BlockNumber) RELSEG_SIZE)
-		elog(FATAL, "segment too big");
-	return (maxsegno * ((BlockNumber) RELSEG_SIZE)) + nblocks;
-}
-
-static BlockNumber
-umfile_nblocks_dense(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
-					 ForkNumber forknum)
+umfile_nblocks_physical(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
+						ForkNumber forknum)
 {
 	UmfdVec    *v;
 	BlockNumber nblocks;
@@ -2363,17 +2018,14 @@ umfile_nblocks_dense(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 }
 
 BlockNumber
-umfile_nblocks(UmbraFileContext *ctx, ForkNumber forknum, UmFileNblocksMode mode)
+umfile_nblocks(UmbraFileContext *ctx, ForkNumber forknum)
 {
 	RelFileLocatorBackend rlocator;
 
 	Assert(ctx != NULL);
 	rlocator = ctx->rlocator;
 
-	if (mode == UMFILE_NBLOCKS_SPARSE)
-		return umfile_nblocks_sparse(ctx, rlocator, forknum);
-
-	return umfile_nblocks_dense(ctx, rlocator, forknum);
+	return umfile_nblocks_physical(ctx, rlocator, forknum);
 }
 
 void
@@ -2451,45 +2103,7 @@ umfile_registersync(UmbraFileContext *ctx, ForkNumber forknum)
 	int			segno;
 	int			min_inactive_seg;
 
-	if (umfile_fork_allows_sparse_segments(forknum))
-	{
-		RelPathStr	path = umfile_segpath(ctx->rlocator, forknum, 0);
-		BlockNumber *segnos = NULL;
-		int			nsegnos = 0;
-		int			i;
-
-		if (!umfile_collect_existing_segnos_by_path(path.str, &segnos, &nsegnos))
-			return;
-
-		for (i = 0; i < nsegnos; i++)
-		{
-			BlockNumber	curseg = segnos[i];
-			UmfdVec	   *v;
-
-			if (curseg < (BlockNumber) ctx->num_open_segs[forknum] &&
-				umfile_seg_entry_is_open(umfile_v_get(ctx, forknum, (int) curseg)))
-				v = umfile_v_get(ctx, forknum, (int) curseg);
-			else
-			{
-				v = umfile_openseg(ctx, ctx->rlocator, forknum, curseg, 0);
-				if (v == NULL)
-					ereport(ERROR,
-							(errcode_for_file_access(),
-							 errmsg("could not open file \"%s\": %m",
-									umfile_segpath(ctx->rlocator, forknum, curseg).str)));
-			}
-
-			umfile_register_dirty_seg(ctx->rlocator,
-									  RelFileLocatorBackendIsTemp(ctx->rlocator),
-									  forknum, v);
-		}
-
-		if (segnos != NULL)
-			pfree(segnos);
-		return;
-	}
-
-	(void) umfile_nblocks(ctx, forknum, UMFILE_NBLOCKS_DENSE);
+	(void) umfile_nblocks(ctx, forknum);
 
 	min_inactive_seg = segno = ctx->num_open_segs[forknum];
 
@@ -2520,47 +2134,7 @@ umfile_immedsync(UmbraFileContext *ctx, ForkNumber forknum)
 	int			segno;
 	int			min_inactive_seg;
 
-	if (umfile_fork_allows_sparse_segments(forknum))
-	{
-		RelPathStr	path = umfile_segpath(ctx->rlocator, forknum, 0);
-		BlockNumber *segnos = NULL;
-		int			nsegnos = 0;
-		int			i;
-
-		if (!umfile_collect_existing_segnos_by_path(path.str, &segnos, &nsegnos))
-			return;
-
-		for (i = 0; i < nsegnos; i++)
-		{
-			BlockNumber	curseg = segnos[i];
-			UmfdVec	   *v;
-
-			if (curseg < (BlockNumber) ctx->num_open_segs[forknum] &&
-				umfile_seg_entry_is_open(umfile_v_get(ctx, forknum, (int) curseg)))
-				v = umfile_v_get(ctx, forknum, (int) curseg);
-			else
-			{
-				v = umfile_openseg(ctx, ctx->rlocator, forknum, curseg, 0);
-				if (v == NULL)
-					ereport(ERROR,
-							(errcode_for_file_access(),
-							 errmsg("could not open file \"%s\": %m",
-									umfile_segpath(ctx->rlocator, forknum, curseg).str)));
-			}
-
-			if (FileSync(v->umfd_vfd, WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC) < 0)
-				ereport(data_sync_elevel(ERROR),
-						(errcode_for_file_access(),
-						 errmsg("could not fsync file \"%s\": %m",
-								FilePathName(v->umfd_vfd))));
-		}
-
-		if (segnos != NULL)
-			pfree(segnos);
-		return;
-	}
-
-	(void) umfile_nblocks(ctx, forknum, UMFILE_NBLOCKS_DENSE);
+	(void) umfile_nblocks(ctx, forknum);
 
 	min_inactive_seg = segno = ctx->num_open_segs[forknum];
 
@@ -2593,13 +2167,7 @@ umfile_fd(UmbraFileContext *ctx, ForkNumber forknum, BlockNumber blocknum, uint3
 {
 	UmfdVec    *v;
 
-	/*
-	 * Sparse mapped forks can address a target segment even when segment 0 is
-	 * absent. Reopen the specific target segment directly instead of insisting
-	 * that segment 0 exists.
-	 */
-	if (!umfile_fork_allows_sparse_segments(forknum))
-		(void) umfile_openfork(ctx, ctx->rlocator, forknum, UM_EXTENSION_FAIL);
+	(void) umfile_openfork(ctx, ctx->rlocator, forknum, UM_EXTENSION_FAIL);
 
 	v = umfile_getseg(ctx, ctx->rlocator,
 					  forknum, blocknum, false /* skipFsync */,

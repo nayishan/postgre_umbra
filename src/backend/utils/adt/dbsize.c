@@ -387,9 +387,8 @@ pg_relation_size(PG_FUNCTION_ARGS)
 	smgr = RelationGetSmgr(rel);
 
 	/*
-	 * Umbra may remap a relation's logical blocks onto a sparse physical file.
-	 * SQL-visible relation size follows the storage manager's logical block
-	 * count, not raw stat(2) bytes.
+	 * Umbra physical layout may differ from the SQL-visible logical fork size.
+	 * Report the storage manager's logical block count, not raw stat(2) bytes.
 	 */
 	size = (int64) smgrnblocks(smgr, forknum) * BLCKSZ;
 

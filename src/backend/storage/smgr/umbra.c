@@ -237,8 +237,7 @@ static void um_filetag_path(const FileTag *ftag, char *path);
 bool
 UmMetadataExists(SMgrRelation reln)
 {
-	return umfile_exists(um_ctx_acquire(reln), UMBRA_METADATA_FORKNUM,
-						 UMFILE_EXISTS_DENSE);
+	return umfile_exists(um_ctx_acquire(reln), UMBRA_METADATA_FORKNUM);
 }
 
 bool
@@ -251,8 +250,7 @@ UmMetadataOpenOrCreate(SMgrRelation reln, bool isRedo, bool *created)
 BlockNumber
 UmMetadataNblocks(SMgrRelation reln)
 {
-	return umfile_nblocks(um_ctx_acquire(reln), UMBRA_METADATA_FORKNUM,
-						  UMFILE_NBLOCKS_DENSE);
+	return umfile_nblocks(um_ctx_acquire(reln), UMBRA_METADATA_FORKNUM);
 }
 
 void
@@ -829,10 +827,10 @@ UmRebuildMapAndSuperblockForSkipWAL(SMgrRelation reln)
 		if (!UmbraForkUsesMapTranslation(forknum))
 			continue;
 
-		if (!umfile_exists(ctx, forknum, UMFILE_EXISTS_DENSE))
+		if (!umfile_exists(ctx, forknum))
 			continue;
 
-		nblocks = umfile_nblocks(ctx, forknum, UMFILE_NBLOCKS_DENSE);
+		nblocks = umfile_nblocks(ctx, forknum);
 		apply_entries[apply_count].forknum = forknum;
 		apply_entries[apply_count].nblocks = nblocks;
 		apply_count++;
@@ -1765,11 +1763,11 @@ umexists(SMgrRelation reln, ForkNumber forknum)
 	UmbraFileContext *ctx = um_ctx_acquire(reln);
 
 	if (!um_fork_uses_map_translation(forknum))
-		return umfile_exists(ctx, forknum, UMFILE_EXISTS_DENSE);
+		return umfile_exists(ctx, forknum);
 
 	policy = um_map_policy_for_access(reln, forknum);
 	if (policy != UMBRA_MAP_POLICY_REQUIRE_MAP)
-		return umfile_exists(ctx, forknum, UMFILE_EXISTS_DENSE);
+		return umfile_exists(ctx, forknum);
 
 	return um_mapped_exists_from_super(reln, forknum);
 }
@@ -2503,7 +2501,7 @@ umnblocks_for_access(SMgrRelation reln, ForkNumber forknum,
 	BlockNumber nblocks;
 
 	if (!access->map_available)
-		return umfile_nblocks(ctx, forknum, UMFILE_NBLOCKS_DENSE);
+		return umfile_nblocks(ctx, forknum);
 
 	if (MapSBlockTryGetLogicalNblocks(ctx, reln->smgr_rlocator.locator,
 									  forknum, &nblocks))

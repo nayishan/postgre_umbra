@@ -98,8 +98,7 @@ MapFlushWritePage(RelFileLocatorBackend rlocator, UmbraFileContext *ctx,
 	Assert(ctx != NULL);
 	Assert(page != NULL);
 	Assert(map_blkno != MAP_BLOCK_SUPER);
-	Assert(umfile_ctx_fork_exists(ctx, UMBRA_METADATA_FORKNUM,
-								 UMFILE_EXISTS_DENSE));
+	Assert(umfile_ctx_fork_exists(ctx, UMBRA_METADATA_FORKNUM));
 
 	if (!InRecovery && page_lsn != InvalidXLogRecPtr)
 		XLogFlush(page_lsn);

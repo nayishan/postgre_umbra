@@ -151,8 +151,7 @@ umbra_redo(XLogReaderState *record)
 					BlockNumber nblocks;
 					char		pagebuf[BLCKSZ];
 
-					nblocks = umfile_ctx_get_nblocks(ctx, xlrec->forknum,
-													 UMFILE_NBLOCKS_SPARSE);
+					nblocks = umfile_ctx_get_nblocks(ctx, xlrec->forknum);
 					if (xlrec->old_pblkno < nblocks)
 					{
 						umfile_ctx_read(ctx, xlrec->forknum, xlrec->old_pblkno,
