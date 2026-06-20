@@ -175,10 +175,6 @@ static const struct
 	{
 		.fn_name = "MapWriterMain",
 		.fn_addr = MapWriterMain
-	},
-	{
-		.fn_name = "MapCompactorMain",
-		.fn_addr = MapCompactorMain
 	}
 #endif
 };

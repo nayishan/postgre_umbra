@@ -71,10 +71,6 @@ static BlockNumber MapSuperGetExtendingTarget(const MapSuperEntry *entry,
 static void MapSuperSetExtendingTarget(MapSuperEntry *entry,
 									   ForkNumber forknum,
 									   BlockNumber nblocks);
-static void MapSuperSetReclaimBoundary(MapSuperEntry *entry,
-									   ForkNumber forknum,
-									   BlockNumber boundary_pblk);
-static void MapSuperResetReclaimBoundaries(MapSuperEntry *entry);
 static bool MapSuperPrepareEntryForUpdate(UmbraFileContext *map_ctx,
 										  RelFileLocator rnode,
 										  XLogRecPtr map_lsn,
@@ -585,9 +581,6 @@ MapSuperEnsureEntryLocked(RelFileLocator rnode)
 	entry->extending_target_main = InvalidBlockNumber;
 	entry->extending_target_fsm = InvalidBlockNumber;
 	entry->extending_target_vm = InvalidBlockNumber;
-	entry->reclaim_boundary_main = 0;
-	entry->reclaim_boundary_fsm = 0;
-	entry->reclaim_boundary_vm = 0;
 	MapSuperIndex[insert_bucket].slot_id = slot_id;
 
 	LWLockAcquire(&entry->lock, LW_EXCLUSIVE);
@@ -625,9 +618,6 @@ MapSuperDeleteEntry(RelFileLocator rnode)
 		entry->extending_target_main = InvalidBlockNumber;
 		entry->extending_target_fsm = InvalidBlockNumber;
 		entry->extending_target_vm = InvalidBlockNumber;
-		entry->reclaim_boundary_main = 0;
-		entry->reclaim_boundary_fsm = 0;
-		entry->reclaim_boundary_vm = 0;
 		entry->in_use = false;
 		SpinLockAcquire(&MapSuperCtlData->free_list_lock);
 		entry->next_free = MapSuperCtlData->free_head;
@@ -664,7 +654,6 @@ MapSBlockRead(UmbraFileContext *map_ctx, RelFileLocator rnode, MapSuperblock *su
 				entry->page_lsn = MapSuperblockGetLastUpdatedLSN(&disk_super);
 				entry->flags = MAPSUPER_FLAG_VALID;
 				MapSuperResetReservedNextFrees(entry);
-				MapSuperResetReclaimBoundaries(entry);
 				Assert(MapNormalizeForkBlockCount(MAIN_FORKNUM,
 												  MapSuperblockGetNextFreePhysBlock(&entry->super,
 																					MAIN_FORKNUM)) <=
@@ -684,7 +673,6 @@ MapSBlockRead(UmbraFileContext *map_ctx, RelFileLocator rnode, MapSuperblock *su
 				entry->page_lsn = InvalidXLogRecPtr;
 				entry->flags = MAPSUPER_FLAG_VALID | MAPSUPER_FLAG_CORRUPT;
 				MapSuperResetReservedNextFrees(entry);
-				MapSuperResetReclaimBoundaries(entry);
 				Assert(MapNormalizeForkBlockCount(MAIN_FORKNUM,
 												  MapSuperblockGetNextFreePhysBlock(&entry->super,
 																					MAIN_FORKNUM)) <=
@@ -720,7 +708,6 @@ MapSBlockRead(UmbraFileContext *map_ctx, RelFileLocator rnode, MapSuperblock *su
 				entry->page_lsn = MapSuperblockGetLastUpdatedLSN(&disk_super);
 				entry->flags = MAPSUPER_FLAG_VALID;
 				MapSuperResetReservedNextFrees(entry);
-				MapSuperResetReclaimBoundaries(entry);
 				Assert(MapNormalizeForkBlockCount(MAIN_FORKNUM,
 												  MapSuperblockGetNextFreePhysBlock(&entry->super,
 																					MAIN_FORKNUM)) <=
@@ -740,7 +727,6 @@ MapSBlockRead(UmbraFileContext *map_ctx, RelFileLocator rnode, MapSuperblock *su
 				entry->page_lsn = InvalidXLogRecPtr;
 				entry->flags = MAPSUPER_FLAG_VALID | MAPSUPER_FLAG_CORRUPT;
 				MapSuperResetReservedNextFrees(entry);
-				MapSuperResetReclaimBoundaries(entry);
 				Assert(MapNormalizeForkBlockCount(MAIN_FORKNUM,
 												  MapSuperblockGetNextFreePhysBlock(&entry->super,
 																					MAIN_FORKNUM)) <=
@@ -924,67 +910,6 @@ MapSuperSetExtendingTarget(MapSuperEntry *entry, ForkNumber forknum,
 	}
 }
 
-BlockNumber
-MapSuperGetReclaimBoundary(const MapSuperEntry *entry, ForkNumber forknum)
-{
-	Assert(entry != NULL);
-
-	switch (forknum)
-	{
-		case MAIN_FORKNUM:
-			return entry->reclaim_boundary_main;
-		case FSM_FORKNUM:
-			return entry->reclaim_boundary_fsm;
-		case VISIBILITYMAP_FORKNUM:
-			return entry->reclaim_boundary_vm;
-		default:
-			elog(ERROR, "unsupported fork number for reclaim boundary: %d", forknum);
-	}
-
-	pg_unreachable();
-}
-
-static void
-MapSuperSetReclaimBoundary(MapSuperEntry *entry, ForkNumber forknum,
-						   BlockNumber boundary_pblk)
-{
-	Assert(entry != NULL);
-
-	switch (forknum)
-	{
-		case MAIN_FORKNUM:
-			entry->reclaim_boundary_main = boundary_pblk;
-			break;
-		case FSM_FORKNUM:
-			entry->reclaim_boundary_fsm = boundary_pblk;
-			break;
-		case VISIBILITYMAP_FORKNUM:
-			entry->reclaim_boundary_vm = boundary_pblk;
-			break;
-		default:
-			elog(ERROR, "unsupported fork number for reclaim boundary: %d", forknum);
-	}
-}
-
-static void
-MapSuperResetReclaimBoundaries(MapSuperEntry *entry)
-{
-	Assert(entry != NULL);
-
-	entry->reclaim_boundary_main =
-		MapNormalizeForkBlockCount(MAIN_FORKNUM,
-								   MapSuperblockGetNextFreePhysBlock(&entry->super,
-																	 MAIN_FORKNUM));
-	entry->reclaim_boundary_fsm =
-		MapNormalizeForkBlockCount(FSM_FORKNUM,
-								   MapSuperblockGetNextFreePhysBlock(&entry->super,
-																	 FSM_FORKNUM));
-	entry->reclaim_boundary_vm =
-		MapNormalizeForkBlockCount(VISIBILITYMAP_FORKNUM,
-								   MapSuperblockGetNextFreePhysBlock(&entry->super,
-																	 VISIBILITYMAP_FORKNUM));
-}
-
 static bool
 MapSuperPrepareEntryForUpdate(UmbraFileContext *map_ctx, RelFileLocator rnode,
 							  XLogRecPtr map_lsn, const char *missing_errmsg,
@@ -1021,7 +946,6 @@ MapSuperPrepareEntryForUpdate(UmbraFileContext *map_ctx, RelFileLocator rnode,
 				entry->page_lsn = MapSuperblockGetLastUpdatedLSN(&disk_super);
 				entry->flags = MAPSUPER_FLAG_VALID;
 				MapSuperResetReservedNextFrees(entry);
-				MapSuperResetReclaimBoundaries(entry);
 			}
 			else
 			{
@@ -1029,7 +953,6 @@ MapSuperPrepareEntryForUpdate(UmbraFileContext *map_ctx, RelFileLocator rnode,
 				entry->page_lsn = InvalidXLogRecPtr;
 				entry->flags = MAPSUPER_FLAG_VALID | MAPSUPER_FLAG_CORRUPT;
 				MapSuperResetReservedNextFrees(entry);
-				MapSuperResetReclaimBoundaries(entry);
 			}
 		}
 	}
@@ -1051,7 +974,6 @@ MapSuperPrepareEntryForUpdate(UmbraFileContext *map_ctx, RelFileLocator rnode,
 		MapSuperblockInit(&entry->super, 0);
 		entry->flags = MAPSUPER_FLAG_VALID;
 		MapSuperResetReservedNextFrees(entry);
-		MapSuperResetReclaimBoundaries(entry);
 	}
 
 	Assert(MapNormalizeForkBlockCount(MAIN_FORKNUM,
@@ -1181,8 +1103,6 @@ MapSBlockBumpPhysicalState(UmbraFileContext *map_ctx, RelFileLocator rnode,
 	{
 		MapSuperblockSetNextFreePhysBlock(&entry->super, forknum, nblocks);
 		MapSuperMaybeBumpReservedNextFree(entry, forknum, nblocks);
-		if (InRecovery)
-			MapSuperSetReclaimBoundary(entry, forknum, nblocks);
 		changed = true;
 	}
 	if (bump_capacity && current_capacity < nblocks)
@@ -1354,7 +1274,6 @@ MapSBlockInit(UmbraFileContext *map_ctx, RelFileLocator rnode, XLogRecPtr map_ls
 	MapSuperblockSetLastUpdatedLSN(&entry->super, entry->page_lsn);
 	entry->flags = MAPSUPER_FLAG_VALID | MAPSUPER_FLAG_DIRTY;
 	MapSuperResetReservedNextFrees(entry);
-	MapSuperResetReclaimBoundaries(entry);
 	Assert(MapNormalizeForkBlockCount(MAIN_FORKNUM,
 									  MapSuperblockGetNextFreePhysBlock(&entry->super,
 																		MAIN_FORKNUM)) <=
@@ -1417,7 +1336,6 @@ MapSBlockEnsureLoaded(UmbraFileContext *map_ctx, RelFileLocator rnode)
 				entry->page_lsn = MapSuperblockGetLastUpdatedLSN(&disk_super);
 				entry->flags = MAPSUPER_FLAG_VALID;
 				MapSuperResetReservedNextFrees(entry);
-				MapSuperResetReclaimBoundaries(entry);
 			}
 			else
 			{
@@ -1425,7 +1343,6 @@ MapSBlockEnsureLoaded(UmbraFileContext *map_ctx, RelFileLocator rnode)
 				entry->page_lsn = InvalidXLogRecPtr;
 				entry->flags = MAPSUPER_FLAG_VALID | MAPSUPER_FLAG_CORRUPT;
 				MapSuperResetReservedNextFrees(entry);
-				MapSuperResetReclaimBoundaries(entry);
 			}
 		}
 	}
@@ -1564,83 +1481,6 @@ MapSBlockTryGetNextFreePhysBlock(UmbraFileContext *map_ctx, RelFileLocator rnode
 	return true;
 }
 
-bool
-MapSBlockTryGetReclaimBoundary(UmbraFileContext *map_ctx, RelFileLocator rnode,
-							   ForkNumber forknum, BlockNumber *boundary_pblk)
-{
-	MapSuperEntry *entry;
-	uint32		flags;
-
-	Assert(boundary_pblk != NULL);
-
-	if (!MapForkHasMappedState(forknum))
-		return false;
-	if (!MapSBlockEnsureLoaded(map_ctx, rnode))
-		return false;
-	if (!MapSuperFindEntryLocked(rnode, LW_SHARED, &entry))
-		return false;
-
-	flags = entry->flags;
-	if ((flags & MAPSUPER_FLAG_CORRUPT) ||
-		!MapSuperblockHasValidIdentity(&entry->super) ||
-		((flags & MAPSUPER_FLAG_DIRTY) == 0 &&
-		 !MapSuperblockCheckCRC(&entry->super)))
-	{
-		LWLockRelease(&entry->lock);
-		if (!InRecovery)
-			MapSBlockReportCorrupt(rnode, "invalid identity or CRC");
-		return false;
-	}
-
-	*boundary_pblk = MapNormalizeForkBlockCount(forknum,
-												MapSuperGetReclaimBoundary(entry,
-																		   forknum));
-	LWLockRelease(&entry->lock);
-	return true;
-}
-
-void
-MapSBlockAdvanceReclaimBoundary(UmbraFileContext *map_ctx, RelFileLocator rnode,
-								ForkNumber forknum, BlockNumber boundary_pblk)
-{
-	MapSuperEntry *entry;
-	BlockNumber	current;
-	BlockNumber	next_free;
-
-	if (!MapForkHasMappedState(forknum))
-		return;
-	if (boundary_pblk == InvalidBlockNumber)
-		return;
-	if (!MapSBlockEnsureLoaded(map_ctx, rnode))
-		return;
-	if (!MapSuperFindEntryLocked(rnode, LW_EXCLUSIVE, &entry))
-		return;
-
-	if (!entry->in_use ||
-		(entry->flags & MAPSUPER_FLAG_VALID) == 0 ||
-		(entry->flags & MAPSUPER_FLAG_CORRUPT) != 0 ||
-		!MapSuperblockHasValidIdentity(&entry->super) ||
-		((entry->flags & MAPSUPER_FLAG_DIRTY) == 0 &&
-		 !MapSuperblockCheckCRC(&entry->super)))
-	{
-		LWLockRelease(&entry->lock);
-		return;
-	}
-
-	current = MapNormalizeForkBlockCount(forknum,
-										 MapSuperGetReclaimBoundary(entry,
-																	forknum));
-	next_free = MapNormalizeForkBlockCount(forknum,
-										   MapSuperblockGetNextFreePhysBlock(&entry->super,
-																			 forknum));
-	if (boundary_pblk > next_free)
-		boundary_pblk = next_free;
-	if (boundary_pblk > current)
-		MapSuperSetReclaimBoundary(entry, forknum, boundary_pblk);
-
-	LWLockRelease(&entry->lock);
-}
-
 void
 MapSBlockBumpLogicalNblocks(UmbraFileContext *map_ctx, RelFileLocator rnode,
 							ForkNumber forknum, BlockNumber nblocks,
@@ -1772,9 +1612,6 @@ MapSuperTableShmemInit(void)
 		entry->extending_target_main = InvalidBlockNumber;
 		entry->extending_target_fsm = InvalidBlockNumber;
 		entry->extending_target_vm = InvalidBlockNumber;
-		entry->reclaim_boundary_main = 0;
-		entry->reclaim_boundary_fsm = 0;
-		entry->reclaim_boundary_vm = 0;
 		LWLockInitialize(&entry->lock, LWTRANCHE_MAP_BUFFER_CONTENT);
 	}
 

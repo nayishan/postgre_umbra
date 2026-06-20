@@ -89,15 +89,10 @@ typedef struct MapSharedData
 	slock_t		clock_lock;
 	int			first_free_buffer;	/* head of free list, -1 if empty */
 	int			mapwriter_procno;	/* procno to wake, -1 if none */
-	int			mapcompactor_procno;	/* procno to wake, -1 if none */
 
 	/* statistics */
 	pg_atomic_uint32 num_allocs;
 	uint32		complete_passes;
-	pg_atomic_uint64 map_compactor_relocations;
-	pg_atomic_uint64 map_reclaim_enqueued;
-	pg_atomic_uint64 map_reclaim_processed;
-	pg_atomic_uint64 map_reclaim_failed;
 
 	/* configuration */
 	int			num_slots;
@@ -135,14 +130,6 @@ typedef struct MapInflightBarrier
 
 extern void MapBackendInit(void);
 extern const ShmemCallbacks MapShmemCallbacks;
-extern void MapStatsAddCompactorRelocations(uint64 count);
-extern void MapStatsAddReclaimEnqueued(uint64 count);
-extern void MapStatsAddReclaimProcessed(uint64 count);
-extern void MapStatsAddReclaimFailed(uint64 count);
-extern uint64 MapStatsGetCompactorRelocations(void);
-extern uint64 MapStatsGetReclaimEnqueued(void);
-extern uint64 MapStatsGetReclaimProcessed(void);
-extern uint64 MapStatsGetReclaimFailed(void);
 
 /* Lookup/modification */
 extern bool MapTryLookup(UmbraFileContext *map_ctx, RelFileLocator rnode,
@@ -272,13 +259,9 @@ extern BlockNumber MapGetPhysicalBlockCount(UmbraFileContext *map_ctx,
 extern int	MapClockGetBuffer(void);
 extern void MapClockFreeBuffer(int slot_id);
 extern int	MapSyncStart(uint32 *complete_passes, uint32 *num_allocs);
-extern uint32 MapAllocPressurePeek(void);
 extern void MapStrategyNotifyWriter(int mapwriter_procno);
 extern void MapWakeWriter(void);
-extern void MapStrategyNotifyCompactor(int mapcompactor_procno);
-extern void MapWakeCompactor(void);
 extern int	MapPreallocStep(int max_relations);
-extern int	MapCompactorStep(int max_relations);
 
 /* Map cache hash table (in mapclock.c) */
 extern int	MapCacheLookup(RelFileLocator rnode, ForkNumber forknum,
@@ -307,10 +290,6 @@ extern int	map_prealloc_fsm_batch;
 extern int	map_prealloc_vm_low;
 extern int	map_prealloc_vm_hard;
 extern int	map_prealloc_vm_batch;
-extern bool map_compactor_enable;
-extern int	map_compactor_extent_blocks;
-extern int	map_compactor_low_live_percent;
-extern int	map_compactor_max_moves;
 
 /* Global data (defined in map.c) */
 extern MapSharedData *MapShared;

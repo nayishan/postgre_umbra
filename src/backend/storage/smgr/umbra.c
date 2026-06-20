@@ -2686,27 +2686,3 @@ umfiletagmatches(const FileTag *ftag, const FileTag *candidate)
 		ftag->forknum == candidate->forknum &&
 		ftag->segno == candidate->segno;
 }
-
-uint64
-umgetmapcompactorrelocations(void)
-{
-	return MapStatsGetCompactorRelocations();
-}
-
-uint64
-umgetmapreclaimenqueued(void)
-{
-	return MapStatsGetReclaimEnqueued();
-}
-
-uint64
-umgetmapreclaimprocessed(void)
-{
-	return MapStatsGetReclaimProcessed();
-}
-
-uint64
-umgetmapreclaimfailed(void)
-{
-	return MapStatsGetReclaimFailed();
-}

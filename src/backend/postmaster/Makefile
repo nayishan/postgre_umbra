@@ -32,8 +32,7 @@ OBJS = \
 
 ifeq ($(with_umbra), yes)
 OBJS += \
-	mapwriter.o \
-	mapcompactor.o
+	mapwriter.o
 endif
 
 include $(top_srcdir)/src/backend/common.mk

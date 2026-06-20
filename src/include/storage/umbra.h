@@ -136,10 +136,6 @@ extern int umfd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uin
 extern int umsyncfiletag(const FileTag *ftag, char *path);
 extern int umunlinkfiletag(const FileTag *ftag, char *path);
 extern bool umfiletagmatches(const FileTag *ftag, const FileTag *candidate);
-extern uint64 umgetmapcompactorrelocations(void);
-extern uint64 umgetmapreclaimenqueued(void);
-extern uint64 umgetmapreclaimprocessed(void);
-extern uint64 umgetmapreclaimfailed(void);
 
 /*
  * Runtime semantic helpers.

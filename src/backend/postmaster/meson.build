@@ -22,6 +22,5 @@ backend_sources += files(
 if get_option('umbra').enabled()
   backend_sources += files(
     'mapwriter.c',
-    'mapcompactor.c',
   )
 endif

@@ -13,7 +13,6 @@
 #include "access/xloginsert.h"
 #include "storage/map.h"
 #include "storage/smgr.h"
-#include "storage/sync.h"
 #include "storage/umbra.h"
 #include "storage/umfile.h"
 
@@ -112,23 +111,6 @@ log_umbra_skip_wal_dense_map(RelFileLocator rlocator,
 
 	return XLogInsert(RM_UMBRA_ID,
 					  XLOG_UMBRA_SKIP_WAL_DENSE_MAP | XLR_SPECIAL_REL_UPDATE);
-}
-
-XLogRecPtr
-log_umbra_reclaim_unlink(RelFileLocator rlocator, ForkNumber forknum,
-						 BlockNumber segno)
-{
-	xl_umbra_reclaim_unlink xlrec;
-
-	xlrec.rlocator = rlocator;
-	xlrec.forknum = forknum;
-	xlrec.segno = segno;
-
-	XLogBeginInsert();
-	XLogRegisterData((char *) &xlrec, sizeof(xlrec));
-
-	return XLogInsert(RM_UMBRA_ID,
-					  XLOG_UMBRA_RECLAIM_UNLINK | XLR_SPECIAL_REL_UPDATE);
 }
 
 void
@@ -332,31 +314,6 @@ umbra_redo(XLogReaderState *record)
 											   forknum, nblocks,
 											   record->EndRecPtr);
 				}
-			}
-			break;
-
-		case XLOG_UMBRA_RECLAIM_UNLINK:
-			{
-				xl_umbra_reclaim_unlink *xlrec;
-				FileTag		tag;
-				char		path[MAXPGPATH];
-				int			ret;
-
-				xlrec = (xl_umbra_reclaim_unlink *) XLogRecGetData(record);
-				tag.handler = SYNC_HANDLER_UMBRA;
-				tag.forknum = xlrec->forknum;
-				tag.rlocator = xlrec->rlocator;
-				tag.segno = (uint64) xlrec->segno;
-
-				/*
-				 * Recovery consumes reclaim targets eagerly. ENOENT is fine
-				 * because replay can race with prior deletion on the same path.
-				 */
-				ret = umunlinkfiletag(&tag, path);
-				if (ret < 0 && errno != ENOENT)
-					ereport(WARNING,
-							(errcode_for_file_access(),
-							 errmsg("could not remove file \"%s\": %m", path)));
 			}
 			break;
 

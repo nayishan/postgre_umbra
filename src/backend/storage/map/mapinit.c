@@ -35,10 +35,6 @@ int			map_prealloc_fsm_batch = 128; /* 1MB in 8k blocks */
 int			map_prealloc_vm_low = 64;	/* 512kB in 8k blocks */
 int			map_prealloc_vm_hard = 16;	/* 128kB in 8k blocks */
 int			map_prealloc_vm_batch = 128; /* 1MB in 8k blocks */
-bool		map_compactor_enable = false;
-int			map_compactor_extent_blocks = 1024;	/* 8MB in 8k blocks */
-int			map_compactor_low_live_percent = 10;
-int			map_compactor_max_moves = 16;
 
 /* Shared memory pointer */
 MapSharedData *MapShared = NULL;
@@ -119,13 +115,8 @@ MapShmemInit(void *arg)
 	MapShared->num_slots = map_buffers;
 	MapShared->first_free_buffer = 0;
 	MapShared->mapwriter_procno = -1;
-	MapShared->mapcompactor_procno = -1;
 	pg_atomic_init_u32(&MapShared->next_victim_buffer, 0);
 	pg_atomic_init_u32(&MapShared->num_allocs, 0);
-	pg_atomic_init_u64(&MapShared->map_compactor_relocations, 0);
-	pg_atomic_init_u64(&MapShared->map_reclaim_enqueued, 0);
-	pg_atomic_init_u64(&MapShared->map_reclaim_processed, 0);
-	pg_atomic_init_u64(&MapShared->map_reclaim_failed, 0);
 	MapShared->complete_passes = 0;
 	SpinLockInit(&MapShared->clock_lock);
 
@@ -164,76 +155,4 @@ MapShmemAttach(void *arg)
 	Assert(MapShared->num_slots == map_buffers);
 
 	MapSuperTableShmemAttach();
-}
-
-void
-MapStatsAddCompactorRelocations(uint64 count)
-{
-	if (MapShared == NULL || count == 0)
-		return;
-
-	pg_atomic_fetch_add_u64(&MapShared->map_compactor_relocations, count);
-}
-
-void
-MapStatsAddReclaimEnqueued(uint64 count)
-{
-	if (MapShared == NULL || count == 0)
-		return;
-
-	pg_atomic_fetch_add_u64(&MapShared->map_reclaim_enqueued, count);
-}
-
-void
-MapStatsAddReclaimProcessed(uint64 count)
-{
-	if (MapShared == NULL || count == 0)
-		return;
-
-	pg_atomic_fetch_add_u64(&MapShared->map_reclaim_processed, count);
-}
-
-void
-MapStatsAddReclaimFailed(uint64 count)
-{
-	if (MapShared == NULL || count == 0)
-		return;
-
-	pg_atomic_fetch_add_u64(&MapShared->map_reclaim_failed, count);
-}
-
-uint64
-MapStatsGetCompactorRelocations(void)
-{
-	if (MapShared == NULL)
-		return 0;
-
-	return pg_atomic_read_u64(&MapShared->map_compactor_relocations);
-}
-
-uint64
-MapStatsGetReclaimEnqueued(void)
-{
-	if (MapShared == NULL)
-		return 0;
-
-	return pg_atomic_read_u64(&MapShared->map_reclaim_enqueued);
-}
-
-uint64
-MapStatsGetReclaimProcessed(void)
-{
-	if (MapShared == NULL)
-		return 0;
-
-	return pg_atomic_read_u64(&MapShared->map_reclaim_processed);
-}
-
-uint64
-MapStatsGetReclaimFailed(void)
-{
-	if (MapShared == NULL)
-		return 0;
-
-	return pg_atomic_read_u64(&MapShared->map_reclaim_failed);
 }

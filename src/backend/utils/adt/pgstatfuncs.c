@@ -1337,30 +1337,6 @@ pg_stat_get_buf_alloc(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(pgstat_fetch_stat_bgwriter()->buf_alloc);
 }
 
-Datum
-pg_stat_get_map_compactor_relocations(PG_FUNCTION_ARGS)
-{
-	PG_RETURN_INT64((int64) smgrgetmapcompactorrelocations());
-}
-
-Datum
-pg_stat_get_map_reclaim_enqueued(PG_FUNCTION_ARGS)
-{
-	PG_RETURN_INT64((int64) smgrgetmapreclaimenqueued());
-}
-
-Datum
-pg_stat_get_map_reclaim_processed(PG_FUNCTION_ARGS)
-{
-	PG_RETURN_INT64((int64) smgrgetmapreclaimprocessed());
-}
-
-Datum
-pg_stat_get_map_reclaim_failed(PG_FUNCTION_ARGS)
-{
-	PG_RETURN_INT64((int64) smgrgetmapreclaimfailed());
-}
-
 /*
  * When adding a new column to the pg_stat_io view and the
  * pg_stat_get_backend_io() function, add a new enum value here above

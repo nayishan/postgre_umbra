@@ -42,9 +42,6 @@ typedef struct MapSuperEntry
 	BlockNumber	extending_target_main;
 	BlockNumber	extending_target_fsm;
 	BlockNumber	extending_target_vm;
-	BlockNumber	reclaim_boundary_main;
-	BlockNumber	reclaim_boundary_fsm;
-	BlockNumber	reclaim_boundary_vm;
 	int			next_free;
 	bool		in_use;
 	LWLock		lock;
@@ -150,8 +147,6 @@ extern void MapSuperDeleteEntry(RelFileLocator rnode);
 extern bool MapSuperForkExists(const MapSuperblock *super,
 							   ForkNumber forknum);
 extern uint32 MapSuperPreallocFlag(ForkNumber forknum);
-extern BlockNumber MapSuperGetReclaimBoundary(const MapSuperEntry *entry,
-											  ForkNumber forknum);
 extern void MapSBlockBumpPhysicalState(UmbraFileContext *map_ctx,
 									   RelFileLocator rnode,
 									   ForkNumber forknum,
@@ -159,14 +154,6 @@ extern void MapSBlockBumpPhysicalState(UmbraFileContext *map_ctx,
 									   bool bump_next_free,
 									   bool bump_capacity,
 									   XLogRecPtr map_lsn);
-extern bool MapSBlockTryGetReclaimBoundary(UmbraFileContext *map_ctx,
-										   RelFileLocator rnode,
-										   ForkNumber forknum,
-										   BlockNumber *boundary_pblk);
-extern void MapSBlockAdvanceReclaimBoundary(UmbraFileContext *map_ctx,
-											RelFileLocator rnode,
-											ForkNumber forknum,
-											BlockNumber boundary_pblk);
 extern void MapSuperTableShmemRequest(void);
 extern void MapSuperTableShmemInit(void);
 extern void MapSuperTableShmemAttach(void);
