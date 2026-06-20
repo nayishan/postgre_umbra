@@ -322,10 +322,11 @@ umfile_ctx_extend(UmbraFileContext *ctx, ForkNumber forknum, BlockNumber blkno,
 bool
 umfile_ctx_preallocate_blocks(UmbraFileContext *ctx, ForkNumber forknum,
 							  UmFileNblocksMode mode,
-							  BlockNumber target_nblocks)
+							  BlockNumber target_nblocks, bool skipFsync)
 {
 	BlockNumber	nblocks;
 	BlockNumber	cur_nblocks;
+	bool		isTempRelation;
 
 	if (ctx == NULL)
 		return false;
@@ -336,6 +337,7 @@ umfile_ctx_preallocate_blocks(UmbraFileContext *ctx, ForkNumber forknum,
 					   UMFILE_EXISTS_DENSE))
 		return false;
 
+	isTempRelation = RelFileLocatorBackendIsTemp(ctx->rlocator);
 	nblocks = umfile_nblocks(ctx, forknum, mode);
 	if (target_nblocks <= nblocks)
 		return true;
@@ -370,11 +372,13 @@ umfile_ctx_preallocate_blocks(UmbraFileContext *ctx, ForkNumber forknum,
 		target_bytes = (off_t) targetseg_nblocks * BLCKSZ;
 
 		v = umfile_getseg(ctx, ctx->rlocator, forknum, target_blkno,
-						  true /* skipFsync */,
+						  skipFsync,
 						  UM_EXTENSION_CREATE,
-						  RelFileLocatorBackendIsTemp(ctx->rlocator));
+						  isTempRelation);
 		if (!umfile_preallocate_fd(v->umfd_vfd, target_bytes))
 			return false;
+		if (!skipFsync && !isTempRelation)
+			umfile_register_dirty_seg(ctx->rlocator, false, forknum, v);
 
 		cur_nblocks = (BlockNumber) seg_end;
 	}
