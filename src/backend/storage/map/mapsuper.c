@@ -1140,6 +1140,7 @@ MapSBlockEnsurePhysicalNblocks(UmbraFileContext *map_ctx, RelFileLocator rnode,
 	uint32		extend_flag;
 	BlockNumber	current;
 	BlockNumber	desired;
+	bool		success = false;
 
 	if (!MapForkHasMappedState(forknum))
 		return false;
@@ -1227,7 +1228,8 @@ retry:
 				entry->runtime_flags &= ~extend_flag;
 				MapSuperSetExtendingTarget(entry, forknum, InvalidBlockNumber);
 				LWLockRelease(&entry->lock);
-				return true;
+				success = true;
+				break;
 			}
 
 			MapSuperSetExtendingTarget(entry, forknum, desired);
@@ -1246,7 +1248,7 @@ retry:
 	}
 	PG_END_TRY();
 
-	return false;
+	return success;
 }
 
 void
