@@ -288,6 +288,7 @@ umbra_redo(XLogReaderState *record)
 				{
 					ForkNumber	forknum = entries[i].forknum;
 					BlockNumber nblocks = entries[i].nblocks;
+					BlockNumber physical_nblocks;
 
 					if (!UmbraForkUsesMapTranslation(forknum) ||
 						!BlockNumberIsValid(nblocks))
@@ -300,14 +301,35 @@ umbra_redo(XLogReaderState *record)
 					Assert(nblocks > 0);
 
 					for (BlockNumber lblk = 0; lblk < nblocks; lblk++)
+					{
+						BlockNumber pblk;
+
+						if (!UmbraChunkPairedBasePblk(lblk, &pblk))
+							elog(PANIC,
+								 "invalid UMBRA skip-WAL chunk base mapping for relation %u/%u/%u fork %d lblk %u",
+								 xlrec->rlocator.spcOid,
+								 xlrec->rlocator.dbOid,
+								 xlrec->rlocator.relNumber,
+								 forknum, lblk);
+
 						MapSetMapping(ctx, xlrec->rlocator, forknum,
-									  lblk, lblk, record->EndRecPtr);
+									  lblk, pblk, record->EndRecPtr);
+					}
+
+					if (!UmbraChunkPairedPhysicalCapacity(nblocks,
+														 &physical_nblocks))
+						elog(PANIC,
+							 "invalid UMBRA skip-WAL chunk physical capacity for relation %u/%u/%u fork %d nblocks %u",
+							 xlrec->rlocator.spcOid,
+							 xlrec->rlocator.dbOid,
+							 xlrec->rlocator.relNumber,
+							 forknum, nblocks);
 
 					MapSBlockBumpNextFreePhysBlock(ctx, xlrec->rlocator,
-												   forknum, nblocks,
+												   forknum, physical_nblocks,
 												   record->EndRecPtr);
 					MapSBlockBumpPhysicalNblocks(ctx, xlrec->rlocator,
-												 forknum, nblocks,
+												 forknum, physical_nblocks,
 												 record->EndRecPtr);
 					MapSBlockSetLogicalNblocks(ctx, xlrec->rlocator,
 											   forknum, nblocks,

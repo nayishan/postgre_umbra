@@ -56,6 +56,64 @@ UmbraForkIsAuxiliaryMapped(ForkNumber forknum)
 			forknum == VISIBILITYMAP_FORKNUM);
 }
 
+/*
+ * Chunk-paired physical layout.
+ *
+ * Each logical chunk owns a base half and a shadow half in the same data fork:
+ *
+ *   [base chunk][shadow chunk]
+ *
+ * The current transition keeps using MAP entries, but all first materialization
+ * in skip-WAL/base state must use this formula instead of lblk == pblk.
+ */
+#define UMBRA_CHUNK_PAIRED_PAGES 32U
+
+static inline bool
+UmbraChunkPairedBasePblk(BlockNumber lblkno, BlockNumber *pblkno)
+{
+	uint64		chunk_id;
+	uint64		offset;
+	uint64		pblk;
+
+	Assert(pblkno != NULL);
+
+	chunk_id = (uint64) lblkno / UMBRA_CHUNK_PAIRED_PAGES;
+	offset = (uint64) lblkno % UMBRA_CHUNK_PAIRED_PAGES;
+	pblk = chunk_id * (2 * (uint64) UMBRA_CHUNK_PAIRED_PAGES) + offset;
+
+	if (pblk > (uint64) MaxBlockNumber)
+		return false;
+
+	*pblkno = (BlockNumber) pblk;
+	return true;
+}
+
+static inline bool
+UmbraChunkPairedPhysicalCapacity(BlockNumber logical_nblocks,
+								 BlockNumber *physical_nblocks)
+{
+	uint64		chunks;
+	uint64		capacity;
+
+	Assert(physical_nblocks != NULL);
+
+	if (logical_nblocks == 0)
+	{
+		*physical_nblocks = 0;
+		return true;
+	}
+
+	chunks = ((uint64) logical_nblocks + UMBRA_CHUNK_PAIRED_PAGES - 1) /
+		UMBRA_CHUNK_PAIRED_PAGES;
+	capacity = chunks * (2 * (uint64) UMBRA_CHUNK_PAIRED_PAGES);
+
+	if (capacity > (uint64) MaxBlockNumber + 1)
+		return false;
+
+	*physical_nblocks = (BlockNumber) capacity;
+	return true;
+}
+
 extern bool UmMetadataExists(SMgrRelation reln);
 extern bool UmMetadataOpenOrCreate(SMgrRelation reln, bool isRedo, bool *created);
 extern BlockNumber UmMetadataNblocks(SMgrRelation reln);

@@ -71,7 +71,7 @@ umbra_desc(StringInfo buf, XLogReaderState *record)
 			(xl_umbra_skip_wal_dense_map *) rec;
 		RelPathStr	path = umbra_metadata_relpath(xlrec->rlocator);
 
-		appendStringInfo(buf, "%s skip_wal_dense count %u",
+		appendStringInfo(buf, "%s skip_wal_chunk_base count %u",
 						 path.str, xlrec->count);
 		for (uint16 i = 0; i < xlrec->count; i++)
 			appendStringInfo(buf, " fork %d nblocks %u",
@@ -97,7 +97,7 @@ umbra_identify(uint8 info)
 			id = "RANGE_REMAP_COMPACT";
 			break;
 		case XLOG_UMBRA_SKIP_WAL_DENSE_MAP:
-			id = "SKIP_WAL_DENSE_MAP";
+			id = "SKIP_WAL_CHUNK_BASE";
 			break;
 	}
 

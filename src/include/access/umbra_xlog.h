@@ -7,7 +7,7 @@
  * - MAP_SET: establish/switch lblkno -> pblkno mapping
  * - RANGE_REMAP: atomically establish a range of first-born mappings
  * - RANGE_REMAP_COMPACT: same semantics for contiguous lblk/pblk runs
- * - SKIP_WAL_DENSE_MAP: record non-empty skip-WAL dense lblk==pblk frontiers
+ * - SKIP_WAL_DENSE_MAP: record non-empty skip-WAL chunk-base frontiers
  *
  *-------------------------------------------------------------------------
  */
