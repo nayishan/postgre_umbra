@@ -1211,27 +1211,12 @@ um_resolve_mapped_read_run(SMgrRelation reln, ForkNumber forknum,
 
 	if (um_state_uses_chunk_base(access->policy))
 	{
-		BlockNumber logical_nblocks;
-
-		if (!lookup_state->have_logical_nblocks)
-		{
-			lookup_state->logical_nblocks =
-				umnblocks_for_access(reln, forknum, access);
-			lookup_state->have_logical_nblocks = true;
-		}
-		logical_nblocks = lookup_state->logical_nblocks;
-		if (logical_nblocks != InvalidBlockNumber &&
-			blocknum >= logical_nblocks)
-			return 0;
-
 		if (um_redo_shift_source_pblk(reln, forknum, blocknum, start_pblk))
 			return 1;
 
 		run_blocks = um_chunk_active_pblk_run_checked(reln, forknum,
 													  blocknum, maxblocks,
 													  start_pblk);
-		if (logical_nblocks != InvalidBlockNumber)
-			run_blocks = Min(run_blocks, logical_nblocks - blocknum);
 		return run_blocks;
 	}
 
@@ -2180,29 +2165,6 @@ umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 			BlockNumber segment_run;
 			BlockNumber write_run;
 
-			if (!um_lblk_precedes_logical_eof_for_access(reln, forknum,
-														 &access,
-														 &lookup_state,
-														 lblk))
-			{
-				BlockNumber logical_nblocks = InvalidBlockNumber;
-
-				if (lookup_state.have_logical_nblocks)
-					logical_nblocks = lookup_state.logical_nblocks;
-				ereport(ERROR,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("cannot write Umbra relation %u/%u/%u fork %d block %u beyond logical EOF %u",
-								reln->smgr_rlocator.locator.spcOid,
-								reln->smgr_rlocator.locator.dbOid,
-								reln->smgr_rlocator.locator.relNumber,
-								forknum, lblk, logical_nblocks),
-						 errdetail("New logical pages must be born through smgrextend or smgrzeroextend before ordinary writes.")));
-			}
-
-			if (lookup_state.have_logical_nblocks &&
-				lookup_state.logical_nblocks != InvalidBlockNumber)
-				max_run = Min(max_run, lookup_state.logical_nblocks - lblk);
-
 			active_run = um_chunk_active_pblk_run_checked(reln, forknum, lblk,
 														 max_run, &pblk);
 			segment_run = Min(active_run,
@@ -2237,13 +2199,6 @@ umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 																			blocknum + nblocks),
 										 InvalidXLogRecPtr);
 
-		if (nblocks > 0)
-		{
-			BlockNumber logical_nblocks;
-
-			logical_nblocks = umnblocks_for_access(reln, forknum, &access);
-			Assert(logical_nblocks >= blocknum + nblocks);
-		}
 		return;
 	}
 
@@ -2379,27 +2334,6 @@ umwriteback(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 			BlockNumber max_run = nblocks - i;
 			BlockNumber active_run;
 			BlockNumber writeback_run;
-
-			if (!um_lblk_precedes_logical_eof_for_access(reln, forknum,
-														 &access,
-														 &lookup_state,
-														 lblk))
-			{
-				if (um_is_stale_post_truncate_lblk_for_access(reln, forknum,
-															  &access,
-															  &lookup_state,
-															  lblk))
-				{
-					i++;
-					continue;
-				}
-				um_report_legacy_entry_map_path(reln, forknum, &access, lblk);
-				pg_unreachable();
-			}
-
-			if (lookup_state.have_logical_nblocks &&
-				lookup_state.logical_nblocks != InvalidBlockNumber)
-				max_run = Min(max_run, lookup_state.logical_nblocks - lblk);
 
 			active_run = um_chunk_active_pblk_run_checked(reln, forknum,
 														 lblk, max_run,
