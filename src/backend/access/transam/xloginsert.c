@@ -1228,10 +1228,6 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 	uint64		total_len = 0;
 	int			block_id;
 	pg_crc32c	rdata_crc;
-	bool		needs_backup_by_block[XLR_MAX_BLOCK_ID + 1] = {0};
-	bool		needs_data_by_block[XLR_MAX_BLOCK_ID + 1] = {0};
-	bool		include_image_by_block[XLR_MAX_BLOCK_ID + 1] = {0};
-	bool		include_shift_by_block[XLR_MAX_BLOCK_ID + 1] = {0};
 	registered_buffer *prev_regbuf = NULL;
 	XLogRecData *rdt_datas_last;
 	XLogRecord *rechdr;
@@ -1252,12 +1248,17 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 	for (block_id = 0; block_id < max_registered_block_id; block_id++)
 	{
 		registered_buffer *regbuf = &registered_buffers[block_id];
-		bool		needs_backup;
+		bool		needs_backup = false;
 		bool		needs_shift;
+		bool		needs_data;
+		XLogRecordBlockHeader bkpb;
 		XLogRecordBlockShiftHeader rbsh;
+		XLogRecordBlockImageHeader bimg;
+		XLogRecordBlockCompressHeader cbimg = {0};
+		bool		samerel;
+		bool		is_compressed = false;
 		bool		include_image;
 		bool		include_shift = false;
-		bool		wal_owned_shift_available = false;
 		SMgrRelation reln = NULL;
 
 		if (!regbuf->in_use)
@@ -1271,39 +1272,15 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 			needs_shift = false;
 		}
 		else if (regbuf->flags & REGBUF_NO_IMAGE)
-		{
-			needs_backup = false;
 			needs_shift = false;
-		}
 		else if (!doPageWrites)
-		{
-			needs_backup = false;
 			needs_shift = false;
-		}
 		else
 		{
 			XLogRecPtr	page_lsn = PageGetLSN(regbuf->page);
 
-			if (rmid != RM_XLOG_ID || info != XLOG_FPI_FOR_HINT)
-			{
-				reln = smgropen(regbuf->rlocator, INVALID_PROC_NUMBER);
-				regbuf->shift_reln = reln;
-				wal_owned_shift_available =
-					UmShiftWalOwnerAvailable(reln, regbuf->forkno);
-			}
-
-			if (!wal_owned_shift_available ||
-				(rmid == RM_XLOG_ID && info == XLOG_FPI_FOR_HINT))
-			{
-				needs_backup = (page_lsn <= RedoRecPtr);
-				needs_shift = false;
-			}
-			else
-			{
-				needs_backup = false;
-				needs_shift = (page_lsn <= RedoRecPtr);
-			}
-			if (!needs_backup && !needs_shift)
+			needs_shift = (page_lsn <= RedoRecPtr);
+			if (!needs_shift)
 			{
 				if (!XLogRecPtrIsValid(*fpw_lsn) || page_lsn < *fpw_lsn)
 					*fpw_lsn = page_lsn;
@@ -1317,11 +1294,8 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 			include_shift = regbuf->has_shift;
 		else if (needs_shift)
 		{
-			if (reln == NULL)
-			{
-				reln = smgropen(regbuf->rlocator, INVALID_PROC_NUMBER);
-				regbuf->shift_reln = reln;
-			}
+			reln = smgropen(regbuf->rlocator, INVALID_PROC_NUMBER);
+			regbuf->shift_reln = reln;
 			regbuf->shifted_to_shadow =
 				UmShiftGetInactiveSide(reln, regbuf->forkno, regbuf->block);
 
@@ -1341,40 +1315,11 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 		}
 
 		if (regbuf->rdata_len == 0)
-			needs_data_by_block[block_id] = false;
+			needs_data = false;
 		else if ((regbuf->flags & REGBUF_KEEP_DATA) != 0)
-			needs_data_by_block[block_id] = true;
+			needs_data = true;
 		else
-			needs_data_by_block[block_id] = (!needs_backup || include_shift);
-
-		needs_backup_by_block[block_id] = needs_backup;
-		include_image_by_block[block_id] = include_image;
-		include_shift_by_block[block_id] = include_shift;
-	}
-
-	for (block_id = 0; block_id < max_registered_block_id; block_id++)
-	{
-		registered_buffer *regbuf = &registered_buffers[block_id];
-		bool		needs_backup;
-		bool		needs_data;
-		XLogRecordBlockHeader bkpb;
-		XLogRecordBlockShiftHeader rbsh;
-		XLogRecordBlockImageHeader bimg;
-		XLogRecordBlockCompressHeader cbimg = {0};
-		bool		samerel;
-		bool		is_compressed = false;
-		bool		include_image;
-		bool		include_shift;
-
-		if (!regbuf->in_use)
-			continue;
-
-		needs_backup = needs_backup_by_block[block_id];
-		needs_data = needs_data_by_block[block_id];
-		include_image = include_image_by_block[block_id];
-		include_shift = include_shift_by_block[block_id];
-
-		regbuf->shift_in_record = false;
+			needs_data = !needs_backup;
 
 		bkpb.id = block_id;
 		bkpb.fork_flags = regbuf->forkno;

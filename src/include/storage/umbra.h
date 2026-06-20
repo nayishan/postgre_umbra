@@ -246,7 +246,6 @@ extern BlockNumber umnblocks_cached(SMgrRelation reln, ForkNumber forknum);
 extern bool UmUsesChunkPairedTranslation(SMgrRelation reln, ForkNumber forknum);
 extern bool UmTranslationTryLookupPblkno(SMgrRelation reln, ForkNumber forknum,
 										BlockNumber lblkno, BlockNumber *pblkno);
-extern bool UmShiftWalOwnerAvailable(SMgrRelation reln, ForkNumber forknum);
 extern bool UmShiftGetInactiveSide(SMgrRelation reln, ForkNumber forknum,
 								   BlockNumber lblkno);
 extern void UmShiftSetActiveSide(SMgrRelation reln, ForkNumber forknum,

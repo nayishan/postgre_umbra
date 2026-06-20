@@ -1390,15 +1390,6 @@ umphysicalblock(SMgrRelation reln, ForkNumber forknum, BlockNumber lblkno)
 }
 
 bool
-UmShiftWalOwnerAvailable(SMgrRelation reln, ForkNumber forknum)
-{
-	UmbraAccessState access;
-
-	access = um_classify_access(reln, forknum);
-	return access.policy == UMBRA_MAP_POLICY_REQUIRE_MAP;
-}
-
-bool
 UmUsesChunkPairedTranslation(SMgrRelation reln, ForkNumber forknum)
 {
 	UmbraAccessState access;
