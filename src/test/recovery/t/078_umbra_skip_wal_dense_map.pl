@@ -49,16 +49,16 @@ my ($dump_stdout, $dump_stderr) = run_command(
 is($dump_stderr, '', 'pg_waldump raw dump completed without stderr');
 
 my @dense_lines =
-  grep { /desc: SKIP_WAL_DENSE_MAP/ }
+  grep { /desc: SKIP_WAL_CHUNK_BASE/ }
   split /\n/, $dump_stdout;
 ok(@dense_lines > 0,
-   'raw WAL dump contains skip-WAL dense MAP records');
+   'raw WAL dump contains skip-WAL chunk-base MAP records');
 
 my @main_dense_lines =
   grep { /fork 0 nblocks ([1-9][0-9]*)/ }
   @dense_lines;
 ok(@main_dense_lines > 0,
-   'skip-WAL dense MAP record carries concrete MAIN fork nblocks');
+   'skip-WAL chunk-base MAP record carries concrete MAIN fork nblocks');
 
 $node->stop();
 

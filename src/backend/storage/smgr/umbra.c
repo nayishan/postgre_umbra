@@ -2380,7 +2380,7 @@ umtruncate(SMgrRelation reln, ForkNumber forknum,
 
 	access = um_classify_access(reln, forknum);
 	if (um_fork_uses_map_translation(forknum) &&
-		(access.policy == UMBRA_MAP_POLICY_REQUIRE_MAP ||
+		(um_state_uses_chunk_base(access.policy) ||
 		 access.map_available))
 	{
 		XLogRecPtr	map_lsn;

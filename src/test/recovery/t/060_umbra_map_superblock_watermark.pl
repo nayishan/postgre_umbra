@@ -23,6 +23,16 @@ sub u32le_from_hex
 	  (hex($b[3]) << 24);
 }
 
+my $chunk_pages = 32;
+
+sub chunk_capacity_for_nblocks
+{
+	my ($nblocks) = @_;
+
+	return 0 if $nblocks == 0;
+	return (int(($nblocks - 1) / $chunk_pages) + 1) * (2 * $chunk_pages);
+}
+
 my $node = PostgreSQL::Test::Cluster->new('master');
 $node->init();
 $node->append_conf(
@@ -61,8 +71,8 @@ is($version_1, 1, 'superblock version matches');
 is($blcksz_1, 8192, 'superblock block size matches');
 cmp_ok($logical_main_1, '==', $logical_expected_1,
 	'logical_nblocks_main matches relation size in blocks');
-cmp_ok($next_free_main_1, '>=', $logical_main_1,
-	'next_free_phys_block_main not behind logical_nblocks_main');
+cmp_ok($phys_capacity_main_1, '>=', chunk_capacity_for_nblocks($logical_main_1),
+	'phys_capacity_main covers chunk-paired logical capacity');
 cmp_ok($phys_capacity_main_1, '>=', $next_free_main_1,
 	'phys_capacity_main not behind next_free_phys_block_main');
 

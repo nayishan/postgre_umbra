@@ -363,6 +363,9 @@ MapSuperLoadFromDisk(UmbraFileContext *map_ctx, RelFileLocator rnode,
 	if (!umfile_ctx_fork_exists(map_ctx, UMBRA_METADATA_FORKNUM))
 		return MAP_SBLOCK_READ_MISSING;
 
+	if (umfile_ctx_get_nblocks(map_ctx, UMBRA_METADATA_FORKNUM) <= MAP_BLOCK_SUPER)
+		return MAP_SBLOCK_READ_CORRUPT;
+
 	umfile_ctx_read(map_ctx, UMBRA_METADATA_FORKNUM, MAP_BLOCK_SUPER,
 					sector, MAP_SUPERBLOCK_SIZE);
 	MapSuperblockUnpackSector(super, sector);

@@ -1,13 +1,13 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# Verify that Umbra crash recovery can recover a remapped heap page even when
-# the newly allocated physical block contains a torn write image.  In md mode,
+# Verify that Umbra crash recovery can recover a shifted heap page even when
+# the WAL target physical block contains a torn write image.  In md mode,
 # run the same workload with full_page_writes=off as a negative control: the
 # manually torn heap page must not be recoverable as correct data.
 #
 # The test:
 # - checkpoints a relation, then updates existing heap pages
-# - in Umbra mode, extracts one new physical block number from the remap WAL
+# - in Umbra mode, extracts one chunk-paired shift target from the WAL
 # - in md mode, extracts one updated heap block as the negative control target
 # - kills the server, overwrites half of that physical block, and restarts
 # - verifies Umbra restores the logical relation contents while md/FPW-off
@@ -21,6 +21,18 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 
 my $use_umbra = check_pg_config('^#define USE_UMBRA 1$');
+my $chunk_pages = 32;
+
+sub chunk_paired_pblk
+{
+	my ($lblk, $shifted_to_shadow) = @_;
+	my $chunk_id = int($lblk / $chunk_pages);
+	my $offset = $lblk % $chunk_pages;
+	my $pblk = $chunk_id * (2 * $chunk_pages) + $offset;
+
+	$pblk += $chunk_pages if $shifted_to_shadow;
+	return $pblk;
+}
 
 sub overwrite_half_physical_block
 {
@@ -130,7 +142,7 @@ FROM umb_torn_page_t;
 ];
 }
 
-sub find_umbra_remap
+sub find_umbra_shift
 {
 	my ($locator, $dump_stdout) = @_;
 
@@ -141,13 +153,9 @@ sub find_umbra_remap
 		my $lblk = $1;
 		next
 		  unless $blkref =~
-		  /; remap: old_pblk (\d+) new_pblk (\d+) logical_nblocks \d+ next_free_pblk \d+/;
+		  /; shift: shifted_to_shadow (true|false) logical_nblocks \d+/;
 
-		my ($old, $new) = ($1, $2);
-		next if $old == 4294967295;
-		next if $old == $new;
-
-		return ($lblk, $old, $new);
+		return ($lblk, $1 eq 'true');
 	}
 
 	return;
@@ -201,22 +209,23 @@ if ($use_umbra)
 	my ($locator, $relpath, $block_size, $before, $dump_stdout) =
 	  prepare_and_update_table($node);
 
-	my ($target_lblk, $old_pblk, $new_pblk) =
-	  find_umbra_remap($locator, $dump_stdout);
+	my ($target_lblk, $shifted_to_shadow) =
+	  find_umbra_shift($locator, $dump_stdout);
 
-	ok(defined($new_pblk),
-		'update WAL contains a heap remap header with a new physical block');
-	BAIL_OUT('could not locate a concrete Umbra remap block for test relation')
-		unless defined($new_pblk);
-	cmp_ok($new_pblk, '!=', $old_pblk,
-		'selected WAL remap moves the heap page to a different physical block');
+	ok(defined($target_lblk),
+		'update WAL contains a heap chunk-paired shift header');
+	BAIL_OUT('could not locate a concrete Umbra shift block for test relation')
+		unless defined($target_lblk);
+	my $target_pblk = chunk_paired_pblk($target_lblk, $shifted_to_shadow);
+	cmp_ok($target_pblk, '>=', 0,
+		'selected WAL shift maps the heap page to a concrete physical block');
 
 	$node->stop('immediate');
 
 	my ($corrupt_path, $corrupt_offset) =
-	  overwrite_half_physical_block($node, $relpath, $block_size, $new_pblk);
+	  overwrite_half_physical_block($node, $relpath, $block_size, $target_pblk);
 	ok(-e $corrupt_path,
-		'new physical block segment exists after torn-write injection');
+		'shift target physical block segment exists after torn-write injection');
 	ok($corrupt_offset >= 0,
 		'torn-write injection targeted a concrete physical offset');
 

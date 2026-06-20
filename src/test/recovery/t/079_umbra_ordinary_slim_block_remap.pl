@@ -59,11 +59,11 @@ my ($dump_stdout, $dump_stderr) = run_command(
 	]);
 is($dump_stderr, '', 'pg_waldump block dump completed without stderr');
 
-my @remap_header_lines =
-  grep { /; remap: old_pblk \d+ new_pblk \d+ logical_nblocks \d+ next_free_pblk \d+/ }
+my @shift_header_lines =
+  grep { /; shift: shifted_to_shadow (?:true|false) logical_nblocks \d+/ }
   split /\n/, $dump_stdout;
 
-ok(@remap_header_lines > 0,
-   'raw WAL dump contains full remap block headers for updated heap pages');
+ok(@shift_header_lines > 0,
+   'raw WAL dump contains chunk-paired shift headers for updated heap pages');
 
 done_testing();
