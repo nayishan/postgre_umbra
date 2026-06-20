@@ -99,12 +99,24 @@ MapTruncatePreloadEntry(RelFileLocator rnode, ForkNumber forknum)
 BlockNumber MapForkPageIndexToMapBlkno(ForkNumber forknum,
 									   BlockNumber fork_page_idx);
 BlockNumber MapLblknoToMapBlkno(ForkNumber forknum, BlockNumber lblkno);
+static BlockNumber MapForkPageIndexToActiveBlkno(ForkNumber forknum,
+												 BlockNumber active_page_idx);
+static void MapLblknoToActiveLocation(ForkNumber forknum, BlockNumber lblkno,
+									   BlockNumber *active_blkno,
+									   int *bit_idx);
 static bool MapDecodeMapBlkno(BlockNumber map_blkno, ForkNumber *forknum,
 							  BlockNumber *fork_page_idx);
+static bool MapDecodeActiveBlkno(BlockNumber map_blkno, ForkNumber *forknum,
+								 BlockNumber *active_page_idx);
 static bool MapMapPageWithinLogicalRange(UmbraFileContext *map_ctx,
 										 RelFileLocator rnode,
 										 ForkNumber forknum,
 										 BlockNumber map_blkno);
+static bool MapActivePageWithinLogicalRange(UmbraFileContext *map_ctx,
+											RelFileLocator rnode,
+											ForkNumber forknum,
+											BlockNumber map_blkno);
+static bool MapBlknoIsActiveBitmap(BlockNumber map_blkno);
 bool MapForkPreallocSettings(ForkNumber forknum, BlockNumber *soft_low,
 							 BlockNumber *hard_low,
 							 BlockNumber *batch_blocks);
@@ -234,7 +246,8 @@ MapForkPageIndexToMapBlkno(ForkNumber forknum, BlockNumber fork_page_idx)
 			group_no = (uint64) fork_page_idx;
 			blkno64 = (uint64) MAP_BLOCK_FIRST_GROUP +
 				group_no * (uint64) MAP_GROUP_TOTAL_PAGES +
-				(uint64) MAP_GROUP_FSM_PAGES;
+				(uint64) MAP_GROUP_FSM_PAGES +
+				(uint64) MAP_GROUP_FSM_ACTIVE_PAGES;
 			break;
 
 		case MAIN_FORKNUM:
@@ -244,7 +257,9 @@ MapForkPageIndexToMapBlkno(ForkNumber forknum, BlockNumber fork_page_idx)
 			blkno64 = (uint64) MAP_BLOCK_FIRST_GROUP +
 				group_no * (uint64) MAP_GROUP_TOTAL_PAGES +
 				(uint64) MAP_GROUP_FSM_PAGES +
+				(uint64) MAP_GROUP_FSM_ACTIVE_PAGES +
 				(uint64) MAP_GROUP_VM_PAGES +
+				(uint64) MAP_GROUP_VM_ACTIVE_PAGES +
 				(group_page_idx % (uint64) MAP_GROUP_MAIN_PAGES);
 			break;
 		}
@@ -263,11 +278,69 @@ MapForkPageIndexToMapBlkno(ForkNumber forknum, BlockNumber fork_page_idx)
 	return (BlockNumber) blkno64;
 }
 
+static BlockNumber
+MapForkPageIndexToActiveBlkno(ForkNumber forknum, BlockNumber active_page_idx)
+{
+	uint64 group_no;
+	uint64 blkno64;
+
+	if (forknum == UMBRA_METADATA_FORKNUM)
+		elog(ERROR, "Umbra metadata fork should not call MapForkPageIndexToActiveBlkno");
+
+	switch (forknum)
+	{
+		case FSM_FORKNUM:
+			group_no = (uint64) active_page_idx;
+			blkno64 = (uint64) MAP_BLOCK_FIRST_GROUP +
+				group_no * (uint64) MAP_GROUP_TOTAL_PAGES +
+				(uint64) MAP_GROUP_FSM_PAGES;
+			break;
+
+		case VISIBILITYMAP_FORKNUM:
+			group_no = (uint64) active_page_idx;
+			blkno64 = (uint64) MAP_BLOCK_FIRST_GROUP +
+				group_no * (uint64) MAP_GROUP_TOTAL_PAGES +
+				(uint64) MAP_GROUP_FSM_PAGES +
+				(uint64) MAP_GROUP_FSM_ACTIVE_PAGES +
+				(uint64) MAP_GROUP_VM_PAGES;
+			break;
+
+		case MAIN_FORKNUM:
+		{
+			uint64 group_page_idx = (uint64) active_page_idx;
+
+			group_no = group_page_idx / (uint64) MAP_GROUP_MAIN_ACTIVE_PAGES;
+			blkno64 = (uint64) MAP_BLOCK_FIRST_GROUP +
+				group_no * (uint64) MAP_GROUP_TOTAL_PAGES +
+				(uint64) MAP_GROUP_FSM_PAGES +
+				(uint64) MAP_GROUP_FSM_ACTIVE_PAGES +
+				(uint64) MAP_GROUP_VM_PAGES +
+				(uint64) MAP_GROUP_VM_ACTIVE_PAGES +
+				(uint64) MAP_GROUP_MAIN_PAGES +
+				(group_page_idx % (uint64) MAP_GROUP_MAIN_ACTIVE_PAGES);
+			break;
+		}
+
+		default:
+			elog(ERROR, "unsupported fork number %d in active bitmap lookup",
+				 (int) forknum);
+			return 0;
+	}
+
+	if (blkno64 > (uint64) MaxBlockNumber)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("cannot address active bitmap page %u for fork %d in MAP",
+						active_page_idx, forknum)));
+
+	return (BlockNumber) blkno64;
+}
+
 /*
  * MapLblknoToMapBlkno - convert (forknum, lblkno) to linear MAP entry index.
  *
  * The metadata fork stores repeated proportional groups:
- * [FSM page][VM page][8192 MAIN pages].
+ * [FSM map][FSM active][VM map][VM active][MAIN maps][MAIN active maps].
  * Each fork page still maps MAP_ENTRIES_PER_PAGE logical blocks.
  */
 BlockNumber
@@ -288,6 +361,20 @@ MapLblknoToMapBlkno(ForkNumber forknum, BlockNumber lblkno)
 						lblkno, forknum)));
 
 	return (BlockNumber) entry64;
+}
+
+static void
+MapLblknoToActiveLocation(ForkNumber forknum, BlockNumber lblkno,
+						  BlockNumber *active_blkno, int *bit_idx)
+{
+	BlockNumber	active_page_idx;
+
+	Assert(active_blkno != NULL);
+	Assert(bit_idx != NULL);
+
+	active_page_idx = lblkno / MAP_ACTIVE_BITS_PER_PAGE;
+	*active_blkno = MapForkPageIndexToActiveBlkno(forknum, active_page_idx);
+	*bit_idx = lblkno % MAP_ACTIVE_BITS_PER_PAGE;
 }
 
 static bool
@@ -313,6 +400,10 @@ MapDecodeMapBlkno(BlockNumber map_blkno, ForkNumber *forknum,
 	}
 
 	in_group -= (uint64) MAP_GROUP_FSM_PAGES;
+	if (in_group < (uint64) MAP_GROUP_FSM_ACTIVE_PAGES)
+		return false;
+
+	in_group -= (uint64) MAP_GROUP_FSM_ACTIVE_PAGES;
 	if (in_group < (uint64) MAP_GROUP_VM_PAGES)
 	{
 		*forknum = VISIBILITYMAP_FORKNUM;
@@ -321,11 +412,69 @@ MapDecodeMapBlkno(BlockNumber map_blkno, ForkNumber *forknum,
 	}
 
 	in_group -= (uint64) MAP_GROUP_VM_PAGES;
+	if (in_group < (uint64) MAP_GROUP_VM_ACTIVE_PAGES)
+		return false;
+
+	in_group -= (uint64) MAP_GROUP_VM_ACTIVE_PAGES;
 	if (in_group < (uint64) MAP_GROUP_MAIN_PAGES)
 	{
 		*forknum = MAIN_FORKNUM;
 		*fork_page_idx = (BlockNumber)
 			(group_no * (uint64) MAP_GROUP_MAIN_PAGES + in_group);
+		return true;
+	}
+
+	return false;
+}
+
+static bool
+MapDecodeActiveBlkno(BlockNumber map_blkno, ForkNumber *forknum,
+					 BlockNumber *active_page_idx)
+{
+	uint64 offset;
+	uint64 group_no;
+	uint64 in_group;
+
+	if (map_blkno == MAP_BLOCK_SUPER || map_blkno < MAP_BLOCK_FIRST_GROUP)
+		return false;
+
+	offset = (uint64) (map_blkno - MAP_BLOCK_FIRST_GROUP);
+	group_no = offset / (uint64) MAP_GROUP_TOTAL_PAGES;
+	in_group = offset % (uint64) MAP_GROUP_TOTAL_PAGES;
+
+	if (in_group < (uint64) MAP_GROUP_FSM_PAGES)
+		return false;
+
+	in_group -= (uint64) MAP_GROUP_FSM_PAGES;
+	if (in_group < (uint64) MAP_GROUP_FSM_ACTIVE_PAGES)
+	{
+		*forknum = FSM_FORKNUM;
+		*active_page_idx = (BlockNumber) group_no;
+		return true;
+	}
+
+	in_group -= (uint64) MAP_GROUP_FSM_ACTIVE_PAGES;
+	if (in_group < (uint64) MAP_GROUP_VM_PAGES)
+		return false;
+
+	in_group -= (uint64) MAP_GROUP_VM_PAGES;
+	if (in_group < (uint64) MAP_GROUP_VM_ACTIVE_PAGES)
+	{
+		*forknum = VISIBILITYMAP_FORKNUM;
+		*active_page_idx = (BlockNumber) group_no;
+		return true;
+	}
+
+	in_group -= (uint64) MAP_GROUP_VM_ACTIVE_PAGES;
+	if (in_group < (uint64) MAP_GROUP_MAIN_PAGES)
+		return false;
+
+	in_group -= (uint64) MAP_GROUP_MAIN_PAGES;
+	if (in_group < (uint64) MAP_GROUP_MAIN_ACTIVE_PAGES)
+	{
+		*forknum = MAIN_FORKNUM;
+		*active_page_idx = (BlockNumber)
+			(group_no * (uint64) MAP_GROUP_MAIN_ACTIVE_PAGES + in_group);
 		return true;
 	}
 
@@ -362,6 +511,40 @@ MapMapPageWithinLogicalRange(UmbraFileContext *map_ctx, RelFileLocator rnode,
 		return false;
 
 	return true;
+}
+
+static bool
+MapActivePageWithinLogicalRange(UmbraFileContext *map_ctx, RelFileLocator rnode,
+								ForkNumber forknum, BlockNumber map_blkno)
+{
+	BlockNumber n_lblknos;
+	ForkNumber	page_forknum;
+	BlockNumber	page_idx;
+	uint64		page_first_lblk;
+
+	if (!MapSBlockTryGetLogicalNblocks(map_ctx, rnode, forknum, &n_lblknos))
+		return true;
+
+	if (!MapDecodeActiveBlkno(map_blkno, &page_forknum, &page_idx))
+		return false;
+
+	if (page_forknum != forknum)
+		return false;
+
+	page_first_lblk = (uint64) page_idx * (uint64) MAP_ACTIVE_BITS_PER_PAGE;
+	if (page_first_lblk >= (uint64) n_lblknos)
+		return false;
+
+	return true;
+}
+
+static bool
+MapBlknoIsActiveBitmap(BlockNumber map_blkno)
+{
+	ForkNumber	forknum;
+	BlockNumber	page_idx;
+
+	return MapDecodeActiveBlkno(map_blkno, &forknum, &page_idx);
 }
 
 /*
@@ -806,6 +989,7 @@ MapReadBuffer(UmbraFileContext *map_ctx, RelFileLocator rnode,
 	int			old_page_number;
 	ForkNumber	old_forknum;
 	RelFileLocator old_rnode;
+	bool		active_bitmap;
 
 	if (map_blkno == MAP_BLOCK_SUPER)
 		elog(ERROR, "MapReadBuffer cannot be used for MAP superblock");
@@ -918,17 +1102,22 @@ MapReadBuffer(UmbraFileContext *map_ctx, RelFileLocator rnode,
 		MapBufferUpdateStateBits(buf, MAPBUF_USAGECOUNT_ONE, 0);
 
 		page = MapGetPage(slot_id);
+		active_bitmap = MapBlknoIsActiveBitmap(map_blkno);
 		if (umfile_ctx_fork_exists(map_ctx, UMBRA_METADATA_FORKNUM))
 		{
 			map_nblocks = umfile_ctx_get_nblocks(map_ctx, UMBRA_METADATA_FORKNUM);
 			if (map_blkno < map_nblocks &&
-				MapMapPageWithinLogicalRange(map_ctx, rnode, forknum, map_blkno))
+				(active_bitmap ?
+				 MapActivePageWithinLogicalRange(map_ctx, rnode, forknum,
+												 map_blkno) :
+				 MapMapPageWithinLogicalRange(map_ctx, rnode, forknum,
+											  map_blkno)))
 			{
 				umfile_ctx_read(map_ctx, UMBRA_METADATA_FORKNUM, map_blkno,
 								(char *) page, BLCKSZ);
 				MapBufferUpdateStateBits(buf, 0, MAPBUF_NOT_MATERIALIZED);
 
-				if (pg_memory_is_all_zeros(page, BLCKSZ))
+				if (!active_bitmap && pg_memory_is_all_zeros(page, BLCKSZ))
 				{
 					BlockNumber	n_lblknos = 0;
 					ForkNumber	page_forknum;
@@ -959,7 +1148,7 @@ MapReadBuffer(UmbraFileContext *map_ctx, RelFileLocator rnode,
 			}
 			else
 			{
-				MemSet(page, 0xFF, BLCKSZ);
+				MemSet(page, active_bitmap ? 0 : 0xFF, BLCKSZ);
 				if (map_blkno >= map_nblocks)
 					MapBufferUpdateStateBits(buf, MAPBUF_NOT_MATERIALIZED, 0);
 				else
@@ -968,7 +1157,7 @@ MapReadBuffer(UmbraFileContext *map_ctx, RelFileLocator rnode,
 		}
 		else
 		{
-			MemSet(page, 0xFF, BLCKSZ);
+			MemSet(page, active_bitmap ? 0 : 0xFF, BLCKSZ);
 			MapBufferUpdateStateBits(buf, MAPBUF_NOT_MATERIALIZED, 0);
 		}
 
@@ -1083,6 +1272,156 @@ MapTruncate(UmbraFileContext *map_ctx, RelFileLocator rnode,
 	 * Keep dirty map pages in cache and let checkpoint/bgwriter flush them.
 	 * Invalidating relation slots here would clear dirty state before writeback.
 	 */
+}
+
+bool
+MapActiveBitmapGet(UmbraFileContext *map_ctx, RelFileLocator rnode,
+				   ForkNumber forknum, BlockNumber lblkno,
+				   bool *shadow_active)
+{
+	BlockNumber	active_blkno;
+	int			bit_idx;
+	int			slot_id;
+	MapPage    *page;
+	MapBufferDesc *buf;
+	uint8	   *bytes;
+
+	Assert(shadow_active != NULL);
+
+	if (forknum == UMBRA_METADATA_FORKNUM)
+		elog(ERROR, "MapActiveBitmapGet does not accept Umbra metadata fork");
+
+	if (!umfile_ctx_fork_exists(map_ctx, UMBRA_METADATA_FORKNUM))
+	{
+		*shadow_active = false;
+		return false;
+	}
+
+	MapLblknoToActiveLocation(forknum, lblkno, &active_blkno, &bit_idx);
+
+	slot_id = MapReadBuffer(map_ctx, rnode, forknum, active_blkno);
+	buf = &MapBuffers[slot_id];
+	page = MapGetPage(slot_id);
+	bytes = (uint8 *) page;
+
+	LWLockAcquire(&buf->buffer_lock, LW_SHARED);
+	*shadow_active =
+		(bytes[bit_idx / BITS_PER_BYTE] &
+		 (1U << (bit_idx % BITS_PER_BYTE))) != 0;
+	LWLockRelease(&buf->buffer_lock);
+
+	MapUnpinBuffer(slot_id);
+	return true;
+}
+
+void
+MapActiveBitmapSet(UmbraFileContext *map_ctx, RelFileLocator rnode,
+				   ForkNumber forknum, BlockNumber lblkno,
+				   bool shadow_active, XLogRecPtr map_lsn)
+{
+	BlockNumber	active_blkno;
+	int			bit_idx;
+	uint8		mask;
+	int			slot_id;
+	MapPage    *page;
+	MapBufferDesc *buf;
+	uint8	   *bytes;
+
+	if (forknum == UMBRA_METADATA_FORKNUM)
+		elog(ERROR, "MapActiveBitmapSet does not accept Umbra metadata fork");
+
+	MapLblknoToActiveLocation(forknum, lblkno, &active_blkno, &bit_idx);
+	mask = (uint8) (1U << (bit_idx % BITS_PER_BYTE));
+
+	slot_id = MapReadBuffer(map_ctx, rnode, forknum, active_blkno);
+	buf = &MapBuffers[slot_id];
+	page = MapGetPage(slot_id);
+	bytes = (uint8 *) page;
+
+	LWLockAcquire(&buf->buffer_lock, LW_EXCLUSIVE);
+	if (shadow_active)
+		bytes[bit_idx / BITS_PER_BYTE] |= mask;
+	else
+		bytes[bit_idx / BITS_PER_BYTE] &= (uint8) ~mask;
+
+	if (map_lsn == InvalidXLogRecPtr)
+	{
+		if (InRecovery)
+			map_lsn = GetXLogReplayRecPtr(NULL);
+		else
+			map_lsn = GetXLogWriteRecPtr();
+	}
+	MapMarkBufferDirty(map_ctx, buf, map_lsn);
+	LWLockRelease(&buf->buffer_lock);
+
+	MapUnpinBuffer(slot_id);
+}
+
+void
+MapActiveBitmapTruncate(UmbraFileContext *map_ctx, RelFileLocator rnode,
+						ForkNumber forknum, BlockNumber n_lblknos,
+						XLogRecPtr map_lsn)
+{
+	BlockNumber old_n_lblknos = 0;
+	BlockNumber start_page_idx;
+	BlockNumber end_page_idx;
+	int			start_bit_idx;
+	int			end_bit_idx;
+	BlockNumber page_idx;
+
+	if (forknum == UMBRA_METADATA_FORKNUM)
+		return;
+
+	Assert(map_ctx != NULL);
+	Assert(map_lsn != InvalidXLogRecPtr);
+
+	if (!umfile_ctx_fork_exists(map_ctx, UMBRA_METADATA_FORKNUM))
+		return;
+
+	if (!MapSBlockTryGetLogicalNblocks(map_ctx, rnode, forknum,
+									   &old_n_lblknos))
+		return;
+	if (old_n_lblknos <= n_lblknos)
+		return;
+
+	start_page_idx = n_lblknos / MAP_ACTIVE_BITS_PER_PAGE;
+	start_bit_idx = n_lblknos % MAP_ACTIVE_BITS_PER_PAGE;
+	end_page_idx = (old_n_lblknos - 1) / MAP_ACTIVE_BITS_PER_PAGE;
+	end_bit_idx = (old_n_lblknos - 1) % MAP_ACTIVE_BITS_PER_PAGE;
+
+	for (page_idx = start_page_idx; page_idx <= end_page_idx; page_idx++)
+	{
+		BlockNumber	active_blkno;
+		int			begin_bit;
+		int			last_bit;
+		int			slot_id;
+		MapPage    *page;
+		MapBufferDesc *buf;
+		uint8	   *bytes;
+
+		active_blkno = MapForkPageIndexToActiveBlkno(forknum, page_idx);
+		if (active_blkno >=
+			umfile_ctx_get_nblocks(map_ctx, UMBRA_METADATA_FORKNUM))
+			break;
+
+		begin_bit = (page_idx == start_page_idx) ? start_bit_idx : 0;
+		last_bit = (page_idx == end_page_idx) ? end_bit_idx :
+			(MAP_ACTIVE_BITS_PER_PAGE - 1);
+
+		slot_id = MapReadBuffer(map_ctx, rnode, forknum, active_blkno);
+		buf = &MapBuffers[slot_id];
+		page = MapGetPage(slot_id);
+		bytes = (uint8 *) page;
+
+		LWLockAcquire(&buf->buffer_lock, LW_EXCLUSIVE);
+		for (int bit = begin_bit; bit <= last_bit; bit++)
+			bytes[bit / BITS_PER_BYTE] &=
+				(uint8) ~(1U << (bit % BITS_PER_BYTE));
+		MapMarkBufferDirty(map_ctx, buf, map_lsn);
+		LWLockRelease(&buf->buffer_lock);
+
+		MapUnpinBuffer(slot_id);
+	}
 }
 
 void

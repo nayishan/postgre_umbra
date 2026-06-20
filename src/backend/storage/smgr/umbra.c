@@ -2831,6 +2831,8 @@ umtruncate(SMgrRelation reln, ForkNumber forknum,
 
 		MapTruncate(ctx, reln->smgr_rlocator.locator,
 					forknum, nblocks, map_lsn);
+		MapActiveBitmapTruncate(ctx, reln->smgr_rlocator.locator,
+								forknum, nblocks, map_lsn);
 		MapSBlockSetLogicalNblocks(ctx, reln->smgr_rlocator.locator,
 								   forknum, nblocks, map_lsn);
 		MapReleasePreloadedTruncatePages(reln->smgr_rlocator.locator, forknum);

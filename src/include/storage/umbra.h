@@ -89,6 +89,27 @@ UmbraChunkPairedBasePblk(BlockNumber lblkno, BlockNumber *pblkno)
 }
 
 static inline bool
+UmbraChunkPairedShadowPblk(BlockNumber lblkno, BlockNumber *pblkno)
+{
+	uint64		chunk_id;
+	uint64		offset;
+	uint64		pblk;
+
+	Assert(pblkno != NULL);
+
+	chunk_id = (uint64) lblkno / UMBRA_CHUNK_PAIRED_PAGES;
+	offset = (uint64) lblkno % UMBRA_CHUNK_PAIRED_PAGES;
+	pblk = chunk_id * (2 * (uint64) UMBRA_CHUNK_PAIRED_PAGES) +
+		(uint64) UMBRA_CHUNK_PAIRED_PAGES + offset;
+
+	if (pblk > (uint64) MaxBlockNumber)
+		return false;
+
+	*pblkno = (BlockNumber) pblk;
+	return true;
+}
+
+static inline bool
 UmbraChunkPairedPhysicalCapacity(BlockNumber logical_nblocks,
 								 BlockNumber *physical_nblocks)
 {

@@ -40,8 +40,11 @@ typedef struct MapBufferDesc MapBufferDesc;
  *
  * Each proportional group contains:
  * - 1 FSM map page
+ * - 1 FSM chunk-active bitmap page
  * - 1 VM map page
+ * - 1 VM chunk-active bitmap page
  * - 8192 MAIN map pages
+ * - 256 MAIN chunk-active bitmap pages
  *
  * This keeps MAIN close to the front of the file while preserving a stable
  * formula-based layout and reserving room for auxiliary forks as MAIN grows.
@@ -49,10 +52,18 @@ typedef struct MapBufferDesc MapBufferDesc;
 #define MAP_BLOCK_SUPER        0
 #define MAP_BLOCK_FIRST_GROUP  1
 #define MAP_GROUP_FSM_PAGES    1
+#define MAP_GROUP_FSM_ACTIVE_PAGES 1
 #define MAP_GROUP_VM_PAGES     1
+#define MAP_GROUP_VM_ACTIVE_PAGES 1
 #define MAP_GROUP_MAIN_PAGES   8192
+#define MAP_ACTIVE_BITS_PER_PAGE (BLCKSZ * BITS_PER_BYTE)
+#define MAP_GROUP_MAIN_ACTIVE_PAGES \
+	(((MAP_GROUP_MAIN_PAGES * MAP_ENTRIES_PER_PAGE) + \
+	  MAP_ACTIVE_BITS_PER_PAGE - 1) / MAP_ACTIVE_BITS_PER_PAGE)
 #define MAP_GROUP_TOTAL_PAGES \
-	(MAP_GROUP_FSM_PAGES + MAP_GROUP_VM_PAGES + MAP_GROUP_MAIN_PAGES)
+	(MAP_GROUP_FSM_PAGES + MAP_GROUP_FSM_ACTIVE_PAGES + \
+	 MAP_GROUP_VM_PAGES + MAP_GROUP_VM_ACTIVE_PAGES + \
+	 MAP_GROUP_MAIN_PAGES + MAP_GROUP_MAIN_ACTIVE_PAGES)
 
 /* Map buffer state bits */
 #define MAPBUF_VALID_MASK  0x000001FF	/* refcount (max 511) */
@@ -167,6 +178,17 @@ extern void MapGetNewPbkno(UmbraFileContext *map_ctx, RelFileLocator rnode,
 extern void MapSetMapping(UmbraFileContext *map_ctx, RelFileLocator rnode,
 						  ForkNumber forknum, BlockNumber lblkno,
 						  BlockNumber new_pblkno, XLogRecPtr map_lsn);
+extern bool MapActiveBitmapGet(UmbraFileContext *map_ctx, RelFileLocator rnode,
+							   ForkNumber forknum, BlockNumber lblkno,
+							   bool *shadow_active);
+extern void MapActiveBitmapSet(UmbraFileContext *map_ctx, RelFileLocator rnode,
+							   ForkNumber forknum, BlockNumber lblkno,
+							   bool shadow_active, XLogRecPtr map_lsn);
+extern void MapActiveBitmapTruncate(UmbraFileContext *map_ctx,
+									RelFileLocator rnode,
+									ForkNumber forknum,
+									BlockNumber n_lblknos,
+									XLogRecPtr map_lsn);
 
 /* MAP superblock helpers */
 extern void MapSBlockInit(UmbraFileContext *map_ctx, RelFileLocator rnode,
