@@ -202,23 +202,9 @@ static void
 XLogFillBlockShiftFrontierUmbra(registered_buffer *regbuf,
 								XLogRecordBlockShiftHeader *rbsh)
 {
-	SMgrRelation	reln = regbuf->shift_reln;
-	UmbraFileContext *ctx;
-	BlockNumber		logical_nblocks = InvalidBlockNumber;
-
 	Assert(rbsh != NULL);
 
-	if (reln == NULL)
-		reln = smgropen(regbuf->rlocator, INVALID_PROC_NUMBER);
-
-	ctx = umfile_ctx_acquire(reln->smgr_rlocator);
-
-	if (MapSBlockTryGetLogicalNblocks(ctx, regbuf->rlocator,
-									  regbuf->forkno, &logical_nblocks))
-		rbsh->logical_nblocks = Max(logical_nblocks, regbuf->block + 1);
-	else
-		rbsh->logical_nblocks = regbuf->block + 1;
-
+	rbsh->logical_nblocks = regbuf->block + 1;
 	rbsh->shifted_to_shadow = regbuf->shifted_to_shadow;
 	regbuf->shift_logical_nblocks = rbsh->logical_nblocks;
 }
@@ -1279,8 +1265,15 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 		{
 			XLogRecPtr	page_lsn = PageGetLSN(regbuf->page);
 
-			needs_shift = (page_lsn <= RedoRecPtr);
-			if (!needs_shift)
+			if (rmid == RM_XLOG_ID && info == XLOG_FPI_FOR_HINT)
+			{
+				needs_backup = (page_lsn <= RedoRecPtr);
+				needs_shift = false;
+			}
+			else
+				needs_shift = (page_lsn <= RedoRecPtr);
+
+			if (!needs_backup && !needs_shift)
 			{
 				if (!XLogRecPtrIsValid(*fpw_lsn) || page_lsn < *fpw_lsn)
 					*fpw_lsn = page_lsn;
