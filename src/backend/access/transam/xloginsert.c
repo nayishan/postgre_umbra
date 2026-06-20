@@ -209,6 +209,8 @@ XLogFillBlockRemapFrontierUmbra(registered_buffer *regbuf,
 	UmbraFileContext *ctx;
 	BlockNumber		logical_nblocks = InvalidBlockNumber;
 	BlockNumber		next_free_pblk = InvalidBlockNumber;
+	BlockNumber		chunk_capacity = InvalidBlockNumber;
+	bool			chunk_paired;
 
 	Assert(rbmh != NULL);
 
@@ -216,6 +218,7 @@ XLogFillBlockRemapFrontierUmbra(registered_buffer *regbuf,
 		reln = smgropen(regbuf->rlocator, INVALID_PROC_NUMBER);
 
 	ctx = umfile_ctx_acquire(reln->smgr_rlocator);
+	chunk_paired = UmMapUsesChunkPaired(reln, regbuf->forkno);
 
 	if (MapSBlockTryGetLogicalNblocks(ctx, regbuf->rlocator,
 									  regbuf->forkno, &logical_nblocks))
@@ -223,10 +226,12 @@ XLogFillBlockRemapFrontierUmbra(registered_buffer *regbuf,
 	else
 		rbmh->logical_nblocks = regbuf->block + 1;
 
-	if (MapSBlockTryGetNextFreePhysBlock(ctx, regbuf->rlocator,
-										 regbuf->forkno, &next_free_pblk))
-		rbmh->next_free_pblkno = Max(next_free_pblk,
-									 regbuf->new_pblkno + 1);
+	if (chunk_paired &&
+		UmbraChunkPairedCapacityForPblk(regbuf->new_pblkno, &chunk_capacity))
+		rbmh->next_free_pblkno = chunk_capacity;
+	else if (MapSBlockTryGetNextFreePhysBlock(ctx, regbuf->rlocator,
+											  regbuf->forkno, &next_free_pblk))
+		rbmh->next_free_pblkno = Max(next_free_pblk, regbuf->new_pblkno + 1);
 	else
 		rbmh->next_free_pblkno = regbuf->new_pblkno + 1;
 
@@ -243,6 +248,7 @@ XLogCommitBlockRemapsUmbra(XLogRecPtr record_endptr)
 	{
 		registered_buffer *regbuf = &registered_buffers[block_id];
 		UmbraFileContext *ctx;
+		bool			chunk_paired;
 
 		if (!regbuf->in_use || !regbuf->has_remap || !regbuf->remap_in_record)
 			continue;
@@ -250,6 +256,8 @@ XLogCommitBlockRemapsUmbra(XLogRecPtr record_endptr)
 			continue;
 
 		ctx = umfile_ctx_acquire(regbuf->remap_reln->smgr_rlocator);
+		chunk_paired = UmMapUsesChunkPaired(regbuf->remap_reln,
+											regbuf->forkno);
 
 		UmMapSetMapping(regbuf->remap_reln, regbuf->forkno, regbuf->block,
 						regbuf->new_pblkno, record_endptr);
@@ -267,13 +275,22 @@ XLogCommitBlockRemapsUmbra(XLogRecPtr record_endptr)
 								  regbuf->block + 1);
 		}
 
-		MapSBlockBumpNextFreePhysBlock(ctx,
-									   regbuf->rlocator,
-									   regbuf->forkno,
-									   regbuf->remap_next_free_pblkno != InvalidBlockNumber ?
-									   regbuf->remap_next_free_pblkno :
-									   regbuf->new_pblkno + 1,
-									   record_endptr);
+		if (chunk_paired &&
+			UmbraChunkPairedCapacityForPblk(regbuf->new_pblkno,
+											&regbuf->remap_next_free_pblkno))
+			MapSBlockBumpPhysicalNblocks(ctx,
+										 regbuf->rlocator,
+										 regbuf->forkno,
+										 regbuf->remap_next_free_pblkno,
+										 record_endptr);
+		else
+			MapSBlockBumpNextFreePhysBlock(ctx,
+										   regbuf->rlocator,
+										   regbuf->forkno,
+										   regbuf->remap_next_free_pblkno != InvalidBlockNumber ?
+										   regbuf->remap_next_free_pblkno :
+										   regbuf->new_pblkno + 1,
+										   record_endptr);
 		MapInflightRelease(regbuf->rlocator, regbuf->forkno,
 						   regbuf->block);
 		regbuf->wal_owns_firstborn = false;

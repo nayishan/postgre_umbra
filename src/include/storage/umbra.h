@@ -135,6 +135,25 @@ UmbraChunkPairedPhysicalCapacity(BlockNumber logical_nblocks,
 	return true;
 }
 
+static inline bool
+UmbraChunkPairedCapacityForPblk(BlockNumber pblkno,
+							   BlockNumber *physical_nblocks)
+{
+	uint64		chunk_id;
+	uint64		capacity;
+
+	Assert(physical_nblocks != NULL);
+
+	chunk_id = (uint64) pblkno / (2 * (uint64) UMBRA_CHUNK_PAIRED_PAGES);
+	capacity = (chunk_id + 1) * (2 * (uint64) UMBRA_CHUNK_PAIRED_PAGES);
+
+	if (capacity > (uint64) MaxBlockNumber + 1)
+		return false;
+
+	*physical_nblocks = (BlockNumber) capacity;
+	return true;
+}
+
 extern bool UmMetadataExists(SMgrRelation reln);
 extern bool UmMetadataOpenOrCreate(SMgrRelation reln, bool isRedo, bool *created);
 extern BlockNumber UmMetadataNblocks(SMgrRelation reln);
@@ -243,6 +262,7 @@ extern bool UmMapAccessAvailable(SMgrRelation reln, ForkNumber forknum);
 extern bool UmWalOwnedRemapAvailable(SMgrRelation reln, ForkNumber forknum);
 extern bool UmWalOwnedFirstbornAvailable(SMgrRelation reln, ForkNumber forknum,
 										 BlockNumber lblkno);
+extern bool UmMapUsesChunkPaired(SMgrRelation reln, ForkNumber forknum);
 extern bool UmMapTryLookupPblkno(SMgrRelation reln, ForkNumber forknum,
 								 BlockNumber lblkno, BlockNumber *pblkno);
 extern bool UmMapIsLogicalUnmaterialized(SMgrRelation reln, ForkNumber forknum,

@@ -807,9 +807,16 @@ XLogReadBufferForRedoExtendedUmbra(XLogReaderState *record,
 			blk->next_free_pblkno : blk->new_pblkno + 1;
 
 		UmMapSetMapping(remap_smgr, forknum, blkno, blk->new_pblkno, lsn);
-		MapSBlockBumpNextFreePhysBlock(ctx, rlocator,
-									   forknum, redo_next_free_pblkno,
-									   lsn);
+		if (UmMapUsesChunkPaired(remap_smgr, forknum) &&
+			UmbraChunkPairedCapacityForPblk(blk->new_pblkno,
+											&redo_next_free_pblkno))
+			MapSBlockBumpPhysicalNblocks(ctx, rlocator,
+										 forknum, redo_next_free_pblkno,
+										 lsn);
+		else
+			MapSBlockBumpNextFreePhysBlock(ctx, rlocator,
+										   forknum, redo_next_free_pblkno,
+										   lsn);
 		if (blk->old_pblkno == InvalidBlockNumber)
 		{
 			MapSBlockBumpLogicalNblocks(ctx, rlocator,
@@ -862,9 +869,16 @@ XLogReadBufferForRedoExtendedUmbra(XLogReaderState *record,
 			blk->next_free_pblkno : blk->new_pblkno + 1;
 
 		UmMapSetMapping(remap_smgr, forknum, blkno, blk->new_pblkno, lsn);
-		MapSBlockBumpNextFreePhysBlock(ctx, rlocator,
-									   forknum, redo_next_free_pblkno,
-									   lsn);
+		if (UmMapUsesChunkPaired(remap_smgr, forknum) &&
+			UmbraChunkPairedCapacityForPblk(blk->new_pblkno,
+											&redo_next_free_pblkno))
+			MapSBlockBumpPhysicalNblocks(ctx, rlocator,
+										 forknum, redo_next_free_pblkno,
+										 lsn);
+		else
+			MapSBlockBumpNextFreePhysBlock(ctx, rlocator,
+										   forknum, redo_next_free_pblkno,
+										   lsn);
 		if (blk->old_pblkno == InvalidBlockNumber)
 		{
 			MapSBlockBumpLogicalNblocks(ctx, rlocator,
@@ -904,10 +918,21 @@ XLogReadBufferForRedoExtendedUmbra(XLogReaderState *record,
 
 	UmMapSetMapping(remap_smgr, forknum, blkno, blk->new_pblkno, lsn);
 	if (blk->next_free_pblkno != InvalidBlockNumber)
-		MapSBlockBumpNextFreePhysBlock(umfile_ctx_acquire(remap_smgr->smgr_rlocator),
-									   rlocator,
-									   forknum, blk->next_free_pblkno,
-									   lsn);
+	{
+		UmbraFileContext *ctx = umfile_ctx_acquire(remap_smgr->smgr_rlocator);
+		BlockNumber redo_phys_capacity;
+
+		if (UmMapUsesChunkPaired(remap_smgr, forknum) &&
+			UmbraChunkPairedCapacityForPblk(blk->new_pblkno,
+											&redo_phys_capacity))
+			MapSBlockBumpPhysicalNblocks(ctx, rlocator,
+										 forknum, redo_phys_capacity,
+										 lsn);
+		else
+			MapSBlockBumpNextFreePhysBlock(ctx, rlocator,
+										   forknum, blk->next_free_pblkno,
+										   lsn);
+	}
 
 	if (lsn <= PageGetLSN(BufferGetPage(*buf)))
 		return BLK_DONE;

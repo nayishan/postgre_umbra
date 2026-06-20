@@ -43,6 +43,7 @@
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/map.h"
+#include "storage/map_internal.h"
 #include "storage/proc.h"
 #include "storage/smgr.h"
 #include "storage/umbra.h"
@@ -226,6 +227,7 @@ static bool um_mapped_exists_from_super(SMgrRelation reln, ForkNumber forknum);
 static UmbraMapPolicy um_open_map_state(SMgrRelation reln);
 static bool um_state_uses_map(UmbraMapPolicy state);
 static bool um_state_uses_chunk_base(UmbraMapPolicy state);
+static bool um_state_uses_chunk_direct_base(UmbraMapPolicy state);
 static bool um_state_requires_durable_sync(UmbraMapPolicy state);
 static bool um_relation_requires_durable_sync(SMgrRelation reln);
 static UmbraMappedBirthResult um_publish_mapped_birth(SMgrRelation reln,
@@ -237,6 +239,16 @@ static void um_filetag_path(const FileTag *ftag, char *path);
 static BlockNumber um_chunk_base_pblk_checked(SMgrRelation reln,
 											  ForkNumber forknum,
 											  BlockNumber lblkno);
+static BlockNumber um_chunk_shadow_pblk_checked(SMgrRelation reln,
+												ForkNumber forknum,
+												BlockNumber lblkno);
+static BlockNumber um_chunk_active_pblk_checked(SMgrRelation reln,
+												ForkNumber forknum,
+												BlockNumber lblkno);
+static BlockNumber um_chunk_inactive_pblk_checked(SMgrRelation reln,
+												  ForkNumber forknum,
+												  BlockNumber lblkno,
+												  BlockNumber *active_pblkno);
 static BlockNumber um_chunk_physical_capacity_checked(SMgrRelation reln,
 													  ForkNumber forknum,
 													  BlockNumber logical_nblocks);
@@ -353,8 +365,14 @@ um_ensure_datafork_batch_ready_for_access(SMgrRelation reln,
 						reln->smgr_rlocator.locator.relNumber,
 						forknum)));
 
-	(void) MapSBlockEnsurePhysicalNblocks(ctx, reln->smgr_rlocator.locator,
-										  forknum, pblkno + 1, skipFsync);
+	if (um_state_uses_chunk_base(access->policy) &&
+		!umfile_ctx_block_exists(ctx, forknum, pblkno))
+		umfile_zeroextend(ctx, forknum, pblkno, 1, skipFsync);
+	else
+		(void) MapSBlockEnsurePhysicalNblocks(ctx,
+											  reln->smgr_rlocator.locator,
+											  forknum, pblkno + 1,
+											  skipFsync);
 }
 
 void
@@ -687,6 +705,13 @@ um_state_uses_map(UmbraMapPolicy state)
 static bool
 um_state_uses_chunk_base(UmbraMapPolicy state)
 {
+	return state == UMBRA_MAP_POLICY_REQUIRE_MAP ||
+		state == UMBRA_MAP_POLICY_SKIP_WAL_PENDING_MAP;
+}
+
+static bool
+um_state_uses_chunk_direct_base(UmbraMapPolicy state)
+{
 	return state == UMBRA_MAP_POLICY_SKIP_WAL_PENDING_MAP;
 }
 
@@ -760,6 +785,67 @@ um_chunk_base_pblk_checked(SMgrRelation reln, ForkNumber forknum,
 						forknum, lblkno)));
 
 	return pblkno;
+}
+
+static BlockNumber
+um_chunk_shadow_pblk_checked(SMgrRelation reln, ForkNumber forknum,
+							 BlockNumber lblkno)
+{
+	BlockNumber pblkno;
+
+	if (!UmbraChunkPairedShadowPblk(lblkno, &pblkno))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("chunk-paired shadow physical block overflow for relation %u/%u/%u fork %d logical block %u",
+						reln->smgr_rlocator.locator.spcOid,
+						reln->smgr_rlocator.locator.dbOid,
+						reln->smgr_rlocator.locator.relNumber,
+						forknum, lblkno)));
+
+	return pblkno;
+}
+
+static BlockNumber
+um_chunk_active_pblk_checked(SMgrRelation reln, ForkNumber forknum,
+							 BlockNumber lblkno)
+{
+	UmbraFileContext *ctx = um_ctx_acquire(reln);
+	bool		shadow_active = false;
+
+	(void) MapActiveBitmapGet(ctx, reln->smgr_rlocator.locator,
+							  forknum, lblkno, &shadow_active);
+
+	if (shadow_active)
+		return um_chunk_shadow_pblk_checked(reln, forknum, lblkno);
+	return um_chunk_base_pblk_checked(reln, forknum, lblkno);
+}
+
+static BlockNumber
+um_chunk_inactive_pblk_checked(SMgrRelation reln, ForkNumber forknum,
+							   BlockNumber lblkno, BlockNumber *active_pblkno)
+{
+	UmbraFileContext *ctx = um_ctx_acquire(reln);
+	bool		shadow_active = false;
+	BlockNumber active_pblk;
+	BlockNumber inactive_pblk;
+
+	(void) MapActiveBitmapGet(ctx, reln->smgr_rlocator.locator,
+							  forknum, lblkno, &shadow_active);
+
+	if (shadow_active)
+	{
+		active_pblk = um_chunk_shadow_pblk_checked(reln, forknum, lblkno);
+		inactive_pblk = um_chunk_base_pblk_checked(reln, forknum, lblkno);
+	}
+	else
+	{
+		active_pblk = um_chunk_base_pblk_checked(reln, forknum, lblkno);
+		inactive_pblk = um_chunk_shadow_pblk_checked(reln, forknum, lblkno);
+	}
+
+	if (active_pblkno != NULL)
+		*active_pblkno = active_pblk;
+	return inactive_pblk;
 }
 
 static BlockNumber
@@ -1054,6 +1140,9 @@ um_is_logical_unmaterialized_for_access(SMgrRelation reln, ForkNumber forknum,
 												 lblkno))
 		return false;
 
+	if (um_state_uses_chunk_base(access->policy))
+		return false;
+
 	return !MapTryLookup(ctx, reln->smgr_rlocator.locator,
 						 forknum, lblkno, &pblkno);
 }
@@ -1068,9 +1157,35 @@ um_reserve_fresh_pblkno_for_access(SMgrRelation reln, ForkNumber forknum,
 
 	Assert(new_pblkno != NULL);
 
-	if (um_state_uses_chunk_base(access->policy))
+	if (um_state_uses_chunk_direct_base(access->policy))
 	{
 		*new_pblkno = um_chunk_base_pblk_checked(reln, forknum, lblkno);
+		return;
+	}
+
+	if (um_state_uses_chunk_base(access->policy))
+	{
+		if (MapInflightLookupOwnedPblk(reln->smgr_rlocator.locator,
+									   forknum, lblkno, new_pblkno))
+			return;
+
+		if (!MapInflightTryClaim(ctx, reln->smgr_rlocator.locator,
+								 forknum, lblkno))
+		{
+			if (MapInflightLookupOwnedPblk(reln->smgr_rlocator.locator,
+										   forknum, lblkno, new_pblkno))
+				return;
+			elog(ERROR,
+				 "failed to claim chunk-paired first-born block for relation %u/%u/%u fork %d blk %u",
+				 reln->smgr_rlocator.locator.spcOid,
+				 reln->smgr_rlocator.locator.dbOid,
+				 reln->smgr_rlocator.locator.relNumber,
+				 forknum, lblkno);
+		}
+
+		*new_pblkno = um_chunk_base_pblk_checked(reln, forknum, lblkno);
+		MapInflightFinishClaim(reln->smgr_rlocator.locator, forknum,
+							   lblkno, *new_pblkno);
 		return;
 	}
 
@@ -1177,7 +1292,28 @@ um_resolve_lblk_for_access(SMgrRelation reln, ForkNumber forknum,
 
 	if (um_state_uses_chunk_base(access->policy))
 	{
-		*pblkno = um_chunk_base_pblk_checked(reln, forknum, lblkno);
+		if (mode == UMBRA_ACCESS_RESOLVE_READ &&
+			!um_lblk_precedes_logical_eof_for_access(reln, forknum,
+													 access, lookup_state,
+													 lblkno))
+			return um_resolve_lblk_for_read(reln, forknum, access,
+											lookup_state, lblkno);
+
+		if (mode == UMBRA_ACCESS_RESOLVE_WRITEBACK &&
+			!um_lblk_precedes_logical_eof_for_access(reln, forknum,
+													 access, lookup_state,
+													 lblkno))
+		{
+			if (um_is_stale_post_truncate_lblk_for_access(reln, forknum,
+														  access,
+														  lookup_state,
+														  lblkno))
+				return UMBRA_ACCESS_RESOLVED_SKIP;
+			um_report_unmapped_map_entry(reln, forknum, access, lblkno);
+			pg_unreachable();
+		}
+
+		*pblkno = um_chunk_active_pblk_checked(reln, forknum, lblkno);
 		return UMBRA_ACCESS_RESOLVED_PBLK;
 	}
 
@@ -1258,10 +1394,21 @@ um_resolve_mapped_read_run(SMgrRelation reln, ForkNumber forknum,
 			blocknum >= logical_nblocks)
 			return 0;
 
-		*start_pblk = um_chunk_base_pblk_checked(reln, forknum, blocknum);
+		*start_pblk = um_chunk_active_pblk_checked(reln, forknum, blocknum);
 		run_blocks = Min(maxblocks,
 						 (BlockNumber) UMBRA_CHUNK_PAIRED_PAGES -
 						 (blocknum % (BlockNumber) UMBRA_CHUNK_PAIRED_PAGES));
+		for (BlockNumber i = 1; i < run_blocks; i++)
+		{
+			BlockNumber pblk =
+				um_chunk_active_pblk_checked(reln, forknum, blocknum + i);
+
+			if (pblk != *start_pblk + i)
+			{
+				run_blocks = i;
+				break;
+			}
+		}
 		if (logical_nblocks != InvalidBlockNumber)
 			run_blocks = Min(run_blocks, logical_nblocks - blocknum);
 		return run_blocks;
@@ -1353,6 +1500,9 @@ um_try_pure_firstborn_range_remap_zeroextend(SMgrRelation reln, ForkNumber forkn
 	Assert(access != NULL);
 	Assert(access->map_available);
 	Assert(nblocks > 0);
+
+	if (um_state_uses_chunk_base(access->policy))
+		return false;
 
 	/*
 	 * Try to collapse an EOF zeroextend range into one or more RANGE_REMAP
@@ -1505,17 +1655,24 @@ um_publish_mapped_birth(SMgrRelation reln, ForkNumber forknum,
 			 reln->smgr_rlocator.locator.relNumber,
 			 forknum, lblkno);
 
-	MapGetNewPbkno(ctx, reln->smgr_rlocator.locator, forknum, lblkno,
-				   &result.pblkno, &old_pblkno);
-	Assert(old_pblkno == InvalidBlockNumber);
+	if (um_state_uses_chunk_base(access->policy))
+	{
+		result.pblkno = um_chunk_base_pblk_checked(reln, forknum, lblkno);
+		old_pblkno = InvalidBlockNumber;
+	}
+	else
+	{
+		MapGetNewPbkno(ctx, reln->smgr_rlocator.locator, forknum, lblkno,
+					   &result.pblkno, &old_pblkno);
+		Assert(old_pblkno == InvalidBlockNumber);
+	}
 
 	wal_owns_firstborn = false;
 
 	if (InRecovery)
 	{
 		map_lsn = GetXLogReplayRecPtr(NULL);
-		MapSetMapping(ctx, reln->smgr_rlocator.locator, forknum, lblkno,
-					  result.pblkno, map_lsn);
+		UmMapSetMapping(reln, forknum, lblkno, result.pblkno, map_lsn);
 		result.mapping_published = true;
 	}
 	else
@@ -1555,16 +1712,27 @@ um_publish_mapped_birth(SMgrRelation reln, ForkNumber forknum,
 
 		if (emit_map_set)
 		{
-			MapSetMapping(ctx, reln->smgr_rlocator.locator, forknum, lblkno,
-						  result.pblkno, map_lsn);
+			UmMapSetMapping(reln, forknum, lblkno, result.pblkno, map_lsn);
 			result.mapping_published = true;
 		}
 	}
 
 	if (result.mapping_published)
-		MapSBlockBumpNextFreePhysBlock(ctx, reln->smgr_rlocator.locator,
-									   forknum, result.pblkno + 1,
-									   map_lsn);
+	{
+		if (um_state_uses_chunk_base(access->policy))
+		{
+			MapSBlockBumpPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
+										 forknum,
+										 um_chunk_physical_capacity_checked(reln,
+																			forknum,
+																			lblkno + 1),
+										 map_lsn);
+		}
+		else
+			MapSBlockBumpNextFreePhysBlock(ctx, reln->smgr_rlocator.locator,
+										   forknum, result.pblkno + 1,
+										   map_lsn);
+	}
 
 	if (delay_chkp_started)
 	{
@@ -1718,7 +1886,7 @@ umphysicalblock(SMgrRelation reln, ForkNumber forknum, BlockNumber lblkno)
 
 	access = um_classify_access(reln, forknum);
 	if (um_state_uses_chunk_base(access.policy))
-		return um_chunk_base_pblk_checked(reln, forknum, lblkno);
+		return um_chunk_active_pblk_checked(reln, forknum, lblkno);
 
 	if (!access.map_available)
 		return lblkno;
@@ -1745,8 +1913,8 @@ UmMapGetNewPbkno(SMgrRelation reln, ForkNumber forknum,
 	access = um_classify_access(reln, forknum);
 	if (um_state_uses_chunk_base(access.policy))
 	{
-		*old_pblkno = InvalidBlockNumber;
-		*new_pblkno = um_chunk_base_pblk_checked(reln, forknum, lblkno);
+		*new_pblkno = um_chunk_inactive_pblk_checked(reln, forknum,
+													 lblkno, old_pblkno);
 		return;
 	}
 
@@ -1806,6 +1974,15 @@ UmWalOwnedFirstbornAvailable(SMgrRelation reln, ForkNumber forknum,
 }
 
 bool
+UmMapUsesChunkPaired(SMgrRelation reln, ForkNumber forknum)
+{
+	UmbraAccessState access;
+
+	access = um_classify_access(reln, forknum);
+	return um_state_uses_chunk_base(access.policy);
+}
+
+bool
 UmMapTryLookupPblkno(SMgrRelation reln, ForkNumber forknum,
 					 BlockNumber lblkno, BlockNumber *pblkno)
 {
@@ -1815,7 +1992,14 @@ UmMapTryLookupPblkno(SMgrRelation reln, ForkNumber forknum,
 	access = um_classify_access(reln, forknum);
 	if (um_state_uses_chunk_base(access.policy))
 	{
-		*pblkno = um_chunk_base_pblk_checked(reln, forknum, lblkno);
+		BlockNumber logical_nblocks;
+
+		if (!MapSBlockTryGetLogicalNblocks(ctx, reln->smgr_rlocator.locator,
+										   forknum, &logical_nblocks) ||
+			lblkno >= logical_nblocks)
+			return false;
+
+		*pblkno = um_chunk_active_pblk_checked(reln, forknum, lblkno);
 		return true;
 	}
 
@@ -1849,6 +2033,34 @@ UmMapSetMapping(SMgrRelation reln, ForkNumber forknum,
 	UmbraFileContext *ctx = um_ctx_acquire(reln);
 
 	access = um_classify_access(reln, forknum);
+	if (um_state_uses_chunk_base(access.policy))
+	{
+		BlockNumber base_pblk;
+		BlockNumber shadow_pblk;
+		bool		shadow_active;
+
+		base_pblk = um_chunk_base_pblk_checked(reln, forknum, lblkno);
+		shadow_pblk = um_chunk_shadow_pblk_checked(reln, forknum, lblkno);
+
+		if (new_pblkno == base_pblk)
+			shadow_active = false;
+		else if (new_pblkno == shadow_pblk)
+			shadow_active = true;
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("chunk-paired mapping target %u is not a valid slot for relation %u/%u/%u fork %d logical block %u",
+							new_pblkno,
+							reln->smgr_rlocator.locator.spcOid,
+							reln->smgr_rlocator.locator.dbOid,
+							reln->smgr_rlocator.locator.relNumber,
+							forknum, lblkno)));
+
+		MapActiveBitmapSet(ctx, reln->smgr_rlocator.locator,
+						   forknum, lblkno, shadow_active, map_lsn);
+		return;
+	}
+
 	if (!access.map_available)
 		return;
 
@@ -1954,7 +2166,7 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 	access = um_classify_access(reln, forknum);
 
-	if (um_state_uses_chunk_base(access.policy))
+	if (um_state_uses_chunk_direct_base(access.policy))
 	{
 		pblkno = um_chunk_base_pblk_checked(reln, forknum, blocknum);
 		logical_nblocks = umnblocks_for_access(reln, forknum, &access);
@@ -1985,13 +2197,17 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	 * create mappings and materialize zero pages for the gap.
 	 */
 	logical_nblocks = umnblocks_for_access(reln, forknum, &access);
-	(void) MapSBlockTryGetPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
-										  forknum, &materialized_nblocks);
+	if (um_state_uses_chunk_base(access.policy))
+		materialized_nblocks = umfile_nblocks(ctx, forknum);
+	else
+		(void) MapSBlockTryGetPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
+											  forknum, &materialized_nblocks);
 	if (blocknum > logical_nblocks)
 	{
 		umzeroextend(reln, forknum, logical_nblocks,
 					 (int) (blocknum - logical_nblocks),
 					 skipFsync);
+		logical_nblocks = blocknum;
 	}
 
 	/*
@@ -1999,7 +2215,18 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	 * block gets its first physical block. Existing mappings can appear during
 	 * redo/replay and should be reused.
 	 */
-	if (!MapTryLookup(ctx, reln->smgr_rlocator.locator, forknum, blocknum, &pblkno))
+	if (um_state_uses_chunk_base(access.policy) &&
+		blocknum < logical_nblocks)
+	{
+		pblkno = um_chunk_active_pblk_checked(reln, forknum, blocknum);
+	}
+	else if (!um_state_uses_chunk_base(access.policy) &&
+			 MapTryLookup(ctx, reln->smgr_rlocator.locator,
+						  forknum, blocknum, &pblkno))
+	{
+		/* Existing mapping found. */
+	}
+	else
 	{
 		UmbraMappedBirthResult birth;
 
@@ -2007,42 +2234,27 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		pblkno = birth.pblkno;
 		mapping_committed = birth.mapping_published;
 
-		/*
-		 * Reservation/publication can make the mapping visible before the data
-		 * fork is physically materialized. Extend when the chosen pblk is still
-		 * beyond the materialized physical EOF; otherwise just write the page.
-		 */
-		/*
-		 * Page checksum stays keyed by the logical block identity; callers
-		 * reaching smgrextend() have already set it using the logical blkno.
-		 */
-		if (pblkno >= materialized_nblocks)
-		{
-			umfile_extend(ctx, forknum, pblkno, buffer, skipFsync);
-			max_pblkno = pblkno;
-		}
-		else
-		{
-			const void *single_buffer[1];
+	}
 
-			single_buffer[0] = buffer;
-			umfile_writev(ctx, forknum, pblkno, single_buffer, 1, skipFsync);
-		}
+	/*
+	 * Reservation/publication can make the mapping visible before the data
+	 * fork is physically materialized. Extend when the chosen pblk is still
+	 * beyond the materialized physical EOF; otherwise just write the page.
+	 *
+	 * Page checksum stays keyed by the logical block identity; callers
+	 * reaching smgrextend() have already set it using the logical blkno.
+	 */
+	if (pblkno >= materialized_nblocks)
+	{
+		umfile_extend(ctx, forknum, pblkno, buffer, skipFsync);
+		max_pblkno = pblkno;
 	}
 	else
 	{
-		if (pblkno >= materialized_nblocks)
-		{
-			umfile_extend(ctx, forknum, pblkno, buffer, skipFsync);
-			max_pblkno = pblkno;
-		}
-		else
-		{
-			const void *single_buffer[1];
+		const void *single_buffer[1];
 
-			single_buffer[0] = buffer;
-			umfile_writev(ctx, forknum, pblkno, single_buffer, 1, skipFsync);
-		}
+		single_buffer[0] = buffer;
+		umfile_writev(ctx, forknum, pblkno, single_buffer, 1, skipFsync);
 	}
 
 	if (mapping_committed)
@@ -2050,9 +2262,19 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 										forknum, blocknum + 1,
 										InvalidXLogRecPtr);
 	if (max_pblkno != InvalidBlockNumber)
-		MapSBlockBumpPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
+	{
+		if (um_state_uses_chunk_base(access.policy))
+			MapSBlockBumpPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
+										 forknum,
+										 um_chunk_physical_capacity_checked(reln,
+																			forknum,
+																			blocknum + 1),
+										 InvalidXLogRecPtr);
+		else
+			MapSBlockBumpPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
 										 forknum, max_pblkno + 1,
 										 InvalidXLogRecPtr);
+	}
 }
 
 void
@@ -2070,7 +2292,7 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 	access = um_classify_access(reln, forknum);
 
-	if (um_state_uses_chunk_base(access.policy))
+	if (um_state_uses_chunk_direct_base(access.policy))
 	{
 		BlockNumber logical_end = blocknum + (BlockNumber) nblocks;
 
@@ -2154,7 +2376,19 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		BlockNumber lblk = blocknum + (BlockNumber) i;
 		BlockNumber pblk;
 
-		if (!MapTryLookup(ctx, reln->smgr_rlocator.locator, forknum, lblk, &pblk))
+		if (um_state_uses_chunk_base(access.policy) &&
+			um_lblk_precedes_logical_eof_for_access(reln, forknum,
+													&access, NULL, lblk))
+		{
+			pblk = um_chunk_active_pblk_checked(reln, forknum, lblk);
+		}
+		else if (!um_state_uses_chunk_base(access.policy) &&
+				 MapTryLookup(ctx, reln->smgr_rlocator.locator,
+							  forknum, lblk, &pblk))
+		{
+			/* Existing mapping found. */
+		}
+		else
 		{
 			UmbraMappedBirthResult birth;
 
@@ -2188,9 +2422,19 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 						  skipFsync);
 
 	if (max_pblkno != InvalidBlockNumber)
-		MapSBlockBumpPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
-									 forknum, max_pblkno + 1,
-									 InvalidXLogRecPtr);
+	{
+		if (um_state_uses_chunk_base(access.policy))
+			MapSBlockBumpPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
+										 forknum,
+										 um_chunk_physical_capacity_checked(reln,
+																			forknum,
+																			blocknum + (BlockNumber) nblocks),
+										 InvalidXLogRecPtr);
+		else
+			MapSBlockBumpPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
+										 forknum, max_pblkno + 1,
+										 InvalidXLogRecPtr);
+	}
 
 	MapSBlockBumpLogicalNblocks(ctx, reln->smgr_rlocator.locator,
 								forknum, blocknum + (BlockNumber) nblocks,
@@ -2513,7 +2757,7 @@ umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 	access = um_classify_access(reln, forknum);
 
-	if (um_state_uses_chunk_base(access.policy))
+	if (um_state_uses_chunk_direct_base(access.policy))
 	{
 		BlockNumber logical_end = blocknum + nblocks;
 
@@ -2555,8 +2799,11 @@ umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		return;
 	}
 
-	(void) MapSBlockTryGetPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
-										  forknum, &materialized_nblocks);
+	if (um_state_uses_chunk_base(access.policy))
+		materialized_nblocks = umfile_nblocks(ctx, forknum);
+	else
+		(void) MapSBlockTryGetPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
+											  forknum, &materialized_nblocks);
 
 	PG_TRY();
 	{
@@ -2649,9 +2896,19 @@ umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	PG_END_TRY();
 
 	if (max_extended_pblk != InvalidBlockNumber)
-		MapSBlockBumpPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
-									 forknum, max_extended_pblk + 1,
-									 InvalidXLogRecPtr);
+	{
+		if (um_state_uses_chunk_base(access.policy))
+			MapSBlockBumpPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
+										 forknum,
+										 um_chunk_physical_capacity_checked(reln,
+																			forknum,
+																			blocknum + nblocks),
+										 InvalidXLogRecPtr);
+		else
+			MapSBlockBumpPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
+										 forknum, max_extended_pblk + 1,
+										 InvalidXLogRecPtr);
+	}
 
 	if (nblocks > 0)
 	{
@@ -2674,7 +2931,7 @@ umwriteback(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 	access = um_classify_access(reln, forknum);
 
-	if (um_state_uses_chunk_base(access.policy))
+	if (um_state_uses_chunk_direct_base(access.policy))
 	{
 		for (BlockNumber i = 0; i < nblocks;)
 		{

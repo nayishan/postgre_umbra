@@ -177,13 +177,24 @@ umbra_redo(XLogReaderState *record)
 					}
 				}
 
-				MapSetMapping(ctx, xlrec->rlocator, xlrec->forknum,
-							  xlrec->lblkno, xlrec->new_pblkno,
-							  record->EndRecPtr);
-				MapSBlockBumpNextFreePhysBlock(ctx, xlrec->rlocator,
-											   xlrec->forknum,
-											   xlrec->new_pblkno + 1,
-											   record->EndRecPtr);
+				UmMapSetMapping(reln, xlrec->forknum, xlrec->lblkno,
+								xlrec->new_pblkno, record->EndRecPtr);
+				{
+					BlockNumber physical_nblocks;
+
+					if (UmMapUsesChunkPaired(reln, xlrec->forknum) &&
+						UmbraChunkPairedCapacityForPblk(xlrec->new_pblkno,
+														&physical_nblocks))
+						MapSBlockBumpPhysicalNblocks(ctx, xlrec->rlocator,
+													 xlrec->forknum,
+													 physical_nblocks,
+													 record->EndRecPtr);
+					else
+						MapSBlockBumpNextFreePhysBlock(ctx, xlrec->rlocator,
+													   xlrec->forknum,
+													   xlrec->new_pblkno + 1,
+													   record->EndRecPtr);
+				}
 
 				/*
 				 * MAP_SET with invalid old_pblkno means first mapping for this
@@ -212,10 +223,18 @@ umbra_redo(XLogReaderState *record)
 				}
 
 				if (materialized)
+				{
+					BlockNumber physical_nblocks;
+
+					if (!UmMapUsesChunkPaired(reln, xlrec->forknum) ||
+						!UmbraChunkPairedCapacityForPblk(xlrec->new_pblkno,
+														 &physical_nblocks))
+						physical_nblocks = xlrec->new_pblkno + 1;
 					MapSBlockBumpPhysicalNblocks(ctx, xlrec->rlocator,
 												 xlrec->forknum,
-												 xlrec->new_pblkno + 1,
+												 physical_nblocks,
 												 record->EndRecPtr);
+				}
 			}
 			break;
 
