@@ -76,7 +76,7 @@ typedef struct UmbraRedoShiftSourceState
 	RelFileLocator rlocator;
 	ForkNumber	forknum;
 	BlockNumber lblkno;
-	bool		shifted_to_shadow;
+	uint8		source_slot;
 } UmbraRedoShiftSourceState;
 
 typedef enum UmbraAccessResolveMode
@@ -227,12 +227,13 @@ static BlockNumber um_prepare_mapped_birth(SMgrRelation reln,
 										   const UmbraAccessState *access,
 										   BlockNumber lblkno);
 static void um_filetag_path(const FileTag *ftag, char *path);
+static BlockNumber um_chunk_slot_pblk_checked(SMgrRelation reln,
+											  ForkNumber forknum,
+											  BlockNumber lblkno,
+											  uint8 active_slot);
 static BlockNumber um_chunk_base_pblk_checked(SMgrRelation reln,
 											  ForkNumber forknum,
 											  BlockNumber lblkno);
-static BlockNumber um_chunk_shadow_pblk_checked(SMgrRelation reln,
-												ForkNumber forknum,
-												BlockNumber lblkno);
 static BlockNumber um_chunk_active_pblk_checked(SMgrRelation reln,
 												ForkNumber forknum,
 												BlockNumber lblkno);
@@ -679,39 +680,38 @@ um_classify_access(SMgrRelation reln, ForkNumber forknum)
 }
 
 static BlockNumber
-um_chunk_base_pblk_checked(SMgrRelation reln, ForkNumber forknum,
-						   BlockNumber lblkno)
+um_chunk_slot_pblk_checked(SMgrRelation reln, ForkNumber forknum,
+						   BlockNumber lblkno, uint8 active_slot)
 {
 	BlockNumber pblkno;
 
-	if (!UmbraChunkPairedBasePblk(lblkno, &pblkno))
+	if (!UmbraChunkActiveSlotIsValid(active_slot))
 		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("chunk-paired physical block overflow for relation %u/%u/%u fork %d logical block %u",
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid Umbra active slot %u for relation %u/%u/%u fork %d logical block %u",
+						active_slot,
 						reln->smgr_rlocator.locator.spcOid,
 						reln->smgr_rlocator.locator.dbOid,
 						reln->smgr_rlocator.locator.relNumber,
 						forknum, lblkno)));
+
+	if (!UmbraChunkPairedSlotPblk(lblkno, active_slot, &pblkno))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("chunk-paired slot physical block overflow for relation %u/%u/%u fork %d logical block %u slot %u",
+						reln->smgr_rlocator.locator.spcOid,
+						reln->smgr_rlocator.locator.dbOid,
+						reln->smgr_rlocator.locator.relNumber,
+						forknum, lblkno, active_slot)));
 
 	return pblkno;
 }
 
 static BlockNumber
-um_chunk_shadow_pblk_checked(SMgrRelation reln, ForkNumber forknum,
-							 BlockNumber lblkno)
+um_chunk_base_pblk_checked(SMgrRelation reln, ForkNumber forknum,
+						   BlockNumber lblkno)
 {
-	BlockNumber pblkno;
-
-	if (!UmbraChunkPairedShadowPblk(lblkno, &pblkno))
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("chunk-paired shadow physical block overflow for relation %u/%u/%u fork %d logical block %u",
-						reln->smgr_rlocator.locator.spcOid,
-						reln->smgr_rlocator.locator.dbOid,
-						reln->smgr_rlocator.locator.relNumber,
-						forknum, lblkno)));
-
-	return pblkno;
+	return um_chunk_slot_pblk_checked(reln, forknum, lblkno, 0);
 }
 
 static BlockNumber
@@ -719,14 +719,12 @@ um_chunk_active_pblk_checked(SMgrRelation reln, ForkNumber forknum,
 							 BlockNumber lblkno)
 {
 	UmbraFileContext *ctx = um_ctx_acquire(reln);
-	bool		shifted_to_shadow = false;
+	uint8		active_slot = 0;
 
 	(void) UmbraShiftGet(ctx, reln->smgr_rlocator.locator,
-							  forknum, lblkno, &shifted_to_shadow);
+						  forknum, lblkno, &active_slot);
 
-	if (shifted_to_shadow)
-		return um_chunk_shadow_pblk_checked(reln, forknum, lblkno);
-	return um_chunk_base_pblk_checked(reln, forknum, lblkno);
+	return um_chunk_slot_pblk_checked(reln, forknum, lblkno, active_slot);
 }
 
 static BlockNumber
@@ -737,7 +735,7 @@ um_chunk_active_pblk_run_checked(SMgrRelation reln, ForkNumber forknum,
 	UmbraFileContext *ctx = um_ctx_acquire(reln);
 	BlockNumber	chunk_blocks;
 	BlockNumber	run_blocks;
-	bool		shifted_to_shadow = false;
+	uint8		active_slot = 0;
 
 	Assert(maxblocks > 0);
 	Assert(start_pblk != NULL);
@@ -747,15 +745,13 @@ um_chunk_active_pblk_run_checked(SMgrRelation reln, ForkNumber forknum,
 					   (lblkno % (BlockNumber) UMBRA_CHUNK_PAIRED_PAGES));
 	run_blocks = UmbraShiftGetRun(ctx, reln->smgr_rlocator.locator,
 								  forknum, lblkno, chunk_blocks,
-								  &shifted_to_shadow);
+								  &active_slot);
 
 	Assert(run_blocks > 0);
 	Assert(run_blocks <= chunk_blocks);
 
-	if (shifted_to_shadow)
-		*start_pblk = um_chunk_shadow_pblk_checked(reln, forknum, lblkno);
-	else
-		*start_pblk = um_chunk_base_pblk_checked(reln, forknum, lblkno);
+	*start_pblk = um_chunk_slot_pblk_checked(reln, forknum, lblkno,
+											 active_slot);
 
 	return run_blocks;
 }
@@ -775,10 +771,8 @@ um_redo_shift_source_pblk(SMgrRelation reln, ForkNumber forknum,
 	if (!RelFileLocatorEquals(state->rlocator, reln->smgr_rlocator.locator))
 		return false;
 
-	if (state->shifted_to_shadow)
-		*pblkno = um_chunk_shadow_pblk_checked(reln, forknum, lblkno);
-	else
-		*pblkno = um_chunk_base_pblk_checked(reln, forknum, lblkno);
+	*pblkno = um_chunk_slot_pblk_checked(reln, forknum, lblkno,
+										 state->source_slot);
 	return true;
 }
 
@@ -937,10 +931,9 @@ UmRebuildMapAndSuperblockForSkipWAL(SMgrRelation reln)
 		BlockNumber physical_nblocks;
 
 		/*
-		 * Chunk-paired base slots are formula-derived.  Dense skip-WAL
-		 * transition records only need to make the frontiers durable; the
-		 * shift bitmap's all-zero default means every logical block remains
-		 * on its base side until a later shift flips the bit.
+		 * Chunk-paired slots are formula-derived.  Dense skip-WAL transition
+		 * records only need to make the frontiers durable; active-slot
+		 * metadata defaults to slot 0 until a later shift rotates it.
 		 */
 		physical_nblocks =
 			um_chunk_physical_capacity_checked(reln, forknum, nblocks);
@@ -1437,16 +1430,22 @@ UmTranslationTryLookupPblkno(SMgrRelation reln, ForkNumber forknum,
 	return false;
 }
 
-bool
-UmShiftGetInactiveSide(SMgrRelation reln, ForkNumber forknum, BlockNumber lblkno)
+uint8
+UmShiftChooseTargetSlot(SMgrRelation reln, ForkNumber forknum, BlockNumber lblkno,
+						uint8 *source_slot)
 {
 	UmbraAccessState access;
 	UmbraFileContext *ctx = um_ctx_acquire(reln);
-	bool		shifted_to_shadow = false;
+	uint8		active_slot = 0;
+
+	Assert(source_slot != NULL);
 
 	access = um_classify_access(reln, forknum);
 	if (!um_state_uses_chunk_base(access.policy))
-		return false;
+	{
+		*source_slot = 0;
+		return 0;
+	}
 
 	if (lblkno >= umnblocks_for_access(reln, forknum, &access))
 		ereport(ERROR,
@@ -1458,13 +1457,14 @@ UmShiftGetInactiveSide(SMgrRelation reln, ForkNumber forknum, BlockNumber lblkno
 						forknum, lblkno)));
 
 	(void) UmbraShiftGet(ctx, reln->smgr_rlocator.locator,
-						 forknum, lblkno, &shifted_to_shadow);
-	return !shifted_to_shadow;
+						 forknum, lblkno, &active_slot);
+	*source_slot = active_slot;
+	return UmbraChunkNextActiveSlot(active_slot);
 }
 
 void
-UmShiftSetActiveSide(SMgrRelation reln, ForkNumber forknum, BlockNumber lblkno,
-					 bool shifted_to_shadow, XLogRecPtr map_lsn)
+UmShiftSetActiveSlot(SMgrRelation reln, ForkNumber forknum, BlockNumber lblkno,
+					 uint8 active_slot, XLogRecPtr map_lsn)
 {
 	UmbraAccessState access;
 	UmbraFileContext *ctx = um_ctx_acquire(reln);
@@ -1473,7 +1473,7 @@ UmShiftSetActiveSide(SMgrRelation reln, ForkNumber forknum, BlockNumber lblkno,
 	if (um_state_uses_chunk_base(access.policy))
 	{
 		UmbraShiftSet(ctx, reln->smgr_rlocator.locator,
-							   forknum, lblkno, shifted_to_shadow, map_lsn);
+					  forknum, lblkno, active_slot, map_lsn);
 		return;
 	}
 
@@ -1490,15 +1490,16 @@ UmShiftSetActiveSide(SMgrRelation reln, ForkNumber forknum, BlockNumber lblkno,
 
 void
 UmRedoBeginShiftSourceSide(SMgrRelation reln, ForkNumber forknum,
-						   BlockNumber lblkno, bool shifted_to_shadow)
+						   BlockNumber lblkno, uint8 source_slot)
 {
 	Assert(InRecovery);
+	Assert(UmbraChunkActiveSlotIsValid(source_slot));
 
 	um_redo_shift_source_state.active = true;
 	um_redo_shift_source_state.rlocator = reln->smgr_rlocator.locator;
 	um_redo_shift_source_state.forknum = forknum;
 	um_redo_shift_source_state.lblkno = lblkno;
-	um_redo_shift_source_state.shifted_to_shadow = shifted_to_shadow;
+	um_redo_shift_source_state.source_slot = source_slot;
 }
 
 void
@@ -1651,8 +1652,8 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	/*
 	 * For mapped data forks, smgrextend is the point where an unmapped logical
 	 * block gets its first physical block. New pages always start on the
-	 * formula-derived base side; the shift bitmap remains at its default
-	 * false value until a later shift switches the active side.
+	 * formula-derived slot 0; active-slot metadata remains at its default until
+	 * a later shift switches the active slot.
 	 */
 	if (blocknum < logical_nblocks)
 		pblkno = um_chunk_active_pblk_checked(reln, forknum, blocknum);
@@ -1773,7 +1774,7 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	 * For mapped forks we must materialize each newly-mapped physical page as
 	 * a zero page, otherwise a later translated read would hit EOF/short read.
 	 *
-	 * Chunk-paired placement is contiguous inside each base or shadow half, so
+	 * Chunk-paired placement is contiguous inside each active slot, so
 	 * batch physical zero-extension until the formula crosses a non-contiguous
 	 * boundary.
 	 */

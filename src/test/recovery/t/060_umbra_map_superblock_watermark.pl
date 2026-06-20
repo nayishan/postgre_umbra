@@ -24,13 +24,15 @@ sub u32le_from_hex
 }
 
 my $chunk_pages = 32;
+my $active_slots = 3;
 
 sub chunk_capacity_for_nblocks
 {
 	my ($nblocks) = @_;
 
 	return 0 if $nblocks == 0;
-	return (int(($nblocks - 1) / $chunk_pages) + 1) * (2 * $chunk_pages);
+	return (int(($nblocks - 1) / $chunk_pages) + 1) *
+	  ($active_slots * $chunk_pages);
 }
 
 my $node = PostgreSQL::Test::Cluster->new('master');
@@ -67,7 +69,7 @@ my $phys_capacity_main_1 = u32le_from_hex($map_super_hex, 20);
 my $logical_main_1 = u32le_from_hex($map_super_hex, 40);
 
 is($magic_1, 0x554D4252, 'superblock magic matches UMBR');
-is($version_1, 1, 'superblock version matches');
+is($version_1, 2, 'superblock version matches');
 is($blcksz_1, 8192, 'superblock block size matches');
 cmp_ok($logical_main_1, '==', $logical_expected_1,
 	'logical_nblocks_main matches relation size in blocks');

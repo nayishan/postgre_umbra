@@ -94,9 +94,10 @@ typedef struct
 #ifdef USE_UMBRA
 	bool		has_shift;		/* true if shift metadata is prepared */
 	bool		shift_in_record;	/* current record includes shift */
-	bool		shift_committed;	/* shift bit was committed after insert */
+	bool		shift_committed;	/* shift slot was committed after insert */
 	SMgrRelation shift_reln;	/* cached relation handle for shift commit */
-	bool		shifted_to_shadow; /* target active side */
+	uint8		shift_source_slot; /* active slot before this record */
+	uint8		shift_target_slot; /* target active slot after this record */
 	BlockNumber shift_logical_nblocks;	/* assembled logical frontier payload */
 #endif
 
@@ -205,7 +206,8 @@ XLogFillBlockShiftFrontierUmbra(registered_buffer *regbuf,
 	Assert(rbsh != NULL);
 
 	rbsh->logical_nblocks = regbuf->block + 1;
-	rbsh->shifted_to_shadow = regbuf->shifted_to_shadow;
+	rbsh->source_slot = regbuf->shift_source_slot;
+	rbsh->target_slot = regbuf->shift_target_slot;
 	regbuf->shift_logical_nblocks = rbsh->logical_nblocks;
 }
 
@@ -227,8 +229,8 @@ XLogCommitBlockShiftsUmbra(XLogRecPtr record_endptr)
 
 		ctx = umfile_ctx_acquire(regbuf->shift_reln->smgr_rlocator);
 
-		UmShiftSetActiveSide(regbuf->shift_reln, regbuf->forkno, regbuf->block,
-							  regbuf->shifted_to_shadow, record_endptr);
+		UmShiftSetActiveSlot(regbuf->shift_reln, regbuf->forkno, regbuf->block,
+							  regbuf->shift_target_slot, record_endptr);
 		if (UmbraChunkPairedPhysicalCapacity(regbuf->shift_logical_nblocks,
 											 &physical_nblocks) &&
 			physical_nblocks > 0)
@@ -364,7 +366,8 @@ XLogResetInsertion(void)
 		registered_buffers[i].shift_in_record = false;
 		registered_buffers[i].shift_committed = false;
 		registered_buffers[i].shift_reln = NULL;
-		registered_buffers[i].shifted_to_shadow = false;
+		registered_buffers[i].shift_source_slot = 0;
+		registered_buffers[i].shift_target_slot = 0;
 		registered_buffers[i].shift_logical_nblocks = InvalidBlockNumber;
 #endif
 	}
@@ -428,7 +431,8 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
 	regbuf->shift_in_record = false;
 	regbuf->shift_committed = false;
 	regbuf->shift_reln = NULL;
-	regbuf->shifted_to_shadow = false;
+	regbuf->shift_source_slot = 0;
+	regbuf->shift_target_slot = 0;
 	regbuf->shift_logical_nblocks = InvalidBlockNumber;
 #endif
 
@@ -489,7 +493,8 @@ XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator, ForkNumber forknum,
 	regbuf->shift_in_record = false;
 	regbuf->shift_committed = false;
 	regbuf->shift_reln = NULL;
-	regbuf->shifted_to_shadow = false;
+	regbuf->shift_source_slot = 0;
+	regbuf->shift_target_slot = 0;
 	regbuf->shift_logical_nblocks = InvalidBlockNumber;
 #endif
 
@@ -1289,8 +1294,9 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 		{
 			reln = smgropen(regbuf->rlocator, INVALID_PROC_NUMBER);
 			regbuf->shift_reln = reln;
-			regbuf->shifted_to_shadow =
-				UmShiftGetInactiveSide(reln, regbuf->forkno, regbuf->block);
+			regbuf->shift_target_slot =
+				UmShiftChooseTargetSlot(reln, regbuf->forkno, regbuf->block,
+										&regbuf->shift_source_slot);
 
 			regbuf->has_shift = true;
 			regbuf->shift_committed = false;
@@ -1299,7 +1305,8 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 
 		if (include_shift)
 		{
-			rbsh.shifted_to_shadow = regbuf->shifted_to_shadow;
+			rbsh.source_slot = regbuf->shift_source_slot;
+			rbsh.target_slot = regbuf->shift_target_slot;
 			XLogFillBlockShiftFrontierUmbra(regbuf, &rbsh);
 
 			if ((regbuf->flags & REGBUF_FORCE_IMAGE) == 0 &&
@@ -1464,9 +1471,12 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 		scratch += SizeOfXLogRecordBlockHeader;
 		if (include_shift)
 		{
-			rbsh.shifted_to_shadow = regbuf->shifted_to_shadow ? 1 : 0;
+			rbsh.source_slot = regbuf->shift_source_slot;
+			rbsh.target_slot = regbuf->shift_target_slot;
 			rbsh.logical_nblocks = regbuf->shift_logical_nblocks;
-			memcpy(scratch, &rbsh.shifted_to_shadow, sizeof(uint8));
+			memcpy(scratch, &rbsh.source_slot, sizeof(uint8));
+			scratch += sizeof(uint8);
+			memcpy(scratch, &rbsh.target_slot, sizeof(uint8));
 			scratch += sizeof(uint8);
 			memcpy(scratch, &rbsh.logical_nblocks, sizeof(BlockNumber));
 			scratch += sizeof(BlockNumber);

@@ -2,7 +2,7 @@
 #
 # In UMBRA mode this test checks that FSM and VM on-disk metadata is recorded
 # in the relation metadata superblock.  Base-born pages use the missing/all-zero
-# shift bitmap default and therefore do not require materialized shift pages.
+# active-slot default and therefore do not require materialized active-slot pages.
 #
 # In md mode, MAP fork does not exist and the test is skipped.
 use strict;

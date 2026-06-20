@@ -1,10 +1,10 @@
 /*-------------------------------------------------------------------------
  *
  * map.c
- *	  Umbra metadata fork cache and chunk-paired shift bitmap support
+ *	  Umbra metadata fork cache and chunk-paired active-slot support
  *
  * This module owns metadata-fork layout helpers and shared cache support for
- * the chunk-paired shift bitmap.  Chunk-paired data placement is formula-based;
+ * the chunk-paired active-slot metadata.  Chunk-paired data placement is formula-based;
  * this file must not maintain a logical-block to arbitrary-physical-block
  * entry map.
  *
@@ -27,6 +27,7 @@
 #include "storage/map_internal.h"
 #include "storage/mapsuper.h"
 #include "storage/mapsuper_internal.h"
+#include "storage/umbra.h"
 #include "storage/procnumber.h"
 #include "storage/shmem.h"
 #include "storage/sync.h"
@@ -48,6 +49,35 @@ static bool UmbraShiftPageWithinLogicalRange(UmbraFileContext *map_ctx,
 											ForkNumber forknum,
 											BlockNumber map_blkno);
 static bool UmbraShiftBlknoIsShiftPage(BlockNumber map_blkno);
+static uint8 UmbraShiftReadSlot(const uint8 *bytes, int bit_idx);
+static void UmbraShiftWriteSlot(uint8 *bytes, int bit_idx, uint8 active_slot);
+
+static uint8
+UmbraShiftReadSlot(const uint8 *bytes, int bit_idx)
+{
+	int			byte_idx = bit_idx / BITS_PER_BYTE;
+	int			bit_off = bit_idx % BITS_PER_BYTE;
+
+	Assert(bit_off <= BITS_PER_BYTE - UMBRA_ACTIVE_SLOT_BITS);
+
+	return (uint8) ((bytes[byte_idx] >> bit_off) &
+					((1U << UMBRA_ACTIVE_SLOT_BITS) - 1U));
+}
+
+static void
+UmbraShiftWriteSlot(uint8 *bytes, int bit_idx, uint8 active_slot)
+{
+	int			byte_idx = bit_idx / BITS_PER_BYTE;
+	int			bit_off = bit_idx % BITS_PER_BYTE;
+	uint8		mask = (uint8) (((1U << UMBRA_ACTIVE_SLOT_BITS) - 1U) <<
+								bit_off);
+
+	Assert(bit_off <= BITS_PER_BYTE - UMBRA_ACTIVE_SLOT_BITS);
+	Assert(UmbraChunkActiveSlotIsValid(active_slot));
+
+	bytes[byte_idx] = (uint8) ((bytes[byte_idx] & ~mask) |
+							   ((active_slot << bit_off) & mask));
+}
 
 static BlockNumber
 UmbraShiftPageIndexToBlkno(ForkNumber forknum, BlockNumber shift_page_idx)
@@ -87,7 +117,7 @@ UmbraShiftPageIndexToBlkno(ForkNumber forknum, BlockNumber shift_page_idx)
 		}
 
 		default:
-			elog(ERROR, "unsupported fork number %d in shift bitmap lookup",
+			elog(ERROR, "unsupported fork number %d in active-slot metadata lookup",
 				 (int) forknum);
 			return 0;
 	}
@@ -95,7 +125,7 @@ UmbraShiftPageIndexToBlkno(ForkNumber forknum, BlockNumber shift_page_idx)
 	if (blkno64 > (uint64) MaxBlockNumber)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("cannot address Umbra shift bitmap page %u for fork %d",
+				 errmsg("cannot address Umbra active-slot metadata page %u for fork %d",
 						shift_page_idx, forknum)));
 
 	return (BlockNumber) blkno64;
@@ -112,7 +142,8 @@ UmbraShiftLocation(ForkNumber forknum, BlockNumber lblkno,
 
 	shift_page_idx = lblkno / UMBRA_SHIFT_BITS_PER_PAGE;
 	*shift_blkno = UmbraShiftPageIndexToBlkno(forknum, shift_page_idx);
-	*bit_idx = lblkno % UMBRA_SHIFT_BITS_PER_PAGE;
+	*bit_idx = (lblkno % UMBRA_SHIFT_BITS_PER_PAGE) *
+		UMBRA_ACTIVE_SLOT_BITS;
 }
 
 static bool
@@ -192,7 +223,7 @@ UmbraShiftBlknoIsShiftPage(BlockNumber map_blkno)
 }
 
 /*
- * MapReadBuffer - read a shift bitmap page into the metadata buffer cache
+ * MapReadBuffer - read an active-slot metadata page into the buffer cache
  *
  * Returns the slot_id of the buffer, with the buffer pinned.
  */
@@ -364,7 +395,7 @@ MapDrop(RelFileLocator rnode)
 bool
 UmbraShiftGet(UmbraFileContext *map_ctx, RelFileLocator rnode,
 			  ForkNumber forknum, BlockNumber lblkno,
-			  bool *shifted_to_shadow)
+			  uint8 *active_slot)
 {
 	BlockNumber	shift_blkno;
 	int			bit_idx;
@@ -373,14 +404,14 @@ UmbraShiftGet(UmbraFileContext *map_ctx, RelFileLocator rnode,
 	MapBufferDesc *buf;
 	uint8	   *bytes;
 
-	Assert(shifted_to_shadow != NULL);
+	Assert(active_slot != NULL);
 
 	if (forknum == UMBRA_METADATA_FORKNUM)
 		elog(ERROR, "UmbraShiftGet does not accept Umbra metadata fork");
 
 	if (!umfile_ctx_fork_exists(map_ctx, UMBRA_METADATA_FORKNUM))
 	{
-		*shifted_to_shadow = false;
+		*active_slot = 0;
 		return false;
 	}
 
@@ -392,9 +423,13 @@ UmbraShiftGet(UmbraFileContext *map_ctx, RelFileLocator rnode,
 	bytes = (uint8 *) page;
 
 	LWLockAcquire(&buf->buffer_lock, LW_SHARED);
-	*shifted_to_shadow =
-		(bytes[bit_idx / BITS_PER_BYTE] &
-		 (1U << (bit_idx % BITS_PER_BYTE))) != 0;
+	*active_slot = UmbraShiftReadSlot(bytes, bit_idx);
+	if (!UmbraChunkActiveSlotIsValid(*active_slot))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid Umbra active slot %u for relation %u/%u/%u fork %d block %u",
+						*active_slot, rnode.spcOid, rnode.dbOid,
+						rnode.relNumber, forknum, lblkno)));
 	LWLockRelease(&buf->buffer_lock);
 
 	MapUnpinBuffer(slot_id);
@@ -404,19 +439,20 @@ UmbraShiftGet(UmbraFileContext *map_ctx, RelFileLocator rnode,
 BlockNumber
 UmbraShiftGetRun(UmbraFileContext *map_ctx, RelFileLocator rnode,
 				 ForkNumber forknum, BlockNumber lblkno,
-				 BlockNumber maxblocks, bool *shifted_to_shadow)
+				 BlockNumber maxblocks, uint8 *active_slot)
 {
 	BlockNumber	shift_blkno;
 	BlockNumber	bits_this_page;
 	BlockNumber	run_blocks;
 	int			bit_idx;
+	int			block_idx;
 	int			slot_id;
 	MapPage    *page;
 	MapBufferDesc *buf;
 	uint8	   *bytes;
-	bool		first_bit;
+	uint8		first_slot;
 
-	Assert(shifted_to_shadow != NULL);
+	Assert(active_slot != NULL);
 	Assert(maxblocks > 0);
 
 	if (forknum == UMBRA_METADATA_FORKNUM)
@@ -424,12 +460,13 @@ UmbraShiftGetRun(UmbraFileContext *map_ctx, RelFileLocator rnode,
 
 	if (!umfile_ctx_fork_exists(map_ctx, UMBRA_METADATA_FORKNUM))
 	{
-		*shifted_to_shadow = false;
+		*active_slot = 0;
 		return maxblocks;
 	}
 
 	UmbraShiftLocation(forknum, lblkno, &shift_blkno, &bit_idx);
-	bits_this_page = Min((BlockNumber) (UMBRA_SHIFT_BITS_PER_PAGE - bit_idx),
+	block_idx = bit_idx / UMBRA_ACTIVE_SLOT_BITS;
+	bits_this_page = Min((BlockNumber) (UMBRA_SHIFT_BITS_PER_PAGE - block_idx),
 						 maxblocks);
 
 	slot_id = MapReadBuffer(map_ctx, rnode, forknum, shift_blkno);
@@ -438,21 +475,25 @@ UmbraShiftGetRun(UmbraFileContext *map_ctx, RelFileLocator rnode,
 	bytes = (uint8 *) page;
 
 	LWLockAcquire(&buf->buffer_lock, LW_SHARED);
-	first_bit =
-		(bytes[bit_idx / BITS_PER_BYTE] &
-		 (1U << (bit_idx % BITS_PER_BYTE))) != 0;
-	*shifted_to_shadow = first_bit;
+	first_slot = UmbraShiftReadSlot(bytes, bit_idx);
+	if (!UmbraChunkActiveSlotIsValid(first_slot))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid Umbra active slot %u for relation %u/%u/%u fork %d block %u",
+						first_slot, rnode.spcOid, rnode.dbOid,
+						rnode.relNumber, forknum, lblkno)));
+	*active_slot = first_slot;
 	run_blocks = 1;
 
 	for (BlockNumber i = 1; i < bits_this_page; i++)
 	{
-		int			current_bit_idx = bit_idx + (int) i;
-		bool		current_bit;
+		int			current_bit_idx =
+			bit_idx + (int) i * UMBRA_ACTIVE_SLOT_BITS;
+		uint8		current_slot;
 
-		current_bit =
-			(bytes[current_bit_idx / BITS_PER_BYTE] &
-			 (1U << (current_bit_idx % BITS_PER_BYTE))) != 0;
-		if (current_bit != first_bit)
+		current_slot = UmbraShiftReadSlot(bytes, current_bit_idx);
+		if (!UmbraChunkActiveSlotIsValid(current_slot) ||
+			current_slot != first_slot)
 			break;
 		run_blocks++;
 	}
@@ -465,11 +506,10 @@ UmbraShiftGetRun(UmbraFileContext *map_ctx, RelFileLocator rnode,
 void
 UmbraShiftSet(UmbraFileContext *map_ctx, RelFileLocator rnode,
 			  ForkNumber forknum, BlockNumber lblkno,
-			  bool shifted_to_shadow, XLogRecPtr map_lsn)
+			  uint8 active_slot, XLogRecPtr map_lsn)
 {
 	BlockNumber	shift_blkno;
 	int			bit_idx;
-	uint8		mask;
 	int			slot_id;
 	MapPage    *page;
 	MapBufferDesc *buf;
@@ -477,9 +517,10 @@ UmbraShiftSet(UmbraFileContext *map_ctx, RelFileLocator rnode,
 
 	if (forknum == UMBRA_METADATA_FORKNUM)
 		elog(ERROR, "UmbraShiftSet does not accept Umbra metadata fork");
+	if (!UmbraChunkActiveSlotIsValid(active_slot))
+		elog(ERROR, "invalid Umbra active slot %u", active_slot);
 
 	UmbraShiftLocation(forknum, lblkno, &shift_blkno, &bit_idx);
-	mask = (uint8) (1U << (bit_idx % BITS_PER_BYTE));
 
 	slot_id = MapReadBuffer(map_ctx, rnode, forknum, shift_blkno);
 	buf = &MapBuffers[slot_id];
@@ -487,17 +528,14 @@ UmbraShiftSet(UmbraFileContext *map_ctx, RelFileLocator rnode,
 	bytes = (uint8 *) page;
 
 	LWLockAcquire(&buf->buffer_lock, LW_EXCLUSIVE);
-	if (((bytes[bit_idx / BITS_PER_BYTE] & mask) != 0) == shifted_to_shadow)
+	if (UmbraShiftReadSlot(bytes, bit_idx) == active_slot)
 	{
 		LWLockRelease(&buf->buffer_lock);
 		MapUnpinBuffer(slot_id);
 		return;
 	}
 
-	if (shifted_to_shadow)
-		bytes[bit_idx / BITS_PER_BYTE] |= mask;
-	else
-		bytes[bit_idx / BITS_PER_BYTE] &= (uint8) ~mask;
+	UmbraShiftWriteSlot(bytes, bit_idx, active_slot);
 
 	if (map_lsn == InvalidXLogRecPtr)
 	{
@@ -547,8 +585,8 @@ UmbraShiftTruncate(UmbraFileContext *map_ctx, RelFileLocator rnode,
 	for (page_idx = start_page_idx; page_idx <= end_page_idx; page_idx++)
 	{
 		BlockNumber	shift_blkno;
-		int			begin_bit;
-		int			last_bit;
+		int			begin_block;
+		int			last_block;
 		int			slot_id;
 		MapPage    *page;
 		MapBufferDesc *buf;
@@ -559,8 +597,8 @@ UmbraShiftTruncate(UmbraFileContext *map_ctx, RelFileLocator rnode,
 			umfile_ctx_get_nblocks(map_ctx, UMBRA_METADATA_FORKNUM))
 			break;
 
-		begin_bit = (page_idx == start_page_idx) ? start_bit_idx : 0;
-		last_bit = (page_idx == end_page_idx) ? end_bit_idx :
+		begin_block = (page_idx == start_page_idx) ? start_bit_idx : 0;
+		last_block = (page_idx == end_page_idx) ? end_bit_idx :
 			(UMBRA_SHIFT_BITS_PER_PAGE - 1);
 
 		slot_id = MapReadBuffer(map_ctx, rnode, forknum, shift_blkno);
@@ -569,9 +607,10 @@ UmbraShiftTruncate(UmbraFileContext *map_ctx, RelFileLocator rnode,
 		bytes = (uint8 *) page;
 
 		LWLockAcquire(&buf->buffer_lock, LW_EXCLUSIVE);
-		for (int bit = begin_bit; bit <= last_bit; bit++)
-			bytes[bit / BITS_PER_BYTE] &=
-				(uint8) ~(1U << (bit % BITS_PER_BYTE));
+		for (int block = begin_block; block <= last_block; block++)
+			UmbraShiftWriteSlot(bytes,
+								block * UMBRA_ACTIVE_SLOT_BITS,
+								0);
 		MapMarkBufferDirty(map_ctx, buf, map_lsn);
 		LWLockRelease(&buf->buffer_lock);
 

@@ -118,16 +118,19 @@ typedef struct XLogRecordBlockHeader
  * Extra header information for Umbra chunk-paired shift metadata.
  *
  * When BKPBLOCK_HAS_SHIFT is set, this header follows XLogRecordBlockHeader
- * and stores the target active side for the referenced logical block.
+ * and stores the source and target active slots for the referenced logical
+ * block.
  */
 typedef struct XLogRecordBlockShiftHeader
 {
-	uint8		shifted_to_shadow;
+	uint8		source_slot;
+	uint8		target_slot;
 	BlockNumber logical_nblocks;
 } XLogRecordBlockShiftHeader;
 
 #ifdef USE_UMBRA
-#define SizeOfXLogRecordBlockShiftHeader (sizeof(uint8) + sizeof(BlockNumber))
+#define SizeOfXLogRecordBlockShiftHeader \
+	(sizeof(uint8) + sizeof(uint8) + sizeof(BlockNumber))
 #else
 #define SizeOfXLogRecordBlockShiftHeader 0
 #endif

@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * map.h
- *	  Umbra metadata fork cache and chunk-paired shift bitmap support
+ *	  Umbra metadata fork cache and chunk-paired active-slot support
  *
  * This header defines MAP metadata page layout, shared cache APIs, and address
  * translation helpers for Umbra relation-local metadata.
@@ -35,21 +35,23 @@ typedef struct MapBufferDesc MapBufferDesc;
 /*
  * Umbra metadata fork page layout:
  * - block 0: superblock (512-byte payload)
- * - blocks 1..: repeated proportional groups of chunk-shift bitmap pages
+ * - blocks 1..: repeated proportional groups of chunk active-slot pages
  *
  * Each proportional group contains:
- * - 1 FSM chunk-shift bitmap page
- * - 1 VM chunk-shift bitmap page
- * - 256 MAIN chunk-shift bitmap pages
+ * - 1 FSM chunk active-slot page
+ * - 1 VM chunk active-slot page
+ * - 256 MAIN chunk active-slot pages
  *
- * The shift bit selects the active side of each formula-derived base/shadow
- * pair.  There is no logical-block to arbitrary-physical-block entry map.
+ * Two bits select the active slot of each formula-derived three-slot group.
+ * There is no logical-block to arbitrary-physical-block entry map.
  */
 #define MAP_BLOCK_SUPER        0
 #define MAP_BLOCK_FIRST_GROUP  1
 #define UMBRA_SHIFT_FSM_PAGES 1
 #define UMBRA_SHIFT_VM_PAGES 1
-#define UMBRA_SHIFT_BITS_PER_PAGE (BLCKSZ * BITS_PER_BYTE)
+#define UMBRA_ACTIVE_SLOT_BITS 2
+#define UMBRA_SHIFT_BITS_PER_PAGE \
+	((BLCKSZ * BITS_PER_BYTE) / UMBRA_ACTIVE_SLOT_BITS)
 #define UMBRA_SHIFT_MAIN_PAGES 256
 #define MAP_GROUP_TOTAL_PAGES \
 	(UMBRA_SHIFT_FSM_PAGES + UMBRA_SHIFT_VM_PAGES + \
@@ -118,23 +120,23 @@ typedef struct MapBufferDesc
 extern void MapBackendInit(void);
 extern const ShmemCallbacks MapShmemCallbacks;
 
-/* Buffer management used by shift bitmap helpers. */
+/* Buffer management used by active-slot helpers. */
 extern int	MapReadBuffer(UmbraFileContext *map_ctx, RelFileLocator rnode,
 						  ForkNumber forknum, BlockNumber map_blkno);
 
-/* Chunk-paired shift bitmap helpers. */
+/* Chunk-paired active-slot helpers. */
 extern bool UmbraShiftGet(UmbraFileContext *map_ctx, RelFileLocator rnode,
 						  ForkNumber forknum, BlockNumber lblkno,
-						  bool *shifted_to_shadow);
+						  uint8 *active_slot);
 extern BlockNumber UmbraShiftGetRun(UmbraFileContext *map_ctx,
 									RelFileLocator rnode,
 									ForkNumber forknum,
 									BlockNumber lblkno,
 									BlockNumber maxblocks,
-									bool *shifted_to_shadow);
+									uint8 *active_slot);
 extern void UmbraShiftSet(UmbraFileContext *map_ctx, RelFileLocator rnode,
 						  ForkNumber forknum, BlockNumber lblkno,
-						  bool shifted_to_shadow, XLogRecPtr map_lsn);
+						  uint8 active_slot, XLogRecPtr map_lsn);
 extern void UmbraShiftTruncate(UmbraFileContext *map_ctx,
 							   RelFileLocator rnode,
 							   ForkNumber forknum,

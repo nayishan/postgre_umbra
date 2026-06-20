@@ -25,12 +25,12 @@ my $chunk_pages = 32;
 
 sub chunk_paired_pblk
 {
-	my ($lblk, $shifted_to_shadow) = @_;
+	my ($lblk, $target_slot) = @_;
 	my $chunk_id = int($lblk / $chunk_pages);
 	my $offset = $lblk % $chunk_pages;
-	my $pblk = $chunk_id * (2 * $chunk_pages) + $offset;
+	my $pblk = $chunk_id * (3 * $chunk_pages) + $offset;
 
-	$pblk += $chunk_pages if $shifted_to_shadow;
+	$pblk += $target_slot * $chunk_pages;
 	return $pblk;
 }
 
@@ -153,9 +153,9 @@ sub find_umbra_shift
 		my $lblk = $1;
 		next
 		  unless $blkref =~
-		  /; shift: shifted_to_shadow (true|false) logical_nblocks \d+/;
+		  /; shift: source_slot ([0-2]) target_slot ([0-2]) logical_nblocks \d+/;
 
-		return ($lblk, $1 eq 'true');
+		return ($lblk, $2);
 	}
 
 	return;
@@ -209,14 +209,14 @@ if ($use_umbra)
 	my ($locator, $relpath, $block_size, $before, $dump_stdout) =
 	  prepare_and_update_table($node);
 
-	my ($target_lblk, $shifted_to_shadow) =
+	my ($target_lblk, $target_slot) =
 	  find_umbra_shift($locator, $dump_stdout);
 
 	ok(defined($target_lblk),
 		'update WAL contains a heap chunk-paired shift header');
 	BAIL_OUT('could not locate a concrete Umbra shift block for test relation')
 		unless defined($target_lblk);
-	my $target_pblk = chunk_paired_pblk($target_lblk, $shifted_to_shadow);
+	my $target_pblk = chunk_paired_pblk($target_lblk, $target_slot);
 	cmp_ok($target_pblk, '>=', 0,
 		'selected WAL shift maps the heap page to a concrete physical block');
 

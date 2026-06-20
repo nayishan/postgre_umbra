@@ -1797,7 +1797,8 @@ DecodeXLogRecord(XLogReaderState *state,
 			blk->apply_image = false;
 #ifdef USE_UMBRA
 			blk->has_shift = false;
-			blk->shifted_to_shadow = false;
+			blk->source_slot = 0;
+			blk->target_slot = 0;
 			blk->logical_nblocks = InvalidBlockNumber;
 #endif
 
@@ -1834,10 +1835,13 @@ DecodeXLogRecord(XLogReaderState *state,
 #ifdef USE_UMBRA
 			if (blk->has_shift)
 			{
-				uint8		shifted_to_shadow;
+				uint8		source_slot;
+				uint8		target_slot;
 
-				COPY_HEADER_FIELD(&shifted_to_shadow, sizeof(uint8));
-				blk->shifted_to_shadow = shifted_to_shadow != 0;
+				COPY_HEADER_FIELD(&source_slot, sizeof(uint8));
+				COPY_HEADER_FIELD(&target_slot, sizeof(uint8));
+				blk->source_slot = source_slot;
+				blk->target_slot = target_slot;
 				COPY_HEADER_FIELD(&blk->logical_nblocks, sizeof(BlockNumber));
 			}
 #else

@@ -133,7 +133,8 @@ typedef struct
 	uint8		flags;
 #ifdef USE_UMBRA
 	bool		has_shift;
-	bool		shifted_to_shadow;
+	uint8		source_slot;
+	uint8		target_slot;
 	BlockNumber logical_nblocks;
 #endif
 

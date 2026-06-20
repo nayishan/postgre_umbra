@@ -238,9 +238,9 @@ void
 MapCheckpoint(void)
 {
 	/*
-	 * Checkpoint ordering: persist shift bitmap pages first, then superblocks.
+	 * Checkpoint ordering: persist active-slot pages first, then superblocks.
 	 * This keeps on-disk superblock as a checkpoint-boundary snapshot and
-	 * avoids it getting ahead of shift-page durability.
+	 * avoids it getting ahead of active-slot page durability.
 	 */
 	(void) MapFlushDirtyBuffers(-1, true);
 	(void) MapFlushDirtySuperblocks();
@@ -354,7 +354,7 @@ MapBgWriterFlush(int max_pages)
 	if (max_pages <= 0)
 		return 0;
 
-	/* mapwriter flushes shift bitmap pages only; superblock is checkpoint-owned. */
+	/* mapwriter flushes active-slot pages only; superblock is checkpoint-owned. */
 	return MapFlushDirtyBuffers(max_pages, false);
 }
 

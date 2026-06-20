@@ -57,7 +57,7 @@ my ($dump_stdout, $dump_stderr) = run_command(
 is($dump_stderr, '', 'pg_waldump block dump completed without stderr');
 
 my @shift_header_lines =
-  grep { /; shift: shifted_to_shadow (?:true|false) logical_nblocks \d+/ }
+  grep { /; shift: source_slot [0-2] target_slot [0-2] logical_nblocks \d+/ }
   split /\n/, $dump_stdout;
 
 ok(@shift_header_lines > 0,

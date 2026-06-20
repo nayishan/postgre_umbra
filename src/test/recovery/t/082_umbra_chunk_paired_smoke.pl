@@ -20,7 +20,7 @@ sub chunk_capacity_for_lblk
 {
 	my ($lblk) = @_;
 
-	return (int($lblk / $chunk_pages) + 1) * (2 * $chunk_pages);
+	return (int($lblk / $chunk_pages) + 1) * (3 * $chunk_pages);
 }
 
 sub u32le_from_hex

@@ -747,18 +747,19 @@ XLogReadBufferForRedoExtendedUmbra(XLogReaderState *record,
 		smgrbumpcachednblocks(smgr, forknum, blk->logical_nblocks);
 
 		if (has_image || zeromode)
-			UmShiftSetActiveSide(smgr, forknum, blkno,
-								  blk->shifted_to_shadow, lsn);
+			UmShiftSetActiveSlot(smgr, forknum, blkno,
+								  blk->target_slot, lsn);
 		else
 		{
 			/*
-			 * WAL stores the new active bit.  Redo without an FPI must read
-			 * the old page from the opposite side before publishing it.
+			 * WAL stores the old and new active slots.  Redo without an FPI
+			 * must read the old page from the recorded source slot before
+			 * publishing the target slot.
 			 */
 			shift_smgr = smgr;
 			set_shift_after_read = true;
 			UmRedoBeginShiftSourceSide(smgr, forknum, blkno,
-									   !blk->shifted_to_shadow);
+									   blk->source_slot);
 			redo_source_override = true;
 		}
 	}
@@ -810,17 +811,16 @@ XLogReadBufferForRedoExtendedUmbra(XLogReaderState *record,
 		if (has_shift)
 		{
 			/*
-			 * Match shadow redo: materialize the source page while the old
-			 * side is still active.  The redo routine will apply this record's
-			 * delta after we return, and that later dirty flush belongs on the
-			 * new active side.
+			 * Materialize the source page while the old slot is still active.
+			 * The redo routine will apply this record's delta after we return,
+			 * and that later dirty flush belongs on the new active slot.
 			 */
 			MarkBufferDirty(*buf);
 			FlushOneBuffer(*buf);
 		}
 		if (set_shift_after_read)
-			UmShiftSetActiveSide(shift_smgr, forknum, blkno,
-								  blk->shifted_to_shadow, lsn);
+			UmShiftSetActiveSlot(shift_smgr, forknum, blkno,
+								  blk->target_slot, lsn);
 		if (lsn <= PageGetLSN(BufferGetPage(*buf)))
 			return BLK_DONE;
 		return BLK_NEEDS_REDO;

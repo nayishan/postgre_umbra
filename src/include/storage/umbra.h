@@ -37,8 +37,8 @@ typedef enum UmbraMapPolicy
 
 /*
  * Umbra keeps MAIN/FSM/VM under chunk-paired translation. New logical pages are
- * born on their formula-derived base slot; later rewrites can switch the active
- * side through the shift bitmap.
+ * born on their formula-derived slot 0; later rewrites can switch the active
+ * slot through the shift metadata.
  */
 static inline bool
 UmbraForkUsesMapTranslation(ForkNumber forknum)
@@ -58,27 +58,46 @@ UmbraForkIsAuxiliaryMapped(ForkNumber forknum)
 /*
  * Chunk-paired physical layout.
  *
- * Each logical chunk owns a base half and a shadow half in the same data fork:
+ * Each logical chunk owns three physical slots in the same data fork:
  *
- *   [base chunk][shadow chunk]
+ *   [slot 0 chunk][slot 1 chunk][slot 2 chunk]
  *
- * Each logical page is born on its base slot.  Later rewrites switch the active
- * slot by flipping a shift bit for that logical block.
+ * Each logical page is born on slot 0.  Later rewrites rotate the active slot
+ * through the metadata stored for that logical block.
  */
 #define UMBRA_CHUNK_PAIRED_PAGES 32U
+#define UMBRA_CHUNK_ACTIVE_SLOTS 3U
 
 static inline bool
-UmbraChunkPairedBasePblk(BlockNumber lblkno, BlockNumber *pblkno)
+UmbraChunkActiveSlotIsValid(uint8 active_slot)
+{
+	return active_slot < UMBRA_CHUNK_ACTIVE_SLOTS;
+}
+
+static inline uint8
+UmbraChunkNextActiveSlot(uint8 active_slot)
+{
+	Assert(UmbraChunkActiveSlotIsValid(active_slot));
+	return (uint8) ((active_slot + 1) % UMBRA_CHUNK_ACTIVE_SLOTS);
+}
+
+static inline bool
+UmbraChunkPairedSlotPblk(BlockNumber lblkno, uint8 active_slot,
+						BlockNumber *pblkno)
 {
 	uint64		chunk_id;
 	uint64		offset;
 	uint64		pblk;
 
 	Assert(pblkno != NULL);
+	Assert(UmbraChunkActiveSlotIsValid(active_slot));
 
 	chunk_id = (uint64) lblkno / UMBRA_CHUNK_PAIRED_PAGES;
 	offset = (uint64) lblkno % UMBRA_CHUNK_PAIRED_PAGES;
-	pblk = chunk_id * (2 * (uint64) UMBRA_CHUNK_PAIRED_PAGES) + offset;
+	pblk = chunk_id *
+		(UMBRA_CHUNK_ACTIVE_SLOTS * (uint64) UMBRA_CHUNK_PAIRED_PAGES) +
+		(uint64) active_slot * (uint64) UMBRA_CHUNK_PAIRED_PAGES +
+		offset;
 
 	if (pblk > (uint64) MaxBlockNumber)
 		return false;
@@ -88,24 +107,9 @@ UmbraChunkPairedBasePblk(BlockNumber lblkno, BlockNumber *pblkno)
 }
 
 static inline bool
-UmbraChunkPairedShadowPblk(BlockNumber lblkno, BlockNumber *pblkno)
+UmbraChunkPairedBasePblk(BlockNumber lblkno, BlockNumber *pblkno)
 {
-	uint64		chunk_id;
-	uint64		offset;
-	uint64		pblk;
-
-	Assert(pblkno != NULL);
-
-	chunk_id = (uint64) lblkno / UMBRA_CHUNK_PAIRED_PAGES;
-	offset = (uint64) lblkno % UMBRA_CHUNK_PAIRED_PAGES;
-	pblk = chunk_id * (2 * (uint64) UMBRA_CHUNK_PAIRED_PAGES) +
-		(uint64) UMBRA_CHUNK_PAIRED_PAGES + offset;
-
-	if (pblk > (uint64) MaxBlockNumber)
-		return false;
-
-	*pblkno = (BlockNumber) pblk;
-	return true;
+	return UmbraChunkPairedSlotPblk(lblkno, 0, pblkno);
 }
 
 static inline bool
@@ -125,7 +129,8 @@ UmbraChunkPairedPhysicalCapacity(BlockNumber logical_nblocks,
 
 	chunks = ((uint64) logical_nblocks + UMBRA_CHUNK_PAIRED_PAGES - 1) /
 		UMBRA_CHUNK_PAIRED_PAGES;
-	capacity = chunks * (2 * (uint64) UMBRA_CHUNK_PAIRED_PAGES);
+	capacity = chunks *
+		(UMBRA_CHUNK_ACTIVE_SLOTS * (uint64) UMBRA_CHUNK_PAIRED_PAGES);
 
 	if (capacity > (uint64) MaxBlockNumber + 1)
 		return false;
@@ -143,8 +148,10 @@ UmbraChunkPairedCapacityForPblk(BlockNumber pblkno,
 
 	Assert(physical_nblocks != NULL);
 
-	chunk_id = (uint64) pblkno / (2 * (uint64) UMBRA_CHUNK_PAIRED_PAGES);
-	capacity = (chunk_id + 1) * (2 * (uint64) UMBRA_CHUNK_PAIRED_PAGES);
+	chunk_id = (uint64) pblkno /
+		(UMBRA_CHUNK_ACTIVE_SLOTS * (uint64) UMBRA_CHUNK_PAIRED_PAGES);
+	capacity = (chunk_id + 1) *
+		(UMBRA_CHUNK_ACTIVE_SLOTS * (uint64) UMBRA_CHUNK_PAIRED_PAGES);
 
 	if (capacity > (uint64) MaxBlockNumber + 1)
 		return false;
@@ -240,20 +247,20 @@ extern BlockNumber umnblocks_cached(SMgrRelation reln, ForkNumber forknum);
 /*
  * Translation helpers used by WAL and replay code.
  *
- * These expose chunk-paired translation and shift-bit updates only. Runtime
+ * These expose chunk-paired translation and active-slot updates only. Runtime
  * read-miss interpretation stays in umbra.c.
  */
 extern bool UmUsesChunkPairedTranslation(SMgrRelation reln, ForkNumber forknum);
 extern bool UmTranslationTryLookupPblkno(SMgrRelation reln, ForkNumber forknum,
 										BlockNumber lblkno, BlockNumber *pblkno);
-extern bool UmShiftGetInactiveSide(SMgrRelation reln, ForkNumber forknum,
-								   BlockNumber lblkno);
-extern void UmShiftSetActiveSide(SMgrRelation reln, ForkNumber forknum,
-								 BlockNumber lblkno, bool shifted_to_shadow,
+extern uint8 UmShiftChooseTargetSlot(SMgrRelation reln, ForkNumber forknum,
+									 BlockNumber lblkno, uint8 *source_slot);
+extern void UmShiftSetActiveSlot(SMgrRelation reln, ForkNumber forknum,
+								 BlockNumber lblkno, uint8 active_slot,
 								 XLogRecPtr map_lsn);
 extern void UmRedoBeginShiftSourceSide(SMgrRelation reln, ForkNumber forknum,
 									   BlockNumber lblkno,
-									   bool shifted_to_shadow);
+									   uint8 source_slot);
 extern void UmRedoEndShiftSourceSide(void);
 
 #endif							/* UMBRA_H */

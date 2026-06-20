@@ -385,8 +385,9 @@ XLogRecGetBlockRefInfo(XLogReaderState *record, bool pretty,
 #ifdef USE_UMBRA
 			if (blkref->has_shift)
 				appendStringInfo(buf,
-								 "; shift: shifted_to_shadow %s logical_nblocks %u",
-								 blkref->shifted_to_shadow ? "true" : "false",
+								 "; shift: source_slot %u target_slot %u logical_nblocks %u",
+								 blkref->source_slot,
+								 blkref->target_slot,
 								 blkref->logical_nblocks);
 #endif
 
