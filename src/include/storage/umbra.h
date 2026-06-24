@@ -65,7 +65,13 @@ UmbraForkIsAuxiliaryMapped(ForkNumber forknum)
  * Each logical page is born on slot 0.  Later rewrites rotate the active slot
  * through the metadata stored for that logical block.
  */
-#define UMBRA_CHUNK_PAIRED_PAGES 32U
+#ifndef UMBRA_CHUNK_PAIRED_PAGES
+#define UMBRA_CHUNK_PAIRED_PAGES 1U
+#endif
+#if UMBRA_CHUNK_PAIRED_PAGES <= 0
+#error "UMBRA_CHUNK_PAIRED_PAGES must be greater than zero"
+#endif
+
 #define UMBRA_CHUNK_ACTIVE_SLOTS 3U
 
 static inline bool
