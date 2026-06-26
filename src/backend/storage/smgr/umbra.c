@@ -1713,6 +1713,7 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 	if (um_state_uses_chunk_direct_base(access.policy))
 	{
+		BlockNumber logical_nblocks;
 		BlockNumber logical_end = blocknum + (BlockNumber) nblocks;
 
 		if (logical_end < blocknum)
@@ -1723,6 +1724,16 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 							reln->smgr_rlocator.locator.dbOid,
 							reln->smgr_rlocator.locator.relNumber,
 							forknum)));
+
+		logical_nblocks = umnblocks_for_access(reln, forknum, &access);
+		if (blocknum != logical_nblocks)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("cannot zero-extend Umbra relation %u/%u/%u fork %d from block %u with logical EOF %u",
+							reln->smgr_rlocator.locator.spcOid,
+							reln->smgr_rlocator.locator.dbOid,
+							reln->smgr_rlocator.locator.relNumber,
+							forknum, blocknum, logical_nblocks)));
 
 		um_ensure_chunk_physical_capacity(reln, forknum, ctx,
 										  logical_end, skipFsync);
@@ -1798,6 +1809,14 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 		logical_nblocks = umnblocks_for_access(reln, forknum, &access);
 		extends_logical = logical_end > logical_nblocks;
+		if (blocknum != logical_nblocks)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("cannot zero-extend Umbra relation %u/%u/%u fork %d from block %u with logical EOF %u",
+							reln->smgr_rlocator.locator.spcOid,
+							reln->smgr_rlocator.locator.dbOid,
+							reln->smgr_rlocator.locator.relNumber,
+							forknum, blocknum, logical_nblocks)));
 		if (extends_logical)
 			um_ensure_chunk_physical_capacity(reln, forknum, ctx,
 											  logical_end,
