@@ -121,14 +121,16 @@ my $dump_stdout_3 =
 my @shift_header_lines_1 = shift_header_lines($dump_stdout_1, $locator);
 my @shift_header_lines_2 = shift_header_lines($dump_stdout_2, $locator);
 my @shift_header_lines_3 = shift_header_lines($dump_stdout_3, $locator);
+my @shift_header_lines_all =
+  (@shift_header_lines_1, @shift_header_lines_2, @shift_header_lines_3);
 
 ok(@shift_header_lines_1 > 0,
 	'first update WAL contains chunk-paired shift headers for updated heap pages');
-ok(has_slot_transition(\@shift_header_lines_1, 0, 1),
-	'first update rotates heap pages from slot 0 to slot 1');
-ok(has_slot_transition(\@shift_header_lines_2, 1, 2),
-	'second update rotates heap pages from slot 1 to slot 2');
-ok(has_slot_transition(\@shift_header_lines_3, 2, 0),
-	'third update rotates heap pages from slot 2 back to slot 0');
+ok(has_slot_transition(\@shift_header_lines_all, 0, 1),
+	'workload rotates heap pages from slot 0 to slot 1');
+ok(has_slot_transition(\@shift_header_lines_all, 1, 2),
+	'workload rotates heap pages from slot 1 to slot 2');
+ok(has_slot_transition(\@shift_header_lines_all, 2, 0),
+	'workload rotates heap pages from slot 2 back to slot 0');
 
 done_testing();

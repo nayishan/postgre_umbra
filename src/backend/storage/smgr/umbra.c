@@ -1430,6 +1430,125 @@ UmTranslationTryLookupPblkno(SMgrRelation reln, ForkNumber forknum,
 	return false;
 }
 
+bool
+UmTranslationPhysicalBlockExists(SMgrRelation reln, ForkNumber forknum,
+								 BlockNumber lblkno)
+{
+	UmbraAccessState access;
+	UmbraFileContext *ctx = um_ctx_acquire(reln);
+	BlockNumber	pblk;
+
+	access = um_classify_access(reln, forknum);
+	if (um_state_uses_chunk_base(access.policy))
+	{
+		if (!UmTranslationTryLookupPblkno(reln, forknum, lblkno, &pblk))
+			return false;
+		return umfile_ctx_block_exists(ctx, forknum, pblk);
+	}
+
+	if (!access.map_available)
+		return umfile_ctx_block_exists(ctx, forknum, lblkno);
+
+	return false;
+}
+
+bool
+UmTranslationSlotPhysicalBlockExists(SMgrRelation reln, ForkNumber forknum,
+									 BlockNumber lblkno, uint8 slot)
+{
+	UmbraAccessState access;
+	UmbraFileContext *ctx = um_ctx_acquire(reln);
+	BlockNumber	logical_nblocks;
+	BlockNumber	pblk;
+
+	if (!UmbraChunkActiveSlotIsValid(slot))
+		return false;
+
+	access = um_classify_access(reln, forknum);
+	if (!um_state_uses_chunk_base(access.policy))
+		return UmTranslationPhysicalBlockExists(reln, forknum, lblkno);
+
+	if (!MapSBlockTryGetLogicalNblocks(ctx, reln->smgr_rlocator.locator,
+									   forknum, &logical_nblocks) ||
+		lblkno >= logical_nblocks)
+		return false;
+
+	pblk = um_chunk_slot_pblk_checked(reln, forknum, lblkno, slot);
+	return umfile_ctx_block_exists(ctx, forknum, pblk);
+}
+
+bool
+UmCheckpointCaptureSlot(SMgrRelation reln, ForkNumber forknum,
+						BlockNumber lblkno, uint8 *checkpoint_slot)
+{
+	UmbraAccessState access;
+	UmbraFileContext *ctx = um_ctx_acquire(reln);
+	uint8		active_slot = 0;
+
+	Assert(checkpoint_slot != NULL);
+
+	access = um_classify_access(reln, forknum);
+	if (!um_state_uses_chunk_base(access.policy))
+		return false;
+
+	if (lblkno >= umnblocks_for_access(reln, forknum, &access))
+		return false;
+
+	(void) UmbraShiftGet(ctx, reln->smgr_rlocator.locator,
+						 forknum, lblkno, &active_slot);
+	*checkpoint_slot = active_slot;
+	return true;
+}
+
+void
+UmCheckpointWriteSlot(SMgrRelation reln, ForkNumber forknum,
+					  BlockNumber lblkno, const void *buffer,
+					  uint8 checkpoint_slot)
+{
+	UmbraAccessState access;
+	UmbraFileContext *ctx = um_ctx_acquire(reln);
+	BlockNumber		pblk;
+
+	if (!UmbraChunkActiveSlotIsValid(checkpoint_slot))
+		elog(ERROR, "invalid Umbra checkpoint slot %u", checkpoint_slot);
+
+	access = um_classify_access(reln, forknum);
+	if (!um_state_uses_chunk_base(access.policy))
+		elog(ERROR,
+			 "checkpoint slot write requested for non-chunk Umbra relation %u/%u/%u fork %d block %u",
+			 reln->smgr_rlocator.locator.spcOid,
+			 reln->smgr_rlocator.locator.dbOid,
+			 reln->smgr_rlocator.locator.relNumber,
+			 forknum, lblkno);
+
+	um_ensure_chunk_physical_capacity(reln, forknum, ctx, lblkno + 1,
+									  false);
+	pblk = um_chunk_slot_pblk_checked(reln, forknum, lblkno,
+									  checkpoint_slot);
+	umfile_ctx_ensure_block_exists(ctx, forknum, pblk);
+	umfile_writev(ctx, forknum, pblk, &buffer, 1, false);
+}
+
+void
+UmCheckpointWritebackSlot(SMgrRelation reln, ForkNumber forknum,
+						  BlockNumber lblkno, uint8 checkpoint_slot)
+{
+	UmbraAccessState access;
+	UmbraFileContext *ctx = um_ctx_acquire(reln);
+	BlockNumber		pblk;
+
+	if (!UmbraChunkActiveSlotIsValid(checkpoint_slot))
+		return;
+
+	access = um_classify_access(reln, forknum);
+	if (!um_state_uses_chunk_base(access.policy))
+		return;
+
+	pblk = um_chunk_slot_pblk_checked(reln, forknum, lblkno,
+									  checkpoint_slot);
+	umfile_writeback(ctx, forknum, pblk, 1);
+}
+
 uint8
 UmShiftChooseTargetSlot(SMgrRelation reln, ForkNumber forknum, BlockNumber lblkno,
 						uint8 *source_slot)

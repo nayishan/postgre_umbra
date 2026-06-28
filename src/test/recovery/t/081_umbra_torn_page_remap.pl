@@ -21,14 +21,19 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 
 my $use_umbra = check_pg_config('^#define USE_UMBRA 1$');
-my $chunk_pages = 32;
+my ($chunk_pages) =
+  scan_server_header('storage/umbra.h',
+	q{#define UMBRA_CHUNK_PAIRED_PAGES ([0-9]+)U});
+my ($active_slots) =
+  scan_server_header('storage/umbra.h',
+	q{#define UMBRA_CHUNK_ACTIVE_SLOTS ([0-9]+)U});
 
 sub chunk_paired_pblk
 {
 	my ($lblk, $target_slot) = @_;
 	my $chunk_id = int($lblk / $chunk_pages);
 	my $offset = $lblk % $chunk_pages;
-	my $pblk = $chunk_id * (3 * $chunk_pages) + $offset;
+	my $pblk = $chunk_id * ($active_slots * $chunk_pages) + $offset;
 
 	$pblk += $target_slot * $chunk_pages;
 	return $pblk;

@@ -13,14 +13,25 @@ use Test::More;
 plan skip_all => 'requires --with-umbra MAP fork'
 	unless check_pg_config('^#define USE_UMBRA 1$');
 
-my $chunk_pages = 32;
-my @boundary_blocks = (0, 31, 32, 63, 64);
+my ($chunk_pages) =
+  scan_server_header('storage/umbra.h',
+	q{#define UMBRA_CHUNK_PAIRED_PAGES ([0-9]+)U});
+my ($active_slots) =
+  scan_server_header('storage/umbra.h',
+	q{#define UMBRA_CHUNK_ACTIVE_SLOTS ([0-9]+)U});
+my @boundary_blocks = (
+	0,
+	$chunk_pages - 1,
+	$chunk_pages,
+	(2 * $chunk_pages) - 1,
+	2 * $chunk_pages);
 
 sub chunk_capacity_for_lblk
 {
 	my ($lblk) = @_;
 
-	return (int($lblk / $chunk_pages) + 1) * (3 * $chunk_pages);
+	return (int($lblk / $chunk_pages) + 1) *
+	  ($active_slots * $chunk_pages);
 }
 
 sub u32le_from_hex

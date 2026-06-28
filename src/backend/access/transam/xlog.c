@@ -7608,6 +7608,10 @@ CreateCheckPoint(int flags)
 	XLogCtl->RedoRecPtr = checkPoint.redo;
 	SpinLockRelease(&XLogCtl->info_lck);
 
+#ifdef USE_UMBRA
+	CheckPointBuffersCaptureBegin();
+#endif
+
 	/*
 	 * If enabled, log checkpoint start.  We postpone this until now so as not
 	 * to log anything if we decided to skip the checkpoint.
@@ -8065,6 +8069,7 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 	CheckPointMultiXact();
 	CheckPointPredicate();
 #ifdef USE_UMBRA
+	CheckPointBuffersPrepare(flags);
 	MapCheckpoint();
 #endif
 	CheckPointBuffers(flags);
@@ -8214,6 +8219,10 @@ CreateRestartPoint(int flags)
 	SpinLockAcquire(&XLogCtl->info_lck);
 	XLogCtl->RedoRecPtr = lastCheckPoint.redo;
 	SpinLockRelease(&XLogCtl->info_lck);
+
+#ifdef USE_UMBRA
+	CheckPointBuffersCaptureBegin();
+#endif
 
 	/*
 	 * Prepare to accumulate statistics.

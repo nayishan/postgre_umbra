@@ -259,6 +259,21 @@ extern BlockNumber umnblocks_cached(SMgrRelation reln, ForkNumber forknum);
 extern bool UmUsesChunkPairedTranslation(SMgrRelation reln, ForkNumber forknum);
 extern bool UmTranslationTryLookupPblkno(SMgrRelation reln, ForkNumber forknum,
 										BlockNumber lblkno, BlockNumber *pblkno);
+extern bool UmTranslationPhysicalBlockExists(SMgrRelation reln,
+											 ForkNumber forknum,
+											 BlockNumber lblkno);
+extern bool UmTranslationSlotPhysicalBlockExists(SMgrRelation reln,
+												 ForkNumber forknum,
+												 BlockNumber lblkno,
+												 uint8 slot);
+extern bool UmCheckpointCaptureSlot(SMgrRelation reln, ForkNumber forknum,
+									BlockNumber lblkno, uint8 *checkpoint_slot);
+extern void UmCheckpointWriteSlot(SMgrRelation reln, ForkNumber forknum,
+								  BlockNumber lblkno, const void *buffer,
+								  uint8 checkpoint_slot);
+extern void UmCheckpointWritebackSlot(SMgrRelation reln, ForkNumber forknum,
+									  BlockNumber lblkno,
+									  uint8 checkpoint_slot);
 extern uint8 UmShiftChooseTargetSlot(SMgrRelation reln, ForkNumber forknum,
 									 BlockNumber lblkno, uint8 *source_slot);
 extern void UmShiftSetActiveSlot(SMgrRelation reln, ForkNumber forknum,

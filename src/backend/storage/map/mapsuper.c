@@ -1198,8 +1198,6 @@ retry:
 											   skipFsync) &&
 				!umfile_ctx_block_exists(map_ctx, forknum, desired - 1))
 			{
-				PGIOAlignedBlock zero_buffer = {0};
-
 				/*
 				 * Fall back to making EOF cover the published physical capacity
 				 * when the platform cannot preallocate the range. Sparse holes
@@ -1207,8 +1205,8 @@ retry:
 				 * avoid later EOF/short reads without forcing every intervening
 				 * page through the foreground extension path.
 				 */
-				umfile_extend(map_ctx, forknum, desired - 1,
-							  zero_buffer.data, skipFsync);
+				umfile_zeroextend(map_ctx, forknum, desired - 1,
+								  1, skipFsync);
 			}
 
 			if (!MapSuperPrepareEntryForUpdate(map_ctx, rnode, InvalidXLogRecPtr,

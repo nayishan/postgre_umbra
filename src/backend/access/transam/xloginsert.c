@@ -92,6 +92,7 @@ typedef struct
 								 * backup block data in XLogRecordAssemble() */
 
 #ifdef USE_UMBRA
+	Buffer		buffer;			/* shared buffer, if registered from one */
 	bool		has_shift;		/* true if shift metadata is prepared */
 	bool		shift_in_record;	/* current record includes shift */
 	bool		shift_committed;	/* shift slot was committed after insert */
@@ -229,6 +230,7 @@ XLogCommitBlockShiftsUmbra(XLogRecPtr record_endptr)
 
 		ctx = umfile_ctx_acquire(regbuf->shift_reln->smgr_rlocator);
 
+		BufferSaveCheckpointSlot(regbuf->buffer, regbuf->shift_source_slot);
 		UmShiftSetActiveSlot(regbuf->shift_reln, regbuf->forkno, regbuf->block,
 							  regbuf->shift_target_slot, record_endptr);
 		if (UmbraChunkPairedPhysicalCapacity(regbuf->shift_logical_nblocks,
@@ -362,6 +364,7 @@ XLogResetInsertion(void)
 	{
 		registered_buffers[i].in_use = false;
 #ifdef USE_UMBRA
+		registered_buffers[i].buffer = InvalidBuffer;
 		registered_buffers[i].has_shift = false;
 		registered_buffers[i].shift_in_record = false;
 		registered_buffers[i].shift_committed = false;
@@ -427,6 +430,7 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
 	regbuf->rdata_tail = (XLogRecData *) &regbuf->rdata_head;
 	regbuf->rdata_len = 0;
 #ifdef USE_UMBRA
+	regbuf->buffer = buffer;
 	regbuf->has_shift = false;
 	regbuf->shift_in_record = false;
 	regbuf->shift_committed = false;
@@ -489,6 +493,7 @@ XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator, ForkNumber forknum,
 	regbuf->rdata_tail = (XLogRecData *) &regbuf->rdata_head;
 	regbuf->rdata_len = 0;
 #ifdef USE_UMBRA
+	regbuf->buffer = InvalidBuffer;
 	regbuf->has_shift = false;
 	regbuf->shift_in_record = false;
 	regbuf->shift_committed = false;
@@ -1297,6 +1302,8 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 			regbuf->shift_target_slot =
 				UmShiftChooseTargetSlot(reln, regbuf->forkno, regbuf->block,
 										&regbuf->shift_source_slot);
+			BufferSaveCheckpointSlot(regbuf->buffer,
+									  regbuf->shift_source_slot);
 
 			regbuf->has_shift = true;
 			regbuf->shift_committed = false;

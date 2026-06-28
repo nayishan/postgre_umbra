@@ -119,6 +119,9 @@ static bool XLogUmbraPrepareLogicalBirthForRedo(RelFileLocator rlocator,
 												ForkNumber forknum,
 												BlockNumber blkno,
 												XLogRecPtr lsn);
+static bool XLogUmbraPhysicalPageExistsForRedo(RelFileLocator rlocator,
+											   ForkNumber forknum,
+											   BlockNumber blkno);
 #endif
 
 /* Report a reference to an invalid page */
@@ -516,6 +519,22 @@ XLogUmbraPrepareLogicalBirthForRedo(RelFileLocator rlocator, ForkNumber forknum,
 	return true;
 }
 
+static bool
+XLogUmbraPhysicalPageExistsForRedo(RelFileLocator rlocator, ForkNumber forknum,
+								   BlockNumber blkno)
+{
+	SMgrRelation smgr;
+
+	if (forknum == INIT_FORKNUM || smgrisinternalfork(forknum))
+		return true;
+
+	smgr = smgropen(rlocator, INVALID_PROC_NUMBER);
+	if (!UmUsesChunkPairedTranslation(smgr, forknum))
+		return true;
+
+	return UmTranslationPhysicalBlockExists(smgr, forknum, blkno);
+}
+
 #endif
 
 
@@ -731,6 +750,13 @@ XLogReadBufferForRedoExtendedUmbra(XLogReaderState *record,
 		BlockNumber physical_nblocks;
 
 		smgrcreate(smgr, forknum, true);
+		if (!has_image && !zeromode && mode == RBM_NORMAL &&
+			!UmTranslationSlotPhysicalBlockExists(smgr, forknum, blkno,
+												  blk->source_slot))
+		{
+			log_invalid_page(rlocator, forknum, blkno, false);
+			return BLK_NOTFOUND;
+		}
 		if (!UmbraChunkPairedPhysicalCapacity(blk->logical_nblocks,
 											 &physical_nblocks))
 			elog(PANIC,
@@ -898,6 +924,16 @@ XLogReadBufferExtended(RelFileLocator rlocator, ForkNumber forknum,
 
 	if (blkno < lastblock)
 	{
+#ifdef USE_UMBRA
+		if ((mode == RBM_NORMAL || mode == RBM_NORMAL_NO_LOG) &&
+			!XLogUmbraPhysicalPageExistsForRedo(rlocator, forknum, blkno))
+		{
+			if (mode == RBM_NORMAL)
+				log_invalid_page(rlocator, forknum, blkno, false);
+			return InvalidBuffer;
+		}
+#endif
+
 		/* page exists in file */
 		buffer = ReadBufferWithoutRelcache(rlocator, forknum, blkno,
 										   mode, NULL, true);

@@ -23,8 +23,12 @@ sub u32le_from_hex
 	  (hex($b[3]) << 24);
 }
 
-my $chunk_pages = 32;
-my $active_slots = 3;
+my ($chunk_pages) =
+  scan_server_header('storage/umbra.h',
+	q{#define UMBRA_CHUNK_PAIRED_PAGES ([0-9]+)U});
+my ($active_slots) =
+  scan_server_header('storage/umbra.h',
+	q{#define UMBRA_CHUNK_ACTIVE_SLOTS ([0-9]+)U});
 
 sub chunk_capacity_for_nblocks
 {
