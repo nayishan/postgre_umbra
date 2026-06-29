@@ -69,7 +69,7 @@ UmbraForkIsAuxiliaryMapped(ForkNumber forknum)
  * through the metadata stored for that logical block.
  */
 #ifndef UMBRA_CHUNK_PAIRED_PAGES
-#define UMBRA_CHUNK_PAIRED_PAGES 1U
+#define UMBRA_CHUNK_PAIRED_PAGES 32U
 #endif
 #if UMBRA_CHUNK_PAIRED_PAGES <= 0
 #error "UMBRA_CHUNK_PAIRED_PAGES must be greater than zero"
