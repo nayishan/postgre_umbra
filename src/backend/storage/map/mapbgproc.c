@@ -18,12 +18,15 @@
 
 static bool MapForkPreallocSettings(ForkNumber forknum,
 									BlockNumber *soft_low,
-									BlockNumber *batch_blocks);
+									BlockNumber *max_batch_blocks);
 static bool MapForkNeedsPrealloc(const MapSuperEntry *entry, ForkNumber forknum,
 								 BlockNumber *demand_p);
 static bool MapMaybePreallocateFork(UmbraFileContext *map_ctx,
 									RelFileLocator rnode,
 									ForkNumber forknum);
+static BlockNumber MapPreallocBatchForCount(uint64 prealloc_count,
+											BlockNumber max_batch_blocks);
+static void MapPreallocCountSuccess(MapSuperEntry *entry, ForkNumber forknum);
 static BlockNumber MapPreallocRoundGroups(BlockNumber nblocks);
 static bool MapPreallocDemandForFork(const MapSuperEntry *entry,
 									 ForkNumber forknum,
@@ -54,7 +57,7 @@ MapWakeWriter(void)
 
 static bool
 MapForkPreallocSettings(ForkNumber forknum, BlockNumber *soft_low,
-						BlockNumber *batch_blocks)
+						BlockNumber *max_batch_blocks)
 {
 	int			low;
 	int			batch;
@@ -81,8 +84,35 @@ MapForkPreallocSettings(ForkNumber forknum, BlockNumber *soft_low,
 		return false;
 
 	*soft_low = MapPreallocRoundGroups((BlockNumber) low);
-	*batch_blocks = MapPreallocRoundGroups((BlockNumber) batch);
+	*max_batch_blocks = MapPreallocRoundGroups((BlockNumber) batch);
 	return true;
+}
+
+static BlockNumber
+MapPreallocBatchForCount(uint64 prealloc_count, BlockNumber max_batch_blocks)
+{
+	BlockNumber	group_blocks;
+	BlockNumber	stage_blocks;
+
+	group_blocks = MapPreallocRoundGroups(1);
+	if (prealloc_count < 2)
+		stage_blocks = group_blocks;
+	else if (prealloc_count < 6)
+		stage_blocks = group_blocks * 4;
+	else
+		stage_blocks = group_blocks * 16;
+
+	stage_blocks = Min(stage_blocks, max_batch_blocks);
+	return MapPreallocRoundGroups(stage_blocks);
+}
+
+static void
+MapPreallocCountSuccess(MapSuperEntry *entry, ForkNumber forknum)
+{
+	uint64		count;
+
+	count = MapSuperGetPreallocCount(entry, forknum);
+	MapSuperSetPreallocCount(entry, forknum, count + 1);
 }
 
 static BlockNumber
@@ -130,7 +160,7 @@ MapForkNeedsPrealloc(const MapSuperEntry *entry, ForkNumber forknum,
 					 BlockNumber *demand_p)
 {
 	BlockNumber		soft_low;
-	BlockNumber		batch_blocks;
+	BlockNumber		max_batch_blocks;
 	BlockNumber		capacity;
 	BlockNumber		demand;
 	BlockNumber		remaining;
@@ -138,7 +168,7 @@ MapForkNeedsPrealloc(const MapSuperEntry *entry, ForkNumber forknum,
 
 	if (!MapForkHasMappedState(forknum))
 		return false;
-	if (!MapForkPreallocSettings(forknum, &soft_low, &batch_blocks))
+	if (!MapForkPreallocSettings(forknum, &soft_low, &max_batch_blocks))
 		return false;
 	if (!MapPreallocDemandForFork(entry, forknum, &demand))
 		return false;
@@ -166,6 +196,7 @@ MapMaybePreallocateFork(UmbraFileContext *map_ctx, RelFileLocator rnode,
 {
 	MapSuperEntry *entry;
 	BlockNumber		soft_low;
+	BlockNumber		max_batch_blocks;
 	BlockNumber		batch_blocks;
 	BlockNumber		capacity;
 	BlockNumber		demand;
@@ -180,7 +211,7 @@ MapMaybePreallocateFork(UmbraFileContext *map_ctx, RelFileLocator rnode,
 		return false;
 	if (!MapForkHasMappedState(forknum))
 		return false;
-	if (!MapForkPreallocSettings(forknum, &soft_low, &batch_blocks))
+	if (!MapForkPreallocSettings(forknum, &soft_low, &max_batch_blocks))
 		return false;
 	if (!MapSBlockEnsureLoaded(map_ctx, rnode))
 		return false;
@@ -231,8 +262,10 @@ MapMaybePreallocateFork(UmbraFileContext *map_ctx, RelFileLocator rnode,
 		return false;
 	}
 
-	target64 = Max((uint64) demand + (uint64) soft_low,
-				   (uint64) capacity + (uint64) batch_blocks);
+	batch_blocks = MapPreallocBatchForCount(MapSuperGetPreallocCount(entry,
+																	 forknum),
+											max_batch_blocks);
+	target64 = (uint64) Max(demand, capacity) + (uint64) batch_blocks;
 	target64 = (uint64) MapPreallocRoundGroups((BlockNumber)
 											   Min(target64,
 												   (uint64) (InvalidBlockNumber - 1)));
@@ -285,6 +318,8 @@ MapMaybePreallocateFork(UmbraFileContext *map_ctx, RelFileLocator rnode,
 
 	if (MapSuperFindEntryLocked(rnode, LW_EXCLUSIVE, &entry))
 	{
+		if (prealloc_ok)
+			MapPreallocCountSuccess(entry, forknum);
 		entry->runtime_flags &= ~prealloc_flag;
 		LWLockRelease(&entry->lock);
 	}
