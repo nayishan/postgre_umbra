@@ -666,6 +666,7 @@ static bool FlushBuffer(BufferDesc *buf, SMgrRelation reln,
 						IOObject io_object, IOContext io_context,
 						bool flush_active_after_checkpoint_slot,
 						uint8 *checkpoint_slot);
+static bool FlushVictimBuffer(BufferDesc *buf, IOContext io_context);
 #ifdef USE_UMBRA
 static bool CkptBufferIdsPrepared = false;
 static int	CkptBufferIdsPreparedCount = 0;
@@ -2665,25 +2666,7 @@ again:
 		}
 
 		/* OK, do the I/O */
-		{
-			uint8		checkpoint_slot = CKPT_BUFFER_SLOT_INVALID;
-
-			if (FlushBuffer(buf_hdr, NULL, IOOBJECT_RELATION,
-							io_context, true, &checkpoint_slot))
-			{
-				if (checkpoint_slot != CKPT_BUFFER_SLOT_INVALID)
-					ScheduleBufferTagForWritebackWithSlot(&BackendWritebackContext,
-														  io_context,
-														  &buf_hdr->tag,
-														  true,
-														  checkpoint_slot);
-				ScheduleBufferTagForWritebackWithSlot(&BackendWritebackContext,
-													  io_context,
-													  &buf_hdr->tag,
-													  false,
-													  CKPT_BUFFER_SLOT_INVALID);
-			}
-		}
+		(void) FlushVictimBuffer(buf_hdr, io_context);
 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 	}
 
@@ -4918,6 +4901,36 @@ FlushUnlockedBuffer(BufferDesc *buf, SMgrRelation reln,
 						  checkpoint_slot);
 	BufferLockUnlock(buffer, buf);
 	return flushed;
+}
+
+/*
+ * Flush a victim buffer selected for replacement.
+ *
+ * In Umbra, a checkpoint-only write can satisfy only the checkpoint image.
+ * Victim flushes must leave the buffer clean and reusable, so allow
+ * FlushBuffer() to write the current active slot too.
+ */
+static bool
+FlushVictimBuffer(BufferDesc *buf, IOContext io_context)
+{
+	uint8		checkpoint_slot = CKPT_BUFFER_SLOT_INVALID;
+
+	if (!FlushBuffer(buf, NULL, IOOBJECT_RELATION, io_context,
+					 true, &checkpoint_slot))
+		return false;
+
+	if (checkpoint_slot != CKPT_BUFFER_SLOT_INVALID)
+		ScheduleBufferTagForWritebackWithSlot(&BackendWritebackContext,
+											  io_context,
+											  &buf->tag,
+											  true,
+											  checkpoint_slot);
+	ScheduleBufferTagForWritebackWithSlot(&BackendWritebackContext,
+										  io_context,
+										  &buf->tag,
+										  false,
+										  CKPT_BUFFER_SLOT_INVALID);
+	return true;
 }
 
 #ifdef USE_UMBRA
