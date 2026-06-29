@@ -168,11 +168,9 @@ MapMaybePreallocateFork(UmbraFileContext *map_ctx, RelFileLocator rnode,
 	BlockNumber		soft_low;
 	BlockNumber		batch_blocks;
 	BlockNumber		capacity;
-	BlockNumber		actual_nblocks;
 	BlockNumber		demand;
 	BlockNumber		remaining;
 	BlockNumber		target_nblocks;
-	BlockNumber		published_nblocks = 0;
 	uint32			prealloc_flag;
 	bool			prealloc_ok = false;
 	bool			started = false;
@@ -257,33 +255,20 @@ MapMaybePreallocateFork(UmbraFileContext *map_ctx, RelFileLocator rnode,
 	{
 		if (umfile_ctx_fork_exists(map_ctx, forknum))
 		{
-			actual_nblocks = umfile_nblocks(map_ctx, forknum);
-
 			if (umbra_chunk_zero_fill_all_slots)
 			{
-				BlockNumber	zero_start = actual_nblocks;
-
-				while (zero_start < target_nblocks)
-				{
-					int			zero_blocks;
-
-					zero_blocks = (int) Min(target_nblocks - zero_start,
-											 (BlockNumber) INT_MAX);
-					umfile_zeroextend(map_ctx, forknum, zero_start,
-									  zero_blocks, false);
-					zero_start += (BlockNumber) zero_blocks;
-				}
-				prealloc_ok = true;
-				published_nblocks = target_nblocks;
+				prealloc_ok = MapSBlockEnsurePhysicalNblocksZeroFill(map_ctx,
+																	  rnode,
+																	  forknum,
+																	  target_nblocks,
+																	  false);
 			}
 			else
 			{
 				prealloc_ok = MapSBlockEnsurePhysicalNblocks(map_ctx, rnode,
-															 forknum,
-															 target_nblocks,
-															 false);
-				if (prealloc_ok)
-					published_nblocks = target_nblocks;
+																 forknum,
+																 target_nblocks,
+																 false);
 			}
 		}
 	}
@@ -300,23 +285,6 @@ MapMaybePreallocateFork(UmbraFileContext *map_ctx, RelFileLocator rnode,
 
 	if (MapSuperFindEntryLocked(rnode, LW_EXCLUSIVE, &entry))
 	{
-		if (prealloc_ok &&
-			entry->in_use &&
-			(entry->flags & MAPSUPER_FLAG_VALID) != 0)
-		{
-			XLogRecPtr	map_lsn = GetXLogWriteRecPtr();
-
-			if (MapNormalizeForkBlockCount(forknum,
-										   MapSuperblockGetPhysCapacity(&entry->super,
-																		forknum)) < published_nblocks)
-			{
-				MapSuperblockSetPhysCapacity(&entry->super, forknum,
-											 published_nblocks);
-				MapSuperblockSetLastUpdatedLSN(&entry->super, map_lsn);
-				entry->page_lsn = map_lsn;
-				entry->flags |= MAPSUPER_FLAG_DIRTY;
-			}
-		}
 		entry->runtime_flags &= ~prealloc_flag;
 		LWLockRelease(&entry->lock);
 	}
