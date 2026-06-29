@@ -86,6 +86,12 @@ static void MapSBlockSetPendingFlag(UmbraFileContext *map_ctx,
 									RelFileLocator rnode,
 									bool pending,
 									XLogRecPtr map_lsn);
+static bool MapSBlockEnsurePhysicalNblocksInternal(UmbraFileContext *map_ctx,
+												   RelFileLocator rnode,
+												   ForkNumber forknum,
+												   BlockNumber nblocks,
+												   bool skipFsync,
+												   bool zero_fill);
 void MapSBlockBumpPhysicalState(UmbraFileContext *map_ctx,
 								RelFileLocator rnode,
 								ForkNumber forknum,
@@ -1141,6 +1147,29 @@ MapSBlockEnsurePhysicalNblocks(UmbraFileContext *map_ctx, RelFileLocator rnode,
 							   ForkNumber forknum, BlockNumber nblocks,
 							   bool skipFsync)
 {
+	return MapSBlockEnsurePhysicalNblocksInternal(map_ctx, rnode, forknum,
+												  nblocks, skipFsync, false);
+}
+
+bool
+MapSBlockEnsurePhysicalNblocksZeroFill(UmbraFileContext *map_ctx,
+									   RelFileLocator rnode,
+									   ForkNumber forknum,
+									   BlockNumber nblocks,
+									   bool skipFsync)
+{
+	return MapSBlockEnsurePhysicalNblocksInternal(map_ctx, rnode, forknum,
+												  nblocks, skipFsync, true);
+}
+
+static bool
+MapSBlockEnsurePhysicalNblocksInternal(UmbraFileContext *map_ctx,
+									   RelFileLocator rnode,
+									   ForkNumber forknum,
+									   BlockNumber nblocks,
+									   bool skipFsync,
+									   bool zero_fill)
+{
 	MapSuperEntry *entry;
 	uint32		extend_flag;
 	BlockNumber	current;
@@ -1194,9 +1223,28 @@ retry:
 
 		for (;;)
 		{
-			if (!umfile_ctx_preallocate_blocks(map_ctx, forknum, desired,
-											   skipFsync) &&
-				!umfile_ctx_block_exists(map_ctx, forknum, desired - 1))
+			if (zero_fill)
+			{
+				current = MapNormalizeForkBlockCount(forknum, current);
+				if (current < desired)
+				{
+					BlockNumber zero_start = current;
+
+					while (zero_start < desired)
+					{
+						int			zero_blocks;
+
+						zero_blocks = (int) Min(desired - zero_start,
+												 (BlockNumber) INT_MAX);
+						umfile_zeroextend(map_ctx, forknum, zero_start,
+										  zero_blocks, skipFsync);
+						zero_start += (BlockNumber) zero_blocks;
+					}
+				}
+			}
+			else if (!umfile_ctx_preallocate_blocks(map_ctx, forknum, desired,
+												   skipFsync) &&
+					 !umfile_ctx_block_exists(map_ctx, forknum, desired - 1))
 			{
 				/*
 				 * Fall back to making EOF cover the published physical capacity

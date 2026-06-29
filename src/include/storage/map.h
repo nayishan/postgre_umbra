@@ -177,6 +177,11 @@ extern bool MapSBlockEnsurePhysicalNblocks(UmbraFileContext *map_ctx,
 										   ForkNumber forknum,
 										   BlockNumber nblocks,
 										   bool skipFsync);
+extern bool MapSBlockEnsurePhysicalNblocksZeroFill(UmbraFileContext *map_ctx,
+												   RelFileLocator rnode,
+												   ForkNumber forknum,
+												   BlockNumber nblocks,
+												   bool skipFsync);
 extern void MapSBlockBumpNextFreePhysBlock(UmbraFileContext *map_ctx,
 										   RelFileLocator rnode,
 										   ForkNumber forknum,

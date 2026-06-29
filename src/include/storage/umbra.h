@@ -20,6 +20,8 @@
 #include "storage/sync.h"
 #include "storage/um_defs.h"
 
+extern PGDLLIMPORT bool umbra_chunk_zero_fill_all_slots;
+
 /*
  * Umbra MAP policy.
  *

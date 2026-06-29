@@ -52,6 +52,8 @@
 #include "utils/memutils.h"
 #include "utils/wait_event.h"
 
+bool		umbra_chunk_zero_fill_all_slots = false;
+
 typedef struct UmbraAccessState
 {
 	UmbraMapPolicy policy;
@@ -801,22 +803,35 @@ um_ensure_chunk_physical_capacity(SMgrRelation reln, ForkNumber forknum,
 								  bool skipFsync)
 {
 	BlockNumber physical_nblocks;
+	bool		materialized;
 
 	physical_nblocks =
 		um_chunk_physical_capacity_checked(reln, forknum, logical_nblocks);
 	if (physical_nblocks == 0)
 		return;
 
-	if (!MapSBlockEnsurePhysicalNblocks(ctx, reln->smgr_rlocator.locator,
-										forknum, physical_nblocks,
-										skipFsync))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("could not materialize chunk-paired physical capacity for relation %u/%u/%u fork %d",
-						reln->smgr_rlocator.locator.spcOid,
-						reln->smgr_rlocator.locator.dbOid,
-						reln->smgr_rlocator.locator.relNumber,
-						forknum)));
+	if (umbra_chunk_zero_fill_all_slots)
+		materialized = MapSBlockEnsurePhysicalNblocksZeroFill(ctx,
+															  reln->smgr_rlocator.locator,
+															  forknum,
+															  physical_nblocks,
+															  skipFsync);
+	else
+		materialized = MapSBlockEnsurePhysicalNblocks(ctx,
+													  reln->smgr_rlocator.locator,
+													  forknum,
+													  physical_nblocks,
+													  skipFsync);
+	if (materialized)
+		return;
+
+	ereport(ERROR,
+			(errcode(ERRCODE_DATA_CORRUPTED),
+			 errmsg("could not materialize chunk-paired physical capacity for relation %u/%u/%u fork %d",
+					reln->smgr_rlocator.locator.spcOid,
+					reln->smgr_rlocator.locator.dbOid,
+					reln->smgr_rlocator.locator.relNumber,
+					forknum)));
 }
 
 static void

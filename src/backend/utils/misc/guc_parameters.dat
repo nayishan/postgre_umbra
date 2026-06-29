@@ -3319,6 +3319,13 @@
   boot_val => 'false',
 },
 
+{ name => 'umbra_chunk_zero_fill_all_slots', type => 'bool', context => 'PGC_SIGHUP', group => 'RESOURCES_BGWRITER',
+  short_desc => 'Zero-fill all Umbra chunk physical slots before publishing physical capacity.',
+  variable => 'umbra_chunk_zero_fill_all_slots',
+  boot_val => 'false',
+  ifdef => 'USE_UMBRA',
+},
+
 { name => 'unix_socket_directories', type => 'string', context => 'PGC_POSTMASTER', group => 'CONN_AUTH_SETTINGS',
   short_desc => 'Sets the directories where Unix-domain sockets will be created.',
   flags => 'GUC_LIST_INPUT | GUC_LIST_QUOTE | GUC_SUPERUSER_ONLY',
