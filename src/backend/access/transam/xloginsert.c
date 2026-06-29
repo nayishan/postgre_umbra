@@ -294,7 +294,6 @@ XLogCommitBlockShiftsUmbra(XLogRecPtr record_endptr)
 	{
 		registered_buffer *regbuf = &registered_buffers[block_id];
 		UmbraFileContext *ctx;
-		BlockNumber	physical_nblocks;
 
 		if (!regbuf->in_use || !regbuf->has_shift || !regbuf->shift_in_record)
 			continue;
@@ -306,14 +305,6 @@ XLogCommitBlockShiftsUmbra(XLogRecPtr record_endptr)
 		BufferSaveCheckpointSlot(regbuf->buffer, regbuf->shift_source_slot);
 		UmShiftSetActiveSlot(regbuf->shift_reln, regbuf->forkno, regbuf->block,
 							  regbuf->shift_target_slot, record_endptr);
-		if (UmbraChunkPairedPhysicalCapacity(regbuf->shift_logical_nblocks,
-											 &physical_nblocks) &&
-			physical_nblocks > 0)
-			MapSBlockBumpPhysicalNblocks(ctx,
-										 regbuf->rlocator,
-										 regbuf->forkno,
-										 physical_nblocks,
-										 record_endptr);
 		MapSBlockBumpLogicalNblocks(ctx, regbuf->rlocator,
 									regbuf->forkno,
 									regbuf->shift_logical_nblocks,

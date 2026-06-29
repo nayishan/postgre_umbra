@@ -2,7 +2,7 @@
 #
 # In UMBRA mode:
 # - map writer backend should exist in pg_stat_activity
-# - wait event should be MapwriterMain/MapwriterHibernate or NULL transiently
+# - wait event should be idle, NULL transiently, or file-extension work
 #
 # In md mode, skip this test.
 use strict;
@@ -36,7 +36,8 @@ SELECT count(*) > 0
 FROM pg_stat_activity
 WHERE backend_type = 'map writer'
   AND (wait_event IN ('MapwriterMain', 'MapwriterHibernate')
-	   OR wait_event IS NULL);
+		   OR (wait_event_type = 'IO' AND wait_event = 'DataFileExtend')
+		   OR wait_event IS NULL);
 });
 is($mapwriter_wait_ok, 't', 'map writer wait event is expected');
 
