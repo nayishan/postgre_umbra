@@ -9,6 +9,7 @@
 
 #include "access/xlog.h"
 #include "access/xlogrecovery.h"
+#include "postmaster/interrupt.h"
 #include "storage/map.h"
 #include "storage/mapsuper_internal.h"
 #include "storage/proc.h"
@@ -255,7 +256,7 @@ MapMaybePreallocateFork(UmbraFileContext *map_ctx, RelFileLocator rnode,
 	}
 
 	batch_blocks = MapPreallocBatchForCapacity(capacity, max_batch_blocks);
-	target64 = (uint64) Max(demand, capacity) + (uint64) batch_blocks;
+	target64 = (uint64) capacity + (uint64) batch_blocks;
 	target64 = (uint64) MapPreallocRoundGroups((BlockNumber)
 											   Min(target64,
 												   (uint64) (InvalidBlockNumber - 1)));
@@ -276,6 +277,8 @@ MapMaybePreallocateFork(UmbraFileContext *map_ctx, RelFileLocator rnode,
 
 	PG_TRY();
 	{
+		CHECK_FOR_INTERRUPTS();
+
 		if (umfile_ctx_fork_exists(map_ctx, forknum))
 		{
 			if (umbra_chunk_zero_fill_all_slots)
@@ -343,6 +346,8 @@ MapPreallocStep(int max_relations)
 		scan_slot = (scan_slot + 1) % MapSuperCapacity;
 		scanned++;
 
+		ProcessMainLoopInterrupts();
+
 		LWLockAcquire(&entry->lock, LW_SHARED);
 		if (!entry->in_use)
 		{
@@ -374,12 +379,15 @@ MapPreallocStep(int max_relations)
 		if (ctx == NULL)
 			continue;
 
+		ProcessMainLoopInterrupts();
 		if (prealloc_main &&
 			MapMaybePreallocateFork(ctx, rnode, MAIN_FORKNUM))
 			prealloc_ops++;
+		ProcessMainLoopInterrupts();
 		if (prealloc_fsm &&
 			MapMaybePreallocateFork(ctx, rnode, FSM_FORKNUM))
 			prealloc_ops++;
+		ProcessMainLoopInterrupts();
 		if (prealloc_vm &&
 			MapMaybePreallocateFork(ctx, rnode, VISIBILITYMAP_FORKNUM))
 			prealloc_ops++;

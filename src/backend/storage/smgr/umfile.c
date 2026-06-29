@@ -1524,6 +1524,8 @@ umfile_zeroextend(UmbraFileContext *ctx, ForkNumber forknum, BlockNumber blocknu
 		curblocknum = blocknum;
 		remblocks = nblocks;
 
+		CHECK_FOR_INTERRUPTS();
+
 		numblocks = Min(remblocks, RELSEG_SIZE - (curblocknum % RELSEG_SIZE));
 		numblocks = Min(numblocks, PG_IOV_MAX);
 

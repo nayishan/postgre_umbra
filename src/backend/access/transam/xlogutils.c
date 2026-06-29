@@ -493,7 +493,18 @@ XLogUmbraPrepareLogicalBirthForRedo(RelFileLocator rlocator, ForkNumber forknum,
 	if (MapSBlockTryGetLogicalNblocks(ctx, rlocator, forknum,
 									  &logical_nblocks) &&
 		blkno < logical_nblocks)
-		return true;
+	{
+		if (!UmbraChunkPairedPhysicalCapacity(logical_nblocks,
+											 &physical_nblocks))
+			elog(PANIC,
+				 "chunk-paired physical capacity overflow during redo for relation %u/%u/%u fork %d logical blocks %u",
+				 rlocator.spcOid, rlocator.dbOid, rlocator.relNumber,
+				 forknum, logical_nblocks);
+
+		return MapSBlockEnsurePhysicalNblocks(ctx, rlocator, forknum,
+											  physical_nblocks,
+											  true /* skipFsync */);
+	}
 
 	if (blkno == MaxBlockNumber)
 		elog(PANIC,

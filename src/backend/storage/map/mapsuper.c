@@ -617,6 +617,25 @@ MapSuperDeleteEntry(RelFileLocator rnode)
 	{
 		entry = MapSuperEntryBySlot(slot_id);
 		LWLockAcquire(&entry->lock, LW_EXCLUSIVE);
+		while (entry->runtime_flags != 0)
+		{
+			LWLockRelease(&entry->lock);
+			LWLockRelease(partition_lock);
+			CHECK_FOR_INTERRUPTS();
+			pg_usleep(1000L);
+			LWLockAcquire(partition_lock, LW_EXCLUSIVE);
+			slot_id = MapSuperLookupSlotLocked(rnode, hashcode, partition,
+											   &bucket);
+			if (slot_id < 0)
+				break;
+			entry = MapSuperEntryBySlot(slot_id);
+			LWLockAcquire(&entry->lock, LW_EXCLUSIVE);
+		}
+		if (slot_id < 0)
+		{
+			LWLockRelease(partition_lock);
+			return;
+		}
 		entry->flags = 0;
 		entry->runtime_flags = 0;
 		entry->page_lsn = InvalidXLogRecPtr;
@@ -1174,6 +1193,7 @@ MapSBlockEnsurePhysicalNblocksInternal(UmbraFileContext *map_ctx,
 	uint32		extend_flag;
 	BlockNumber	current;
 	BlockNumber	desired;
+	BlockNumber	physical_nblocks;
 	bool		success = false;
 
 	if (!MapForkHasMappedState(forknum))
@@ -1196,7 +1216,8 @@ retry:
 
 	current = MapSuperblockGetPhysCapacity(&entry->super, forknum);
 	current = MapNormalizeForkBlockCount(forknum, current);
-	if (current >= nblocks)
+	if (current >= nblocks &&
+		umfile_ctx_block_exists(map_ctx, forknum, nblocks - 1))
 	{
 		LWLockRelease(&entry->lock);
 		return true;
@@ -1225,14 +1246,18 @@ retry:
 		{
 			if (zero_fill)
 			{
-				current = MapNormalizeForkBlockCount(forknum, current);
-				if (current < desired)
+				physical_nblocks = umfile_ctx_get_nblocks(map_ctx, forknum);
+				physical_nblocks = MapNormalizeForkBlockCount(forknum,
+															  physical_nblocks);
+				if (physical_nblocks < desired)
 				{
-					BlockNumber zero_start = current;
+					BlockNumber zero_start = physical_nblocks;
 
 					while (zero_start < desired)
 					{
 						int			zero_blocks;
+
+						CHECK_FOR_INTERRUPTS();
 
 						zero_blocks = (int) Min(desired - zero_start,
 												 (BlockNumber) INT_MAX);
@@ -1283,7 +1308,8 @@ retry:
 			}
 
 			desired = Max(desired, MapSuperGetExtendingTarget(entry, forknum));
-			if (current >= desired)
+			if (current >= desired &&
+				umfile_ctx_block_exists(map_ctx, forknum, desired - 1))
 			{
 				entry->runtime_flags &= ~extend_flag;
 				MapSuperSetExtendingTarget(entry, forknum, InvalidBlockNumber);
