@@ -3322,7 +3322,7 @@
 { name => 'umbra_chunk_zero_fill_all_slots', type => 'bool', context => 'PGC_SIGHUP', group => 'RESOURCES_BGWRITER',
   short_desc => 'Zero-fill all Umbra chunk physical slots before publishing physical capacity.',
   variable => 'umbra_chunk_zero_fill_all_slots',
-  boot_val => 'false',
+  boot_val => 'true',
   ifdef => 'USE_UMBRA',
 },
 
