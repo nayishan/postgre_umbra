@@ -4702,6 +4702,7 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	uint64		buf_state;
 	bool		checkpoint_needed = false;
 	bool		checkpoint_only = false;
+	bool		saved_checkpoint_slot_valid = false;
 	uint8		saved_checkpoint_slot = CKPT_BUFFER_SLOT_INVALID;
 #endif
 
@@ -4722,13 +4723,20 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 #ifdef USE_UMBRA
 	buf_state = LockBufHdr(buf);
 	checkpoint_needed = (buf_state & BM_CHECKPOINT_NEEDED) != 0;
-	if (checkpoint_needed &&
-		CkptBufferSlots[buf->buf_id] != CKPT_BUFFER_SLOT_INVALID)
+	if (checkpoint_needed)
 	{
-		checkpoint_only = true;
-		saved_checkpoint_slot = CkptBufferSlots[buf->buf_id];
-		if (checkpoint_slot != NULL)
-			*checkpoint_slot = saved_checkpoint_slot;
+		uint32		epoch_state;
+		uint32		checkpoint_epoch;
+
+		epoch_state = pg_atomic_read_u32(CkptBufferSlotCaptureEpoch);
+		checkpoint_epoch = epoch_state & CKPT_BUFFER_SLOT_EPOCH_MASK;
+		if (checkpoint_epoch != 0 &&
+			CkptBufferSlotEpochs[buf->buf_id] == checkpoint_epoch &&
+			CkptBufferSlots[buf->buf_id] != CKPT_BUFFER_SLOT_INVALID)
+		{
+			saved_checkpoint_slot = CkptBufferSlots[buf->buf_id];
+			saved_checkpoint_slot_valid = true;
+		}
 	}
 	UnlockBufHdr(buf);
 #endif
@@ -4744,15 +4752,22 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 		reln = smgropen(BufTagGetRelFileLocator(&buf->tag), INVALID_PROC_NUMBER);
 
 #ifdef USE_UMBRA
-	if (checkpoint_needed && !checkpoint_only &&
+	if (saved_checkpoint_slot_valid &&
 		UmUsesChunkPairedTranslation(reln, BufTagGetForkNum(&buf->tag)))
-		elog(ERROR,
-			 "checkpoint-needed Umbra chunk buffer has no saved checkpoint slot for relation %u/%u/%u fork %d block %u",
-			 reln->smgr_rlocator.locator.spcOid,
-			 reln->smgr_rlocator.locator.dbOid,
-			 reln->smgr_rlocator.locator.relNumber,
-			 BufTagGetForkNum(&buf->tag),
-			 buf->tag.blockNum);
+	{
+		uint8		current_checkpoint_slot = CKPT_BUFFER_SLOT_INVALID;
+
+		if (UmCheckpointCaptureSlot(reln,
+									BufTagGetForkNum(&buf->tag),
+									buf->tag.blockNum,
+									&current_checkpoint_slot) &&
+			current_checkpoint_slot != saved_checkpoint_slot)
+		{
+			checkpoint_only = true;
+			if (checkpoint_slot != NULL)
+				*checkpoint_slot = saved_checkpoint_slot;
+		}
+	}
 #endif
 
 	TRACE_POSTGRESQL_BUFFER_FLUSH_START(BufTagGetForkNum(&buf->tag),
