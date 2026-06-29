@@ -53,7 +53,6 @@
 #include "utils/wait_event.h"
 
 bool		umbra_chunk_zero_fill_all_slots = false;
-bool		umbra_exp2_c3_pause = false;
 
 typedef struct UmbraAccessState
 {
@@ -804,37 +803,35 @@ um_ensure_chunk_physical_capacity(SMgrRelation reln, ForkNumber forknum,
 								  bool skipFsync)
 {
 	BlockNumber physical_nblocks;
+	bool		materialized;
 
 	physical_nblocks =
 		um_chunk_physical_capacity_checked(reln, forknum, logical_nblocks);
 	if (physical_nblocks == 0)
 		return;
 
-	MapSBlockRequestPhysicalCapacity(ctx, reln->smgr_rlocator.locator,
-									 forknum, physical_nblocks);
-}
-
-static void
-um_ensure_chunk_physical_block_for_write(SMgrRelation reln, ForkNumber forknum,
-										 UmbraFileContext *ctx,
-										 BlockNumber pblkno,
-										 bool skipFsync)
-{
-	BlockNumber materialized_nblocks;
-
-	if (MapSBlockTryGetPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
-									   forknum, &materialized_nblocks) &&
-		pblkno < materialized_nblocks)
+	if (umbra_chunk_zero_fill_all_slots)
+		materialized = MapSBlockEnsurePhysicalNblocksZeroFill(ctx,
+															  reln->smgr_rlocator.locator,
+															  forknum,
+															  physical_nblocks,
+															  skipFsync);
+	else
+		materialized = MapSBlockEnsurePhysicalNblocks(ctx,
+													  reln->smgr_rlocator.locator,
+													  forknum,
+													  physical_nblocks,
+													  skipFsync);
+	if (materialized)
 		return;
 
-	materialized_nblocks = umfile_nblocks(ctx, forknum);
-	if (pblkno < materialized_nblocks)
-		return;
-
-	umfile_zeroextend(ctx, forknum, pblkno, 1, skipFsync);
-	MapSBlockBumpPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
-								 forknum, pblkno + 1,
-								 InvalidXLogRecPtr);
+	ereport(ERROR,
+			(errcode(ERRCODE_DATA_CORRUPTED),
+			 errmsg("could not materialize chunk-paired physical capacity for relation %u/%u/%u fork %d",
+					reln->smgr_rlocator.locator.spcOid,
+					reln->smgr_rlocator.locator.dbOid,
+					reln->smgr_rlocator.locator.relNumber,
+					forknum)));
 }
 
 static void
@@ -1752,15 +1749,7 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 						 skipFsync);
 		um_ensure_chunk_physical_capacity(reln, forknum, ctx,
 										  blocknum + 1, skipFsync);
-		um_ensure_chunk_physical_block_for_write(reln, forknum, ctx,
-												 pblkno, skipFsync);
-		{
-			const void *single_buffer[1];
-
-			single_buffer[0] = buffer;
-			umfile_writev(ctx, forknum, pblkno, single_buffer, 1,
-						  skipFsync);
-		}
+		umfile_extend(ctx, forknum, pblkno, buffer, skipFsync);
 		MapSBlockBumpLogicalNblocks(ctx, reln->smgr_rlocator.locator,
 									 forknum, blocknum + 1,
 									 InvalidXLogRecPtr);
@@ -1829,7 +1818,10 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	{
 		if (um_state_uses_chunk_base(access.policy))
 			MapSBlockBumpPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
-										 forknum, max_pblkno + 1,
+										 forknum,
+										 um_chunk_physical_capacity_checked(reln,
+																			forknum,
+																			blocknum + 1),
 										 InvalidXLogRecPtr);
 		else
 			MapSBlockBumpPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
@@ -2001,7 +1993,10 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 		if (max_pblkno != InvalidBlockNumber)
 			MapSBlockBumpPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
-										 forknum, max_pblkno + 1,
+										 forknum,
+										 um_chunk_physical_capacity_checked(reln,
+																			forknum,
+																			blocknum + (BlockNumber) nblocks),
 										 InvalidXLogRecPtr);
 
 		if (extends_logical)
@@ -2308,9 +2303,6 @@ umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 			run_blocks = Min(nblocks - i,
 							 (BlockNumber) UMBRA_CHUNK_PAIRED_PAGES -
 							 (lblk % (BlockNumber) UMBRA_CHUNK_PAIRED_PAGES));
-			um_ensure_chunk_physical_block_for_write(reln, forknum, ctx,
-													 pblk + run_blocks - 1,
-													 skipFsync);
 			umfile_writev(ctx, forknum, pblk, &buffers[i], run_blocks,
 						  skipFsync);
 			i += run_blocks;
@@ -2374,7 +2366,10 @@ umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 		if (max_extended_pblk != InvalidBlockNumber)
 			MapSBlockBumpPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
-										 forknum, max_extended_pblk + 1,
+										 forknum,
+										 um_chunk_physical_capacity_checked(reln,
+																			forknum,
+																			blocknum + nblocks),
 										 InvalidXLogRecPtr);
 
 		return;
@@ -2448,7 +2443,10 @@ umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	{
 		if (um_state_uses_chunk_base(access.policy))
 			MapSBlockBumpPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
-										 forknum, max_extended_pblk + 1,
+										 forknum,
+										 um_chunk_physical_capacity_checked(reln,
+																			forknum,
+																			blocknum + nblocks),
 										 InvalidXLogRecPtr);
 		else
 			MapSBlockBumpPhysicalNblocks(ctx, reln->smgr_rlocator.locator,

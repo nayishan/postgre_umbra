@@ -586,9 +586,6 @@ MapSuperEnsureEntryLocked(RelFileLocator rnode)
 	entry->reserved_next_free_main = 0;
 	entry->reserved_next_free_fsm = 0;
 	entry->reserved_next_free_vm = 0;
-	entry->prealloc_target_main = 0;
-	entry->prealloc_target_fsm = 0;
-	entry->prealloc_target_vm = 0;
 	entry->extending_target_main = InvalidBlockNumber;
 	entry->extending_target_fsm = InvalidBlockNumber;
 	entry->extending_target_vm = InvalidBlockNumber;
@@ -626,9 +623,6 @@ MapSuperDeleteEntry(RelFileLocator rnode)
 		entry->reserved_next_free_main = 0;
 		entry->reserved_next_free_fsm = 0;
 		entry->reserved_next_free_vm = 0;
-		entry->prealloc_target_main = 0;
-		entry->prealloc_target_fsm = 0;
-		entry->prealloc_target_vm = 0;
 		entry->extending_target_main = InvalidBlockNumber;
 		entry->extending_target_fsm = InvalidBlockNumber;
 		entry->extending_target_vm = InvalidBlockNumber;
@@ -1168,33 +1162,6 @@ MapSBlockEnsurePhysicalNblocksZeroFill(UmbraFileContext *map_ctx,
 												  nblocks, skipFsync, true);
 }
 
-void
-MapSBlockRequestPhysicalCapacity(UmbraFileContext *map_ctx, RelFileLocator rnode,
-								 ForkNumber forknum, BlockNumber nblocks)
-{
-	MapSuperEntry *entry;
-
-	if (!MapForkHasMappedState(forknum))
-		return;
-
-	if (nblocks == 0)
-		return;
-
-	if (!MapSBlockEnsureLoaded(map_ctx, rnode))
-		return;
-
-	if (!MapSuperFindEntryLocked(rnode, LW_EXCLUSIVE, &entry))
-		return;
-
-	if (entry->in_use &&
-		(entry->flags & MAPSUPER_FLAG_VALID) != 0 &&
-		(entry->flags & MAPSUPER_FLAG_CORRUPT) == 0)
-		MapSuperMaybeBumpPreallocTarget(entry, forknum, nblocks);
-
-	LWLockRelease(&entry->lock);
-	MapWakeWriter();
-}
-
 static bool
 MapSBlockEnsurePhysicalNblocksInternal(UmbraFileContext *map_ctx,
 									   RelFileLocator rnode,
@@ -1701,9 +1668,6 @@ MapSuperTableShmemInit(void)
 		entry->reserved_next_free_main = 0;
 		entry->reserved_next_free_fsm = 0;
 		entry->reserved_next_free_vm = 0;
-		entry->prealloc_target_main = 0;
-		entry->prealloc_target_fsm = 0;
-		entry->prealloc_target_vm = 0;
 		entry->extending_target_main = InvalidBlockNumber;
 		entry->extending_target_fsm = InvalidBlockNumber;
 		entry->extending_target_vm = InvalidBlockNumber;
