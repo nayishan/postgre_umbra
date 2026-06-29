@@ -671,8 +671,6 @@ static int	CkptBufferIdsPreparedCount = 0;
 #define CKPT_BUFFER_SLOT_EPOCH_MASK		((uint32) 0x7FFFFFFF)
 static uint32 CkptBufferSlotActiveEpoch(void);
 static void ClearCheckpointBufferSlot(BufferDesc *buf);
-static bool CaptureCheckpointBufferSlot(BufferDesc *bufHdr, uint64 mask,
-										CkptSortItem *item);
 static void TerminateCheckpointBufferIO(BufferDesc *buf, bool forget_owner,
 										bool release_aio);
 #endif
@@ -3620,8 +3618,7 @@ BufferSyncPrepare(int flags)
 		mask |= BM_PERMANENT;
 
 #ifdef USE_UMBRA
-	if (CkptBufferSlotActiveEpoch() == 0)
-		CheckPointBuffersCaptureBegin();
+	CheckPointBuffersCaptureBegin();
 #endif
 
 	/*
@@ -3666,12 +3663,6 @@ BufferSyncPrepare(int flags)
 
 		UnlockBufHdr(bufHdr);
 
-#ifdef USE_UMBRA
-		if (needs_checkpoint &&
-			!CaptureCheckpointBufferSlot(bufHdr, mask, &item))
-			needs_checkpoint = false;
-#endif
-
 		if (needs_checkpoint)
 		{
 			buf_state = LockBufHdr(bufHdr);
@@ -3705,16 +3696,6 @@ BufferSyncPrepare(int flags)
 		if (ProcSignalBarrierPending)
 			ProcessProcSignalBarrier();
 	}
-
-#ifdef USE_UMBRA
-	{
-		uint32		epoch_state;
-
-		epoch_state = pg_atomic_read_u32(CkptBufferSlotCaptureEpoch);
-		pg_atomic_write_u32(CkptBufferSlotCaptureEpoch,
-							 epoch_state & CKPT_BUFFER_SLOT_EPOCH_MASK);
-	}
-#endif
 
 	return num_to_scan;
 }
@@ -3755,7 +3736,16 @@ BufferSync(int flags)
 		num_to_scan = BufferSyncPrepare(flags);
 
 	if (num_to_scan == 0)
+	{
+#ifdef USE_UMBRA
+		uint32		epoch_state;
+
+		epoch_state = pg_atomic_read_u32(CkptBufferSlotCaptureEpoch);
+		pg_atomic_write_u32(CkptBufferSlotCaptureEpoch,
+							 epoch_state & CKPT_BUFFER_SLOT_EPOCH_MASK);
+#endif
 		return;					/* nothing to do */
+	}
 
 	WritebackContextInit(&wb_context, &checkpoint_flush_after);
 
@@ -3944,6 +3934,16 @@ BufferSync(int flags)
 	CheckpointStats.ckpt_bufs_written += num_written;
 
 	TRACE_POSTGRESQL_BUFFER_SYNC_DONE(NBuffers, num_written, num_to_scan);
+
+#ifdef USE_UMBRA
+	{
+		uint32		epoch_state;
+
+		epoch_state = pg_atomic_read_u32(CkptBufferSlotCaptureEpoch);
+		pg_atomic_write_u32(CkptBufferSlotCaptureEpoch,
+							 epoch_state & CKPT_BUFFER_SLOT_EPOCH_MASK);
+	}
+#endif
 }
 
 #ifdef USE_UMBRA
@@ -4912,69 +4912,6 @@ ClearCheckpointBufferSlot(BufferDesc *buf)
 	CkptBufferSlotEpochs[buf->buf_id] = 0;
 }
 
-static bool
-CaptureCheckpointBufferSlot(BufferDesc *bufHdr, uint64 mask, CkptSortItem *item)
-{
-	RelFileLocator rlocator;
-	SMgrRelation reln;
-	uint64		buf_state;
-	uint8		checkpoint_slot = CKPT_BUFFER_SLOT_INVALID;
-	uint32		epoch;
-
-	Assert(item != NULL);
-
-	epoch = CkptBufferSlotActiveEpoch();
-	if (epoch == 0)
-		epoch = 1;
-
-	rlocator.spcOid = item->tsId;
-	rlocator.dbOid = item->dbOid;
-	rlocator.relNumber = item->relNumber;
-
-	reln = smgropen(rlocator, INVALID_PROC_NUMBER);
-	if (!UmUsesChunkPairedTranslation(reln, item->forkNum))
-	{
-		buf_state = LockBufHdr(bufHdr);
-		if (bufHdr->tag.spcOid == item->tsId &&
-			bufHdr->tag.dbOid == item->dbOid &&
-			BufTagGetRelNumber(&bufHdr->tag) == item->relNumber &&
-			BufTagGetForkNum(&bufHdr->tag) == item->forkNum &&
-			bufHdr->tag.blockNum == item->blockNum)
-			ClearCheckpointBufferSlot(bufHdr);
-		UnlockBufHdr(bufHdr);
-		return true;
-	}
-
-	if (!UmCheckpointCaptureSlot(reln, item->forkNum, item->blockNum,
-								 &checkpoint_slot))
-		elog(ERROR,
-			 "could not capture checkpoint slot for Umbra chunk relation %u/%u/%u fork %d block %u",
-			 rlocator.spcOid, rlocator.dbOid, rlocator.relNumber,
-			 item->forkNum, item->blockNum);
-
-	buf_state = LockBufHdr(bufHdr);
-	if ((buf_state & mask) != mask ||
-		bufHdr->tag.spcOid != item->tsId ||
-		bufHdr->tag.dbOid != item->dbOid ||
-		BufTagGetRelNumber(&bufHdr->tag) != item->relNumber ||
-		BufTagGetForkNum(&bufHdr->tag) != item->forkNum ||
-		bufHdr->tag.blockNum != item->blockNum)
-	{
-		UnlockBufHdr(bufHdr);
-		return false;
-	}
-	if (CkptBufferSlotEpochs[bufHdr->buf_id] == epoch &&
-		CkptBufferSlots[bufHdr->buf_id] != CKPT_BUFFER_SLOT_INVALID)
-	{
-		UnlockBufHdr(bufHdr);
-		return true;
-	}
-
-	CkptBufferSlots[bufHdr->buf_id] = checkpoint_slot;
-	CkptBufferSlotEpochs[bufHdr->buf_id] = epoch;
-	UnlockBufHdr(bufHdr);
-	return true;
-}
 #endif
 
 /*
