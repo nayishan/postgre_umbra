@@ -3326,6 +3326,14 @@
   ifdef => 'USE_UMBRA',
 },
 
+{ name => 'umbra_exp2_c3_pause', type => 'bool', context => 'PGC_SUSET', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Pauses Umbra block-shift insertion after WAL insert and before MAP publication.',
+  flags => 'GUC_NOT_IN_SAMPLE',
+  variable => 'umbra_exp2_c3_pause',
+  boot_val => 'false',
+  ifdef => 'USE_UMBRA',
+},
+
 { name => 'unix_socket_directories', type => 'string', context => 'PGC_POSTMASTER', group => 'CONN_AUTH_SETTINGS',
   short_desc => 'Sets the directories where Unix-domain sockets will be created.',
   flags => 'GUC_LIST_INPUT | GUC_LIST_QUOTE | GUC_SUPERUSER_ONLY',

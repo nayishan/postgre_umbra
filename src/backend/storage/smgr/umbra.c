@@ -53,6 +53,7 @@
 #include "utils/wait_event.h"
 
 bool		umbra_chunk_zero_fill_all_slots = false;
+bool		umbra_exp2_c3_pause = false;
 
 typedef struct UmbraAccessState
 {

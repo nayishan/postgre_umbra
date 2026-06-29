@@ -19,6 +19,8 @@
 
 #include "postgres.h"
 
+#include <sys/stat.h>
+
 #ifdef USE_LZ4
 #include <lz4.h>
 #endif
@@ -41,6 +43,7 @@
 #include "storage/proc.h"
 #include "storage/smgr.h"
 #ifdef USE_UMBRA
+#include "storage/fd.h"
 #include "storage/map.h"
 #include "storage/umbra.h"
 #include "storage/umfile.h"
@@ -168,6 +171,7 @@ static XLogRecData *XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 											XLogRecPtr *fpw_lsn, int *num_fpi,
 											uint64 *fpi_bytes,
 											bool *topxid_included);
+static void XLogExp2C3PauseAfterInsertUmbra(XLogRecPtr record_endptr);
 static void XLogCommitBlockShiftsUmbra(XLogRecPtr record_endptr);
 static void XLogAbortBlockShiftsUmbra(void);
 static void XLogFillBlockShiftFrontierUmbra(registered_buffer *regbuf,
@@ -200,6 +204,75 @@ static const xlog_storage_mgr xlog_storage_mgr_f = {
 };
 
 #ifdef USE_UMBRA
+#define UMBRA_EXP2_C3_PAUSE_ENTERED_FILE	"umbra_exp2_c3_pause_entered"
+#define UMBRA_EXP2_C3_RELEASE_FILE		"umbra_exp2_c3_release"
+
+static void
+XLogExp2C3PauseAfterInsertUmbra(XLogRecPtr record_endptr)
+{
+	char		entered_path[MAXPGPATH];
+	char		release_path[MAXPGPATH];
+	char		lsnbuf[64];
+	int			fd;
+	int			len;
+	struct stat st;
+
+	if (!umbra_exp2_c3_pause)
+		return;
+
+	snprintf(entered_path, MAXPGPATH, "%s/%s", DataDir,
+			 UMBRA_EXP2_C3_PAUSE_ENTERED_FILE);
+	snprintf(release_path, MAXPGPATH, "%s/%s", DataDir,
+			 UMBRA_EXP2_C3_RELEASE_FILE);
+
+	fd = BasicOpenFile(entered_path,
+					   O_CREAT | O_TRUNC | O_WRONLY | PG_BINARY);
+	if (fd < 0)
+	{
+		elog(LOG, "could not create Umbra Exp2 C3 pause marker file \"%s\": %m",
+			 entered_path);
+		return;
+	}
+
+	len = snprintf(lsnbuf, sizeof(lsnbuf), "%X/%08X\n",
+				   LSN_FORMAT_ARGS(record_endptr));
+	if (write(fd, lsnbuf, len) != len)
+	{
+		int			save_errno = errno;
+
+		close(fd);
+		errno = save_errno;
+		elog(LOG, "could not write Umbra Exp2 C3 pause marker file \"%s\": %m",
+			 entered_path);
+		return;
+	}
+
+	if (close(fd) != 0)
+	{
+		elog(LOG, "could not close Umbra Exp2 C3 pause marker file \"%s\": %m",
+			 entered_path);
+		return;
+	}
+
+	elog(LOG, "Umbra Exp2 C3 pause after WAL insert at %X/%08X",
+		 LSN_FORMAT_ARGS(record_endptr));
+
+	while (stat(release_path, &st) != 0)
+	{
+		if (errno != ENOENT)
+		{
+			elog(LOG, "could not stat Umbra Exp2 C3 release marker file \"%s\": %m",
+				 release_path);
+			break;
+		}
+
+		pg_usleep(10000L);
+	}
+
+	elog(LOG, "Umbra Exp2 C3 pause released at %X/%08X",
+		 LSN_FORMAT_ARGS(record_endptr));
+}
+
 static void
 XLogFillBlockShiftFrontierUmbra(registered_buffer *regbuf,
 								XLogRecordBlockShiftHeader *rbsh)
@@ -717,6 +790,11 @@ XLogInsert(RmgrId rmid, uint8 info)
 				END_CRIT_SECTION();
 			}
 		} while (!XLogRecPtrIsValid(EndPos));
+
+#ifdef USE_UMBRA
+		if (curinsert_has_block_shift)
+			XLogExp2C3PauseAfterInsertUmbra(EndPos);
+#endif
 
 		xlog_storage_mgr_f.xlog_insert_finish(EndPos);
 
