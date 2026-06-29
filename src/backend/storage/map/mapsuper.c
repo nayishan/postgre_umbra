@@ -589,9 +589,6 @@ MapSuperEnsureEntryLocked(RelFileLocator rnode)
 	entry->extending_target_main = InvalidBlockNumber;
 	entry->extending_target_fsm = InvalidBlockNumber;
 	entry->extending_target_vm = InvalidBlockNumber;
-	entry->prealloc_count_main = 0;
-	entry->prealloc_count_fsm = 0;
-	entry->prealloc_count_vm = 0;
 	MapSuperIndex[insert_bucket].slot_id = slot_id;
 
 	LWLockAcquire(&entry->lock, LW_EXCLUSIVE);
@@ -629,9 +626,6 @@ MapSuperDeleteEntry(RelFileLocator rnode)
 		entry->extending_target_main = InvalidBlockNumber;
 		entry->extending_target_fsm = InvalidBlockNumber;
 		entry->extending_target_vm = InvalidBlockNumber;
-		entry->prealloc_count_main = 0;
-		entry->prealloc_count_fsm = 0;
-		entry->prealloc_count_vm = 0;
 		entry->in_use = false;
 		SpinLockAcquire(&MapSuperCtlData->free_list_lock);
 		entry->next_free = MapSuperCtlData->free_head;
@@ -1677,9 +1671,6 @@ MapSuperTableShmemInit(void)
 		entry->extending_target_main = InvalidBlockNumber;
 		entry->extending_target_fsm = InvalidBlockNumber;
 		entry->extending_target_vm = InvalidBlockNumber;
-		entry->prealloc_count_main = 0;
-		entry->prealloc_count_fsm = 0;
-		entry->prealloc_count_vm = 0;
 		LWLockInitialize(&entry->lock, LWTRANCHE_MAP_BUFFER_CONTENT);
 	}
 

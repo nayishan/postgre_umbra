@@ -24,9 +24,8 @@ static bool MapForkNeedsPrealloc(const MapSuperEntry *entry, ForkNumber forknum,
 static bool MapMaybePreallocateFork(UmbraFileContext *map_ctx,
 									RelFileLocator rnode,
 									ForkNumber forknum);
-static BlockNumber MapPreallocBatchForCount(uint64 prealloc_count,
+static BlockNumber MapPreallocBatchForCapacity(BlockNumber capacity,
 											BlockNumber max_batch_blocks);
-static void MapPreallocCountSuccess(MapSuperEntry *entry, ForkNumber forknum);
 static BlockNumber MapPreallocRoundGroups(BlockNumber nblocks);
 static bool MapPreallocDemandForFork(const MapSuperEntry *entry,
 									 ForkNumber forknum,
@@ -89,30 +88,23 @@ MapForkPreallocSettings(ForkNumber forknum, BlockNumber *soft_low,
 }
 
 static BlockNumber
-MapPreallocBatchForCount(uint64 prealloc_count, BlockNumber max_batch_blocks)
+MapPreallocBatchForCapacity(BlockNumber capacity, BlockNumber max_batch_blocks)
 {
 	BlockNumber	group_blocks;
 	BlockNumber	stage_blocks;
+	uint64		capacity_groups;
 
 	group_blocks = MapPreallocRoundGroups(1);
-	if (prealloc_count < 2)
+	capacity_groups = (uint64) capacity / group_blocks;
+	if (capacity_groups < 8)
 		stage_blocks = group_blocks;
-	else if (prealloc_count < 6)
+	else if (capacity_groups < 12)
 		stage_blocks = group_blocks * 4;
 	else
 		stage_blocks = group_blocks * 16;
 
 	stage_blocks = Min(stage_blocks, max_batch_blocks);
 	return MapPreallocRoundGroups(stage_blocks);
-}
-
-static void
-MapPreallocCountSuccess(MapSuperEntry *entry, ForkNumber forknum)
-{
-	uint64		count;
-
-	count = MapSuperGetPreallocCount(entry, forknum);
-	MapSuperSetPreallocCount(entry, forknum, count + 1);
 }
 
 static BlockNumber
@@ -262,9 +254,7 @@ MapMaybePreallocateFork(UmbraFileContext *map_ctx, RelFileLocator rnode,
 		return false;
 	}
 
-	batch_blocks = MapPreallocBatchForCount(MapSuperGetPreallocCount(entry,
-																	 forknum),
-											max_batch_blocks);
+	batch_blocks = MapPreallocBatchForCapacity(capacity, max_batch_blocks);
 	target64 = (uint64) Max(demand, capacity) + (uint64) batch_blocks;
 	target64 = (uint64) MapPreallocRoundGroups((BlockNumber)
 											   Min(target64,
@@ -318,8 +308,6 @@ MapMaybePreallocateFork(UmbraFileContext *map_ctx, RelFileLocator rnode,
 
 	if (MapSuperFindEntryLocked(rnode, LW_EXCLUSIVE, &entry))
 	{
-		if (prealloc_ok)
-			MapPreallocCountSuccess(entry, forknum);
 		entry->runtime_flags &= ~prealloc_flag;
 		LWLockRelease(&entry->lock);
 	}

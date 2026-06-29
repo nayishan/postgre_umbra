@@ -42,9 +42,6 @@ typedef struct MapSuperEntry
 	BlockNumber	extending_target_main;
 	BlockNumber	extending_target_fsm;
 	BlockNumber	extending_target_vm;
-	uint64		prealloc_count_main;
-	uint64		prealloc_count_fsm;
-	uint64		prealloc_count_vm;
 	int			next_free;
 	bool		in_use;
 	LWLock		lock;
@@ -139,49 +136,6 @@ MapSuperResetReservedNextFrees(MapSuperEntry *entry)
 	MapSuperSetReservedNextFree(entry, VISIBILITYMAP_FORKNUM,
 								MapSuperblockGetNextFreePhysBlock(&entry->super,
 																  VISIBILITYMAP_FORKNUM));
-}
-
-static inline uint64
-MapSuperGetPreallocCount(const MapSuperEntry *entry, ForkNumber forknum)
-{
-	Assert(entry != NULL);
-
-	switch (forknum)
-	{
-		case MAIN_FORKNUM:
-			return entry->prealloc_count_main;
-		case FSM_FORKNUM:
-			return entry->prealloc_count_fsm;
-		case VISIBILITYMAP_FORKNUM:
-			return entry->prealloc_count_vm;
-		default:
-			elog(ERROR, "unsupported fork number for prealloc count: %d",
-				 forknum);
-	}
-
-	pg_unreachable();
-}
-
-static inline void
-MapSuperSetPreallocCount(MapSuperEntry *entry, ForkNumber forknum, uint64 count)
-{
-	Assert(entry != NULL);
-
-	switch (forknum)
-	{
-		case MAIN_FORKNUM:
-			entry->prealloc_count_main = count;
-			break;
-		case FSM_FORKNUM:
-			entry->prealloc_count_fsm = count;
-			break;
-		case VISIBILITYMAP_FORKNUM:
-			entry->prealloc_count_vm = count;
-			break;
-		default:
-			elog(ERROR, "unsupported fork number for prealloc count: %d",
-				 forknum);
-	}
 }
 
 extern bool MapSuperFindEntryLocked(RelFileLocator rnode, LWLockMode mode,
