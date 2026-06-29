@@ -79,6 +79,7 @@ tests += {
       't/079_umbra_ordinary_slim_block_remap.pl',
       't/081_umbra_torn_page_remap.pl',
       't/082_umbra_chunk_paired_smoke.pl',
+      't/083_umbra_chunk_checkpoint_publication.pl',
     ],
   },
 }

@@ -39,6 +39,9 @@ typedef struct MapSuperEntry
 	BlockNumber	reserved_next_free_main;
 	BlockNumber	reserved_next_free_fsm;
 	BlockNumber	reserved_next_free_vm;
+	BlockNumber	prealloc_target_main;
+	BlockNumber	prealloc_target_fsm;
+	BlockNumber	prealloc_target_vm;
 	BlockNumber	extending_target_main;
 	BlockNumber	extending_target_fsm;
 	BlockNumber	extending_target_vm;
@@ -120,6 +123,76 @@ MapSuperMaybeBumpReservedNextFree(MapSuperEntry *entry, ForkNumber forknum,
 	current = MapSuperGetReservedNextFree(entry, forknum);
 	if (current < blkno)
 		MapSuperSetReservedNextFree(entry, forknum, blkno);
+}
+
+static inline BlockNumber
+MapSuperGetPreallocTarget(const MapSuperEntry *entry, ForkNumber forknum)
+{
+	Assert(entry != NULL);
+
+	switch (forknum)
+	{
+		case MAIN_FORKNUM:
+			return entry->prealloc_target_main;
+		case FSM_FORKNUM:
+			return entry->prealloc_target_fsm;
+		case VISIBILITYMAP_FORKNUM:
+			return entry->prealloc_target_vm;
+		default:
+			elog(ERROR, "unsupported fork number for preallocation target: %d",
+				 forknum);
+	}
+
+	pg_unreachable();
+}
+
+static inline void
+MapSuperSetPreallocTarget(MapSuperEntry *entry, ForkNumber forknum,
+						  BlockNumber blkno)
+{
+	Assert(entry != NULL);
+
+	blkno = MapNormalizeForkBlockCount(forknum, blkno);
+
+	switch (forknum)
+	{
+		case MAIN_FORKNUM:
+			entry->prealloc_target_main = blkno;
+			break;
+		case FSM_FORKNUM:
+			entry->prealloc_target_fsm = blkno;
+			break;
+		case VISIBILITYMAP_FORKNUM:
+			entry->prealloc_target_vm = blkno;
+			break;
+		default:
+			elog(ERROR, "unsupported fork number for preallocation target: %d",
+				 forknum);
+	}
+}
+
+static inline void
+MapSuperMaybeBumpPreallocTarget(MapSuperEntry *entry, ForkNumber forknum,
+								BlockNumber blkno)
+{
+	BlockNumber	current;
+
+	Assert(entry != NULL);
+
+	blkno = MapNormalizeForkBlockCount(forknum, blkno);
+	current = MapSuperGetPreallocTarget(entry, forknum);
+	if (current < blkno)
+		MapSuperSetPreallocTarget(entry, forknum, blkno);
+}
+
+static inline void
+MapSuperResetPreallocTargets(MapSuperEntry *entry)
+{
+	Assert(entry != NULL);
+
+	MapSuperSetPreallocTarget(entry, MAIN_FORKNUM, 0);
+	MapSuperSetPreallocTarget(entry, FSM_FORKNUM, 0);
+	MapSuperSetPreallocTarget(entry, VISIBILITYMAP_FORKNUM, 0);
 }
 
 static inline void

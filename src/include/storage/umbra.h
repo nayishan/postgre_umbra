@@ -21,6 +21,7 @@
 #include "storage/um_defs.h"
 
 extern PGDLLIMPORT bool umbra_chunk_zero_fill_all_slots;
+extern PGDLLIMPORT bool umbra_exp2_c3_pause;
 
 /*
  * Umbra MAP policy.
