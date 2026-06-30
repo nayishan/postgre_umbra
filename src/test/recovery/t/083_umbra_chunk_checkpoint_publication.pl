@@ -40,12 +40,13 @@ sub wait_for_marker_file
 my $node = PostgreSQL::Test::Cluster->new('umbra_chunk_checkpoint_publication');
 my $psql_timeout = IPC::Run::timer($PostgreSQL::Test::Utils::timeout_default);
 
-$node->init();
+$node->init(no_data_checksums => 1);
 $node->append_conf(
 	'postgresql.conf', qq[
 wal_level = 'replica'
 autovacuum = off
 full_page_writes = on
+wal_log_hints = off
 shared_buffers = '256MB'
 max_wal_size = '4GB'
 min_wal_size = '1GB'
