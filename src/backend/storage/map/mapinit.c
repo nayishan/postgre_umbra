@@ -26,12 +26,6 @@ int			map_buffers = 1024;	/* Number of map buffer slots */
  * relations do not churn through repeated ensure/load cycles.
  */
 int			map_superblocks = 262144;
-int			map_prealloc_main_low = 512;	/* 4MB in 8k blocks */
-int			map_prealloc_main_batch = 1024; /* 8MB in 8k blocks */
-int			map_prealloc_fsm_low = 64;	/* 512kB in 8k blocks */
-int			map_prealloc_fsm_batch = 128; /* 1MB in 8k blocks */
-int			map_prealloc_vm_low = 64;	/* 512kB in 8k blocks */
-int			map_prealloc_vm_batch = 128; /* 1MB in 8k blocks */
 
 /* Shared memory pointer */
 MapSharedData *MapShared = NULL;

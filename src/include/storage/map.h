@@ -228,7 +228,6 @@ extern void MapClockFreeBuffer(int slot_id);
 extern int	MapSyncStart(uint32 *complete_passes, uint32 *num_allocs);
 extern void MapStrategyNotifyWriter(int mapwriter_procno);
 extern void MapWakeWriter(void);
-extern int	MapPreallocStep(int max_relations);
 
 /* Map cache hash table (in mapclock.c) */
 extern int	MapCacheLookup(RelFileLocator rnode, ForkNumber forknum,
@@ -248,12 +247,6 @@ extern void MapInvalidateBuffer(int slot_id, RelFileLocator expected_rnode,
 /* GUCs */
 extern int	map_buffers;
 extern int	map_superblocks;
-extern int	map_prealloc_main_low;
-extern int	map_prealloc_main_batch;
-extern int	map_prealloc_fsm_low;
-extern int	map_prealloc_fsm_batch;
-extern int	map_prealloc_vm_low;
-extern int	map_prealloc_vm_batch;
 
 /* Global data (defined in map.c) */
 extern MapSharedData *MapShared;

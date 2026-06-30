@@ -60,7 +60,6 @@ ALTER TABLE umb_c3_t ALTER COLUMN payload SET STORAGE PLAIN;
 INSERT INTO umb_c3_t
 SELECT g, repeat('x', 7000)
 FROM generate_series(1, 180) AS g;
-SELECT count(*) FROM umb_c3_t;
 CHECKPOINT;
 ]);
 

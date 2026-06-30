@@ -97,6 +97,7 @@ void MapSBlockBumpPhysicalState(UmbraFileContext *map_ctx,
 								ForkNumber forknum,
 								BlockNumber nblocks,
 								bool bump_next_free,
+								bool bump_capacity,
 								XLogRecPtr map_lsn);
 
 void
@@ -616,25 +617,6 @@ MapSuperDeleteEntry(RelFileLocator rnode)
 	{
 		entry = MapSuperEntryBySlot(slot_id);
 		LWLockAcquire(&entry->lock, LW_EXCLUSIVE);
-		while (entry->runtime_flags != 0)
-		{
-			LWLockRelease(&entry->lock);
-			LWLockRelease(partition_lock);
-			CHECK_FOR_INTERRUPTS();
-			pg_usleep(1000L);
-			LWLockAcquire(partition_lock, LW_EXCLUSIVE);
-			slot_id = MapSuperLookupSlotLocked(rnode, hashcode, partition,
-											   &bucket);
-			if (slot_id < 0)
-				break;
-			entry = MapSuperEntryBySlot(slot_id);
-			LWLockAcquire(&entry->lock, LW_EXCLUSIVE);
-		}
-		if (slot_id < 0)
-		{
-			LWLockRelease(partition_lock);
-			return;
-		}
 		entry->flags = 0;
 		entry->runtime_flags = 0;
 		entry->page_lsn = InvalidXLogRecPtr;
@@ -1102,10 +1084,12 @@ MapSBlockSetPendingFlag(UmbraFileContext *map_ctx, RelFileLocator rnode,
 void
 MapSBlockBumpPhysicalState(UmbraFileContext *map_ctx, RelFileLocator rnode,
 						   ForkNumber forknum, BlockNumber nblocks,
-						   bool bump_next_free, XLogRecPtr map_lsn)
+						   bool bump_next_free, bool bump_capacity,
+						   XLogRecPtr map_lsn)
 {
 	MapSuperEntry *entry;
 	BlockNumber		current_next;
+	BlockNumber		current_capacity;
 	bool			changed = false;
 
 	if (!MapForkHasMappedState(forknum))
@@ -1117,7 +1101,9 @@ MapSBlockBumpPhysicalState(UmbraFileContext *map_ctx, RelFileLocator rnode,
 		return;
 
 	current_next = MapSuperblockGetNextFreePhysBlock(&entry->super, forknum);
+	current_capacity = MapSuperblockGetPhysCapacity(&entry->super, forknum);
 	current_next = MapNormalizeForkBlockCount(forknum, current_next);
+	current_capacity = MapNormalizeForkBlockCount(forknum, current_capacity);
 	Assert(MapNormalizeForkBlockCount(forknum,
 									  MapSuperblockGetNextFreePhysBlock(&entry->super,
 																		forknum)) <=
@@ -1127,6 +1113,11 @@ MapSBlockBumpPhysicalState(UmbraFileContext *map_ctx, RelFileLocator rnode,
 	{
 		MapSuperblockSetNextFreePhysBlock(&entry->super, forknum, nblocks);
 		MapSuperMaybeBumpReservedNextFree(entry, forknum, nblocks);
+		changed = true;
+	}
+	if (bump_capacity && current_capacity < nblocks)
+	{
+		MapSuperblockSetPhysCapacity(&entry->super, forknum, nblocks);
 		changed = true;
 	}
 
@@ -1183,7 +1174,6 @@ MapSBlockEnsurePhysicalNblocksInternal(UmbraFileContext *map_ctx,
 	uint32		extend_flag;
 	BlockNumber	current;
 	BlockNumber	desired;
-	BlockNumber	physical_nblocks;
 	bool		success = false;
 
 	if (!MapForkHasMappedState(forknum))
@@ -1235,18 +1225,14 @@ retry:
 		{
 			if (zero_fill)
 			{
-				physical_nblocks = umfile_ctx_get_nblocks(map_ctx, forknum);
-				physical_nblocks = MapNormalizeForkBlockCount(forknum,
-															  physical_nblocks);
-				if (physical_nblocks < desired)
+				current = MapNormalizeForkBlockCount(forknum, current);
+				if (current < desired)
 				{
-					BlockNumber zero_start = physical_nblocks;
+					BlockNumber zero_start = current;
 
 					while (zero_start < desired)
 					{
 						int			zero_blocks;
-
-						CHECK_FOR_INTERRUPTS();
 
 						zero_blocks = (int) Min(desired - zero_start,
 												 (BlockNumber) INT_MAX);
@@ -1297,8 +1283,7 @@ retry:
 			}
 
 			desired = Max(desired, MapSuperGetExtendingTarget(entry, forknum));
-			if (current >= desired &&
-				umfile_ctx_block_exists(map_ctx, forknum, desired - 1))
+			if (current >= desired)
 			{
 				entry->runtime_flags &= ~extend_flag;
 				MapSuperSetExtendingTarget(entry, forknum, InvalidBlockNumber);
@@ -1569,33 +1554,8 @@ MapSBlockBumpPhysicalNblocks(UmbraFileContext *map_ctx, RelFileLocator rnode,
 							 ForkNumber forknum, BlockNumber nblocks,
 							 XLogRecPtr map_lsn)
 {
-	MapSuperEntry *entry;
-	BlockNumber		current_capacity;
-
-	if (!MapForkHasMappedState(forknum))
-		return;
-
-	if (!MapSuperPrepareEntryForUpdate(map_ctx, rnode, map_lsn,
-									   "MAP fork is missing while validating physical capacity",
-									   &entry))
-		return;
-
-	current_capacity = MapSuperblockGetPhysCapacity(&entry->super, forknum);
-	current_capacity = MapNormalizeForkBlockCount(forknum, current_capacity);
-	Assert(current_capacity >= nblocks);
-
-	if (current_capacity < nblocks)
-	{
-		LWLockRelease(&entry->lock);
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("physical capacity was not materialized before publication for relation %u/%u/%u fork %d",
-						rnode.spcOid, rnode.dbOid, rnode.relNumber, forknum),
-				 errdetail("Requested %u blocks, but published capacity is %u blocks.",
-						   nblocks, current_capacity)));
-	}
-
-	LWLockRelease(&entry->lock);
+	MapSBlockBumpPhysicalState(map_ctx, rnode, forknum, nblocks,
+							   false, true, map_lsn);
 }
 
 void
@@ -1604,7 +1564,7 @@ MapSBlockBumpNextFreePhysBlock(UmbraFileContext *map_ctx, RelFileLocator rnode,
 							   XLogRecPtr map_lsn)
 {
 	MapSBlockBumpPhysicalState(map_ctx, rnode, forknum, next_free_pblk,
-							   true, map_lsn);
+							   true, false, map_lsn);
 }
 
 void

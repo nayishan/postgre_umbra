@@ -152,6 +152,7 @@ extern void MapSBlockBumpPhysicalState(UmbraFileContext *map_ctx,
 									   ForkNumber forknum,
 									   BlockNumber nblocks,
 									   bool bump_next_free,
+									   bool bump_capacity,
 									   XLogRecPtr map_lsn);
 extern void MapSuperTableShmemRequest(void);
 extern void MapSuperTableShmemInit(void);
