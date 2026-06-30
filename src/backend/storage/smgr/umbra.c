@@ -217,6 +217,9 @@ static void um_ensure_datafork_batch_ready_for_access(SMgrRelation reln,
 													  const UmbraAccessState *access,
 													  BlockNumber pblkno,
 													  bool skipFsync);
+static void um_zeroextend_flush_run(UmbraFileContext *ctx, ForkNumber forknum,
+									BlockNumber *run_start_pblk,
+									int *run_len, bool skipFsync);
 static bool um_fork_uses_map_translation(ForkNumber forknum);
 static bool um_mapped_exists_from_super(SMgrRelation reln, ForkNumber forknum);
 static UmbraMapPolicy um_open_map_state(SMgrRelation reln);
@@ -370,6 +373,22 @@ um_ensure_datafork_batch_ready_for_access(SMgrRelation reln,
 											  reln->smgr_rlocator.locator,
 											  forknum, pblkno + 1,
 											  skipFsync);
+}
+
+static void
+um_zeroextend_flush_run(UmbraFileContext *ctx, ForkNumber forknum,
+						BlockNumber *run_start_pblk,
+						int *run_len, bool skipFsync)
+{
+	Assert(run_start_pblk != NULL);
+	Assert(run_len != NULL);
+
+	if (*run_len <= 0)
+		return;
+
+	umfile_zeroextend(ctx, forknum, *run_start_pblk, *run_len, skipFsync);
+	*run_start_pblk = InvalidBlockNumber;
+	*run_len = 0;
 }
 
 /*
@@ -1850,6 +1869,8 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	{
 		BlockNumber logical_nblocks;
 		BlockNumber logical_end = blocknum + (BlockNumber) nblocks;
+		BlockNumber old_physical_nblocks = InvalidBlockNumber;
+		bool		skip_new_capacity_zero;
 
 		if (logical_end < blocknum)
 			ereport(ERROR,
@@ -1870,6 +1891,11 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 							reln->smgr_rlocator.locator.relNumber,
 							forknum, blocknum, logical_nblocks)));
 
+		skip_new_capacity_zero = umbra_chunk_zero_fill_all_slots;
+		if (skip_new_capacity_zero &&
+			!MapSBlockTryGetPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
+											forknum, &old_physical_nblocks))
+			old_physical_nblocks = 0;
 		um_ensure_chunk_physical_capacity(reln, forknum, ctx,
 										  logical_end, skipFsync);
 		run_start_pblk = InvalidBlockNumber;
@@ -1879,6 +1905,13 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		{
 			BlockNumber pblk = um_chunk_base_pblk_checked(reln, forknum,
 														 blocknum + (BlockNumber) i);
+
+			if (skip_new_capacity_zero && pblk >= old_physical_nblocks)
+			{
+				um_zeroextend_flush_run(ctx, forknum, &run_start_pblk,
+										&run_len, skipFsync);
+				continue;
+			}
 
 			if (run_len == 0)
 			{
@@ -1891,16 +1924,15 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 			}
 			else
 			{
-				umfile_zeroextend(ctx, forknum, run_start_pblk,
-								  run_len, skipFsync);
+				um_zeroextend_flush_run(ctx, forknum, &run_start_pblk,
+										&run_len, skipFsync);
 				run_start_pblk = pblk;
 				run_len = 1;
 			}
 		}
 
-		if (run_len > 0)
-			umfile_zeroextend(ctx, forknum, run_start_pblk, run_len,
-							  skipFsync);
+		um_zeroextend_flush_run(ctx, forknum, &run_start_pblk, &run_len,
+								skipFsync);
 
 		MapSBlockBumpLogicalNblocks(ctx, reln->smgr_rlocator.locator,
 									forknum, logical_end,
@@ -1931,7 +1963,9 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	{
 		BlockNumber logical_nblocks;
 		BlockNumber logical_end = blocknum + (BlockNumber) nblocks;
+		BlockNumber old_physical_nblocks = InvalidBlockNumber;
 		bool		extends_logical;
+		bool		skip_new_capacity_zero = false;
 
 		if (logical_end < blocknum)
 			ereport(ERROR,
@@ -1953,9 +1987,16 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 							reln->smgr_rlocator.locator.relNumber,
 							forknum, blocknum, logical_nblocks)));
 		if (extends_logical)
+		{
+			skip_new_capacity_zero = umbra_chunk_zero_fill_all_slots;
+			if (skip_new_capacity_zero &&
+				!MapSBlockTryGetPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
+												forknum, &old_physical_nblocks))
+				old_physical_nblocks = 0;
 			um_ensure_chunk_physical_capacity(reln, forknum, ctx,
 											  logical_end,
 											  true /* skipFsync */);
+		}
 
 		for (int i = 0; i < nblocks; i++)
 		{
@@ -1970,6 +2011,15 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 			if (max_pblkno == InvalidBlockNumber || pblk > max_pblkno)
 				max_pblkno = pblk;
 
+			if (skip_new_capacity_zero &&
+				lblk >= logical_nblocks &&
+				pblk >= old_physical_nblocks)
+			{
+				um_zeroextend_flush_run(ctx, forknum, &run_start_pblk,
+										&run_len, skipFsync);
+				continue;
+			}
+
 			if (run_len == 0)
 			{
 				run_start_pblk = pblk;
@@ -1981,16 +2031,15 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 			}
 			else
 			{
-				umfile_zeroextend(ctx, forknum, run_start_pblk,
-								  run_len, skipFsync);
+				um_zeroextend_flush_run(ctx, forknum, &run_start_pblk,
+										&run_len, skipFsync);
 				run_start_pblk = pblk;
 				run_len = 1;
 			}
 		}
 
-		if (run_len > 0)
-			umfile_zeroextend(ctx, forknum, run_start_pblk, run_len,
-							  skipFsync);
+		um_zeroextend_flush_run(ctx, forknum, &run_start_pblk, &run_len,
+								skipFsync);
 
 		if (max_pblkno != InvalidBlockNumber)
 			MapSBlockBumpPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
