@@ -975,6 +975,32 @@ UmRebuildMapAndSuperblockForSkipWAL(SMgrRelation reln)
 
 		if (physical_nblocks > 0)
 		{
+			if (umbra_chunk_zero_fill_all_slots)
+			{
+				if (!MapSBlockEnsurePhysicalNblocksZeroFill(ctx,
+															reln->smgr_rlocator.locator,
+															forknum,
+															physical_nblocks,
+															true /* skipFsync */))
+					elog(ERROR,
+						 "could not materialize skip-WAL physical capacity for relation %u/%u/%u fork %d",
+						 reln->smgr_rlocator.locator.spcOid,
+						 reln->smgr_rlocator.locator.dbOid,
+						 reln->smgr_rlocator.locator.relNumber,
+						 forknum);
+			}
+			else if (!MapSBlockEnsurePhysicalNblocks(ctx,
+													 reln->smgr_rlocator.locator,
+													 forknum,
+													 physical_nblocks,
+													 true /* skipFsync */))
+				elog(ERROR,
+					 "could not materialize skip-WAL physical capacity for relation %u/%u/%u fork %d",
+					 reln->smgr_rlocator.locator.spcOid,
+					 reln->smgr_rlocator.locator.dbOid,
+					 reln->smgr_rlocator.locator.relNumber,
+					 forknum);
+
 			MapSBlockBumpNextFreePhysBlock(ctx, reln->smgr_rlocator.locator,
 										   forknum, physical_nblocks, fork_lsn);
 			MapSBlockBumpPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
@@ -1821,10 +1847,11 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 {
 	UmbraFileContext *ctx = um_ctx_acquire(reln);
 	UmbraAccessState access;
-	BlockNumber	run_start_pblk;
 	BlockNumber	logical_nblocks;
 	BlockNumber	logical_end;
 	BlockNumber	max_pblkno = InvalidBlockNumber;
+	BlockNumber	old_physical_nblocks = InvalidBlockNumber;
+	bool		have_old_physical_nblocks = false;
 
 	if (nblocks <= 0)
 		return;
@@ -1871,6 +1898,11 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 			max_pblkno = pblk;
 	}
 
+	if (umbra_chunk_zero_fill_all_slots)
+		have_old_physical_nblocks =
+			MapSBlockTryGetPhysicalNblocks(ctx, reln->smgr_rlocator.locator,
+										   forknum, &old_physical_nblocks);
+
 	/*
 	 * Materialize the chunk capacity before issuing any physical writes.  The
 	 * ensure path owns EXTENDING_* and publishes phys_capacity.
@@ -1879,12 +1911,12 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		um_ensure_chunk_physical_capacity_for_pblk(reln, forknum, ctx,
 												   max_pblkno, skipFsync);
 
-	run_start_pblk = InvalidBlockNumber;
 	for (int i = 0; i < nblocks;)
 	{
 		BlockNumber lblk = blocknum + (BlockNumber) i;
 		BlockNumber pblk = um_chunk_base_pblk_checked(reln, forknum, lblk);
 		int			run_len;
+		int			zero_len;
 
 		run_len = (int) Min((BlockNumber) nblocks - (BlockNumber) i,
 							(BlockNumber) UMBRA_CHUNK_PAIRED_PAGES -
@@ -1895,8 +1927,25 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		run_len = Min(run_len, PG_IOV_MAX);
 
 		Assert(run_len > 0);
-		run_start_pblk = pblk;
-		umfile_zeroextend(ctx, forknum, run_start_pblk, run_len, skipFsync);
+		zero_len = run_len;
+		if (umbra_chunk_zero_fill_all_slots && have_old_physical_nblocks)
+		{
+			BlockNumber run_end_pblk = pblk + (BlockNumber) run_len;
+
+			/*
+			 * Pages newly covered by this capacity materialization were already
+			 * zero-filled by the EXTENDING_* owner.  Pages inside the previously
+			 * published capacity may be logical births after truncate, so keep
+			 * explicitly zeroing that prefix.
+			 */
+			if (pblk >= old_physical_nblocks)
+				zero_len = 0;
+			else if (run_end_pblk > old_physical_nblocks)
+				zero_len = (int) (old_physical_nblocks - pblk);
+		}
+
+		if (zero_len > 0)
+			umfile_zeroextend(ctx, forknum, pblk, zero_len, skipFsync);
 		i += run_len;
 	}
 

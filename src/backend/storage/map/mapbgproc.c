@@ -393,8 +393,5 @@ MapPreallocStep(int max_relations)
 			prealloc_ops++;
 	}
 
-	if (visited == 0)
-		scan_slot = 0;
-
 	return prealloc_ops;
 }

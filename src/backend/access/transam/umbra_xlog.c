@@ -92,6 +92,35 @@ umbra_redo(XLogReaderState *record)
 							 xlrec->rlocator.relNumber,
 							 forknum, nblocks);
 
+					if (physical_nblocks > 0)
+					{
+						if (umbra_chunk_zero_fill_all_slots)
+						{
+							if (!MapSBlockEnsurePhysicalNblocksZeroFill(ctx,
+																		xlrec->rlocator,
+																		forknum,
+																		physical_nblocks,
+																		true /* skipFsync */))
+								elog(PANIC,
+									 "could not materialize UMBRA skip-WAL physical capacity for relation %u/%u/%u fork %d",
+									 xlrec->rlocator.spcOid,
+									 xlrec->rlocator.dbOid,
+									 xlrec->rlocator.relNumber,
+									 forknum);
+						}
+						else if (!MapSBlockEnsurePhysicalNblocks(ctx,
+																 xlrec->rlocator,
+																 forknum,
+																 physical_nblocks,
+																 true /* skipFsync */))
+							elog(PANIC,
+								 "could not materialize UMBRA skip-WAL physical capacity for relation %u/%u/%u fork %d",
+								 xlrec->rlocator.spcOid,
+								 xlrec->rlocator.dbOid,
+								 xlrec->rlocator.relNumber,
+								 forknum);
+					}
+
 					MapSBlockBumpNextFreePhysBlock(ctx, xlrec->rlocator,
 												   forknum, physical_nblocks,
 												   record->EndRecPtr);
