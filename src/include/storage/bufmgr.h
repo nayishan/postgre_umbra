@@ -289,6 +289,9 @@ extern void AssertBufferLocksPermitCatalogRead(void);
 #endif
 extern char *DebugPrintBufferRefcount(Buffer buffer);
 extern void CheckPointBuffers(int flags);
+#ifdef USE_UMBRA
+extern void BufferSaveCheckpointPblk(Buffer buffer, BlockNumber checkpoint_pblk);
+#endif
 extern BlockNumber BufferGetBlockNumber(Buffer buffer);
 extern BlockNumber RelationGetNumberOfBlocksInFork(Relation relation,
 												   ForkNumber forkNum);

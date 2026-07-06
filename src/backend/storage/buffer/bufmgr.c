@@ -64,6 +64,9 @@
 #include "storage/read_stream.h"
 #include "storage/smgr.h"
 #include "storage/standby.h"
+#ifdef USE_UMBRA
+#include "storage/umbra.h"
+#endif
 #include "utils/memdebug.h"
 #include "utils/ps_status.h"
 #include "utils/rel.h"
@@ -658,6 +661,18 @@ static void FlushUnlockedBuffer(BufferDesc *buf, SMgrRelation reln,
 								IOObject io_object, IOContext io_context);
 static void FlushBuffer(BufferDesc *buf, SMgrRelation reln,
 						IOObject io_object, IOContext io_context);
+#ifdef USE_UMBRA
+#define CKPT_BUFFER_PBLK_EPOCH_ACTIVE	((uint32) 0x80000000)
+#define CKPT_BUFFER_PBLK_EPOCH_MASK		((uint32) 0x7FFFFFFF)
+static uint32 CkptBufferPblkActiveEpoch(void);
+static void CheckPointBuffersPblkCaptureBegin(void);
+static void CheckPointBuffersPblkCaptureEnd(void);
+static void ClearCheckpointBufferPblk(BufferDesc *buf);
+static bool GetSavedCheckpointPblk(BufferDesc *buf,
+								   BlockNumber *checkpoint_pblk);
+static void TerminateCheckpointBufferIO(BufferDesc *buf, bool forget_owner,
+										bool release_aio);
+#endif
 static void FindAndDropRelationBuffers(RelFileLocator rlocator,
 									   ForkNumber forkNum,
 									   BlockNumber nForkBlock,
@@ -2316,6 +2331,9 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	Assert(BUF_STATE_GET_REFCOUNT(victim_buf_state) == 1);
 	Assert(!(victim_buf_state & (BM_TAG_VALID | BM_VALID | BM_DIRTY | BM_IO_IN_PROGRESS)));
 
+#ifdef USE_UMBRA
+	ClearCheckpointBufferPblk(victim_buf_hdr);
+#endif
 	victim_buf_hdr->tag = newTag;
 
 	/*
@@ -2430,6 +2448,9 @@ retry:
 	 * linear scans of the buffer array don't think the buffer is valid.
 	 */
 	oldFlags = buf_state & BUF_FLAG_MASK;
+#ifdef USE_UMBRA
+	ClearCheckpointBufferPblk(buf);
+#endif
 	ClearBufferTag(&buf->tag);
 
 	UnlockBufHdrExt(buf, buf_state,
@@ -2514,6 +2535,9 @@ InvalidateVictimBuffer(BufferDesc *buf_hdr)
 	 * cheaper pre-check for several linear scans of shared buffers use the
 	 * tag (see e.g. FlushDatabaseBuffers()).
 	 */
+#ifdef USE_UMBRA
+	ClearCheckpointBufferPblk(buf_hdr);
+#endif
 	ClearBufferTag(&buf_hdr->tag);
 	UnlockBufHdrExt(buf_hdr, buf_state,
 					0,
@@ -2977,6 +3001,9 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 			Assert(!(buf_state & (BM_VALID | BM_TAG_VALID | BM_DIRTY)));
 			Assert(BUF_STATE_GET_REFCOUNT(buf_state) == 1);
 
+#ifdef USE_UMBRA
+			ClearCheckpointBufferPblk(victim_buf_hdr);
+#endif
 			victim_buf_hdr->tag = tag;
 
 			set_bits |= BM_TAG_VALID | BUF_USAGECOUNT_ONE;
@@ -3573,6 +3600,10 @@ BufferSync(int flags)
 					CHECKPOINT_FLUSH_UNLOGGED))))
 		mask |= BM_PERMANENT;
 
+#ifdef USE_UMBRA
+	CheckPointBuffersPblkCaptureBegin();
+#endif
+
 	/*
 	 * Loop over all buffers, and mark the ones that need to be written with
 	 * BM_CHECKPOINT_NEEDED.  Count them as we go (num_to_scan), so that we
@@ -3625,7 +3656,12 @@ BufferSync(int flags)
 	}
 
 	if (num_to_scan == 0)
+	{
+#ifdef USE_UMBRA
+		CheckPointBuffersPblkCaptureEnd();
+#endif
 		return;					/* nothing to do */
+	}
 
 	WritebackContextInit(&wb_context, &checkpoint_flush_after);
 
@@ -3814,6 +3850,10 @@ BufferSync(int flags)
 	CheckpointStats.ckpt_bufs_written += num_written;
 
 	TRACE_POSTGRESQL_BUFFER_SYNC_DONE(NBuffers, num_written, num_to_scan);
+
+#ifdef USE_UMBRA
+	CheckPointBuffersPblkCaptureEnd();
+#endif
 }
 
 /*
@@ -4507,6 +4547,10 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	ErrorContextCallback errcallback;
 	instr_time	io_start;
 	Block		bufBlock;
+#ifdef USE_UMBRA
+	bool		checkpoint_only = false;
+	BlockNumber	checkpoint_pblk = InvalidBlockNumber;
+#endif
 
 	Assert(BufferLockHeldByMeInMode(buf, BUFFER_LOCK_EXCLUSIVE) ||
 		   BufferLockHeldByMeInMode(buf, BUFFER_LOCK_SHARE_EXCLUSIVE));
@@ -4519,6 +4563,10 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	if (StartSharedBufferIO(buf, false, true, NULL) == BUFFER_IO_ALREADY_DONE)
 		return;
 
+#ifdef USE_UMBRA
+	(void) GetSavedCheckpointPblk(buf, &checkpoint_pblk);
+#endif
+
 	/* Setup error traceback support for ereport() */
 	errcallback.callback = shared_buffer_write_error_callback;
 	errcallback.arg = buf;
@@ -4528,6 +4576,25 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	/* Find smgr relation for buffer */
 	if (reln == NULL)
 		reln = smgropen(BufTagGetRelFileLocator(&buf->tag), INVALID_PROC_NUMBER);
+
+#ifdef USE_UMBRA
+	if (checkpoint_pblk != InvalidBlockNumber)
+	{
+		BlockNumber	current_pblk = InvalidBlockNumber;
+
+		if (!UmMapTryLookupPblkno(reln, BufTagGetForkNum(&buf->tag),
+								  buf->tag.blockNum, &current_pblk))
+			elog(ERROR,
+				 "checkpoint physical block saved without current Umbra mapping for relation %u/%u/%u fork %d block %u",
+				 reln->smgr_rlocator.locator.spcOid,
+				 reln->smgr_rlocator.locator.dbOid,
+				 reln->smgr_rlocator.locator.relNumber,
+				 BufTagGetForkNum(&buf->tag),
+				 buf->tag.blockNum);
+
+		checkpoint_only = (current_pblk != checkpoint_pblk);
+	}
+#endif
 
 	TRACE_POSTGRESQL_BUFFER_FLUSH_START(BufTagGetForkNum(&buf->tag),
 										buf->tag.blockNum,
@@ -4574,6 +4641,15 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 
 	io_start = pgstat_prepare_io_time(track_io_timing);
 
+#ifdef USE_UMBRA
+	if (checkpoint_only)
+		UmCheckpointWritePblk(reln,
+							  BufTagGetForkNum(&buf->tag),
+							  buf->tag.blockNum,
+							  bufBlock,
+							  checkpoint_pblk);
+	else
+#endif
 	smgrwrite(reln,
 			  BufTagGetForkNum(&buf->tag),
 			  buf->tag.blockNum,
@@ -4606,6 +4682,11 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	/*
 	 * Mark the buffer as clean and end the BM_IO_IN_PROGRESS state.
 	 */
+#ifdef USE_UMBRA
+	if (checkpoint_only)
+		TerminateCheckpointBufferIO(buf, true, false);
+	else
+#endif
 	TerminateBufferIO(buf, true, 0, true, false);
 
 	TRACE_POSTGRESQL_BUFFER_FLUSH_DONE(BufTagGetForkNum(&buf->tag),
@@ -4632,6 +4713,117 @@ FlushUnlockedBuffer(BufferDesc *buf, SMgrRelation reln,
 	FlushBuffer(buf, reln, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
 	BufferLockUnlock(buffer, buf);
 }
+
+#ifdef USE_UMBRA
+static uint32
+CkptBufferPblkActiveEpoch(void)
+{
+	uint32		epoch_state;
+
+	epoch_state = pg_atomic_read_u32(CkptBufferPblkCaptureEpoch);
+	if ((epoch_state & CKPT_BUFFER_PBLK_EPOCH_ACTIVE) == 0)
+		return 0;
+
+	return epoch_state & CKPT_BUFFER_PBLK_EPOCH_MASK;
+}
+
+static void
+CheckPointBuffersPblkCaptureBegin(void)
+{
+	uint32		epoch_state;
+	uint32		epoch;
+
+	epoch_state = pg_atomic_read_u32(CkptBufferPblkCaptureEpoch);
+	epoch = (epoch_state & CKPT_BUFFER_PBLK_EPOCH_MASK) + 1;
+	if (epoch == 0 || epoch > CKPT_BUFFER_PBLK_EPOCH_MASK)
+		epoch = 1;
+
+	pg_atomic_write_u32(CkptBufferPblkCaptureEpoch,
+						CKPT_BUFFER_PBLK_EPOCH_ACTIVE | epoch);
+}
+
+static void
+CheckPointBuffersPblkCaptureEnd(void)
+{
+	uint32		epoch_state;
+
+	epoch_state = pg_atomic_read_u32(CkptBufferPblkCaptureEpoch);
+	pg_atomic_write_u32(CkptBufferPblkCaptureEpoch,
+						epoch_state & CKPT_BUFFER_PBLK_EPOCH_MASK);
+}
+
+static void
+ClearCheckpointBufferPblk(BufferDesc *buf)
+{
+	CkptBufferPblks[buf->buf_id] = InvalidBlockNumber;
+	CkptBufferPblkEpochs[buf->buf_id] = 0;
+}
+
+void
+BufferSaveCheckpointPblk(Buffer buffer, BlockNumber checkpoint_pblk)
+{
+	BufferDesc *bufHdr;
+	uint32		epoch;
+	uint64		buf_state;
+
+	if (!BufferIsValid(buffer) || BufferIsLocal(buffer))
+		return;
+	if (checkpoint_pblk == InvalidBlockNumber)
+		return;
+
+	epoch = CkptBufferPblkActiveEpoch();
+	if (epoch == 0)
+		return;
+
+	bufHdr = GetBufferDescriptor(buffer - 1);
+	buf_state = LockBufHdr(bufHdr);
+
+	if ((buf_state & BM_CHECKPOINT_NEEDED) == 0)
+	{
+		UnlockBufHdr(bufHdr);
+		return;
+	}
+
+	if (CkptBufferPblkEpochs[bufHdr->buf_id] == epoch &&
+		CkptBufferPblks[bufHdr->buf_id] != InvalidBlockNumber)
+	{
+		UnlockBufHdr(bufHdr);
+		return;
+	}
+
+	CkptBufferPblks[bufHdr->buf_id] = checkpoint_pblk;
+	CkptBufferPblkEpochs[bufHdr->buf_id] = epoch;
+	UnlockBufHdr(bufHdr);
+}
+
+static bool
+GetSavedCheckpointPblk(BufferDesc *buf, BlockNumber *checkpoint_pblk)
+{
+	uint64		buf_state;
+	uint32		epoch_state;
+	uint32		checkpoint_epoch;
+	bool		valid = false;
+
+	*checkpoint_pblk = InvalidBlockNumber;
+
+	epoch_state = pg_atomic_read_u32(CkptBufferPblkCaptureEpoch);
+	checkpoint_epoch = epoch_state & CKPT_BUFFER_PBLK_EPOCH_MASK;
+	if (checkpoint_epoch == 0)
+		return false;
+
+	buf_state = LockBufHdr(buf);
+	if ((buf_state & BM_CHECKPOINT_NEEDED) != 0 &&
+		CkptBufferPblkEpochs[buf->buf_id] == checkpoint_epoch &&
+		CkptBufferPblks[buf->buf_id] != InvalidBlockNumber)
+	{
+		*checkpoint_pblk = CkptBufferPblks[buf->buf_id];
+		valid = true;
+	}
+	UnlockBufHdr(buf);
+
+	return valid;
+}
+#endif
 
 /*
  * RelationGetNumberOfBlocksInFork
@@ -7377,7 +7569,12 @@ TerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint64 set_flag_bits,
 	unset_flag_bits |= BM_IO_ERROR;
 
 	if (clear_dirty)
+	{
 		unset_flag_bits |= BM_DIRTY | BM_CHECKPOINT_NEEDED;
+#ifdef USE_UMBRA
+		ClearCheckpointBufferPblk(buf);
+#endif
+	}
 
 	if (release_aio)
 	{
@@ -7408,6 +7605,51 @@ TerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint64 set_flag_bits,
 	if (release_aio && (buf_state & BM_PIN_COUNT_WAITER))
 		WakePinCountWaiter(buf);
 }
+
+#ifdef USE_UMBRA
+static void
+TerminateCheckpointBufferIO(BufferDesc *buf, bool forget_owner, bool release_aio)
+{
+	uint64		buf_state;
+	uint64		unset_flag_bits = 0;
+	int			refcount_change = 0;
+
+	buf_state = LockBufHdr(buf);
+
+	Assert(buf_state & BM_IO_IN_PROGRESS);
+	unset_flag_bits |= BM_IO_IN_PROGRESS;
+
+	/* Clear earlier errors, if this IO failed, it'll be marked again */
+	unset_flag_bits |= BM_IO_ERROR;
+
+	/*
+	 * A checkpoint-pblk write satisfies only the checkpoint image.  The
+	 * buffer remains dirty for its current active pblk.
+	 */
+	unset_flag_bits |= BM_CHECKPOINT_NEEDED;
+	ClearCheckpointBufferPblk(buf);
+
+	if (release_aio)
+	{
+		Assert(BUF_STATE_GET_REFCOUNT(buf_state) > 0);
+		refcount_change = -1;
+		pgaio_wref_clear(&buf->io_wref);
+	}
+
+	buf_state = UnlockBufHdrExt(buf, buf_state,
+								0, unset_flag_bits,
+								refcount_change);
+
+	if (forget_owner)
+		ResourceOwnerForgetBufferIO(CurrentResourceOwner,
+									BufferDescriptorGetBuffer(buf));
+
+	ConditionVariableBroadcast(BufferDescriptorGetIOCV(buf));
+
+	if (release_aio && (buf_state & BM_PIN_COUNT_WAITER))
+		WakePinCountWaiter(buf);
+}
+#endif
 
 /*
  * AbortBufferIO: Clean up active buffer I/O after an error.

@@ -175,5 +175,8 @@ extern bool UmMapIsLogicalUnmaterialized(SMgrRelation reln, ForkNumber forknum,
 extern void UmMapSetMapping(SMgrRelation reln, ForkNumber forknum,
 							BlockNumber lblkno, BlockNumber new_pblkno,
 							XLogRecPtr map_lsn);
+extern void UmCheckpointWritePblk(SMgrRelation reln, ForkNumber forknum,
+								  BlockNumber lblkno, const void *buffer,
+								  BlockNumber checkpoint_pblk);
 
 #endif							/* UMBRA_H */

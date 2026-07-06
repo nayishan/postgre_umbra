@@ -92,6 +92,7 @@ typedef struct
 								 * backup block data in XLogRecordAssemble() */
 
 #ifdef USE_UMBRA
+	Buffer		buffer;			/* shared buffer, if registered from one */
 	bool		has_remap;		/* true if remap metadata is prepared */
 	bool		remap_in_record; /* true if current assembled record includes remap */
 	bool		remap_committed; /* true if mapping switch was committed after insert */
@@ -253,6 +254,8 @@ XLogCommitBlockRemapsUmbra(XLogRecPtr record_endptr)
 
 		UmMapSetMapping(regbuf->remap_reln, regbuf->forkno, regbuf->block,
 						regbuf->new_pblkno, record_endptr);
+		if (regbuf->old_pblkno != InvalidBlockNumber)
+			BufferSaveCheckpointPblk(regbuf->buffer, regbuf->old_pblkno);
 		if (regbuf->old_pblkno == InvalidBlockNumber)
 		{
 			MapSBlockBumpLogicalNblocks(ctx,
@@ -399,6 +402,7 @@ XLogResetInsertion(void)
 	{
 		registered_buffers[i].in_use = false;
 #ifdef USE_UMBRA
+		registered_buffers[i].buffer = InvalidBuffer;
 		registered_buffers[i].has_remap = false;
 		registered_buffers[i].remap_in_record = false;
 		registered_buffers[i].remap_committed = false;
@@ -466,6 +470,7 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
 	regbuf->rdata_tail = (XLogRecData *) &regbuf->rdata_head;
 	regbuf->rdata_len = 0;
 #ifdef USE_UMBRA
+	regbuf->buffer = buffer;
 	regbuf->has_remap = false;
 	regbuf->remap_in_record = false;
 	regbuf->remap_committed = false;
@@ -530,6 +535,7 @@ XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator, ForkNumber forknum,
 	regbuf->rdata_tail = (XLogRecData *) &regbuf->rdata_head;
 	regbuf->rdata_len = 0;
 #ifdef USE_UMBRA
+	regbuf->buffer = InvalidBuffer;
 	regbuf->has_remap = false;
 	regbuf->remap_in_record = false;
 	regbuf->remap_committed = false;

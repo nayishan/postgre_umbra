@@ -1714,6 +1714,36 @@ UmMapSetMapping(SMgrRelation reln, ForkNumber forknum,
 				  forknum, lblkno, new_pblkno, map_lsn);
 }
 
+void
+UmCheckpointWritePblk(SMgrRelation reln, ForkNumber forknum,
+					  BlockNumber lblkno, const void *buffer,
+					  BlockNumber checkpoint_pblk)
+{
+	UmbraAccessState access;
+	UmbraFileContext *ctx = um_ctx_acquire(reln);
+	const void *buffers[1];
+
+	if (checkpoint_pblk == InvalidBlockNumber)
+		elog(ERROR, "invalid Umbra checkpoint physical block");
+
+	access = um_classify_access(reln, forknum);
+	if (!access.map_available)
+		elog(ERROR,
+			 "checkpoint physical write requested for non-mapped Umbra relation %u/%u/%u fork %d block %u",
+			 reln->smgr_rlocator.locator.spcOid,
+			 reln->smgr_rlocator.locator.dbOid,
+			 reln->smgr_rlocator.locator.relNumber,
+			 forknum, lblkno);
+
+	if (!umfile_ctx_block_exists(ctx, forknum, checkpoint_pblk))
+		umfile_zeroextend(ctx, forknum, checkpoint_pblk, 1,
+						  true /* skipFsync */ );
+
+	buffers[0] = buffer;
+	umfile_writev(ctx, forknum, checkpoint_pblk, buffers, 1,
+				  false /* skipFsync */ );
+}
+
 static void
 um_filetag_path(const FileTag *ftag, char *path)
 {

@@ -26,6 +26,11 @@ char	   *BufferBlocks;
 ConditionVariableMinimallyPadded *BufferIOCVArray;
 WritebackContext BackendWritebackContext;
 CkptSortItem *CkptBufferIds;
+#ifdef USE_UMBRA
+BlockNumber *CkptBufferPblks;
+uint32	   *CkptBufferPblkEpochs;
+pg_atomic_uint32 *CkptBufferPblkCaptureEpoch;
+#endif
 
 static void BufferManagerShmemRequest(void *arg);
 static void BufferManagerShmemInit(void *arg);
@@ -108,6 +113,20 @@ BufferManagerShmemRequest(void *arg)
 					   .size = NBuffers * sizeof(CkptSortItem),
 					   .ptr = (void **) &CkptBufferIds,
 		);
+#ifdef USE_UMBRA
+	ShmemRequestStruct(.name = "Checkpoint Buffer Pblks",
+					   .size = NBuffers * sizeof(BlockNumber),
+					   .ptr = (void **) &CkptBufferPblks,
+		);
+	ShmemRequestStruct(.name = "Checkpoint Buffer Pblk Epochs",
+					   .size = NBuffers * sizeof(uint32),
+					   .ptr = (void **) &CkptBufferPblkEpochs,
+		);
+	ShmemRequestStruct(.name = "Checkpoint Buffer Pblk Capture Epoch",
+					   .size = sizeof(pg_atomic_uint32),
+					   .ptr = (void **) &CkptBufferPblkCaptureEpoch,
+		);
+#endif
 }
 
 /*
@@ -119,6 +138,10 @@ BufferManagerShmemRequest(void *arg)
 static void
 BufferManagerShmemInit(void *arg)
 {
+#ifdef USE_UMBRA
+	pg_atomic_init_u32(CkptBufferPblkCaptureEpoch, 0);
+#endif
+
 	/*
 	 * Initialize all the buffer headers.
 	 */
@@ -137,6 +160,10 @@ BufferManagerShmemInit(void *arg)
 
 		proclist_init(&buf->lock_waiters);
 		ConditionVariableInit(BufferDescriptorGetIOCV(buf));
+#ifdef USE_UMBRA
+		CkptBufferPblks[i] = InvalidBlockNumber;
+		CkptBufferPblkEpochs[i] = 0;
+#endif
 	}
 
 	/* Initialize per-backend file flush context */
