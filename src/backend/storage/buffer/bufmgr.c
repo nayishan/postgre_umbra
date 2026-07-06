@@ -660,7 +660,8 @@ static Buffer GetVictimBuffer(BufferAccessStrategy strategy, IOContext io_contex
 static void FlushUnlockedBuffer(BufferDesc *buf, SMgrRelation reln,
 								IOObject io_object, IOContext io_context);
 static void FlushBuffer(BufferDesc *buf, SMgrRelation reln,
-						IOObject io_object, IOContext io_context);
+						IOObject io_object, IOContext io_context,
+						bool flush_active_after_checkpoint_pblk);
 #ifdef USE_UMBRA
 #define CKPT_BUFFER_PBLK_EPOCH_ACTIVE	((uint32) 0x80000000)
 #define CKPT_BUFFER_PBLK_EPOCH_MASK		((uint32) 0x7FFFFFFF)
@@ -2646,7 +2647,7 @@ again:
 		}
 
 		/* OK, do the I/O */
-		FlushBuffer(buf_hdr, NULL, IOOBJECT_RELATION, io_context);
+		FlushBuffer(buf_hdr, NULL, IOOBJECT_RELATION, io_context, true);
 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 
 		ScheduleBufferTagForWriteback(&BackendWritebackContext, io_context,
@@ -4541,15 +4542,18 @@ BufferGetTag(Buffer buffer, RelFileLocator *rlocator, ForkNumber *forknum,
  */
 static void
 FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
-			IOContext io_context)
+			IOContext io_context, bool flush_active_after_checkpoint_pblk)
 {
 	XLogRecPtr	recptr;
 	ErrorContextCallback errcallback;
 	instr_time	io_start;
 	Block		bufBlock;
+	uint32		blocks_written = 1;
 #ifdef USE_UMBRA
 	bool		checkpoint_only = false;
 	BlockNumber	checkpoint_pblk = InvalidBlockNumber;
+#else
+	(void) flush_active_after_checkpoint_pblk;
 #endif
 
 	Assert(BufferLockHeldByMeInMode(buf, BUFFER_LOCK_EXCLUSIVE) ||
@@ -4643,11 +4647,22 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 
 #ifdef USE_UMBRA
 	if (checkpoint_only)
+	{
 		UmCheckpointWritePblk(reln,
 							  BufTagGetForkNum(&buf->tag),
 							  buf->tag.blockNum,
 							  bufBlock,
 							  checkpoint_pblk);
+		if (flush_active_after_checkpoint_pblk)
+		{
+			smgrwrite(reln,
+					  BufTagGetForkNum(&buf->tag),
+					  buf->tag.blockNum,
+					  bufBlock,
+					  false);
+			blocks_written++;
+		}
+	}
 	else
 #endif
 	smgrwrite(reln,
@@ -4675,15 +4690,16 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	 * of a dirty shared buffer (IOCONTEXT_NORMAL IOOP_WRITE).
 	 */
 	pgstat_count_io_op_time(IOOBJECT_RELATION, io_context,
-							IOOP_WRITE, io_start, 1, BLCKSZ);
+							IOOP_WRITE, io_start, blocks_written,
+							(uint64) blocks_written * BLCKSZ);
 
-	pgBufferUsage.shared_blks_written++;
+	pgBufferUsage.shared_blks_written += blocks_written;
 
 	/*
 	 * Mark the buffer as clean and end the BM_IO_IN_PROGRESS state.
 	 */
 #ifdef USE_UMBRA
-	if (checkpoint_only)
+	if (checkpoint_only && !flush_active_after_checkpoint_pblk)
 		TerminateCheckpointBufferIO(buf, true, false);
 	else
 #endif
@@ -4710,7 +4726,7 @@ FlushUnlockedBuffer(BufferDesc *buf, SMgrRelation reln,
 	Buffer		buffer = BufferDescriptorGetBuffer(buf);
 
 	BufferLockAcquire(buffer, buf, BUFFER_LOCK_SHARE_EXCLUSIVE);
-	FlushBuffer(buf, reln, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+	FlushBuffer(buf, reln, IOOBJECT_RELATION, IOCONTEXT_NORMAL, false);
 	BufferLockUnlock(buffer, buf);
 }
 
@@ -5774,7 +5790,7 @@ FlushOneBuffer(Buffer buffer)
 
 	Assert(BufferIsLockedByMe(buffer));
 
-	FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+	FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL, false);
 }
 
 /*
