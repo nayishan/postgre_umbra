@@ -19,10 +19,12 @@ OBJS = \
 
 ifeq ($(with_umbra), yes)
 OBJS += \
-	umbra.o
+	umbra.o \
+	umfile.o
 endif
 
-# Reconfiguration can change both OBJS and the default smgr implementation.
-objfiles.txt smgr.o: $(top_builddir)/src/Makefile.global
+# Reconfiguration can change OBJS, the default smgr implementation, and
+# USE_UMBRA-dependent sync request registration.
+objfiles.txt smgr.o md.o: $(top_builddir)/src/Makefile.global
 
 include $(top_srcdir)/src/backend/common.mk

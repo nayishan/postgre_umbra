@@ -20,6 +20,9 @@
 #include "storage/aio_internal.h"
 #include "storage/bufmgr.h"
 #include "storage/md.h"
+#ifdef USE_UMBRA
+#include "storage/umfile.h"
+#endif
 
 
 /* just to have something to put into aio_handle_cbs */
@@ -42,6 +45,9 @@ static const PgAioHandleCallbacksEntry aio_handle_cbs[] = {
 
 	CALLBACK_ENTRY(PGAIO_HCB_MD_READV, aio_md_readv_cb),
 
+#ifdef USE_UMBRA
+	CALLBACK_ENTRY(PGAIO_HCB_UMFILE_READV, aio_umfile_readv_cb),
+#endif
 	CALLBACK_ENTRY(PGAIO_HCB_SHARED_BUFFER_READV, aio_shared_buffer_readv_cb),
 
 	CALLBACK_ENTRY(PGAIO_HCB_LOCAL_BUFFER_READV, aio_local_buffer_readv_cb),

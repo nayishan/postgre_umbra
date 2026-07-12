@@ -62,6 +62,7 @@
 #include "storage/procarray.h"
 #include "storage/procsignal.h"
 #include "storage/smgr.h"
+#include "storage/sync.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"

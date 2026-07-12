@@ -1,11 +1,11 @@
 /*-------------------------------------------------------------------------
  *
  * umbra.c
- *	  Umbra storage manager skeleton.
+ *	  Umbra storage manager.
  *
- * This file establishes Umbra as a separate smgr implementation from md.c.
- * The initial implementation preserves md semantics by forwarding relation
- * file operations to md.c.
+ * This file owns the smgr implementation boundary for Umbra.  Ordinary
+ * relation fork operations are serviced by Umbra's md-style physical segment
+ * file layer in umfile.c.
  *
  * src/backend/storage/smgr/umbra.c
  *
@@ -13,8 +13,8 @@
  */
 #include "postgres.h"
 
-#include "storage/md.h"
 #include "storage/smgr.h"
+#include "storage/umfile.h"
 #include "storage/umbra.h"
 #include "utils/memutils.h"
 
@@ -23,17 +23,18 @@ typedef struct UmbraSmgrRelationState
 	/*
 	 * State stored in SMgrRelationData.smgr_private.
 	 *
-	 * Patch 1 keeps Umbra behavior equivalent to md.c, but still exercises the
-	 * ownership boundary: Umbra may attach per-relation implementation state
-	 * when the SMgrRelation is opened and release it when smgr destroys the
-	 * handle.
+	 * Umbra owns this state for the lifetime of the SMgrRelation handle.
+	 * umfile.c owns the physical segment descriptors below this context.
 	 */
-	bool		initialized;
+	UmbraFileContext *filectx;
 } UmbraSmgrRelationState;
+
+static UmbraFileContext *um_get_filectx(SMgrRelation reln);
 
 void
 uminit(void)
 {
+	umfile_init();
 }
 
 void
@@ -45,16 +46,17 @@ umopen(SMgrRelation reln)
 
 	state = MemoryContextAllocZero(TopMemoryContext,
 								   sizeof(UmbraSmgrRelationState));
-	state->initialized = true;
+	state->filectx = umfile_open(reln);
 	reln->smgr_private = state;
-
-	mdopen(reln);
 }
 
 void
 umclose(SMgrRelation reln, ForkNumber forknum)
 {
-	mdclose(reln, forknum);
+	UmbraSmgrRelationState *state = reln->smgr_private;
+
+	if (state != NULL && state->filectx != NULL)
+		umfile_close(state->filectx, forknum);
 }
 
 void
@@ -64,7 +66,8 @@ umdestroy(SMgrRelation reln)
 
 	if (state != NULL)
 	{
-		Assert(state->initialized);
+		if (state->filectx != NULL)
+			umfile_destroy(state->filectx);
 		pfree(state);
 		reln->smgr_private = NULL;
 	}
@@ -73,103 +76,117 @@ umdestroy(SMgrRelation reln)
 void
 umcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 {
-	mdcreate(reln, forknum, isRedo);
+	umfile_create(um_get_filectx(reln), forknum, isRedo);
 }
 
 bool
 umexists(SMgrRelation reln, ForkNumber forknum)
 {
-	return mdexists(reln, forknum);
+	return umfile_exists(um_get_filectx(reln), forknum);
 }
 
 void
 umunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 {
-	mdunlink(rlocator, forknum, isRedo);
+	umfile_unlink(rlocator, forknum, isRedo);
 }
 
 void
 umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		 const void *buffer, bool skipFsync)
 {
-	mdextend(reln, forknum, blocknum, buffer, skipFsync);
+	umfile_extend(um_get_filectx(reln), forknum, blocknum, buffer, skipFsync);
 }
 
 void
 umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 			 int nblocks, bool skipFsync)
 {
-	mdzeroextend(reln, forknum, blocknum, nblocks, skipFsync);
+	umfile_zeroextend(um_get_filectx(reln), forknum, blocknum, nblocks,
+					  skipFsync);
 }
 
 bool
 umprefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		   int nblocks)
 {
-	return mdprefetch(reln, forknum, blocknum, nblocks);
+	return umfile_prefetch(um_get_filectx(reln), forknum, blocknum, nblocks);
 }
 
 uint32
 ummaxcombine(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
 {
-	return mdmaxcombine(reln, forknum, blocknum);
+	return umfile_maxcombine(um_get_filectx(reln), forknum, blocknum);
 }
 
 void
 umreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		void **buffers, BlockNumber nblocks)
 {
-	mdreadv(reln, forknum, blocknum, buffers, nblocks);
+	umfile_readv(um_get_filectx(reln), forknum, blocknum, buffers, nblocks);
 }
 
 void
 umstartreadv(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknum,
 			 BlockNumber blocknum, void **buffers, BlockNumber nblocks)
 {
-	mdstartreadv(ioh, reln, forknum, blocknum, buffers, nblocks);
+	umfile_startreadv(ioh, reln, um_get_filectx(reln), forknum, blocknum,
+					  buffers, nblocks);
 }
 
 void
 umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		 const void **buffers, BlockNumber nblocks, bool skipFsync)
 {
-	mdwritev(reln, forknum, blocknum, buffers, nblocks, skipFsync);
+	umfile_writev(um_get_filectx(reln), forknum, blocknum, buffers, nblocks,
+				  skipFsync);
 }
 
 void
 umwriteback(SMgrRelation reln, ForkNumber forknum,
 			BlockNumber blocknum, BlockNumber nblocks)
 {
-	mdwriteback(reln, forknum, blocknum, nblocks);
+	umfile_writeback(um_get_filectx(reln), forknum, blocknum, nblocks);
 }
 
 BlockNumber
 umnblocks(SMgrRelation reln, ForkNumber forknum)
 {
-	return mdnblocks(reln, forknum);
+	return umfile_nblocks(um_get_filectx(reln), forknum);
 }
 
 void
 umtruncate(SMgrRelation reln, ForkNumber forknum,
 		   BlockNumber old_blocks, BlockNumber nblocks)
 {
-	mdtruncate(reln, forknum, old_blocks, nblocks);
+	umfile_truncate(um_get_filectx(reln), forknum, old_blocks, nblocks);
 }
 
 void
 umimmedsync(SMgrRelation reln, ForkNumber forknum)
 {
-	mdimmedsync(reln, forknum);
+	umfile_immedsync(um_get_filectx(reln), forknum);
 }
 
 void
 umregistersync(SMgrRelation reln, ForkNumber forknum)
 {
-	mdregistersync(reln, forknum);
+	umfile_registersync(um_get_filectx(reln), forknum);
 }
 
 int
 umfd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint32 *off)
 {
-	return mdfd(reln, forknum, blocknum, off);
+	return umfile_fd(um_get_filectx(reln), forknum, blocknum, off);
+}
+
+static UmbraFileContext *
+um_get_filectx(SMgrRelation reln)
+{
+	UmbraSmgrRelationState *state = reln->smgr_private;
+
+	Assert(state != NULL);
+	Assert(state->filectx != NULL);
+
+	return state->filectx;
 }
