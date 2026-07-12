@@ -1096,6 +1096,18 @@ build-postgresql:
        </listitem>
       </varlistentry>
 
+      <varlistentry id="configure-option-with-umbra">
+       <term><option>--with-umbra</option></term>
+       <listitem>
+        <para>
+         Build with the experimental Umbra storage manager.  In this build,
+         Umbra is selected as the default storage manager.  The initial Umbra
+         implementation forwards ordinary relation operations to the
+         <quote>magnetic disk</quote> storage manager.
+        </para>
+       </listitem>
+      </varlistentry>
+
       <varlistentry id="configure-option-with-bonjour">
        <term><option>--with-bonjour</option></term>
        <listitem>
@@ -2575,6 +2587,18 @@ ninja install
         linkend="server-start"/> for more information.  Defaults to
         auto.  <application>libsystemd</application> and the associated header
         files need to be installed to use this option.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="configure-with-umbra-meson">
+      <term><option>-Dumbra={ true | false }</option></term>
+      <listitem>
+       <para>
+        Build with the experimental Umbra storage manager.  In this build,
+        Umbra is selected as the default storage manager.  The initial Umbra
+        implementation forwards ordinary relation operations to the
+        <quote>magnetic disk</quote> storage manager.  Defaults to false.
        </para>
       </listitem>
      </varlistentry>

@@ -5,3 +5,9 @@ backend_sources += files(
   'md.c',
   'smgr.c',
 )
+
+if get_option('umbra')
+  backend_sources += files(
+    'umbra.c',
+  )
+endif

@@ -993,6 +993,16 @@ AC_SUBST(with_systemd)
 AC_MSG_RESULT([$with_systemd])
 
 #
+# Umbra storage manager (experimental)
+#
+AC_MSG_CHECKING([whether to build with Umbra storage manager])
+PGAC_ARG_BOOL(with, umbra, no,
+              [build with Umbra storage manager (experimental)],
+              [AC_DEFINE([USE_UMBRA], 1, [Define to build with Umbra storage manager. (--with-umbra)])])
+AC_MSG_RESULT([$with_umbra])
+AC_SUBST(with_umbra)
+
+#
 # Readline
 #
 PGAC_ARG_BOOL(with, readline, yes,

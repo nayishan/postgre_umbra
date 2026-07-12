@@ -723,6 +723,7 @@ LIBURING_LIBS
 LIBURING_CFLAGS
 with_liburing
 with_readline
+with_umbra
 with_systemd
 with_selinux
 with_ldap
@@ -872,6 +873,7 @@ with_ldap
 with_bonjour
 with_selinux
 with_systemd
+with_umbra
 with_readline
 with_libedit_preferred
 with_liburing
@@ -1590,6 +1592,7 @@ Optional Packages:
   --with-bonjour          build with Bonjour support
   --with-selinux          build with SELinux support
   --with-systemd          build with systemd support
+  --with-umbra            build with Umbra storage manager (experimental)
   --without-readline      do not use GNU Readline nor BSD Libedit for editing
   --with-libedit-preferred
                           prefer BSD Libedit over GNU Readline
@@ -8634,6 +8637,41 @@ fi
 
 { $as_echo "$as_me:${as_lineno-$LINENO}: result: $with_systemd" >&5
 $as_echo "$with_systemd" >&6; }
+
+#
+# Umbra storage manager (experimental)
+#
+{ $as_echo "$as_me:${as_lineno-$LINENO}: checking whether to build with Umbra storage manager" >&5
+$as_echo_n "checking whether to build with Umbra storage manager... " >&6; }
+
+
+
+# Check whether --with-umbra was given.
+if test "${with_umbra+set}" = set; then :
+  withval=$with_umbra;
+  case $withval in
+    yes)
+
+$as_echo "#define USE_UMBRA 1" >>confdefs.h
+
+      ;;
+    no)
+      :
+      ;;
+    *)
+      as_fn_error $? "no argument expected for --with-umbra option" "$LINENO" 5
+      ;;
+  esac
+
+else
+  with_umbra=no
+
+fi
+
+
+{ $as_echo "$as_me:${as_lineno-$LINENO}: result: $with_umbra" >&5
+$as_echo "$with_umbra" >&6; }
+
 
 #
 # Readline

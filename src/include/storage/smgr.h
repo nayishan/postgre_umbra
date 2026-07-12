@@ -21,11 +21,11 @@
 
 /*
  * smgr.c maintains a table of SMgrRelation objects, which are essentially
- * cached file handles.  An SMgrRelation is created (if not already present)
- * by smgropen(), and destroyed by smgrdestroy().  Note that neither of these
- * operations imply I/O, they just create or destroy a hashtable entry.  (But
- * smgrdestroy() may release associated resources, such as OS-level file
- * descriptors.)
+ * cached storage-manager handles for a relation.  An SMgrRelation is created
+ * (if not already present) by smgropen(), and destroyed by smgrdestroy().
+ * Note that neither of these operations imply I/O, they just create or destroy
+ * a hashtable entry.  (But smgrdestroy() may release associated resources,
+ * such as OS-level file descriptors.)
  *
  * An SMgrRelation may be "pinned", to prevent it from being destroyed while
  * it's in use.  We use this to prevent pointers in relcache to smgr from being
@@ -53,6 +53,15 @@ typedef struct SMgrRelationData
 	 * submodules.  Do not touch them from elsewhere.
 	 */
 	int			smgr_which;		/* storage manager selector */
+
+	/*
+	 * Per-SMgrRelation state owned by the selected storage manager
+	 * implementation.  smgr.c initializes this to NULL when the handle is
+	 * created; the implementation may fill it in from its open path and must
+	 * release it from its destroy callback.  Code outside smgr.c and the
+	 * selected storage manager must not interpret this pointer.
+	 */
+	void	   *smgr_private;
 
 	/*
 	 * for md.c; per-fork arrays of the number of open segments
