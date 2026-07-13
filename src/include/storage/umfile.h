@@ -24,6 +24,7 @@ typedef struct UmbraFileContext UmbraFileContext;
 extern PGDLLIMPORT const PgAioHandleCallbacks aio_umfile_readv_cb;
 
 extern void umfile_init(void);
+extern UmbraFileContext *umfile_open_temporary(RelFileLocatorBackend rlocator);
 extern UmbraFileContext *umfile_open(SMgrRelation reln);
 extern void umfile_close(UmbraFileContext *ctx, ForkNumber forknum);
 extern void umfile_destroy(UmbraFileContext *ctx);

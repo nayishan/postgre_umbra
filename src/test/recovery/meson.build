@@ -66,6 +66,7 @@ tests += {
       't/055_umbra_map_superblock.pl',
       't/056_umbra_map_truncate.pl',
       't/057_umbra_identity_redo_frontier.pl',
+      't/058_umbra_super_cache.pl',
     ],
   },
 }

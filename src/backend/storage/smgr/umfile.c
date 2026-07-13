@@ -827,22 +827,31 @@ umfile_openfork(UmbraFileContext *ctx, ForkNumber forknum, int behavior)
 }
 
 /*
- * umfile_open() -- Initialize newly-opened Umbra relation file context.
+ * umfile_open_temporary() -- Create an Umbra file context for a locator.
  */
 UmbraFileContext *
-umfile_open(SMgrRelation reln)
+umfile_open_temporary(RelFileLocatorBackend rlocator)
 {
 	UmbraFileContext *ctx;
-
-	Assert(reln != NULL);
 
 	if (UmFileCxt == NULL)
 		umfile_init();
 
 	ctx = MemoryContextAllocZero(UmFileCxt, sizeof(UmbraFileContext));
-	ctx->rlocator = reln->smgr_rlocator;
+	ctx->rlocator = rlocator;
 
 	return ctx;
+}
+
+/*
+ * umfile_open() -- Initialize newly-opened Umbra relation file context.
+ */
+UmbraFileContext *
+umfile_open(SMgrRelation reln)
+{
+	Assert(reln != NULL);
+
+	return umfile_open_temporary(reln->smgr_rlocator);
 }
 
 /*

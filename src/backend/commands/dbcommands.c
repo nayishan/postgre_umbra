@@ -58,6 +58,9 @@
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/lmgr.h"
+#ifdef USE_UMBRA
+#include "storage/map.h"
+#endif
 #include "storage/md.h"
 #include "storage/procarray.h"
 #include "storage/procsignal.h"
@@ -1664,6 +1667,9 @@ createdb_failure_callback(int code, Datum arg)
 	if (fparms->strategy == CREATEDB_WAL_LOG)
 	{
 		DropDatabaseBuffers(fparms->dest_dboid);
+#ifdef USE_UMBRA
+		MapInvalidateDatabase(fparms->dest_dboid);
+#endif
 		ForgetDatabaseSyncRequests(fparms->dest_dboid);
 
 		/* Release lock on the target database. */
@@ -1874,6 +1880,9 @@ dropdb(const char *dbname, bool missing_ok, bool force)
 	 * dirty buffer to the dead database later...
 	 */
 	DropDatabaseBuffers(db_id);
+#ifdef USE_UMBRA
+	MapInvalidateDatabase(db_id);
+#endif
 
 	/*
 	 * Tell checkpointer to forget any pending fsync and unlink requests for
@@ -2165,6 +2174,9 @@ movedb(const char *dbname, const char *tblspcname)
 	 * src_tblspcoid, but bufmgr.c presently provides no API for that.
 	 */
 	DropDatabaseBuffers(db_id);
+#ifdef USE_UMBRA
+	MapInvalidateDatabaseTablespace(db_id, src_tblspcoid);
+#endif
 
 	/*
 	 * Check for existence of files in the target directory, i.e., objects of
@@ -3371,6 +3383,10 @@ dbase_redo(XLogReaderState *record)
 		 * up-to-date for the copy.
 		 */
 		FlushDatabaseBuffers(xlrec->src_db_id);
+#ifdef USE_UMBRA
+		MapFlushDatabaseTablespace(xlrec->src_db_id,
+								   xlrec->src_tablespace_id);
+#endif
 
 		/* Close all smgr fds in all backends. */
 		WaitForProcSignalBarrier(EmitProcSignalBarrier(PROCSIGNAL_BARRIER_SMGRRELEASE));
@@ -3432,6 +3448,9 @@ dbase_redo(XLogReaderState *record)
 
 		/* Drop pages for this database that are in the shared buffer cache */
 		DropDatabaseBuffers(xlrec->db_id);
+#ifdef USE_UMBRA
+		MapInvalidateDatabase(xlrec->db_id);
+#endif
 
 		/* Also, clean out any fsync requests that might be pending in md.c */
 		ForgetDatabaseSyncRequests(xlrec->db_id);

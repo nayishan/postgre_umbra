@@ -5,8 +5,8 @@
  *
  * This file owns the private relation-local map fork used by Umbra.  The fork
  * stores a superblock at block 0 followed by identity logical-to-physical map
- * pages.  Later MAP patches can add remap and cache behavior without moving
- * that work into umbra.c.
+ * pages.  The resident MAP cache owns superblock buffering, while this file
+ * owns the superblock format and relation-local fork lifecycle.
  *
  * The superblock stores relation-wide logical and physical frontiers.  MAP
  * entries separately own the authoritative logical-to-physical translation.
@@ -30,12 +30,12 @@
 #include "access/xlogutils.h"
 #include "common/relpath.h"
 #include "port/pg_crc32c.h"
+#include "storage/map.h"
 #include "storage/umfile.h"
 #include "storage/ummap.h"
 
 #define UMMAP_SUPERBLOCK_MAGIC		0x554D4252U	/* "UMBR" */
 #define UMMAP_SUPERBLOCK_VERSION	1U
-#define UMMAP_SUPERBLOCK_SIZE		512
 #define UMMAP_SUPERBLOCK_PAYLOAD_SIZE 64
 
 #define UMMAP_ENTRIES_PER_PAGE	(BLCKSZ / sizeof(BlockNumber))
@@ -99,11 +99,15 @@ static void ummap_superblock_refresh_crc(UmbraMapSuperblock *super);
 static bool ummap_superblock_check_crc(const UmbraMapSuperblock *super);
 static bool ummap_superblock_has_valid_identity(const UmbraMapSuperblock *super);
 static bool ummap_superblock_is_valid(const UmbraMapSuperblock *super);
-static void ummap_read_superblock(UmbraFileContext *ctx,
-								  UmbraMapSuperblock *super);
-static void ummap_write_superblock(UmbraFileContext *ctx,
+static MapSuperBuffer ummap_lock_superblock(UmbraFileContext *ctx,
+										RelFileLocatorBackend rlocator,
+										LWLockMode mode,
+										UmbraMapSuperblock *super);
+static void ummap_store_superblock(MapSuperBuffer buffer,
 								   const UmbraMapSuperblock *super,
-								   bool skipFsync, bool isNew);
+								   bool skipFsync);
+static void ummap_bootstrap_superblock(UmbraFileContext *ctx,
+									 const UmbraMapSuperblock *super);
 static BlockNumber ummap_superblock_get_logical_nblocks(
 													const UmbraMapSuperblock *super,
 													ForkNumber forknum);
@@ -159,7 +163,7 @@ ummap_create(UmbraFileContext *ctx, bool isRedo)
 		return;
 
 	ummap_superblock_init(&super);
-	ummap_write_superblock(ctx, &super, false, true);
+	ummap_bootstrap_superblock(ctx, &super);
 }
 
 void
@@ -185,42 +189,53 @@ ummap_registersync_if_exists(UmbraFileContext *ctx)
 void
 ummap_unlink(RelFileLocatorBackend rlocator, bool isRedo)
 {
+	MapInvalidateRelation(rlocator);
 	umfile_unlink(rlocator, UMBRA_MAP_FORKNUM, isRedo);
 }
 
 void
-ummap_init_fork(UmbraFileContext *ctx, ForkNumber forknum, bool skipFsync)
+ummap_init_fork(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
+				ForkNumber forknum, bool skipFsync)
 {
-	(void) ummap_set_nblocks(ctx, forknum, 0, skipFsync);
+	(void) ummap_set_nblocks(ctx, rlocator, forknum, 0, skipFsync);
 }
 
 bool
-ummap_fork_exists(UmbraFileContext *ctx, ForkNumber forknum)
+ummap_fork_exists(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
+				  ForkNumber forknum)
 {
 	UmbraMapSuperblock super;
+	bool		exists;
+	MapSuperBuffer buffer;
 
 	if (!ummap_tracks_fork(forknum))
 		return umfile_exists(ctx, forknum);
 
-	ummap_read_superblock(ctx, &super);
+	buffer = ummap_lock_superblock(ctx, rlocator, LW_SHARED, &super);
 	if (!ummap_fork_uses_absent_sentinel(forknum))
-		return true;
+		exists = true;
+	else
+		exists = BlockNumberIsValid(
+			ummap_superblock_get_logical_nblocks(&super, forknum));
 
-	return BlockNumberIsValid(
-		ummap_superblock_get_logical_nblocks(&super, forknum));
+	MapSuperReleaseBuffer(buffer);
+	return exists;
 }
 
 BlockNumber
-ummap_nblocks(UmbraFileContext *ctx, ForkNumber forknum)
+ummap_nblocks(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
+			  ForkNumber forknum)
 {
 	BlockNumber nblocks;
 	UmbraMapSuperblock super;
+	MapSuperBuffer buffer;
 
 	if (!ummap_tracks_fork(forknum))
 		return umfile_nblocks(ctx, forknum);
 
-	ummap_read_superblock(ctx, &super);
+	buffer = ummap_lock_superblock(ctx, rlocator, LW_SHARED, &super);
 	nblocks = ummap_superblock_get_logical_nblocks(&super, forknum);
+	MapSuperReleaseBuffer(buffer);
 	nblocks = ummap_normalize_fork_nblocks(forknum, nblocks);
 	if (!BlockNumberIsValid(nblocks))
 		elog(ERROR, "missing Umbra map fork state for fork %d", (int) forknum);
@@ -229,19 +244,21 @@ ummap_nblocks(UmbraFileContext *ctx, ForkNumber forknum)
 }
 
 bool
-ummap_set_nblocks(UmbraFileContext *ctx, ForkNumber forknum,
-				  BlockNumber nblocks, bool skipFsync)
+ummap_set_nblocks(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
+				  ForkNumber forknum, BlockNumber nblocks, bool skipFsync)
 {
 	UmbraMapSuperblock super;
+	MapSuperBuffer buffer;
 
 	if (!ummap_tracks_fork(forknum))
 		return true;
 
-	ummap_read_superblock(ctx, &super);
+	buffer = ummap_lock_superblock(ctx, rlocator, LW_EXCLUSIVE, &super);
 
 	ummap_superblock_set_logical_nblocks(&super, forknum, nblocks);
 	ummap_superblock_set_identity_physical(&super, forknum, nblocks);
-	ummap_write_superblock(ctx, &super, skipFsync, false);
+	ummap_store_superblock(buffer, &super, skipFsync);
+	MapSuperReleaseBuffer(buffer);
 
 	return true;
 }
@@ -550,25 +567,37 @@ ummap_superblock_is_valid(const UmbraMapSuperblock *super)
 	return ummap_superblock_check_crc(super);
 }
 
-static void
-ummap_read_superblock(UmbraFileContext *ctx, UmbraMapSuperblock *super)
+static MapSuperBuffer
+ummap_lock_superblock(UmbraFileContext *ctx,
+					 RelFileLocatorBackend rlocator, LWLockMode mode,
+					 UmbraMapSuperblock *super)
 {
-	Assert(super != NULL);
+	MapSuperBuffer buffer;
+	char	   *page;
 
-	umfile_read_bytes(ctx, UMBRA_MAP_FORKNUM, UMMAP_BLOCK_SUPER,
-					  super->padding, UMMAP_SUPERBLOCK_SIZE);
+	Assert(super != NULL);
+	Assert(mode == LW_SHARED || mode == LW_EXCLUSIVE);
+
+	buffer = MapSuperBufferRead(ctx, rlocator, mode);
+	page = MapSuperBufferGetData(buffer);
+	memcpy(super->padding, page, UMMAP_SUPERBLOCK_SIZE);
 
 	if (!ummap_superblock_is_valid(super))
+	{
+		MapSuperReleaseBuffer(buffer);
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("Umbra map superblock is corrupted")));
+	}
+
+	return buffer;
 }
 
 static void
-ummap_write_superblock(UmbraFileContext *ctx, const UmbraMapSuperblock *super,
-					   bool skipFsync, bool isNew)
+ummap_store_superblock(MapSuperBuffer buffer,
+					 const UmbraMapSuperblock *super, bool skipFsync)
 {
-	PGIOAlignedBlock page;
+	char	   *page;
 	UmbraMapSuperblock write_super;
 
 	Assert(super != NULL);
@@ -576,17 +605,28 @@ ummap_write_superblock(UmbraFileContext *ctx, const UmbraMapSuperblock *super,
 	write_super = *super;
 	ummap_superblock_refresh_crc(&write_super);
 
-	if (isNew)
-	{
-		MemSet(page.data, 0, BLCKSZ);
-		memcpy(page.data, write_super.padding, UMMAP_SUPERBLOCK_SIZE);
-		umfile_extend(ctx, UMBRA_MAP_FORKNUM, UMMAP_BLOCK_SUPER, page.data,
-					  skipFsync);
-		return;
-	}
+	page = MapSuperBufferGetData(buffer);
+	MemSet(page, 0, UMMAP_SUPERBLOCK_SIZE);
+	memcpy(page, write_super.padding, UMMAP_SUPERBLOCK_SIZE);
+	MapSuperMarkBufferDirty(buffer);
+	(void) skipFsync;
+}
 
-	umfile_write_bytes(ctx, UMBRA_MAP_FORKNUM, UMMAP_BLOCK_SUPER,
-					   write_super.padding, UMMAP_SUPERBLOCK_SIZE, skipFsync);
+static void
+ummap_bootstrap_superblock(UmbraFileContext *ctx,
+						 const UmbraMapSuperblock *super)
+{
+	PGIOAlignedBlock page;
+	UmbraMapSuperblock write_super;
+
+	Assert(super != NULL);
+	Assert(umfile_nblocks(ctx, UMBRA_MAP_FORKNUM) == 0);
+
+	write_super = *super;
+	ummap_superblock_refresh_crc(&write_super);
+	MemSet(page.data, 0, BLCKSZ);
+	memcpy(page.data, write_super.padding, UMMAP_SUPERBLOCK_SIZE);
+	umfile_extend(ctx, UMBRA_MAP_FORKNUM, MAP_BLOCK_SUPER, page.data, false);
 }
 
 static BlockNumber

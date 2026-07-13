@@ -28,6 +28,7 @@
  */
 #include "postgres.h"
 
+#include "storage/map.h"
 #include "storage/smgr.h"
 #include "storage/umfile.h"
 #include "storage/ummap.h"
@@ -121,7 +122,7 @@ umcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 		ummap_tracks_fork(forknum))
 	{
 		if (created && ummap_exists(ctx))
-			ummap_init_fork(ctx, forknum, false);
+			ummap_init_fork(ctx, reln->smgr_rlocator, forknum, false);
 	}
 }
 
@@ -150,7 +151,8 @@ umexists(SMgrRelation reln, ForkNumber forknum)
 		if (!ummap_exists(ctx))
 			return false;
 
-		return ummap_fork_exists(ctx, forknum) && umfile_exists(ctx, forknum);
+		return ummap_fork_exists(ctx, reln->smgr_rlocator, forknum) &&
+			umfile_exists(ctx, forknum);
 	}
 
 	return umfile_exists(ctx, forknum);
@@ -161,6 +163,7 @@ umunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 {
 	if (forknum == InvalidForkNumber)
 	{
+		MapInvalidateRelation(rlocator);
 		umfile_unlink(rlocator, forknum, isRedo);
 		return;
 	}
@@ -216,7 +219,8 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 		lblkno += run_blocks;
 	}
-	(void) ummap_set_nblocks(ctx, forknum, blocknum + 1, skipFsync);
+	(void) ummap_set_nblocks(ctx, reln->smgr_rlocator, forknum,
+							 blocknum + 1, skipFsync);
 }
 
 void
@@ -252,8 +256,8 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 			elog(ERROR,
 				 "identity Umbra map run for fork %d block %u published %u blocks at physical block %u",
 				 (int) forknum, blocknum, published_blocks, published_pblkno);
-		(void) ummap_set_nblocks(ctx, forknum, blocknum + run_blocks,
-								 skipFsync);
+		(void) ummap_set_nblocks(ctx, reln->smgr_rlocator, forknum,
+								 blocknum + run_blocks, skipFsync);
 
 		blocknum += run_blocks;
 		remblocks -= run_blocks;
@@ -470,8 +474,10 @@ umtruncate(SMgrRelation reln, ForkNumber forknum,
 	 * physical storage, so an ERROR after truncation cannot leave MAP metadata
 	 * pointing past the materialized file.
 	 */
-	if (!ummap_set_nblocks(ctx, forknum, nblocks, false))
+	if (!ummap_set_nblocks(ctx, reln->smgr_rlocator, forknum, nblocks,
+							 false))
 		return;
+	MapFlushRelation(ctx, reln->smgr_rlocator);
 	umfile_truncate(ctx, forknum, old_blocks, nblocks);
 }
 
@@ -480,6 +486,8 @@ umimmedsync(SMgrRelation reln, ForkNumber forknum)
 {
 	UmbraFileContext *ctx = um_get_filectx(reln);
 
+	if (um_fork_uses_map(reln, forknum))
+		MapFlushRelation(ctx, reln->smgr_rlocator);
 	umfile_immedsync(ctx, forknum);
 	if (um_fork_uses_map(reln, forknum))
 		ummap_immedsync_if_exists(ctx);
@@ -490,6 +498,8 @@ umregistersync(SMgrRelation reln, ForkNumber forknum)
 {
 	UmbraFileContext *ctx = um_get_filectx(reln);
 
+	if (um_fork_uses_map(reln, forknum))
+		MapFlushRelation(ctx, reln->smgr_rlocator);
 	umfile_registersync(ctx, forknum);
 	if (um_fork_uses_map(reln, forknum))
 		ummap_registersync_if_exists(ctx);
@@ -522,7 +532,7 @@ um_get_logical_nblocks(SMgrRelation reln, ForkNumber forknum)
 	UmbraFileContext *ctx = um_get_filectx(reln);
 
 	if (um_fork_uses_map(reln, forknum))
-		return ummap_nblocks(ctx, forknum);
+		return ummap_nblocks(ctx, reln->smgr_rlocator, forknum);
 
 	return umfile_nblocks(ctx, forknum);
 }

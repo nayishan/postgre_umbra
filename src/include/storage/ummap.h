@@ -30,6 +30,8 @@ typedef struct UmbraFileContext UmbraFileContext;
 #define UMBRA_MAP_FORKNUM	((ForkNumber) (MAX_FORKNUM + 1))
 #define UMBRA_NUM_FORKS		((int) UMBRA_MAP_FORKNUM + 1)
 
+#define UMMAP_SUPERBLOCK_SIZE	512
+
 extern RelPathStr ummap_relpath(RelFileLocatorBackend rlocator);
 
 extern bool ummap_tracks_fork(ForkNumber forknum);
@@ -39,12 +41,19 @@ extern void ummap_close(UmbraFileContext *ctx);
 extern void ummap_immedsync_if_exists(UmbraFileContext *ctx);
 extern void ummap_registersync_if_exists(UmbraFileContext *ctx);
 extern void ummap_unlink(RelFileLocatorBackend rlocator, bool isRedo);
-extern void ummap_init_fork(UmbraFileContext *ctx, ForkNumber forknum,
-							bool skipFsync);
-extern bool ummap_fork_exists(UmbraFileContext *ctx, ForkNumber forknum);
-extern BlockNumber ummap_nblocks(UmbraFileContext *ctx, ForkNumber forknum);
-extern bool ummap_set_nblocks(UmbraFileContext *ctx, ForkNumber forknum,
-								  BlockNumber nblocks, bool skipFsync);
+extern void ummap_init_fork(UmbraFileContext *ctx,
+							RelFileLocatorBackend rlocator,
+							ForkNumber forknum, bool skipFsync);
+extern bool ummap_fork_exists(UmbraFileContext *ctx,
+							  RelFileLocatorBackend rlocator,
+							  ForkNumber forknum);
+extern BlockNumber ummap_nblocks(UmbraFileContext *ctx,
+								 RelFileLocatorBackend rlocator,
+								 ForkNumber forknum);
+extern bool ummap_set_nblocks(UmbraFileContext *ctx,
+								  RelFileLocatorBackend rlocator,
+								  ForkNumber forknum, BlockNumber nblocks,
+								  bool skipFsync);
 
 extern BlockNumber ummap_lookup_block(UmbraFileContext *ctx,
 									  ForkNumber forknum,
