@@ -28,7 +28,7 @@ extern UmbraFileContext *umfile_open(SMgrRelation reln);
 extern void umfile_close(UmbraFileContext *ctx, ForkNumber forknum);
 extern void umfile_destroy(UmbraFileContext *ctx);
 
-extern void umfile_create(UmbraFileContext *ctx, ForkNumber forknum,
+extern bool umfile_create(UmbraFileContext *ctx, ForkNumber forknum,
 						  bool isRedo);
 extern bool umfile_exists(UmbraFileContext *ctx, ForkNumber forknum);
 extern void umfile_unlink(RelFileLocatorBackend rlocator, ForkNumber forknum,
@@ -39,6 +39,11 @@ extern void umfile_extend(UmbraFileContext *ctx, ForkNumber forknum,
 extern void umfile_zeroextend(UmbraFileContext *ctx, ForkNumber forknum,
 							  BlockNumber blocknum, int nblocks,
 							  bool skipFsync);
+extern void umfile_read_bytes(UmbraFileContext *ctx, ForkNumber forknum,
+							  BlockNumber blocknum, void *buffer, int nbytes);
+extern void umfile_write_bytes(UmbraFileContext *ctx, ForkNumber forknum,
+							   BlockNumber blocknum, const void *buffer,
+							   int nbytes, bool skipFsync);
 extern bool umfile_prefetch(UmbraFileContext *ctx, ForkNumber forknum,
 							BlockNumber blocknum, int nblocks);
 extern uint32 umfile_maxcombine(UmbraFileContext *ctx, ForkNumber forknum,

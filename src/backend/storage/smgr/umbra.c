@@ -12,6 +12,14 @@
  * block L.  Later MAP/remap work can replace that identity publication while
  * keeping smgr callbacks separate from physical segment I/O.
  *
+ * The MAP superblock stores relation-wide logical and physical frontiers,
+ * while MAP entries remain authoritative for logical-to-physical translation.
+ * Recovery uses the same superblock size information as normal operation.  If
+ * redo reaches a block whose identity MAP entry was not persisted, MAP lookup
+ * can reconstruct that entry as L -> L because PostgreSQL WAL supplies L and
+ * this patch fixes P equal to L.  A future non-identity policy must WAL-log the
+ * chosen P instead.
+ *
  * Relation-local private map fork handling lives in ummap.c.
  *
  * src/backend/storage/smgr/umbra.c
@@ -96,9 +104,10 @@ umcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 {
 	UmbraSmgrRelationState *state = reln->smgr_private;
 	UmbraFileContext *ctx = um_get_filectx(reln);
+	bool		created;
 
 	Assert(state != NULL);
-	umfile_create(ctx, forknum, isRedo);
+	created = umfile_create(ctx, forknum, isRedo);
 
 	/* Redo of a mapped fork belongs to a permanent relation. */
 	if (isRedo && ummap_tracks_fork(forknum))
@@ -106,6 +115,13 @@ umcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 		state->uses_map = true;
 		if (!ummap_exists(ctx))
 			ummap_create(ctx, true);
+	}
+
+	if (!isRedo && state->uses_map && forknum != MAIN_FORKNUM &&
+		ummap_tracks_fork(forknum))
+	{
+		if (created && ummap_exists(ctx))
+			ummap_init_fork(ctx, forknum, false);
 	}
 }
 
@@ -123,7 +139,21 @@ uminitnewrelation(SMgrRelation reln, bool needs_wal)
 bool
 umexists(SMgrRelation reln, ForkNumber forknum)
 {
-	return umfile_exists(um_get_filectx(reln), forknum);
+	UmbraFileContext *ctx = um_get_filectx(reln);
+
+	if (um_fork_uses_map(reln, forknum))
+	{
+		/*
+		 * A subtransaction abort can unlink a newly-created relation while
+		 * its pending-sync entry and SMgrRelation survive until top commit.
+		 */
+		if (!ummap_exists(ctx))
+			return false;
+
+		return ummap_fork_exists(ctx, forknum) && umfile_exists(ctx, forknum);
+	}
+
+	return umfile_exists(ctx, forknum);
 }
 
 void
@@ -156,7 +186,7 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		return;
 	}
 
-	old_nblocks = umfile_nblocks(ctx, forknum);
+	old_nblocks = um_get_logical_nblocks(reln, forknum);
 	pblkno = blocknum;
 	umfile_extend(ctx, forknum, pblkno, buffer, skipFsync);
 	if (!ummap_tracks_fork(forknum))
@@ -186,6 +216,7 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 		lblkno += run_blocks;
 	}
+	(void) ummap_set_nblocks(ctx, forknum, blocknum + 1, skipFsync);
 }
 
 void
@@ -221,6 +252,8 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 			elog(ERROR,
 				 "identity Umbra map run for fork %d block %u published %u blocks at physical block %u",
 				 (int) forknum, blocknum, published_blocks, published_pblkno);
+		(void) ummap_set_nblocks(ctx, forknum, blocknum + run_blocks,
+								 skipFsync);
 
 		blocknum += run_blocks;
 		remblocks -= run_blocks;
@@ -270,7 +303,7 @@ ummaxcombine(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
 	if (!um_fork_uses_map(reln, forknum))
 		return umfile_maxcombine(ctx, forknum, blocknum);
 
-	logical_nblocks = umfile_nblocks(ctx, forknum);
+	logical_nblocks = um_get_logical_nblocks(reln, forknum);
 	if (blocknum >= logical_nblocks)
 		return 1;
 
@@ -391,14 +424,55 @@ umwriteback(SMgrRelation reln, ForkNumber forknum,
 BlockNumber
 umnblocks(SMgrRelation reln, ForkNumber forknum)
 {
-	return um_get_logical_nblocks(reln, forknum);
+	UmbraFileContext *ctx = um_get_filectx(reln);
+	BlockNumber nblocks;
+	BlockNumber physical_nblocks;
+
+	nblocks = um_get_logical_nblocks(reln, forknum);
+	if (um_fork_uses_map(reln, forknum))
+	{
+		/*
+		 * smgrtruncate() runs in a critical section after smgrnblocks() has
+		 * returned.  Open every active physical segment here so truncate does
+		 * not allocate or open files while it is in that critical section.
+		 *
+		 * This patch uses identity mappings, so a mapped relation's visible EOF
+		 * cannot exceed its physical EOF.  Unlogged and temp relations bypass
+		 * this path entirely.
+		 */
+		physical_nblocks = umfile_nblocks(ctx, forknum);
+		return Min(nblocks, physical_nblocks);
+	}
+
+	return nblocks;
 }
 
 void
 umtruncate(SMgrRelation reln, ForkNumber forknum,
 		   BlockNumber old_blocks, BlockNumber nblocks)
 {
-	umfile_truncate(um_get_filectx(reln), forknum, old_blocks, nblocks);
+	UmbraFileContext *ctx = um_get_filectx(reln);
+
+	if (!um_fork_uses_map(reln, forknum))
+	{
+		umfile_truncate(ctx, forknum, old_blocks, nblocks);
+		return;
+	}
+
+	if (nblocks >= old_blocks)
+	{
+		umfile_truncate(ctx, forknum, old_blocks, nblocks);
+		return;
+	}
+
+	/*
+	 * On shrink, publish the smaller logical/physical frontier before removing
+	 * physical storage, so an ERROR after truncation cannot leave MAP metadata
+	 * pointing past the materialized file.
+	 */
+	if (!ummap_set_nblocks(ctx, forknum, nblocks, false))
+		return;
+	umfile_truncate(ctx, forknum, old_blocks, nblocks);
 }
 
 void
@@ -445,7 +519,12 @@ um_fork_uses_map(SMgrRelation reln, ForkNumber forknum)
 static BlockNumber
 um_get_logical_nblocks(SMgrRelation reln, ForkNumber forknum)
 {
-	return umfile_nblocks(um_get_filectx(reln), forknum);
+	UmbraFileContext *ctx = um_get_filectx(reln);
+
+	if (um_fork_uses_map(reln, forknum))
+		return ummap_nblocks(ctx, forknum);
+
+	return umfile_nblocks(ctx, forknum);
 }
 
 static UmbraFileContext *

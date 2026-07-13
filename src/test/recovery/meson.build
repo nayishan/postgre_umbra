@@ -63,6 +63,9 @@ tests += {
       't/052_checkpoint_segment_missing.pl',
       't/053_umbra_mainfork_unlink.pl',
       't/054_umbra_identity_map.pl',
+      't/055_umbra_map_superblock.pl',
+      't/056_umbra_map_truncate.pl',
+      't/057_umbra_identity_redo_frontier.pl',
     ],
   },
 }
