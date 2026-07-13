@@ -56,23 +56,27 @@ extern bool ummap_set_nblocks(UmbraFileContext *ctx,
 								  bool skipFsync);
 
 extern BlockNumber ummap_lookup_block(UmbraFileContext *ctx,
-									  ForkNumber forknum,
-									  BlockNumber lblkno);
+										  RelFileLocatorBackend rlocator,
+										  ForkNumber forknum,
+										  BlockNumber lblkno);
 extern BlockNumber ummap_lookup_run(UmbraFileContext *ctx,
-									ForkNumber forknum,
-									BlockNumber lblkno,
-									BlockNumber maxblocks,
-									BlockNumber *pblkno);
+										RelFileLocatorBackend rlocator,
+										ForkNumber forknum,
+										BlockNumber lblkno,
+										BlockNumber maxblocks,
+										BlockNumber *pblkno);
 extern BlockNumber ummap_identity_run_limit(ForkNumber forknum,
 											BlockNumber lblkno,
 											BlockNumber maxblocks,
 											BlockNumber *pblkno);
 extern BlockNumber ummap_set_identity_block(UmbraFileContext *ctx,
-											ForkNumber forknum,
-											BlockNumber lblkno,
-											bool skipFsync);
+												 RelFileLocatorBackend rlocator,
+												 ForkNumber forknum,
+												BlockNumber lblkno,
+												bool skipFsync);
 extern BlockNumber ummap_set_identity_run(UmbraFileContext *ctx,
-										  ForkNumber forknum,
+											  RelFileLocatorBackend rlocator,
+											  ForkNumber forknum,
 										  BlockNumber lblkno,
 										  BlockNumber maxblocks,
 										  BlockNumber *pblkno,

@@ -67,6 +67,7 @@ tests += {
       't/056_umbra_map_truncate.pl',
       't/057_umbra_identity_redo_frontier.pl',
       't/058_umbra_super_cache.pl',
+      't/059_umbra_map_page_pool.pl',
     ],
   },
 }

@@ -13,6 +13,8 @@ top_builddir = ../../../..
 include $(top_builddir)/src/Makefile.global
 
 OBJS = \
+	mapbuf.o \
+	mapclock.o \
 	mapflush.o \
 	mapinit.o \
 	mapsuper.o

@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * mapinit.c
- *	  Shared-memory initialization for the resident MAP superblock cache.
+ *	  Shared-memory initialization for Umbra MAP caches.
  *
  *-------------------------------------------------------------------------
  */
@@ -23,17 +23,20 @@ const ShmemCallbacks MapShmemCallbacks = {
 static void
 MapShmemRequest(void *arg)
 {
+	MapPagePoolShmemRequest();
 	MapSuperTableShmemRequest();
 }
 
 static void
 MapShmemInit(void *arg)
 {
+	MapPagePoolShmemInit();
 	MapSuperTableShmemInit();
 }
 
 static void
 MapShmemAttach(void *arg)
 {
+	MapPagePoolShmemAttach();
 	MapSuperTableShmemAttach();
 }
