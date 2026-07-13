@@ -62,6 +62,7 @@ tests += {
       't/051_effective_wal_level.pl',
       't/052_checkpoint_segment_missing.pl',
       't/053_umbra_mainfork_unlink.pl',
+      't/054_umbra_identity_map.pl',
     ],
   },
 }

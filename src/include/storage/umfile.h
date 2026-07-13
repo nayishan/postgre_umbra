@@ -46,10 +46,17 @@ extern uint32 umfile_maxcombine(UmbraFileContext *ctx, ForkNumber forknum,
 extern void umfile_readv(UmbraFileContext *ctx, ForkNumber forknum,
 						 BlockNumber blocknum, void **buffers,
 						 BlockNumber nblocks);
-extern void umfile_startreadv(PgAioHandle *ioh, SMgrRelation reln,
-							  UmbraFileContext *ctx, ForkNumber forknum,
-							  BlockNumber blocknum, void **buffers,
-							  BlockNumber nblocks);
+/*
+ * Start an asynchronous read at a physical block while preserving the caller's
+ * logical block identity in the AIO target data.
+ */
+extern void umfile_startreadv_physical(PgAioHandle *ioh,
+									   UmbraFileContext *ctx,
+									   ForkNumber forknum,
+									   BlockNumber lblkno,
+									   BlockNumber pblkno,
+									   void **buffers,
+									   BlockNumber nblocks);
 extern void umfile_writev(UmbraFileContext *ctx, ForkNumber forknum,
 						  BlockNumber blocknum, const void **buffers,
 						  BlockNumber nblocks, bool skipFsync);

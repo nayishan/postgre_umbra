@@ -149,6 +149,7 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 
 	srel = smgropen(rlocator, procNumber);
 	smgrcreate(srel, MAIN_FORKNUM, false);
+	smgrinitnewrelation(srel, needs_wal);
 
 	if (needs_wal)
 		log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);

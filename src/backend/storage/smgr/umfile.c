@@ -4,9 +4,9 @@
  *	  This code manages Umbra relation segment files.
  *
  * This layer is an Umbra-owned copy of md.c's md-style segment file
- * management.  It uses the ordinary relation fork paths in this patch, but
- * stores open segment state in UmbraFileContext rather than in md.c's
- * SMgrRelation fields.
+ * management.  Standard forks use PostgreSQL relation fork paths.  Umbra's
+ * private map fork uses a local path convention below this layer and is not
+ * exposed as a PostgreSQL fork.
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
@@ -32,6 +32,7 @@
 #include "storage/bufmgr.h"
 #include "storage/fd.h"
 #include "storage/umfile.h"
+#include "storage/ummap.h"
 #include "storage/relfilelocator.h"
 #include "storage/smgr.h"
 #include "storage/sync.h"
@@ -92,8 +93,8 @@ typedef struct UmfdVec
 struct UmbraFileContext
 {
 	RelFileLocatorBackend rlocator;
-	int			num_open_segs[MAX_FORKNUM + 1];
-	UmfdVec    *seg_fds[MAX_FORKNUM + 1];
+	int			num_open_segs[UMBRA_NUM_FORKS];
+	UmfdVec    *seg_fds[UMBRA_NUM_FORKS];
 };
 
 static MemoryContext UmFileCxt;		/* context for all UmfdVec objects */
@@ -156,6 +157,9 @@ static void umfile_register_forget_request(RelFileLocatorBackend rlocator, ForkN
 static void umfile_fdvec_resize(UmbraFileContext *ctx,
 								ForkNumber forknum,
 								int nseg);
+static bool umfile_forknum_is_valid(ForkNumber forknum);
+static RelPathStr umfile_relpath(RelFileLocatorBackend rlocator,
+								 ForkNumber forknum);
 static UmFilePathStr umfile_segpath(RelFileLocatorBackend rlocator, ForkNumber forknum,
 									BlockNumber segno);
 static UmFilePathStr umfile_segpath_perm(RelFileLocator rlocator,
@@ -210,7 +214,7 @@ bool
 umfile_exists(UmbraFileContext *ctx, ForkNumber forknum)
 {
 	Assert(ctx != NULL);
-	Assert(forknum >= 0 && forknum <= MAX_FORKNUM);
+	Assert(umfile_forknum_is_valid(forknum));
 
 	/*
 	 * Close it first, to ensure that we notice if the fork has been unlinked
@@ -236,7 +240,7 @@ umfile_create(UmbraFileContext *ctx, ForkNumber forknum, bool isRedo)
 	File		fd;
 
 	Assert(ctx != NULL);
-	Assert(forknum >= 0 && forknum <= MAX_FORKNUM);
+	Assert(umfile_forknum_is_valid(forknum));
 
 	if (isRedo && ctx->num_open_segs[forknum] > 0)
 		return;					/* created and opened already... */
@@ -256,7 +260,7 @@ umfile_create(UmbraFileContext *ctx, ForkNumber forknum, bool isRedo)
 							ctx->rlocator.locator.dbOid,
 							isRedo);
 
-	path = relpath(ctx->rlocator, forknum);
+	path = umfile_relpath(ctx->rlocator, forknum);
 
 	fd = PathNameOpenFile(path.str, umfile_open_flags() | O_CREAT | O_EXCL);
 
@@ -352,8 +356,8 @@ umfile_unlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 	/* Now do the per-fork work */
 	if (forknum == InvalidForkNumber)
 	{
-		for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
-			umfile_unlinkfork(rlocator, forknum, isRedo);
+		for (int forkidx = 0; forkidx < UMBRA_NUM_FORKS; forkidx++)
+			umfile_unlinkfork(rlocator, (ForkNumber) forkidx, isRedo);
 	}
 	else
 		umfile_unlinkfork(rlocator, forknum, isRedo);
@@ -390,9 +394,9 @@ umfile_unlinkfork(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRed
 	int			ret;
 	int			save_errno;
 
-	Assert(forknum >= 0 && forknum <= MAX_FORKNUM);
+	Assert(umfile_forknum_is_valid(forknum));
 
-	path = relpath(rlocator, forknum);
+	path = umfile_relpath(rlocator, forknum);
 
 	/*
 	 * Truncate and then unlink the first segment, or just register a request
@@ -507,7 +511,7 @@ umfile_extend(UmbraFileContext *ctx, ForkNumber forknum,
 	UmfdVec    *v;
 
 	Assert(ctx != NULL);
-	Assert(forknum >= 0 && forknum <= MAX_FORKNUM);
+	Assert(umfile_forknum_is_valid(forknum));
 
 	/* If this build supports direct I/O, the buffer must be I/O aligned. */
 	if (PG_O_DIRECT != 0 && PG_IO_ALIGN_SIZE <= BLCKSZ)
@@ -528,7 +532,7 @@ umfile_extend(UmbraFileContext *ctx, ForkNumber forknum,
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("cannot extend file \"%s\" beyond %u blocks",
-						relpath(ctx->rlocator, forknum).str,
+						umfile_relpath(ctx->rlocator, forknum).str,
 						InvalidBlockNumber)));
 
 	v = umfile_getseg(ctx, forknum, blocknum, skipFsync, EXTENSION_CREATE);
@@ -576,7 +580,7 @@ umfile_zeroextend(UmbraFileContext *ctx, ForkNumber forknum,
 	int			remblocks = nblocks;
 
 	Assert(ctx != NULL);
-	Assert(forknum >= 0 && forknum <= MAX_FORKNUM);
+	Assert(umfile_forknum_is_valid(forknum));
 	Assert(nblocks > 0);
 
 	/* This assert is too expensive to have on normally ... */
@@ -593,7 +597,7 @@ umfile_zeroextend(UmbraFileContext *ctx, ForkNumber forknum,
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("cannot extend file \"%s\" beyond %u blocks",
-						relpath(ctx->rlocator, forknum).str,
+						umfile_relpath(ctx->rlocator, forknum).str,
 						InvalidBlockNumber)));
 
 	while (remblocks > 0)
@@ -700,13 +704,13 @@ umfile_openfork(UmbraFileContext *ctx, ForkNumber forknum, int behavior)
 	File		fd;
 
 	Assert(ctx != NULL);
-	Assert(forknum >= 0 && forknum <= MAX_FORKNUM);
+	Assert(umfile_forknum_is_valid(forknum));
 
 	/* No work if already open */
 	if (ctx->num_open_segs[forknum] > 0)
 		return &ctx->seg_fds[forknum][0];
 
-	path = relpath(ctx->rlocator, forknum);
+	path = umfile_relpath(ctx->rlocator, forknum);
 
 	fd = PathNameOpenFile(path.str, umfile_open_flags());
 
@@ -758,7 +762,7 @@ umfile_close(UmbraFileContext *ctx, ForkNumber forknum)
 	int			nopensegs;
 
 	Assert(ctx != NULL);
-	Assert(forknum >= 0 && forknum <= MAX_FORKNUM);
+	Assert(umfile_forknum_is_valid(forknum));
 
 	nopensegs = ctx->num_open_segs[forknum];
 
@@ -783,13 +787,11 @@ umfile_close(UmbraFileContext *ctx, ForkNumber forknum)
 void
 umfile_destroy(UmbraFileContext *ctx)
 {
-	ForkNumber	forknum;
-
 	if (ctx == NULL)
 		return;
 
-	for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
-		umfile_close(ctx, forknum);
+	for (int forkidx = 0; forkidx < UMBRA_NUM_FORKS; forkidx++)
+		umfile_close(ctx, (ForkNumber) forkidx);
 
 	pfree(ctx);
 }
@@ -999,8 +1001,8 @@ umfile_readv(UmbraFileContext *ctx, ForkNumber forknum,
 				 * beyond EOF to exist.
 				 *
 				 * Therefore we do not want to copy the logic into
-				 * umfile_startreadv(), where it would have to be more
-				 * complicated due to potential differences in the
+				 * umfile_startreadv_physical(), where it would have to be
+				 * more complicated due to potential differences in the
 				 * zero_damaged_pages setting between the definer and
 				 * completor of IO.
 				 *
@@ -1048,12 +1050,13 @@ umfile_readv(UmbraFileContext *ctx, ForkNumber forknum,
 }
 
 /*
- * umfile_startreadv() -- Asynchronous version of umfile_readv().
+ * umfile_startreadv_physical() -- Asynchronous physical read.
  */
 void
-umfile_startreadv(PgAioHandle *ioh,
-				  SMgrRelation reln, UmbraFileContext *ctx, ForkNumber forknum,
-				  BlockNumber blocknum, void **buffers, BlockNumber nblocks)
+umfile_startreadv_physical(PgAioHandle *ioh, UmbraFileContext *ctx,
+						   ForkNumber forknum, BlockNumber lblkno,
+						   BlockNumber pblkno, void **buffers,
+						   BlockNumber nblocks)
 {
 	pgoff_t		seekpos;
 	UmfdVec    *v;
@@ -1062,16 +1065,16 @@ umfile_startreadv(PgAioHandle *ioh,
 	int			iovcnt;
 	int			ret;
 
-	v = umfile_getseg(ctx, forknum, blocknum, false,
+	v = umfile_getseg(ctx, forknum, pblkno, false,
 					  EXTENSION_FAIL | EXTENSION_CREATE_RECOVERY);
 
-	seekpos = (pgoff_t) BLCKSZ * (blocknum % ((BlockNumber) RELSEG_SIZE));
+	seekpos = (pgoff_t) BLCKSZ * (pblkno % ((BlockNumber) RELSEG_SIZE));
 
 	Assert(seekpos < (pgoff_t) BLCKSZ * RELSEG_SIZE);
 
 	nblocks_this_segment =
 		Min(nblocks,
-			RELSEG_SIZE - (blocknum % ((BlockNumber) RELSEG_SIZE)));
+			RELSEG_SIZE - (pblkno % ((BlockNumber) RELSEG_SIZE)));
 
 	if (nblocks_this_segment != nblocks)
 		elog(ERROR, "read crossing segment boundary");
@@ -1087,12 +1090,6 @@ umfile_startreadv(PgAioHandle *ioh,
 	if (!(io_direct_flags & IO_DIRECT_DATA))
 		pgaio_io_set_flag(ioh, PGAIO_HF_BUFFERED);
 
-	pgaio_io_set_target_smgr(ioh,
-							 reln,
-							 forknum,
-							 blocknum,
-							 nblocks,
-							 false);
 	pgaio_io_register_callbacks(ioh, PGAIO_HCB_UMFILE_READV, 0);
 
 	ret = FileStartReadV(ioh, v->umfd_vfd, iovcnt, seekpos, WAIT_EVENT_DATA_FILE_READ);
@@ -1100,8 +1097,8 @@ umfile_startreadv(PgAioHandle *ioh,
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not start reading blocks %u..%u in file \"%s\": %m",
-						blocknum,
-						blocknum + nblocks_this_segment - 1,
+						lblkno,
+						lblkno + nblocks_this_segment - 1,
 						FilePathName(v->umfd_vfd))));
 
 	/*
@@ -1296,7 +1293,7 @@ umfile_nblocks(UmbraFileContext *ctx, ForkNumber forknum)
 	BlockNumber segno;
 
 	Assert(ctx != NULL);
-	Assert(forknum >= 0 && forknum <= MAX_FORKNUM);
+	Assert(umfile_forknum_is_valid(forknum));
 
 	umfile_openfork(ctx, forknum, EXTENSION_FAIL);
 
@@ -1366,7 +1363,7 @@ umfile_truncate(UmbraFileContext *ctx, ForkNumber forknum,
 	int			curopensegs;
 
 	Assert(ctx != NULL);
-	Assert(forknum >= 0 && forknum <= MAX_FORKNUM);
+	Assert(umfile_forknum_is_valid(forknum));
 
 	if (nblocks > curnblk)
 	{
@@ -1375,7 +1372,7 @@ umfile_truncate(UmbraFileContext *ctx, ForkNumber forknum,
 			return;
 		ereport(ERROR,
 				(errmsg("could not truncate file \"%s\" to %u blocks: it's only %u blocks now",
-						relpath(ctx->rlocator, forknum).str,
+						umfile_relpath(ctx->rlocator, forknum).str,
 						nblocks, curnblk)));
 	}
 	if (nblocks == curnblk)
@@ -1669,6 +1666,8 @@ umfile_fdvec_resize(UmbraFileContext *ctx,
 					ForkNumber forknum,
 					int nseg)
 {
+	Assert(umfile_forknum_is_valid(forknum));
+
 	if (nseg == 0)
 	{
 		if (ctx->num_open_segs[forknum] > 0)
@@ -1707,6 +1706,22 @@ umfile_fdvec_resize(UmbraFileContext *ctx,
 	ctx->num_open_segs[forknum] = nseg;
 }
 
+static bool
+umfile_forknum_is_valid(ForkNumber forknum)
+{
+	return forknum >= 0 && (int) forknum < UMBRA_NUM_FORKS;
+}
+
+static RelPathStr
+umfile_relpath(RelFileLocatorBackend rlocator, ForkNumber forknum)
+{
+	if (forknum == UMBRA_MAP_FORKNUM)
+		return ummap_relpath(rlocator);
+
+	Assert(forknum >= 0 && forknum <= MAX_FORKNUM);
+	return relpath(rlocator, forknum);
+}
+
 /*
  * Return the filename for the specified segment of the relation. The
  * returned string is palloc'd.
@@ -1717,7 +1732,7 @@ umfile_segpath(RelFileLocatorBackend rlocator, ForkNumber forknum, BlockNumber s
 	RelPathStr	path;
 	UmFilePathStr fullpath;
 
-	path = relpath(rlocator, forknum);
+	path = umfile_relpath(rlocator, forknum);
 
 	if (segno > 0)
 		sprintf(fullpath.str, "%s.%u", path.str, segno);
@@ -2004,7 +2019,7 @@ umfilefiletagmatches(const FileTag *ftag, const FileTag *candidate)
 }
 
 /*
- * AIO completion callback for umfile_startreadv().
+ * AIO completion callback for umfile_startreadv_physical().
  */
 static PgAioResult
 umfile_readv_complete(PgAioHandle *ioh, PgAioResult prior_result, uint8 cb_data)
@@ -2067,7 +2082,7 @@ umfile_readv_complete(PgAioHandle *ioh, PgAioResult prior_result, uint8 cb_data)
 }
 
 /*
- * AIO error reporting callback for umfile_startreadv().
+ * AIO error reporting callback for umfile_startreadv_physical().
  *
  * Errors are encoded as follows:
  * - PgAioResult.error_data != 0 encodes IO that failed with that errno
