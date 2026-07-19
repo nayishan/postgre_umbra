@@ -18,3 +18,9 @@ backend_sources += files(
   'walsummarizer.c',
   'walwriter.c',
 )
+
+if get_option('umbra')
+  backend_sources += files(
+    'mapwriter.c',
+  )
+endif

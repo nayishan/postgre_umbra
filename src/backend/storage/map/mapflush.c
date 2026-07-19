@@ -30,6 +30,7 @@ static void MapPageInvalidateSlot(int slot_id,
 static MapSuperTag MapSuperMakeTag(RelFileLocatorBackend rlocator);
 static void MapSuperFlushMatching(Oid dbid, Oid spcOid);
 static void MapSuperInvalidateMatching(Oid dbid, Oid spcOid);
+static int MapPageBgWriterNextSlot = 0;
 
 void
 MapInvalidateRelation(RelFileLocatorBackend rlocator)
@@ -97,6 +98,37 @@ MapCheckpoint(void)
 	 * so a completed checkpoint cannot leave that root ahead of canonical MAP.
 	 */
 	MapPageFlushAll();
+}
+
+int
+MapPageBgWriterFlush(int max_pages)
+{
+	int			cleaned = 0;
+	int			scanned = 0;
+
+	if (max_pages <= 0)
+		return 0;
+	MapPageEnsureInitialized();
+
+	while (scanned < MapPageBufferCount && cleaned < max_pages)
+	{
+		MapPageDesc *desc;
+		uint64		before;
+		int			slot_id = MapPageBgWriterNextSlot;
+
+		MapPageBgWriterNextSlot = (MapPageBgWriterNextSlot + 1) %
+			MapPageBufferCount;
+		scanned++;
+		desc = &MapPageDescriptors[slot_id];
+		before = pg_atomic_read_u64(&desc->state);
+		if ((before & MAP_PAGE_DIRTY) == 0)
+			continue;
+		if (MapPageFlushBuffer(slot_id, NULL, NULL, true) &&
+			(pg_atomic_read_u64(&desc->state) & MAP_PAGE_DIRTY) == 0)
+			cleaned++;
+	}
+
+	return cleaned;
 }
 
 static MapSuperTag

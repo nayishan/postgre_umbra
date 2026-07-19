@@ -22,6 +22,8 @@ autovacuum = off
 checkpoint_timeout = '1h'
 full_page_writes = on
 log_checkpoints = on
+mapwriter_lru_maxpages = 0
+mapwriter_prealloc_max_relations = 0
 });
 $node->start;
 

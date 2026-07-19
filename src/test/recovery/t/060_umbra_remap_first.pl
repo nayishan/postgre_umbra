@@ -80,6 +80,7 @@ checkpoint_timeout = '1h'
 fsync = on
 full_page_writes = on
 max_wal_senders = 0
+map_prealloc_main_low = 1073741823
 recovery_prefetch = on
 wal_level = minimal
 });

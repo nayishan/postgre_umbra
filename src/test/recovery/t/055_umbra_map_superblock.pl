@@ -106,6 +106,7 @@ $node->append_conf(
 autovacuum = off
 checkpoint_timeout = '1h'
 fsync = on
+map_prealloc_main_low = 1073741823
 });
 $node->start;
 

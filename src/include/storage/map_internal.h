@@ -83,10 +83,12 @@ struct MapPageDesc
 typedef struct MapPagePoolCtl
 {
 	pg_atomic_uint64 next_victim;
+	pg_atomic_uint32 num_allocs;
 	/* Distinct pending-pinned descriptors, capped to leave one victim. */
 	pg_atomic_uint32 pending_reservations;
 	slock_t		strategy_lock;
 	int			first_free;
+	int			mapwriter_procno;
 	int			nslots;
 } MapPagePoolCtl;
 
@@ -116,6 +118,7 @@ extern void MapPageCacheDelete(const MapPageTag *tag, uint32 hashcode,
 extern LWLock *MapPageExtensionLock(RelFileLocatorBackend rlocator);
 extern int	MapPageClockGetBuffer(void);
 extern void MapPageClockFreeBuffer(int slot_id);
+extern void MapPageRecordAllocation(void);
 extern bool MapPageRegisterPendingPin(MapPageDesc *desc);
 extern void MapPageUnregisterPendingPin(MapPageDesc *desc);
 extern void MapPagePinBuffer(int slot_id, bool adjust_usage);

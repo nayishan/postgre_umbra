@@ -67,6 +67,9 @@
 #include "postmaster/autovacuum.h"
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/bgwriter.h"
+#ifdef USE_UMBRA
+#include "postmaster/mapwriter.h"
+#endif
 #include "postmaster/postmaster.h"
 #include "postmaster/startup.h"
 #include "postmaster/syslogger.h"
@@ -88,6 +91,9 @@
 #include "storage/proc.h"
 #include "storage/procnumber.h"
 #include "storage/standby.h"
+#ifdef USE_UMBRA
+#include "storage/ummap.h"
+#endif
 #include "tcop/backend_startup.h"
 #include "tcop/tcopprot.h"
 #include "portability/instr_time.h"

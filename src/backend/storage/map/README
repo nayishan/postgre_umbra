@@ -234,8 +234,9 @@ Deliberate Limits
 -----------------
 
 The pool size is fixed at postmaster startup as max(16, NBuffers / 128).  It
-has no access-strategy ring, local MAP buffer pool, pin-count waiter, or
-background mapwriter.
+has no access-strategy ring, local MAP buffer pool, or pin-count waiter.  The
+map writer uses a bounded conditional clock scan; it does not add a separate
+replacement policy.
 
 The root cache uses a 2 MiB in-place DSA and can grow under the postmaster to a
 hard 64 MiB limit.  It has no replacement policy: entries remain until relation
@@ -244,9 +245,9 @@ reached.  This is an explicit RFC limitation rather than a claim of unbounded
 relation cardinality.  Each entry stores only the opaque 64-byte root image;
 disk root I/O transfers one zero-padded 512-byte sector.
 
-This patch can reserve next-free ownership ahead of physical capacity, but it
-does not reclaim or reuse physical blocks, preallocate capacity in the
-background, or run a background mapwriter.  CRC detects an invalid root but
-does not provide a duplicate root or repair arbitrary storage corruption.  The
-authoritative runtime EOF contract and append-only physical frontier must be
-revisited before physical blocks can be reclaimed or reused.
+The map writer preallocates capacity only for permanent MAIN forks.  FSM and VM
+remain on foreground extension because they do not yet have an independent
+physical-allocation lifecycle.  This patch does not relocate live blocks,
+reclaim or reuse retired physical blocks, or unlink physical segments.  CRC
+detects an invalid root but does not provide a duplicate root or repair
+arbitrary storage corruption.

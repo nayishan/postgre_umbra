@@ -99,7 +99,9 @@ MapPagePoolShmemInit(void)
 
 	MapPagePoolCtlData->nslots = MapPageBufferCount;
 	MapPagePoolCtlData->first_free = 0;
+	MapPagePoolCtlData->mapwriter_procno = INVALID_PROC_NUMBER;
 	pg_atomic_init_u64(&MapPagePoolCtlData->next_victim, 0);
+	pg_atomic_init_u32(&MapPagePoolCtlData->num_allocs, 0);
 	pg_atomic_init_u32(&MapPagePoolCtlData->pending_reservations, 0);
 	SpinLockInit(&MapPagePoolCtlData->strategy_lock);
 
@@ -248,6 +250,7 @@ MapPageClockGetBuffer(void)
 			break;
 		if (MapPageTryClaimBuffer(slot_id))
 		{
+			MapPageRecordAllocation();
 			MapPageRememberPin(slot_id);
 			return slot_id;
 		}
@@ -287,6 +290,7 @@ MapPageClockGetBuffer(void)
 				break;
 			}
 
+			MapPageRecordAllocation();
 			MapPageRememberPin(slot_id);
 			return slot_id;
 		}

@@ -31,6 +31,10 @@ typedef struct UmbraMapRange
 	BlockNumber nblocks;
 } UmbraMapRange;
 
+extern PGDLLIMPORT int map_prealloc_main_low;
+extern PGDLLIMPORT int map_prealloc_main_hard;
+extern PGDLLIMPORT int map_prealloc_main_batch;
+
 /* Fixed-size ownership token for one WAL-owned existing-page remap. */
 typedef struct UmbraMapRemap
 {
@@ -99,6 +103,10 @@ extern void ummap_root_advance_capacity(UmbraFileContext *ctx,
 									   ForkNumber forknum,
 									   BlockNumber physical_capacity,
 									   bool skipFsync);
+extern bool ummap_maybe_preallocate(UmbraFileContext *ctx,
+									   RelFileLocatorBackend rlocator,
+									   ForkNumber forknum,
+									   bool background_mode);
 
 extern BlockNumber ummap_nblocks(UmbraFileContext *ctx,
 								  RelFileLocatorBackend rlocator,

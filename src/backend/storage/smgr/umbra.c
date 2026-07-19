@@ -435,7 +435,7 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 								  blocknum - logical_nblocks + 1,
 								  InvalidXLogRecPtr, skipFsync);
 		ummap_root_advance(ctx, reln->smgr_rlocator, forknum, blocknum + 1,
-							 umfile_nblocks(ctx, forknum), InvalidXLogRecPtr,
+							 blocknum + 1, InvalidXLogRecPtr,
 							 skipFsync);
 		return;
 	}
@@ -512,7 +512,7 @@ retry_firstborn:
 									  nblocks, InvalidXLogRecPtr, skipFsync);
 			ummap_root_advance(ctx, reln->smgr_rlocator, forknum,
 								 logical_nblocks + nblocks,
-								 umfile_nblocks(ctx, forknum),
+								 physical_nblocks + nblocks,
 								 InvalidXLogRecPtr, skipFsync);
 		}
 		else if (!ummap_prepare_firstborn_range(ctx, reln->smgr_rlocator,
@@ -580,7 +580,7 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 								  InvalidXLogRecPtr, skipFsync);
 		ummap_root_advance(ctx, reln->smgr_rlocator, forknum,
 							 blocknum + (BlockNumber) nblocks,
-							 umfile_nblocks(ctx, forknum), InvalidXLogRecPtr,
+							 blocknum + (BlockNumber) nblocks, InvalidXLogRecPtr,
 							 skipFsync);
 		return;
 	}
@@ -736,7 +736,7 @@ retry_firstborn:
 									  skipFsync);
 			ummap_root_advance(ctx, reln->smgr_rlocator, forknum,
 								 logical_nblocks + range_nblocks,
-								 umfile_nblocks(ctx, forknum),
+								 first_pblkno + range_nblocks,
 								 InvalidXLogRecPtr, skipFsync);
 		}
 		else if (!ummap_prepare_firstborn_range(ctx, reln->smgr_rlocator,

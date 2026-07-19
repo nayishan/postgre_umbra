@@ -30,4 +30,9 @@ OBJS = \
 	walsummarizer.o \
 	walwriter.o
 
+ifeq ($(with_umbra), yes)
+OBJS += \
+	mapwriter.o
+endif
+
 include $(top_srcdir)/src/backend/common.mk

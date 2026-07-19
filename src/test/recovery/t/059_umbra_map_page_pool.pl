@@ -64,6 +64,7 @@ my $node = PostgreSQL::Test::Cluster->new('map_page_pool');
 $node->init;
 $node->append_conf('postgresql.conf', "shared_buffers = '128kB'");
 $node->append_conf('postgresql.conf', 'max_locks_per_transaction = 512');
+$node->append_conf('postgresql.conf', 'mapwriter_lru_maxpages = 0');
 $node->start;
 
 $node->safe_psql(
