@@ -132,6 +132,13 @@ typedef struct
 	/* copy of the fork_flags field from the XLogRecordBlockHeader */
 	uint8		flags;
 
+#ifdef USE_UMBRA
+	bool		has_remap;
+	BlockNumber first_lblkno;
+	BlockNumber first_pblkno;
+	BlockNumber nblocks;
+#endif
+
 	/* Information on full-page image, if any */
 	bool		has_image;		/* has image, even for consistency checking */
 	bool		apply_image;	/* has image that should be restored */
@@ -424,6 +431,10 @@ extern bool DecodeXLogRecord(XLogReaderState *state,
 	((decoder)->record->blocks[block_id].has_image)
 #define XLogRecBlockImageApply(decoder, block_id)		\
 	((decoder)->record->blocks[block_id].apply_image)
+#ifdef USE_UMBRA
+#define XLogRecBlockHasRemap(decoder, block_id)		\
+	((decoder)->record->blocks[block_id].has_remap)
+#endif
 #define XLogRecHasBlockData(decoder, block_id)		\
 	((decoder)->record->blocks[block_id].has_data)
 

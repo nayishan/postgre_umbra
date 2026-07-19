@@ -20,11 +20,17 @@
  */
 #include "postgres.h"
 
+#include "access/xact.h"
+#include "access/xlog.h"
+#include "access/xlogutils.h"
+#include "catalog/storage.h"
+#include "miscadmin.h"
 #include "storage/map.h"
 #include "storage/smgr.h"
 #include "storage/umfile.h"
 #include "storage/ummap.h"
 #include "storage/umbra.h"
+#include "utils/hsearch.h"
 #include "utils/memutils.h"
 
 typedef struct UmbraSmgrRelationState
@@ -39,15 +45,46 @@ typedef struct UmbraSmgrRelationState
 	bool		uses_map;
 } UmbraSmgrRelationState;
 
+typedef struct UmbraRedoCreateState
+{
+	RelFileLocator rlocator;		/* hash key, must be first */
+	uint32		created_forks;
+} UmbraRedoCreateState;
+
 static UmbraFileContext *um_get_filectx(SMgrRelation reln);
 static bool um_fork_uses_map(SMgrRelation reln, ForkNumber forknum);
 static BlockNumber um_get_logical_nblocks(SMgrRelation reln,
 										  ForkNumber forknum);
+static void um_mapping_xact_callback(XactEvent event, void *arg);
+static void um_mapping_subxact_callback(SubXactEvent event,
+										SubTransactionId mySubid,
+										SubTransactionId parentSubid,
+										void *arg);
+static void um_prepare_firstborn_target(SMgrRelation reln,
+										ForkNumber forknum,
+										BlockNumber target_lblkno,
+										BlockNumber anchor_lblkno);
+static void um_ensure_physical_capacity(UmbraFileContext *ctx,
+										ForkNumber forknum,
+										BlockNumber first_pblkno,
+										BlockNumber nblocks, bool skipFsync);
+static bool um_redo_create_seen(RelFileLocator rlocator, ForkNumber forknum);
+static void um_forget_redo_create(RelFileLocator rlocator);
+static void um_forget_redo_create_database(Oid dbid, Oid spcOid);
+
+static bool um_xact_callbacks_registered = false;
+static HTAB *um_redo_create_hash = NULL;
 
 void
 uminit(void)
 {
 	umfile_init();
+	if (!um_xact_callbacks_registered)
+	{
+		RegisterXactCallback(um_mapping_xact_callback, NULL);
+		RegisterSubXactCallback(um_mapping_subxact_callback, NULL);
+		um_xact_callbacks_registered = true;
+	}
 }
 
 void
@@ -122,6 +159,39 @@ uminitnewrelation(SMgrRelation reln, bool needs_wal)
 }
 
 void
+umredocreate(SMgrRelation reln, ForkNumber forknum)
+{
+	UmbraRedoCreateState *entry;
+	bool		found;
+
+	Assert(InRecovery);
+	Assert(forknum >= 0 && forknum <= MAX_FORKNUM);
+	if (ummap_has_recovery_scratch_relation(reln->smgr_rlocator))
+		elog(PANIC,
+			 "Umbra redo CREATE encountered unresolved recovery mapping for relation %u/%u/%u",
+			 reln->smgr_rlocator.locator.spcOid,
+			 reln->smgr_rlocator.locator.dbOid,
+			 reln->smgr_rlocator.locator.relNumber);
+	if (um_redo_create_hash == NULL)
+	{
+		HASHCTL		ctl;
+
+		MemSet(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(RelFileLocator);
+		ctl.entrysize = sizeof(UmbraRedoCreateState);
+		ctl.hcxt = TopMemoryContext;
+		um_redo_create_hash = hash_create("Umbra redo CREATE state", 128,
+										   &ctl,
+										   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	entry = hash_search(um_redo_create_hash,
+						&reln->smgr_rlocator.locator, HASH_ENTER, &found);
+	if (!found)
+		entry->created_forks = 0;
+	entry->created_forks |= (uint32) 1 << forknum;
+}
+
+void
 umcheckpoint(void)
 {
 	MapCheckpoint();
@@ -136,12 +206,16 @@ umflushdatabasetablespace(Oid dbid, Oid spcOid)
 void
 uminvalidatedatabase(Oid dbid)
 {
+	ummap_forget_recovery_scratch_database(dbid, InvalidOid);
+	um_forget_redo_create_database(dbid, InvalidOid);
 	MapInvalidateDatabase(dbid);
 }
 
 void
 uminvalidatedatabasetablespace(Oid dbid, Oid spcOid)
 {
+	ummap_forget_recovery_scratch_database(dbid, spcOid);
+	um_forget_redo_create_database(dbid, spcOid);
 	MapInvalidateDatabaseTablespace(dbid, spcOid);
 }
 
@@ -156,13 +230,19 @@ umunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 {
 	if (forknum == InvalidForkNumber)
 	{
+		um_forget_redo_create(rlocator.locator);
+		ummap_forget_recovery_scratch(rlocator, MAIN_FORKNUM, 0);
 		MapInvalidateRelation(rlocator);
 		umfile_unlink(rlocator, forknum, isRedo);
 		return;
 	}
 
 	if (forknum == MAIN_FORKNUM)
+	{
+		um_forget_redo_create(rlocator.locator);
+		ummap_forget_recovery_scratch(rlocator, MAIN_FORKNUM, 0);
 		ummap_unlink(rlocator, isRedo);
+	}
 
 	umfile_unlink(rlocator, forknum, isRedo);
 }
@@ -172,46 +252,99 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		 const void *buffer, bool skipFsync)
 {
 	UmbraFileContext *ctx = um_get_filectx(reln);
-	BlockNumber	lblkno;
-	BlockNumber	old_nblocks;
+	UmbraMapRange pending_range;
+	BlockNumber	logical_nblocks;
+	BlockNumber	physical_nblocks;
 	BlockNumber	pblkno;
+	bool		pending_wal_ready;
+	bool		uses_wal;
 
 	if (!um_fork_uses_map(reln, forknum))
 	{
 		umfile_extend(ctx, forknum, blocknum, buffer, skipFsync);
 		return;
 	}
-
-	old_nblocks = umfile_nblocks(ctx, forknum);
-	pblkno = blocknum;
-	umfile_extend(ctx, forknum, pblkno, buffer, skipFsync);
-	if (!ummap_tracks_fork(forknum))
-		return;
-
-	/*
-	 * smgrextend() permits writing beyond EOF.  The physical extension makes
-	 * the intervening sparse blocks read as zeroes, so publish identity MAP
-	 * entries for the entire newly-addressable range.
-	 */
-	lblkno = old_nblocks;
-	while (lblkno <= blocknum)
+	if (forknum != MAIN_FORKNUM)
 	{
-		BlockNumber published_blocks;
-		BlockNumber published_pblkno;
-		BlockNumber run_blocks;
+		logical_nblocks = um_get_logical_nblocks(reln, forknum);
+		if (blocknum < logical_nblocks)
+		{
+			const void *buffers[1] = {buffer};
 
-		run_blocks = ummap_identity_run_limit(forknum, lblkno,
-											  blocknum - lblkno + 1, &pblkno);
-		published_blocks = ummap_set_identity_run(ctx, reln->smgr_rlocator,
-												  forknum, lblkno,
-												  run_blocks, &published_pblkno,
-												  skipFsync);
-		if (published_blocks != run_blocks || published_pblkno != pblkno)
-			elog(ERROR,
-				 "identity Umbra map run for fork %d block %u published %u blocks at physical block %u",
-				 (int) forknum, lblkno, published_blocks, published_pblkno);
+			umfile_writev(ctx, forknum, blocknum, buffers, 1, skipFsync);
+			return;
+		}
+		umfile_extend(ctx, forknum, blocknum, buffer, skipFsync);
+		ummap_publish_mapping_run(ctx, reln->smgr_rlocator, forknum,
+								  logical_nblocks, logical_nblocks,
+								  blocknum - logical_nblocks + 1,
+								  InvalidXLogRecPtr, skipFsync);
+		return;
+	}
 
-		lblkno += run_blocks;
+	/* A WAL-before-extend reservation is not a visible existing page yet. */
+	if (ummap_pending_range_for_target(reln->smgr_rlocator, forknum,
+									 blocknum, &pending_range,
+									 &pending_wal_ready))
+	{
+		bool		critical_started = false;
+
+		pblkno = pending_range.first_pblkno +
+			(blocknum - pending_range.first_lblkno);
+		if (pending_wal_ready)
+		{
+			START_CRIT_SECTION();
+			critical_started = true;
+		}
+		physical_nblocks = umfile_nblocks(ctx, forknum);
+		if (pblkno < physical_nblocks)
+		{
+			const void *buffers[1] = {buffer};
+
+			umfile_writev(ctx, forknum, pblkno, buffers, 1, skipFsync);
+		}
+		else
+			umfile_extend(ctx, forknum, pblkno, buffer, skipFsync);
+		ummap_mark_range_physical(reln->smgr_rlocator, forknum, blocknum);
+		if (critical_started)
+			END_CRIT_SECTION();
+		UmMappingPublicationDone();
+		return;
+	}
+
+	logical_nblocks = um_get_logical_nblocks(reln, forknum);
+	if (blocknum < logical_nblocks)
+	{
+		const void *buffers[1] = {buffer};
+
+		pblkno = ummap_lookup_block(ctx, reln->smgr_rlocator, forknum,
+								 blocknum);
+		umfile_writev(ctx, forknum, pblkno, buffers, 1, skipFsync);
+		return;
+	}
+	if (InRecovery)
+		elog(PANIC,
+			 "missing Umbra WAL mapping for recovery extension at logical block %u",
+			 blocknum);
+
+	uses_wal = !IsBootstrapProcessingMode() &&
+		!RelFileLocatorSkippingWAL(reln->smgr_rlocator.locator);
+	{
+		BlockNumber nblocks = blocknum - logical_nblocks + 1;
+
+		physical_nblocks = ummap_next_physical_block(ctx,
+												 reln->smgr_rlocator, forknum);
+		pblkno = physical_nblocks + (blocknum - logical_nblocks);
+		umfile_extend(ctx, forknum, pblkno, buffer, skipFsync);
+		if (!uses_wal)
+			ummap_publish_mapping_run(ctx, reln->smgr_rlocator, forknum,
+									  logical_nblocks, physical_nblocks,
+									  nblocks, InvalidXLogRecPtr, skipFsync);
+		else
+			ummap_prepare_firstborn_range(ctx, reln->smgr_rlocator,
+												 forknum, logical_nblocks,
+												 physical_nblocks, nblocks,
+												 InvalidBlockNumber, true);
 	}
 }
 
@@ -220,8 +353,12 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 			 int nblocks, bool skipFsync)
 {
 	UmbraFileContext *ctx = um_get_filectx(reln);
-	BlockNumber	pblkno;
-	BlockNumber	remblocks;
+	BlockNumber	logical_nblocks;
+	BlockNumber	first_pblkno;
+	BlockNumber	range_nblocks;
+	UmbraMapRange pending_range;
+	bool		pending_wal_ready;
+	bool		uses_wal;
 
 	Assert(nblocks > 0);
 	if (!um_fork_uses_map(reln, forknum))
@@ -229,29 +366,370 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		umfile_zeroextend(ctx, forknum, blocknum, nblocks, skipFsync);
 		return;
 	}
-
-	remblocks = nblocks;
-	while (remblocks > 0)
+	if (forknum != MAIN_FORKNUM)
 	{
-		BlockNumber published_pblkno;
-		BlockNumber published_blocks;
-		BlockNumber run_blocks;
-
-		run_blocks = ummap_identity_run_limit(forknum, blocknum, remblocks,
-											  &pblkno);
-		umfile_zeroextend(ctx, forknum, pblkno, run_blocks, skipFsync);
-		published_blocks = ummap_set_identity_run(ctx, reln->smgr_rlocator,
-												  forknum,
-												  blocknum, run_blocks,
-												  &published_pblkno,
-												  skipFsync);
-		if (published_blocks != run_blocks || published_pblkno != pblkno)
+		logical_nblocks = um_get_logical_nblocks(reln, forknum);
+		if (blocknum < logical_nblocks)
 			elog(ERROR,
-				 "identity Umbra map run for fork %d block %u published %u blocks at physical block %u",
-				 (int) forknum, blocknum, published_blocks, published_pblkno);
+				 "cannot zero-extend Umbra fork %d from block %u below logical EOF %u",
+				 (int) forknum, blocknum, logical_nblocks);
+		umfile_zeroextend(ctx, forknum, blocknum, nblocks, skipFsync);
+		ummap_publish_mapping_run(ctx, reln->smgr_rlocator, forknum,
+								  logical_nblocks, logical_nblocks,
+								  blocknum - logical_nblocks + nblocks,
+								  InvalidXLogRecPtr, skipFsync);
+		return;
+	}
 
-		blocknum += run_blocks;
-		remblocks -= run_blocks;
+	if (InRecovery)
+	{
+		BlockNumber done = 0;
+		BlockNumber scratch_end;
+		UmbraMapRange replay_range;
+		bool		have_replay_range;
+		bool		replay_physical_ready;
+
+		logical_nblocks = um_get_logical_nblocks(reln, forknum);
+		scratch_end = blocknum + (BlockNumber) nblocks;
+		have_replay_range = ummap_replay_range_for_extension(
+			reln->smgr_rlocator, forknum, blocknum, (BlockNumber) nblocks,
+			&replay_range, &replay_physical_ready);
+		if (have_replay_range && replay_range.first_lblkno < scratch_end)
+		{
+			/*
+			 * A prior recovery attempt may already have persisted a prefix of
+			 * this exact range.  That canonical prefix legitimately lies below
+			 * the recovered EOF; only the uncovered gap before the range needs
+			 * recovery scratch.
+			 */
+			scratch_end = replay_range.first_lblkno;
+		}
+
+		if (blocknum >= logical_nblocks && scratch_end > logical_nblocks)
+		{
+			BlockNumber recovery_nblocks;
+
+			/*
+			 * This path runs after bufmgr has protected every logical block in
+			 * the extension chunk with BM_IO_IN_PROGRESS.  A missing exact WAL
+			 * range can therefore be represented as non-persistent recovery
+			 * scratch until a later DROP or TRUNCATE proves it disposable.
+			 */
+			if (um_redo_create_seen(reln->smgr_rlocator.locator,
+								MAIN_FORKNUM))
+				elog(PANIC,
+					 "missing Umbra WAL mapping after redo create for relation %u/%u/%u block %u",
+					 reln->smgr_rlocator.locator.spcOid,
+					 reln->smgr_rlocator.locator.dbOid,
+					 reln->smgr_rlocator.locator.relNumber, blocknum);
+
+			recovery_nblocks = scratch_end - logical_nblocks;
+			XLogRecordInvalidPage(reln->smgr_rlocator.locator, forknum,
+							  logical_nblocks, false);
+			first_pblkno = ummap_next_physical_block(ctx,
+											 reln->smgr_rlocator, forknum);
+			um_ensure_physical_capacity(ctx, forknum, first_pblkno,
+									 recovery_nblocks, skipFsync);
+			pending_range.first_lblkno = logical_nblocks;
+			pending_range.first_pblkno = first_pblkno;
+			pending_range.nblocks = recovery_nblocks;
+			ummap_prepare_recovery_scratch_range(ctx, reln->smgr_rlocator,
+											 forknum, &pending_range);
+			reln->smgr_cached_nblocks[forknum] = InvalidBlockNumber;
+		}
+		if (have_replay_range && !replay_physical_ready)
+		{
+			um_ensure_physical_capacity(ctx, forknum,
+									replay_range.first_pblkno,
+									replay_range.nblocks, skipFsync);
+			ummap_mark_replay_range_physical(reln->smgr_rlocator, forknum,
+										  &replay_range);
+		}
+
+		while (done < (BlockNumber) nblocks)
+		{
+			BlockNumber pblkno;
+			BlockNumber run_blocks;
+
+			run_blocks = ummap_lookup_run(ctx, reln->smgr_rlocator, forknum,
+										 blocknum + done,
+										 (BlockNumber) nblocks - done,
+										 &pblkno);
+			um_ensure_physical_capacity(ctx, forknum, pblkno, run_blocks,
+								 skipFsync);
+			done += run_blocks;
+		}
+		return;
+	}
+
+	if (ummap_pending_range_for_target(reln->smgr_rlocator, forknum,
+									 blocknum, &pending_range,
+									 &pending_wal_ready))
+	{
+		BlockNumber offset = blocknum - pending_range.first_lblkno;
+		bool		critical_started = false;
+
+		if ((uint64) offset + nblocks > pending_range.nblocks)
+			elog(ERROR, "zero extension crosses an Umbra pending mapping range");
+		if (pending_wal_ready)
+		{
+			START_CRIT_SECTION();
+			critical_started = true;
+		}
+		um_ensure_physical_capacity(ctx, forknum,
+								 pending_range.first_pblkno + offset,
+								 (BlockNumber) nblocks, skipFsync);
+		ummap_mark_range_physical(reln->smgr_rlocator, forknum, blocknum);
+		if (critical_started)
+			END_CRIT_SECTION();
+		UmMappingPublicationDone();
+		return;
+	}
+
+	logical_nblocks = um_get_logical_nblocks(reln, forknum);
+	if (blocknum < logical_nblocks)
+		elog(ERROR,
+			 "cannot zero-extend Umbra fork %d from block %u below logical EOF %u",
+			 (int) forknum, blocknum, logical_nblocks);
+	range_nblocks = blocknum - logical_nblocks + nblocks;
+	first_pblkno = ummap_next_physical_block(ctx, reln->smgr_rlocator,
+											 forknum);
+
+	uses_wal = !IsBootstrapProcessingMode() &&
+		!RelFileLocatorSkippingWAL(reln->smgr_rlocator.locator);
+	um_ensure_physical_capacity(ctx, forknum, first_pblkno, range_nblocks,
+								 skipFsync);
+	if (!uses_wal)
+		ummap_publish_mapping_run(ctx, reln->smgr_rlocator, forknum,
+									  logical_nblocks, first_pblkno,
+									  range_nblocks, InvalidXLogRecPtr,
+									  skipFsync);
+	else
+		ummap_prepare_firstborn_range(ctx, reln->smgr_rlocator,
+												 forknum, logical_nblocks,
+												 first_pblkno, range_nblocks,
+												 InvalidBlockNumber, true);
+}
+
+static bool
+um_redo_create_seen(RelFileLocator rlocator, ForkNumber forknum)
+{
+	UmbraRedoCreateState *entry;
+
+	if (um_redo_create_hash == NULL)
+		return false;
+	entry = hash_search(um_redo_create_hash, &rlocator, HASH_FIND, NULL);
+	return entry != NULL &&
+		(entry->created_forks & ((uint32) 1 << forknum)) != 0;
+}
+
+static void
+um_forget_redo_create(RelFileLocator rlocator)
+{
+	if (um_redo_create_hash != NULL)
+		(void) hash_search(um_redo_create_hash, &rlocator, HASH_REMOVE, NULL);
+}
+
+static void
+um_forget_redo_create_database(Oid dbid, Oid spcOid)
+{
+	HASH_SEQ_STATUS status;
+	UmbraRedoCreateState *entry;
+
+	if (um_redo_create_hash == NULL)
+		return;
+
+	hash_seq_init(&status, um_redo_create_hash);
+	while ((entry = hash_seq_search(&status)) != NULL)
+	{
+		if (entry->rlocator.dbOid != dbid ||
+			(OidIsValid(spcOid) && entry->rlocator.spcOid != spcOid))
+			continue;
+		if (hash_search(um_redo_create_hash, &entry->rlocator,
+						HASH_REMOVE, NULL) == NULL)
+			elog(ERROR, "Umbra redo CREATE hash table corrupted");
+	}
+}
+
+void
+UmPrepareFirstbornLocator(RelFileLocator rlocator, ForkNumber forknum,
+						  BlockNumber lblkno)
+{
+	SMgrRelation reln;
+
+	if (IsBootstrapProcessingMode() || RelFileLocatorSkippingWAL(rlocator))
+		return;
+	if (forknum != MAIN_FORKNUM)
+		return;
+	reln = smgropen(rlocator, INVALID_PROC_NUMBER);
+	if (!um_fork_uses_map(reln, forknum))
+		return;
+
+	um_prepare_firstborn_target(reln, forknum, lblkno, lblkno);
+}
+
+void
+UmPrepareFirstbornRangeLocator(RelFileLocator rlocator, ForkNumber forknum,
+							   int nblocks, const BlockNumber *lblknos)
+{
+	SMgrRelation reln;
+	BlockNumber logical_nblocks;
+	BlockNumber anchor_lblkno = InvalidBlockNumber;
+
+	Assert(nblocks > 0);
+	Assert(lblknos != NULL);
+	for (int i = 0; i < nblocks; i++)
+	{
+		if (!BlockNumberIsValid(lblknos[i]) ||
+			(i > 0 && lblknos[i] <= lblknos[i - 1]))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("Umbra first-born block range is not strictly increasing")));
+	}
+	if (IsBootstrapProcessingMode() || RelFileLocatorSkippingWAL(rlocator))
+		return;
+	if (forknum != MAIN_FORKNUM)
+		return;
+
+	reln = smgropen(rlocator, INVALID_PROC_NUMBER);
+	if (!um_fork_uses_map(reln, forknum))
+		return;
+	logical_nblocks = um_get_logical_nblocks(reln, forknum);
+	for (int i = 0; i < nblocks; i++)
+	{
+		if (lblknos[i] >= logical_nblocks)
+		{
+			anchor_lblkno = lblknos[i];
+			break;
+		}
+	}
+	if (!BlockNumberIsValid(anchor_lblkno))
+		return;
+
+	/* One WAL header covers this batch and any zero-filled logical gaps. */
+	um_prepare_firstborn_target(reln, forknum, lblknos[nblocks - 1],
+								anchor_lblkno);
+}
+
+void
+UmLogMappingRange(RelFileLocator rlocator, ForkNumber forknum,
+				  BlockNumber startblk, BlockNumber endblk,
+				  BlockNumber anchor_lblkno)
+{
+	SMgrRelation reln;
+	UmbraFileContext *ctx;
+	BlockNumber pblkno;
+	BlockNumber run_blocks;
+
+	Assert(!InRecovery);
+	if (startblk >= endblk || anchor_lblkno < startblk ||
+		anchor_lblkno >= endblk)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid Umbra WAL mapping range")));
+	if (!RelFileLocatorSkippingWAL(rlocator))
+		return;
+	if (forknum != MAIN_FORKNUM)
+		return;
+
+	reln = smgropen(rlocator, INVALID_PROC_NUMBER);
+	if (!um_fork_uses_map(reln, forknum))
+		return;
+	ctx = um_get_filectx(reln);
+	run_blocks = ummap_lookup_run(ctx, reln->smgr_rlocator, forknum,
+									  startblk, endblk - startblk, &pblkno);
+	if (run_blocks != endblk - startblk)
+		ereport(ERROR,
+					(errmsg("Umbra skip-WAL mapping range is not physically contiguous")));
+	ummap_prepare_wal_range(ctx, reln->smgr_rlocator, forknum,
+								startblk, pblkno, run_blocks,
+								anchor_lblkno);
+}
+
+void
+UmLogMappingRangeFinish(void)
+{
+	UmMappingPublicationDone();
+}
+
+void
+UmMappingPublicationDone(void)
+{
+	MemoryContext oldcontext = CurrentMemoryContext;
+
+	if (CritSectionCount > 0)
+		return;
+
+	PG_TRY();
+	{
+		ummap_publish_ready_ranges();
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(oldcontext);
+		edata = CopyErrorData();
+		FlushErrorState();
+		edata->elevel = PANIC;
+		ThrowErrorData(edata);
+		pg_unreachable();
+	}
+	PG_END_TRY();
+}
+
+void
+UmPrepareReplayMappingRange(SMgrRelation reln, ForkNumber forknum,
+								const UmbraMapRange *range, XLogRecPtr lsn)
+{
+	UmbraFileContext *ctx;
+	BlockNumber logical_nblocks;
+	bool		physical_ready;
+
+	Assert(InRecovery);
+	Assert(range != NULL);
+	if (forknum != MAIN_FORKNUM)
+		return;
+	smgrcreate(reln, forknum, true);
+	if (!um_fork_uses_map(reln, forknum))
+		return;
+	ctx = um_get_filectx(reln);
+	logical_nblocks = um_get_logical_nblocks(reln, forknum);
+	physical_ready = logical_nblocks >= range->first_lblkno;
+	if (physical_ready)
+		um_ensure_physical_capacity(ctx, forknum, range->first_pblkno,
+									range->nblocks, false);
+	ummap_prepare_replay_range(ctx, reln->smgr_rlocator, forknum, range, lsn,
+							  physical_ready);
+	reln->smgr_cached_nblocks[forknum] = InvalidBlockNumber;
+}
+
+void
+UmPublishReplayMappingRanges(void)
+{
+	ummap_publish_replay_ranges();
+}
+
+void
+UmCheckRecoveryDependencies(void)
+{
+	if (ummap_has_replay_ranges())
+		elog(PANIC, "Umbra exact replay mapping survived its WAL record");
+	if (ummap_has_recovery_scratch())
+		elog(PANIC,
+			 "WAL ended with unresolved Umbra recovery mappings");
+}
+
+void
+UmRecoveryEnd(void)
+{
+	Assert(!ummap_has_replay_ranges());
+	Assert(!ummap_has_recovery_scratch());
+	ummap_recovery_end();
+	if (um_redo_create_hash != NULL)
+	{
+		hash_destroy(um_redo_create_hash);
+		um_redo_create_hash = NULL;
 	}
 }
 
@@ -299,7 +777,7 @@ ummaxcombine(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
 	if (!um_fork_uses_map(reln, forknum))
 		return umfile_maxcombine(ctx, forknum, blocknum);
 
-	logical_nblocks = umfile_nblocks(ctx, forknum);
+	logical_nblocks = um_get_logical_nblocks(reln, forknum);
 	if (blocknum >= logical_nblocks)
 		return 1;
 
@@ -331,8 +809,8 @@ umreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	while (nblocks > 0)
 	{
 		run_blocks = ummap_lookup_run(um_get_filectx(reln),
-									  reln->smgr_rlocator, forknum,
-									  blocknum, nblocks, &pblkno);
+										  reln->smgr_rlocator, forknum,
+										  blocknum, nblocks, &pblkno);
 		umfile_readv(um_get_filectx(reln), forknum, pblkno, buffers,
 					 run_blocks);
 
@@ -385,9 +863,9 @@ umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 	while (nblocks > 0)
 	{
-		run_blocks = ummap_lookup_run(um_get_filectx(reln),
-									  reln->smgr_rlocator, forknum,
-									  blocknum, nblocks, &pblkno);
+		run_blocks = ummap_lookup_write_run(um_get_filectx(reln),
+											reln->smgr_rlocator, forknum,
+											blocknum, nblocks, &pblkno);
 		umfile_writev(um_get_filectx(reln), forknum, pblkno, buffers,
 					  run_blocks, skipFsync);
 
@@ -399,7 +877,7 @@ umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 void
 umwriteback(SMgrRelation reln, ForkNumber forknum,
-			BlockNumber blocknum, BlockNumber nblocks)
+				BlockNumber blocknum, BlockNumber nblocks)
 {
 	BlockNumber	pblkno;
 	BlockNumber	run_blocks;
@@ -412,9 +890,9 @@ umwriteback(SMgrRelation reln, ForkNumber forknum,
 
 	while (nblocks > 0)
 	{
-		run_blocks = ummap_lookup_run(um_get_filectx(reln),
-									  reln->smgr_rlocator, forknum,
-									  blocknum, nblocks, &pblkno);
+		run_blocks = ummap_lookup_write_run(um_get_filectx(reln),
+											reln->smgr_rlocator, forknum,
+											blocknum, nblocks, &pblkno);
 		umfile_writeback(um_get_filectx(reln), forknum, pblkno, run_blocks);
 
 		blocknum += run_blocks;
@@ -429,9 +907,29 @@ umnblocks(SMgrRelation reln, ForkNumber forknum)
 }
 
 void
+umpretruncate(SMgrRelation reln, ForkNumber forknum,
+			  BlockNumber old_blocks, BlockNumber nblocks,
+			  XLogRecPtr truncate_lsn)
+{
+	if (!um_fork_uses_map(reln, forknum))
+		return;
+
+	if (InRecovery)
+		ummap_forget_recovery_scratch(reln->smgr_rlocator, forknum, nblocks);
+	ummap_truncate(um_get_filectx(reln), reln->smgr_rlocator, forknum,
+					 old_blocks, nblocks, truncate_lsn, false);
+}
+
+void
 umtruncate(SMgrRelation reln, ForkNumber forknum,
 		   BlockNumber old_blocks, BlockNumber nblocks)
 {
+	if (um_fork_uses_map(reln, forknum) && forknum == MAIN_FORKNUM)
+	{
+		/* umpretruncate() already cleared the logical MAP; P is append-only. */
+		return;
+	}
+
 	umfile_truncate(um_get_filectx(reln), forknum, old_blocks, nblocks);
 }
 
@@ -484,6 +982,10 @@ um_fork_uses_map(SMgrRelation reln, ForkNumber forknum)
 static BlockNumber
 um_get_logical_nblocks(SMgrRelation reln, ForkNumber forknum)
 {
+	if (um_fork_uses_map(reln, forknum))
+		return ummap_nblocks(um_get_filectx(reln), reln->smgr_rlocator,
+							 forknum);
+
 	return umfile_nblocks(um_get_filectx(reln), forknum);
 }
 
@@ -496,4 +998,113 @@ um_get_filectx(SMgrRelation reln)
 	Assert(state->filectx != NULL);
 
 	return state->filectx;
+}
+
+static void
+um_prepare_firstborn_target(SMgrRelation reln, ForkNumber forknum,
+							BlockNumber target_lblkno,
+							BlockNumber anchor_lblkno)
+{
+	UmbraFileContext *ctx = um_get_filectx(reln);
+	UmbraMapRange pending_range;
+	BlockNumber logical_nblocks;
+	BlockNumber first_pblkno;
+	BlockNumber nblocks;
+	bool		pending_wal_ready;
+
+	if (!BlockNumberIsValid(target_lblkno) ||
+		!BlockNumberIsValid(anchor_lblkno))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("invalid Umbra first-born logical block")));
+	if (ummap_pending_range_for_target(reln->smgr_rlocator, forknum,
+									 target_lblkno, &pending_range,
+									 &pending_wal_ready))
+		return;
+
+	logical_nblocks = um_get_logical_nblocks(reln, forknum);
+	if (target_lblkno < logical_nblocks)
+		return;
+	if (anchor_lblkno < logical_nblocks || anchor_lblkno > target_lblkno)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("Umbra WAL anchor is outside its first-born range")));
+
+	first_pblkno = ummap_next_physical_block(ctx, reln->smgr_rlocator,
+												forknum);
+	nblocks = target_lblkno - logical_nblocks + 1;
+	ummap_prepare_firstborn_range(ctx, reln->smgr_rlocator, forknum,
+									logical_nblocks, first_pblkno, nblocks,
+									anchor_lblkno, false);
+}
+
+static void
+um_mapping_xact_callback(XactEvent event, void *arg)
+{
+	(void) arg;
+
+	if (event == XACT_EVENT_PRE_COMMIT ||
+		event == XACT_EVENT_PARALLEL_PRE_COMMIT ||
+		event == XACT_EVENT_PRE_PREPARE)
+	{
+		UmMappingPublicationDone();
+		if (ummap_has_pending_ranges())
+			elog(PANIC, "Umbra mapping reached commit before publication");
+		return;
+	}
+
+	if (event == XACT_EVENT_ABORT || event == XACT_EVENT_PARALLEL_ABORT)
+		ummap_abort_pending_ranges(InvalidSubTransactionId);
+	else if (event == XACT_EVENT_COMMIT ||
+			 event == XACT_EVENT_PARALLEL_COMMIT ||
+			 event == XACT_EVENT_PREPARE)
+	{
+		if (ummap_has_pending_ranges())
+			elog(PANIC, "Umbra mapping survived transaction completion");
+	}
+}
+
+static void
+um_mapping_subxact_callback(SubXactEvent event,
+							SubTransactionId mySubid,
+							SubTransactionId parentSubid, void *arg)
+{
+	(void) arg;
+
+	if (event == SUBXACT_EVENT_COMMIT_SUB)
+		ummap_reparent_pending_ranges(mySubid, parentSubid);
+	else if (event == SUBXACT_EVENT_ABORT_SUB)
+		ummap_abort_pending_ranges(mySubid);
+}
+
+static void
+um_ensure_physical_capacity(UmbraFileContext *ctx, ForkNumber forknum,
+							BlockNumber first_pblkno, BlockNumber nblocks,
+							bool skipFsync)
+{
+	BlockNumber physical_nblocks;
+	uint64		required_nblocks;
+
+	Assert(nblocks > 0);
+	required_nblocks = (uint64) first_pblkno + nblocks;
+	if (required_nblocks > (uint64) InvalidBlockNumber)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("cannot materialize Umbra physical mapping range")));
+	physical_nblocks = umfile_nblocks(ctx, forknum);
+	if ((uint64) physical_nblocks >= required_nblocks)
+		return;
+
+	/*
+	 * Redo may revisit P after a prior recovery already restored its data.
+	 * Only extend the physical capacity; never zero or rewrite existing P.
+	 */
+	while ((uint64) physical_nblocks < required_nblocks)
+	{
+		uint64		remaining = required_nblocks - physical_nblocks;
+		int			chunk = (int) Min(remaining, (uint64) INT_MAX);
+
+		umfile_zeroextend(ctx, forknum, physical_nblocks, chunk, skipFsync);
+		physical_nblocks += chunk;
+	}
 }

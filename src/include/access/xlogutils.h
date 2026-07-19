@@ -62,6 +62,8 @@ extern PGDLLIMPORT HotStandbyState standbyState;
 
 extern bool XLogHaveInvalidPages(void);
 extern void XLogCheckInvalidPages(void);
+extern void XLogRecordInvalidPage(RelFileLocator locator, ForkNumber forkno,
+								  BlockNumber blkno, bool present);
 
 extern void XLogDropRelation(RelFileLocator rlocator, ForkNumber forknum);
 extern void XLogDropDatabase(Oid dbid);

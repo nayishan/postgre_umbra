@@ -283,9 +283,9 @@ is(
 		'postgres',
 		'SELECT (pg_stat_file('
 		  . sql_literal($map_path)
-		  . ', true)).size IS NULL;'),
-	't',
-	'dropping MAIN immediately removes its private MAP fork');
+		  . ', false)).size;'),
+	$map_size,
+	'dropping MAIN preserves its MAP until checkpoint');
 
 $node->safe_psql('postgres', 'CHECKPOINT');
 
@@ -296,7 +296,7 @@ is(
 		  . sql_literal($map_path)
 		  . ', true)).size IS NULL;'),
 	't',
-	'dropped MAP remains absent after checkpoint');
+	'checkpoint removes the delayed-unlink MAP');
 
 $node->stop;
 done_testing();

@@ -50,10 +50,38 @@ the locks through the normal ERROR path.
 MAP Page Format
 ---------------
 
-An ordinary MAP entry that has no mapping is InvalidBlockNumber.  When this
-patch extends the MAP fork, every newly created ordinary MAP page, including
-intermediate gap pages, is written as 0xFF.  Consequently an all-zero ordinary
-MAP page is corruption, not an alternative representation of an unmapped page.
+An ordinary MAP entry stores the exact physical block for one logical block.
+An entry without a mapping is InvalidBlockNumber.  When the MAP fork grows,
+every new ordinary MAP page, including an intermediate gap page, is written as
+0xFF.  Consequently an all-zero ordinary MAP page is corruption, not an
+alternative representation of an unmapped page.
+
+
+Logical EOF and Mapping Publication
+-----------------------------------
+
+This no-superblock format derives each tracked fork's logical EOF from its MAP:
+it is the length of the contiguous valid prefix beginning at logical block 0.
+The data fork's physical EOF is not a relation-size authority once L can differ
+from P.
+
+Extension publishes the exact contiguous L -> P run selected by the storage
+manager.  Normal publication can fill the current logical EOF or repeat an
+existing mapping, but cannot replace a visible mapping.  Redo installs the
+exact P recorded in WAL; it never repairs a missing entry by guessing L -> L.
+Truncation clears every entry in [new logical EOF, old logical EOF), so a later
+extension cannot make an old tail visible again merely by filling its first
+entry.
+
+
+WAL Ordering
+------------
+
+Each descriptor retains the greatest WAL LSN associated with its unflushed
+MAP changes.  Before writing a dirty MAP page, the pool calls XLogFlush() for
+that LSN.  Successful output clears both the dirty state and the retained LSN;
+failed output leaves both available for retry.  Changes that have no WAL
+dependency use InvalidXLogRecPtr.
 
 
 Lifecycle
@@ -74,7 +102,7 @@ The pool size is fixed at postmaster startup as max(16, NBuffers / 128).  It
 has no access-strategy ring, local MAP buffer pool, pin-count waiter, or
 background mapwriter.
 
-The current identity format fixes logical block L to physical block L.  It has
-no MAP page LSN and no WAL-before-MAP write rule.  The first non-identity
-mapping patch must add the WAL record, redo rule, and exact WAL flush ordering
-needed before a dirty MAP page can reach disk.
+There is no superblock or resident root cache.  Computing logical size scans
+the MAP prefix, and physical allocation remains append-only and outside this
+pool.  This patch does not replace an existing visible mapping, suppress a
+full-page image, reclaim physical blocks, or handle relation generations.

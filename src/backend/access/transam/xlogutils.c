@@ -160,6 +160,14 @@ log_invalid_page(RelFileLocator locator, ForkNumber forkno, BlockNumber blkno,
 	}
 }
 
+/* Record a storage-layer recovery dependency on a later DROP or TRUNCATE. */
+void
+XLogRecordInvalidPage(RelFileLocator locator, ForkNumber forkno,
+					  BlockNumber blkno, bool present)
+{
+	log_invalid_page(locator, forkno, blkno, present);
+}
+
 /* Forget any invalid pages >= minblkno, because they've been dropped */
 static void
 forget_invalid_pages(RelFileLocator locator, ForkNumber forkno,

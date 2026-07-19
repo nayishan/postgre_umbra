@@ -64,6 +64,9 @@
 #include "storage/read_stream.h"
 #include "storage/smgr.h"
 #include "storage/standby.h"
+#ifdef USE_UMBRA
+#include "storage/umbra.h"
+#endif
 #include "utils/memdebug.h"
 #include "utils/ps_status.h"
 #include "utils/rel.h"
@@ -5436,6 +5439,12 @@ RelationCopyStorageUsingBuffer(RelFileLocator srclocator,
 			log_newpage_buffer(dstBuf, true);
 
 		END_CRIT_SECTION();
+
+#ifdef USE_UMBRA
+		/* The initial bulk extension can require MAP I/O after its first WAL. */
+		if (use_wal)
+			UmMappingPublicationDone();
+#endif
 
 		UnlockReleaseBuffer(dstBuf);
 		UnlockReleaseBuffer(srcBuf);

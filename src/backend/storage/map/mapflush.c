@@ -199,7 +199,12 @@ MapPageInvalidateSlot(int slot_id,
 		}
 
 		MapPageCacheDelete(&tag, hashcode, slot_id);
+		Assert(desc->pending_pin_refs == 0);
 		MemSet(&desc->tag, 0, sizeof(desc->tag));
+		desc->wal_flush_lsn = InvalidXLogRecPtr;
+		MemSet(desc->pending_bits, 0, sizeof(desc->pending_bits));
+		MemSet(&desc->pending_range, 0, sizeof(desc->pending_range));
+		MemSet(&desc->replay_range, 0, sizeof(desc->replay_range));
 		pg_atomic_write_u64(&desc->state, 1);
 		LWLockRelease(partition_lock);
 		LWLockRelease(&desc->content_lock);

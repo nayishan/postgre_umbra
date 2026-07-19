@@ -12,6 +12,8 @@
  */
 #include "postgres.h"
 
+#include "access/xlog.h"
+#include "miscadmin.h"
 #include "storage/map_internal.h"
 #include "storage/umfile.h"
 #include "utils/memutils.h"
@@ -22,6 +24,7 @@
 static void MapPageReleaseResource(Datum res);
 static void MapPageReleaseIOResource(Datum res);
 static void MapPageUnpinBufferNoOwner(int slot_id);
+static bool MapPageHasBlockingPending(MapPageDesc *desc);
 static bool MapPageTagEquals(const MapPageTag *left,
 							 const MapPageTag *right);
 static void MapPageWaitIO(MapPageDesc *desc);
@@ -190,7 +193,12 @@ MapPageBufferRead(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 		if (old_valid)
 			MapPageCacheDelete(&old_tag, old_hash, slot_id);
 
+		Assert(desc->pending_pin_refs == 0);
 		desc->tag = tag;
+		desc->wal_flush_lsn = InvalidXLogRecPtr;
+		MemSet(desc->pending_bits, 0, sizeof(desc->pending_bits));
+		MemSet(&desc->pending_range, 0, sizeof(desc->pending_range));
+		MemSet(&desc->replay_range, 0, sizeof(desc->replay_range));
 		pg_atomic_write_u64(&desc->state,
 							MAP_PAGE_GET_REFCOUNT(state) |
 							MAP_PAGE_USAGE_ONE |
@@ -232,7 +240,8 @@ MapPageBufferGetData(MapPageBuffer buffer)
 }
 
 void
-MapPageMarkBufferDirty(MapPageBuffer buffer, bool skipFsync)
+MapPageMarkBufferDirty(MapPageBuffer buffer, bool skipFsync,
+					   XLogRecPtr wal_flush_lsn)
 {
 	MapPageDesc *desc = buffer.desc;
 	uint64		set_bits = MAP_PAGE_DIRTY;
@@ -242,18 +251,66 @@ MapPageMarkBufferDirty(MapPageBuffer buffer, bool skipFsync)
 	Assert((pg_atomic_read_u64(&desc->state) & MAP_PAGE_VALID) != 0);
 	if (!skipFsync)
 		set_bits |= MAP_PAGE_NEEDS_FSYNC;
+	if (wal_flush_lsn > desc->wal_flush_lsn)
+		desc->wal_flush_lsn = wal_flush_lsn;
 	MapPageUpdateState(desc, set_bits, MAP_PAGE_IO_ERROR);
 }
 
 void
 MapPageReleaseBuffer(MapPageBuffer buffer)
 {
+	MapPageReleaseBufferOwned(buffer, CurrentResourceOwner);
+}
+
+void
+MapPageReleaseBufferOwned(MapPageBuffer buffer, ResourceOwner owner)
+{
+	MapPageDesc *desc = buffer.desc;
+
+	Assert(desc != NULL);
+	Assert(owner != NULL);
+	Assert(LWLockHeldByMe(&desc->content_lock));
+	LWLockRelease(&desc->content_lock);
+	ResourceOwnerForget(owner, Int32GetDatum(desc->slot_id),
+						&map_page_resowner_desc);
+	MapPageUnpinBufferNoOwner(desc->slot_id);
+}
+
+void
+MapPageReleasePendingBufferOwned(MapPageBuffer buffer, ResourceOwner owner)
+{
+	MapPageDesc *desc = buffer.desc;
+
+	Assert(desc != NULL);
+	Assert(owner != NULL);
+	Assert(LWLockHeldByMeInMode(&desc->content_lock, LW_EXCLUSIVE));
+
+	/* Keep the global reservation until the corresponding physical pin is gone. */
+	ResourceOwnerForget(owner, Int32GetDatum(desc->slot_id),
+						&map_page_resowner_desc);
+	MapPageUnpinBufferNoOwner(desc->slot_id);
+	MapPageUnregisterPendingPin(desc);
+	LWLockRelease(&desc->content_lock);
+}
+
+void
+MapPageLockBuffer(MapPageBuffer buffer, LWLockMode mode)
+{
+	MapPageDesc *desc = buffer.desc;
+
+	Assert(desc != NULL);
+	Assert(mode == LW_SHARED || mode == LW_EXCLUSIVE);
+	LWLockAcquire(&desc->content_lock, mode);
+}
+
+void
+MapPageUnlockBufferKeepPin(MapPageBuffer buffer)
+{
 	MapPageDesc *desc = buffer.desc;
 
 	Assert(desc != NULL);
 	Assert(LWLockHeldByMe(&desc->content_lock));
 	LWLockRelease(&desc->content_lock);
-	MapPageUnpinBuffer(desc->slot_id);
 }
 
 void
@@ -284,6 +341,26 @@ void
 MapPageRememberPin(int slot_id)
 {
 	ResourceOwnerRemember(CurrentResourceOwner, Int32GetDatum(slot_id),
+						  &map_page_resowner_desc);
+}
+
+void
+MapPageTransferBufferPin(MapPageBuffer buffer, ResourceOwner old_owner,
+						 ResourceOwner new_owner)
+{
+	MapPageDesc *desc = buffer.desc;
+
+	Assert(desc != NULL);
+	Assert(old_owner != NULL);
+	Assert(new_owner != NULL);
+	Assert(LWLockHeldByMe(&desc->content_lock));
+	if (old_owner == new_owner)
+		return;
+
+	ResourceOwnerEnlarge(new_owner);
+	ResourceOwnerForget(old_owner, Int32GetDatum(desc->slot_id),
+						&map_page_resowner_desc);
+	ResourceOwnerRemember(new_owner, Int32GetDatum(desc->slot_id),
 						  &map_page_resowner_desc);
 }
 
@@ -336,7 +413,7 @@ MapPageUpdateState(MapPageDesc *desc, uint64 set_bits, uint64 clear_bits)
 
 bool
 MapPageFlushBuffer(int slot_id, const MapPageTag *expected_tag,
-				   UmbraFileContext *ctx, bool conditional)
+					   UmbraFileContext *ctx, bool conditional)
 {
 	MapPageDesc *desc = &MapPageDescriptors[slot_id];
 	UmbraFileContext *volatile temporary_ctx = NULL;
@@ -353,6 +430,7 @@ MapPageFlushBuffer(int slot_id, const MapPageTag *expected_tag,
 	 * lock cleanup makes it available for a later retry.
 	 */
 
+retry:
 	if (conditional)
 	{
 		if (!LWLockConditionalAcquire(&desc->io_lock, LW_EXCLUSIVE))
@@ -398,6 +476,16 @@ MapPageFlushBuffer(int slot_id, const MapPageTag *expected_tag,
 	}
 	Assert((state & (MAP_PAGE_TAG_VALID | MAP_PAGE_VALID)) ==
 		   (MAP_PAGE_TAG_VALID | MAP_PAGE_VALID));
+	if (MapPageHasBlockingPending(desc))
+	{
+		LWLockRelease(&desc->content_lock);
+		LWLockRelease(&desc->io_lock);
+		if (conditional)
+			return false;
+		CHECK_FOR_INTERRUPTS();
+		pg_usleep(1000L);
+		goto retry;
+	}
 
 	PG_TRY();
 	{
@@ -409,6 +497,8 @@ MapPageFlushBuffer(int slot_id, const MapPageTag *expected_tag,
 		else
 			write_ctx = ctx;
 		buffers[0] = MapPageGetBlock(slot_id);
+		if (XLogRecPtrIsValid(desc->wal_flush_lsn))
+			XLogFlush(desc->wal_flush_lsn);
 		umfile_writev(write_ctx, UMBRA_MAP_FORKNUM,
 					  desc->tag.map_blkno, buffers, 1,
 					  (state & MAP_PAGE_NEEDS_FSYNC) == 0);
@@ -420,6 +510,7 @@ MapPageFlushBuffer(int slot_id, const MapPageTag *expected_tag,
 		MapPageUpdateState(desc, 0,
 						   MAP_PAGE_DIRTY | MAP_PAGE_NEEDS_FSYNC |
 						   MAP_PAGE_IO_ERROR);
+		desc->wal_flush_lsn = InvalidXLogRecPtr;
 	}
 	PG_CATCH();
 	{
@@ -484,6 +575,44 @@ MapPageUnpinBufferNoOwner(int slot_id)
 										   old_state - 1))
 			return;
 	}
+}
+
+/* Recovery barriers protect visibility, not the old canonical page image. */
+static bool
+MapPageHasBlockingPending(MapPageDesc *desc)
+{
+	uint64		recovery_masks[MAP_PAGE_PENDING_WORDS] = {0};
+	MapPagePendingRange *ranges[2] =
+	{
+		&desc->pending_range,
+		&desc->replay_range,
+	};
+
+	Assert(LWLockHeldByMe(&desc->content_lock));
+	for (int range_no = 0; range_no < lengthof(ranges); range_no++)
+	{
+		MapPagePendingRange *range = ranges[range_no];
+		int			entry_idx;
+		int			word_idx;
+
+		if (!range->valid || !range->recovery_replay)
+			continue;
+		entry_idx = range->range.first_lblkno %
+			(BLCKSZ / sizeof(BlockNumber));
+		word_idx = entry_idx / 64;
+		recovery_masks[word_idx] |= UINT64CONST(1) << (entry_idx % 64);
+		Assert((desc->pending_bits[word_idx] &
+				recovery_masks[word_idx]) == recovery_masks[word_idx]);
+	}
+
+	for (int i = 0; i < MAP_PAGE_PENDING_WORDS; i++)
+	{
+		uint64		pending = desc->pending_bits[i] & ~recovery_masks[i];
+
+		if (pending != 0)
+			return true;
+	}
+	return false;
 }
 
 static bool
@@ -597,7 +726,12 @@ MapPageDiscardFailedLoad(MapPageDesc *desc, const MapPageTag *tag,
 		MapPageTagEquals(&desc->tag, tag))
 	{
 		MapPageCacheDelete(tag, hashcode, desc->slot_id);
+		Assert(desc->pending_pin_refs == 0);
 		MemSet(&desc->tag, 0, sizeof(desc->tag));
+		desc->wal_flush_lsn = InvalidXLogRecPtr;
+		MemSet(desc->pending_bits, 0, sizeof(desc->pending_bits));
+		MemSet(&desc->pending_range, 0, sizeof(desc->pending_range));
+		MemSet(&desc->replay_range, 0, sizeof(desc->replay_range));
 		pg_atomic_write_u64(&desc->state, MAP_PAGE_GET_REFCOUNT(state));
 		discarded = true;
 	}

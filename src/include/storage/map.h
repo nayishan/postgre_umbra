@@ -13,6 +13,7 @@
 #ifndef MAP_H
 #define MAP_H
 
+#include "access/xlogdefs.h"
 #include "storage/block.h"
 #include "storage/lwlock.h"
 #include "storage/relfilelocator.h"
@@ -39,7 +40,8 @@ extern MapPageBuffer MapPageBufferRead(UmbraFileContext *ctx,
 									   bool extend, bool skipFsync,
 									   LWLockMode mode);
 extern char *MapPageBufferGetData(MapPageBuffer buffer);
-extern void MapPageMarkBufferDirty(MapPageBuffer buffer, bool skipFsync);
+extern void MapPageMarkBufferDirty(MapPageBuffer buffer, bool skipFsync,
+								   XLogRecPtr wal_flush_lsn);
 extern void MapPageReleaseBuffer(MapPageBuffer buffer);
 
 #endif							/* MAP_H */

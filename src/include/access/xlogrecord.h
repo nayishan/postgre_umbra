@@ -107,12 +107,32 @@ typedef struct XLogRecordBlockHeader
 	uint16		data_length;	/* number of payload bytes (not including page
 								 * image) */
 
+	/* If BKPBLOCK_HAS_REMAP, an XLogRecordBlockRemapHeader struct follows */
 	/* If BKPBLOCK_HAS_IMAGE, an XLogRecordBlockImageHeader struct follows */
 	/* If BKPBLOCK_SAME_REL is not set, a RelFileLocator follows */
 	/* BlockNumber follows */
 } XLogRecordBlockHeader;
 
 #define SizeOfXLogRecordBlockHeader (offsetof(XLogRecordBlockHeader, data_length) + sizeof(uint16))
+
+/*
+ * Umbra mapping metadata attached to an ordinary WAL block reference.
+ *
+ * The range describes first-born logical blocks whose exact physical blocks
+ * must be installed before redo resolves the referenced logical block.
+ */
+typedef struct XLogRecordBlockRemapHeader
+{
+	BlockNumber first_lblkno;
+	BlockNumber first_pblkno;
+	BlockNumber nblocks;
+} XLogRecordBlockRemapHeader;
+
+#ifdef USE_UMBRA
+#define SizeOfXLogRecordBlockRemapHeader sizeof(XLogRecordBlockRemapHeader)
+#else
+#define SizeOfXLogRecordBlockRemapHeader 0
+#endif
 
 /*
  * Additional header information when a full-page image is included
@@ -184,17 +204,26 @@ typedef struct XLogRecordBlockCompressHeader
  */
 #define MaxSizeOfXLogRecordBlockHeader \
 	(SizeOfXLogRecordBlockHeader + \
+	 SizeOfXLogRecordBlockRemapHeader + \
 	 SizeOfXLogRecordBlockImageHeader + \
 	 SizeOfXLogRecordBlockCompressHeader + \
 	 sizeof(RelFileLocator) + \
 	 sizeof(BlockNumber))
 
 /*
- * The fork number fits in the lower 4 bits in the fork_flags field. The upper
- * bits are used for flags.
+ * Normally the fork number fits in the lower 4 bits in fork_flags.  Umbra WAL
+ * reserves bit 3 for mapping metadata, and its existing fork numbers fit in
+ * the lower 3 bits.
  */
+#ifdef USE_UMBRA
+#define BKPBLOCK_FORK_MASK	0x07
+#define BKPBLOCK_HAS_REMAP	0x08	/* has Umbra mapping metadata */
+#define BKPBLOCK_FLAG_MASK	0xF8
+#else
 #define BKPBLOCK_FORK_MASK	0x0F
+#define BKPBLOCK_HAS_REMAP	0x00
 #define BKPBLOCK_FLAG_MASK	0xF0
+#endif
 #define BKPBLOCK_HAS_IMAGE	0x10	/* block data is an XLogRecordBlockImage */
 #define BKPBLOCK_HAS_DATA	0x20
 #define BKPBLOCK_WILL_INIT	0x40	/* redo will re-init the page */

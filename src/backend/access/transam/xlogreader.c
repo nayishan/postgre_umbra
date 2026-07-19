@@ -1795,10 +1795,19 @@ DecodeXLogRecord(XLogReaderState *state,
 			blk = &decoded->blocks[block_id];
 			blk->in_use = true;
 			blk->apply_image = false;
+#ifdef USE_UMBRA
+			blk->has_remap = false;
+			blk->first_lblkno = InvalidBlockNumber;
+			blk->first_pblkno = InvalidBlockNumber;
+			blk->nblocks = InvalidBlockNumber;
+#endif
 
 			COPY_HEADER_FIELD(&fork_flags, sizeof(uint8));
 			blk->forknum = fork_flags & BKPBLOCK_FORK_MASK;
 			blk->flags = fork_flags;
+#ifdef USE_UMBRA
+			blk->has_remap = (fork_flags & BKPBLOCK_HAS_REMAP) != 0;
+#endif
 			blk->has_image = ((fork_flags & BKPBLOCK_HAS_IMAGE) != 0);
 			blk->has_data = ((fork_flags & BKPBLOCK_HAS_DATA) != 0);
 
@@ -1822,6 +1831,30 @@ DecodeXLogRecord(XLogReaderState *state,
 				goto err;
 			}
 			datatotal += blk->data_len;
+
+#ifdef USE_UMBRA
+			if (blk->has_remap)
+			{
+				COPY_HEADER_FIELD(&blk->first_lblkno, sizeof(BlockNumber));
+				COPY_HEADER_FIELD(&blk->first_pblkno, sizeof(BlockNumber));
+				COPY_HEADER_FIELD(&blk->nblocks, sizeof(BlockNumber));
+
+				if (blk->forknum != MAIN_FORKNUM ||
+					!BlockNumberIsValid(blk->first_lblkno) ||
+					!BlockNumberIsValid(blk->first_pblkno) ||
+					blk->nblocks == 0 ||
+					(uint64) blk->first_lblkno + blk->nblocks >
+					(uint64) InvalidBlockNumber ||
+					(uint64) blk->first_pblkno + blk->nblocks >
+					(uint64) InvalidBlockNumber)
+				{
+					report_invalid_record(state,
+									  "invalid Umbra mapping range at %X/%08X",
+									  LSN_FORMAT_ARGS(state->ReadRecPtr));
+					goto err;
+				}
+			}
+#endif
 
 			if (blk->has_image)
 			{
@@ -1921,6 +1954,19 @@ DecodeXLogRecord(XLogReaderState *state,
 				blk->rlocator = *rlocator;
 			}
 			COPY_HEADER_FIELD(&blk->blkno, sizeof(BlockNumber));
+#ifdef USE_UMBRA
+			if (blk->has_remap &&
+				((uint64) blk->blkno < (uint64) blk->first_lblkno ||
+				 (uint64) blk->blkno >=
+				 (uint64) blk->first_lblkno + blk->nblocks))
+			{
+				report_invalid_record(state,
+								  "Umbra mapping range does not cover block %u at %X/%08X",
+								  blk->blkno,
+								  LSN_FORMAT_ARGS(state->ReadRecPtr));
+				goto err;
+			}
+#endif
 		}
 		else
 		{

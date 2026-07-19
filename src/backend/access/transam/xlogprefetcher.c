@@ -537,6 +537,24 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 			uint8		rmid = record->header.xl_rmid;
 			uint8		record_type = record->header.xl_info & ~XLR_INFO_MASK;
 
+#ifdef USE_UMBRA
+			/* Install all range filters before considering any block in the record. */
+			if (prefetcher->next_block_id == 0)
+			{
+				for (int block_id = 0; block_id <= record->max_block_id;
+					 block_id++)
+				{
+					DecodedBkpBlock *block = &record->blocks[block_id];
+
+					if (block->in_use && block->forknum == MAIN_FORKNUM &&
+						block->has_remap)
+						XLogPrefetcherAddFilter(prefetcher, block->rlocator,
+											 block->first_lblkno,
+											 record->lsn);
+				}
+			}
+#endif
+
 			if (rmid == RM_XLOG_ID)
 			{
 				if (record_type == XLOG_CHECKPOINT_SHUTDOWN ||

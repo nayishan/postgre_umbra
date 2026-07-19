@@ -32,7 +32,13 @@
 /*
  * Each page of XLOG file has a header like this:
  */
-#define XLOG_PAGE_MAGIC 0xD11F	/* can be used as WAL version indicator */
+#define XLOG_PAGE_MAGIC_STANDARD 0xD11F
+#define XLOG_PAGE_MAGIC_UMBRA 0xD120
+#ifdef USE_UMBRA
+#define XLOG_PAGE_MAGIC XLOG_PAGE_MAGIC_UMBRA
+#else
+#define XLOG_PAGE_MAGIC XLOG_PAGE_MAGIC_STANDARD
+#endif
 
 typedef struct XLogPageHeaderData
 {

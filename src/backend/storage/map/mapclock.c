@@ -45,6 +45,8 @@ static LWLockPadded *MapPageExtensionLocks = NULL;
 static void MapPageRefreshBufferCount(void);
 static uint32 MapPageRelationHash(RelFileLocatorBackend rlocator);
 static int	MapPageClockTick(void);
+static bool MapPageTryReservePendingSlot(void);
+static void MapPageReleasePendingSlot(void);
 
 void
 MapPagePoolShmemRequest(void)
@@ -98,6 +100,7 @@ MapPagePoolShmemInit(void)
 	MapPagePoolCtlData->nslots = MapPageBufferCount;
 	MapPagePoolCtlData->first_free = 0;
 	pg_atomic_init_u64(&MapPagePoolCtlData->next_victim, 0);
+	pg_atomic_init_u32(&MapPagePoolCtlData->pending_reservations, 0);
 	SpinLockInit(&MapPagePoolCtlData->strategy_lock);
 
 	for (slot_id = 0; slot_id < MapPageBufferCount; slot_id++)
@@ -105,6 +108,10 @@ MapPagePoolShmemInit(void)
 		MapPageDesc *desc = &MapPageDescriptors[slot_id];
 
 		MemSet(&desc->tag, 0, sizeof(desc->tag));
+		MemSet(desc->pending_bits, 0, sizeof(desc->pending_bits));
+		MemSet(&desc->pending_range, 0, sizeof(desc->pending_range));
+		MemSet(&desc->replay_range, 0, sizeof(desc->replay_range));
+		desc->pending_pin_refs = 0;
 		desc->slot_id = slot_id;
 		desc->free_next = slot_id == MapPageBufferCount - 1 ?
 			MAP_PAGE_FREENEXT_END : slot_id + 1;
@@ -295,6 +302,66 @@ MapPageClockFreeBuffer(int slot_id)
 		MapPagePoolCtlData->first_free = slot_id;
 	}
 	SpinLockRelease(&MapPagePoolCtlData->strategy_lock);
+}
+
+bool
+MapPageRegisterPendingPin(MapPageDesc *desc)
+{
+	Assert(desc != NULL);
+	Assert(LWLockHeldByMeInMode(&desc->content_lock, LW_EXCLUSIVE));
+	if (desc->pending_pin_refs == UINT32_MAX)
+		elog(ERROR, "Umbra MAP pending pin reference count overflow");
+	if (desc->pending_pin_refs == 0 && !MapPageTryReservePendingSlot())
+		return false;
+	desc->pending_pin_refs++;
+	return true;
+}
+
+void
+MapPageUnregisterPendingPin(MapPageDesc *desc)
+{
+	Assert(desc != NULL);
+	Assert(LWLockHeldByMeInMode(&desc->content_lock, LW_EXCLUSIVE));
+	Assert(desc->pending_pin_refs > 0);
+	desc->pending_pin_refs--;
+	if (desc->pending_pin_refs == 0)
+		MapPageReleasePendingSlot();
+}
+
+static bool
+MapPageTryReservePendingSlot(void)
+{
+	uint32		limit;
+	uint32		old_reservations;
+
+	MapPageEnsureInitialized();
+	limit = MapPagePoolCtlData->nslots - 1;
+	old_reservations = pg_atomic_read_u32(
+		&MapPagePoolCtlData->pending_reservations);
+	for (;;)
+	{
+		uint32		new_reservations;
+
+		if (old_reservations >= limit)
+			return false;
+		new_reservations = old_reservations + 1;
+		if (pg_atomic_compare_exchange_u32(
+				&MapPagePoolCtlData->pending_reservations,
+				&old_reservations, new_reservations))
+			return true;
+	}
+}
+
+static void
+MapPageReleasePendingSlot(void)
+{
+	uint32		old_reservations;
+
+	MapPageEnsureInitialized();
+	old_reservations = pg_atomic_fetch_sub_u32(
+		&MapPagePoolCtlData->pending_reservations, 1);
+	if (old_reservations == 0)
+		elog(PANIC, "Umbra MAP pending slot reservation underflow");
 }
 
 static void

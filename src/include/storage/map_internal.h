@@ -17,6 +17,7 @@
 #include "storage/map.h"
 #include "storage/spin.h"
 #include "storage/ummap.h"
+#include "utils/resowner.h"
 
 #define MAP_PAGE_REFCOUNT_MASK	UINT64CONST(0x00000000FFFFFFFF)
 #define MAP_PAGE_USAGE_SHIFT	32
@@ -35,6 +36,8 @@
 
 #define MAP_PAGE_FREENEXT_END		(-1)
 #define MAP_PAGE_FREENEXT_NOT_IN_LIST (-2)
+#define MAP_PAGE_PENDING_WORDS \
+	((BLCKSZ / sizeof(BlockNumber) + 63) / 64)
 
 typedef struct MapPageTag
 {
@@ -42,12 +45,30 @@ typedef struct MapPageTag
 	BlockNumber map_blkno;
 } MapPageTag;
 
+typedef struct MapPagePendingRange
+{
+	/* Exact target hidden behind a transaction or recovery barrier. */
+	UmbraMapRange range;
+	ForkNumber	forknum;
+	bool		physical_ready;
+	bool		recovery_replay;
+	bool		recovery_exact;
+	bool		valid;
+} MapPagePendingRange;
+
 struct MapPageDesc
 {
 	MapPageTag	tag;
 	LWLock		content_lock;
 	LWLock		io_lock;
 	pg_atomic_uint64 state;
+	XLogRecPtr	wal_flush_lsn;
+	uint64		pending_bits[MAP_PAGE_PENDING_WORDS];
+	MapPagePendingRange pending_range;
+	/* Record exact redo may coexist with a longer-lived scratch range. */
+	MapPagePendingRange replay_range;
+	/* content_lock protects refs; the global count tracks refs > 0 slots. */
+	uint32		pending_pin_refs;
 	int			slot_id;
 	int			free_next;
 };
@@ -55,6 +76,8 @@ struct MapPageDesc
 typedef struct MapPagePoolCtl
 {
 	pg_atomic_uint64 next_victim;
+	/* Distinct pending-pinned descriptors, capped to leave one victim. */
+	pg_atomic_uint32 pending_reservations;
 	slock_t		strategy_lock;
 	int			first_free;
 	int			nslots;
@@ -82,9 +105,20 @@ extern void MapPageCacheDelete(const MapPageTag *tag, uint32 hashcode,
 extern LWLock *MapPageExtensionLock(RelFileLocatorBackend rlocator);
 extern int	MapPageClockGetBuffer(void);
 extern void MapPageClockFreeBuffer(int slot_id);
+extern bool MapPageRegisterPendingPin(MapPageDesc *desc);
+extern void MapPageUnregisterPendingPin(MapPageDesc *desc);
 extern void MapPagePinBuffer(int slot_id, bool adjust_usage);
 extern void MapPageUnpinBuffer(int slot_id);
 extern void MapPageRememberPin(int slot_id);
+extern void MapPageTransferBufferPin(MapPageBuffer buffer,
+									 ResourceOwner old_owner,
+									 ResourceOwner new_owner);
+extern void MapPageLockBuffer(MapPageBuffer buffer, LWLockMode mode);
+extern void MapPageUnlockBufferKeepPin(MapPageBuffer buffer);
+extern void MapPageReleaseBufferOwned(MapPageBuffer buffer,
+									  ResourceOwner owner);
+extern void MapPageReleasePendingBufferOwned(MapPageBuffer buffer,
+										 ResourceOwner owner);
 extern bool MapPageTryClaimBuffer(int slot_id);
 extern void MapPageReleaseClaimBuffer(int slot_id);
 extern void MapPageUpdateState(MapPageDesc *desc, uint64 set_bits,

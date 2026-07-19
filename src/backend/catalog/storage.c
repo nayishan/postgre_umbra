@@ -77,6 +77,11 @@ typedef struct PendingRelSync
 static PendingRelDelete *pendingDeletes = NULL; /* head of linked list */
 static HTAB *pendingSyncHash = NULL;
 
+static void smgr_pretruncate_or_panic(SMgrRelation reln, ForkNumber *forknum,
+									 int nforks, BlockNumber *old_nblocks,
+									 BlockNumber *nblocks,
+									 XLogRecPtr truncate_lsn);
+
 
 /*
  * AddPendingSync
@@ -296,6 +301,7 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 	BlockNumber old_blocks[MAX_FORKNUM];
 	BlockNumber blocks[MAX_FORKNUM];
 	int			nforks = 0;
+	XLogRecPtr	truncate_lsn = InvalidXLogRecPtr;
 	SMgrRelation reln;
 
 	/*
@@ -384,14 +390,11 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 	 *
 	 * (See also visibilitymap.c if changing this code.)
 	 */
-	START_CRIT_SECTION();
-
 	if (RelationNeedsWAL(rel))
 	{
 		/*
 		 * Make an XLOG entry reporting the file truncation.
 		 */
-		XLogRecPtr	lsn;
 		xl_smgr_truncate xlrec;
 
 		xlrec.blkno = nblocks;
@@ -401,8 +404,8 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 		XLogBeginInsert();
 		XLogRegisterData(&xlrec, sizeof(xlrec));
 
-		lsn = XLogInsert(RM_SMGR_ID,
-						 XLOG_SMGR_TRUNCATE | XLR_SPECIAL_REL_UPDATE);
+		truncate_lsn = XLogInsert(RM_SMGR_ID,
+								  XLOG_SMGR_TRUNCATE | XLR_SPECIAL_REL_UPDATE);
 
 		/*
 		 * Flush, because otherwise the truncation of the main relation might
@@ -412,14 +415,19 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 		 * contain entries for the non-existent heap pages, and standbys would
 		 * also never replay the truncation.
 		 */
-		XLogFlush(lsn);
+		XLogFlush(truncate_lsn);
 	}
+
+	/* MAP buffer reads and victim writeback are legal only before this point. */
+	smgr_pretruncate_or_panic(RelationGetSmgr(rel), forks, nforks,
+							  old_blocks, blocks, truncate_lsn);
 
 	/*
 	 * This will first remove any buffers from the buffer pool that should no
 	 * longer exist after truncation is complete, and then truncate the
 	 * corresponding files on disk.
 	 */
+	START_CRIT_SECTION();
 	smgrtruncate(RelationGetSmgr(rel), forks, nforks, old_blocks, blocks);
 
 	END_CRIT_SECTION();
@@ -994,6 +1002,7 @@ smgr_redo(XLogReaderState *record)
 
 		reln = smgropen(xlrec->rlocator, INVALID_PROC_NUMBER);
 		smgrcreate(reln, xlrec->forkNum, true);
+		smgrredocreate(reln, xlrec->forkNum);
 	}
 	else if (info == XLOG_SMGR_TRUNCATE)
 	{
@@ -1075,6 +1084,8 @@ smgr_redo(XLogReaderState *record)
 		/* Do the real work to truncate relation forks */
 		if (nforks > 0)
 		{
+			smgr_pretruncate_or_panic(reln, forks, nforks, old_blocks,
+								  blocks, lsn);
 			START_CRIT_SECTION();
 			smgrtruncate(reln, forks, nforks, old_blocks, blocks);
 			END_CRIT_SECTION();
@@ -1093,4 +1104,34 @@ smgr_redo(XLogReaderState *record)
 	}
 	else
 		elog(PANIC, "smgr_redo: unknown op code %u", info);
+}
+
+/*
+ * Once truncate WAL is durable, metadata truncation is non-transactional too.
+ * Preserve the original error details, but force recovery through PANIC if a
+ * storage manager cannot complete that metadata update.
+ */
+static void
+smgr_pretruncate_or_panic(SMgrRelation reln, ForkNumber *forknum, int nforks,
+						  BlockNumber *old_nblocks, BlockNumber *nblocks,
+						  XLogRecPtr truncate_lsn)
+{
+	PG_TRY();
+	{
+		smgrpretruncate(reln, forknum, nforks, old_nblocks, nblocks,
+						truncate_lsn);
+	}
+	PG_CATCH();
+	{
+		if (XLogRecPtrIsValid(truncate_lsn))
+		{
+			ErrorData  *edata = CopyErrorData();
+
+			FlushErrorState();
+			edata->elevel = PANIC;
+			ReThrowError(edata);
+		}
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }

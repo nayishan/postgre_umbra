@@ -17,6 +17,7 @@
 #include "storage/block.h"
 #include "storage/relfilelocator.h"
 #include "storage/smgr.h"
+#include "storage/ummap.h"
 
 /* Umbra storage manager functionality */
 extern void uminit(void);
@@ -25,6 +26,7 @@ extern void umclose(SMgrRelation reln, ForkNumber forknum);
 extern void umdestroy(SMgrRelation reln);
 extern void umcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
 extern void uminitnewrelation(SMgrRelation reln, bool needs_wal);
+extern void umredocreate(SMgrRelation reln, ForkNumber forknum);
 extern void umcheckpoint(void);
 extern void umflushdatabasetablespace(Oid dbid, Oid spcOid);
 extern void uminvalidatedatabase(Oid dbid);
@@ -50,11 +52,29 @@ extern void umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum
 extern void umwriteback(SMgrRelation reln, ForkNumber forknum,
 						BlockNumber blocknum, BlockNumber nblocks);
 extern BlockNumber umnblocks(SMgrRelation reln, ForkNumber forknum);
+extern void umpretruncate(SMgrRelation reln, ForkNumber forknum,
+						  BlockNumber old_blocks, BlockNumber nblocks,
+						  XLogRecPtr truncate_lsn);
 extern void umtruncate(SMgrRelation reln, ForkNumber forknum,
 					   BlockNumber old_blocks, BlockNumber nblocks);
 extern void umimmedsync(SMgrRelation reln, ForkNumber forknum);
 extern void umregistersync(SMgrRelation reln, ForkNumber forknum);
 extern int	umfd(SMgrRelation reln, ForkNumber forknum,
 				 BlockNumber blocknum, uint32 *off);
+extern void UmPrepareFirstbornLocator(RelFileLocator rlocator,
+									  ForkNumber forknum, BlockNumber lblkno);
+extern void UmPrepareFirstbornRangeLocator(RelFileLocator rlocator,
+										 ForkNumber forknum, int nblocks,
+										 const BlockNumber *lblknos);
+extern void UmLogMappingRange(RelFileLocator rlocator, ForkNumber forknum,
+							  BlockNumber startblk, BlockNumber endblk,
+							  BlockNumber anchor_lblkno);
+extern void UmLogMappingRangeFinish(void);
+extern void UmMappingPublicationDone(void);
+extern void UmPrepareReplayMappingRange(SMgrRelation reln, ForkNumber forknum,
+									const UmbraMapRange *range, XLogRecPtr lsn);
+extern void UmPublishReplayMappingRanges(void);
+extern void UmCheckRecoveryDependencies(void);
+extern void UmRecoveryEnd(void);
 
 #endif							/* UMBRA_H */

@@ -57,6 +57,11 @@
 #include "storage/latch.h"
 #include "storage/pmsignal.h"
 #include "storage/procarray.h"
+#ifdef USE_UMBRA
+#include "storage/smgr.h"
+#include "storage/umbra.h"
+#include "storage/ummap.h"
+#endif
 #include "storage/spin.h"
 #include "storage/subsystems.h"
 #include "utils/datetime.h"
@@ -337,6 +342,9 @@ static bool recoveryStopAfter;
 
 /* prototypes for local functions */
 static void ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *replayTLI);
+#ifdef USE_UMBRA
+static void ReplayUmbraMappingRanges(XLogReaderState *xlogreader);
+#endif
 
 static void EnableStandbyMode(void);
 static void readRecoverySignalFile(void);
@@ -1842,6 +1850,11 @@ PerformWalRecovery(void)
 
 		RmgrCleanup();
 
+#ifdef USE_UMBRA
+		UmCheckRecoveryDependencies();
+		UmRecoveryEnd();
+#endif
+
 		ereport(LOG,
 				errmsg("redo done at %X/%08X system usage: %s",
 					   LSN_FORMAT_ARGS(xlogreader->ReadRecPtr),
@@ -1872,6 +1885,114 @@ PerformWalRecovery(void)
 				(errcode(ERRCODE_CONFIG_FILE_ERROR),
 				 errmsg("recovery ended before configured recovery target was reached")));
 }
+
+#ifdef USE_UMBRA
+typedef struct UmbraReplayMappingRange
+{
+	RelFileLocator rlocator;
+	ForkNumber	forknum;
+	UmbraMapRange range;
+} UmbraReplayMappingRange;
+
+static int
+UmbraReplayMappingRangeCmp(const void *a, const void *b)
+{
+	const UmbraReplayMappingRange *left = a;
+	const UmbraReplayMappingRange *right = b;
+
+	if (left->rlocator.spcOid != right->rlocator.spcOid)
+		return left->rlocator.spcOid < right->rlocator.spcOid ? -1 : 1;
+	if (left->rlocator.dbOid != right->rlocator.dbOid)
+		return left->rlocator.dbOid < right->rlocator.dbOid ? -1 : 1;
+	if (left->rlocator.relNumber != right->rlocator.relNumber)
+		return left->rlocator.relNumber < right->rlocator.relNumber ? -1 : 1;
+	if (left->forknum != right->forknum)
+		return left->forknum < right->forknum ? -1 : 1;
+	if (left->range.first_lblkno != right->range.first_lblkno)
+		return left->range.first_lblkno < right->range.first_lblkno ? -1 : 1;
+	if (left->range.first_pblkno != right->range.first_pblkno)
+		return left->range.first_pblkno < right->range.first_pblkno ? -1 : 1;
+	if (left->range.nblocks != right->range.nblocks)
+		return left->range.nblocks < right->range.nblocks ? -1 : 1;
+	return 0;
+}
+
+/* Hold exact physical mappings private until the whole record is replayed. */
+static void
+ReplayUmbraMappingRanges(XLogReaderState *xlogreader)
+{
+	UmbraReplayMappingRange ranges[XLR_MAX_BLOCK_ID + 1];
+	int			nranges = 0;
+	int			nmerged = 0;
+
+	for (int block_id = 0; block_id <= XLogRecMaxBlockId(xlogreader);
+		 block_id++)
+	{
+		DecodedBkpBlock *block;
+
+		if (!XLogRecHasBlockRef(xlogreader, block_id) ||
+			!XLogRecBlockHasRemap(xlogreader, block_id))
+			continue;
+
+		block = XLogRecGetBlock(xlogreader, block_id);
+		Assert(nranges < lengthof(ranges));
+		ranges[nranges].rlocator = block->rlocator;
+		ranges[nranges].forknum = block->forknum;
+		ranges[nranges].range.first_lblkno = block->first_lblkno;
+		ranges[nranges].range.first_pblkno = block->first_pblkno;
+		ranges[nranges].range.nblocks = block->nblocks;
+		nranges++;
+	}
+
+	qsort(ranges, nranges, sizeof(ranges[0]), UmbraReplayMappingRangeCmp);
+	for (int range_no = 0; range_no < nranges; range_no++)
+	{
+		UmbraReplayMappingRange *current = &ranges[range_no];
+
+		if (nmerged > 0)
+		{
+			UmbraReplayMappingRange *previous = &ranges[nmerged - 1];
+
+			if (RelFileLocatorEquals(previous->rlocator, current->rlocator) &&
+				previous->forknum == current->forknum)
+			{
+				uint64		previous_lend =
+					(uint64) previous->range.first_lblkno +
+					previous->range.nblocks;
+				uint64		previous_pend =
+					(uint64) previous->range.first_pblkno +
+					previous->range.nblocks;
+
+				if (previous->range.first_lblkno ==
+					current->range.first_lblkno &&
+					previous->range.first_pblkno ==
+					current->range.first_pblkno &&
+					previous->range.nblocks == current->range.nblocks)
+					continue;
+				if (previous_lend != current->range.first_lblkno ||
+					previous_pend != current->range.first_pblkno)
+					elog(PANIC,
+						 "noncontiguous Umbra mapping ranges in one WAL record");
+				previous->range.nblocks += current->range.nblocks;
+				continue;
+			}
+		}
+		if (nmerged != range_no)
+			ranges[nmerged] = *current;
+		nmerged++;
+	}
+
+	for (int range_no = 0; range_no < nmerged; range_no++)
+	{
+		SMgrRelation reln;
+
+		reln = smgropen(ranges[range_no].rlocator, INVALID_PROC_NUMBER);
+		UmPrepareReplayMappingRange(reln, ranges[range_no].forknum,
+									&ranges[range_no].range,
+									xlogreader->EndRecPtr);
+	}
+}
+#endif
 
 /*
  * Subroutine of PerformWalRecovery, to apply one WAL record.
@@ -1952,6 +2073,12 @@ ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *repl
 		TransactionIdIsValid(record->xl_xid))
 		RecordKnownAssignedTransactionIds(record->xl_xid);
 
+#ifdef USE_UMBRA
+	PG_TRY();
+	{
+		ReplayUmbraMappingRanges(xlogreader);
+#endif
+
 	/*
 	 * Some XLOG record types that are related to recovery are processed
 	 * directly here, rather than in xlog_redo()
@@ -1969,6 +2096,17 @@ ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *repl
 	 */
 	if ((record->xl_info & XLR_CHECK_CONSISTENCY) != 0)
 		verifyBackupPageConsistency(xlogreader);
+
+#ifdef USE_UMBRA
+		UmPublishReplayMappingRanges();
+	}
+	PG_CATCH();
+	{
+		error_context_stack = errcallback.previous;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+#endif
 
 	/* Pop the error context stack */
 	error_context_stack = errcallback.previous;
@@ -2206,6 +2344,11 @@ CheckRecoveryConsistency(void)
 		 * references to uninitialized pages.
 		 */
 		XLogCheckInvalidPages();
+
+#ifdef USE_UMBRA
+		/* Recovery scratch cannot be waived by ignore_invalid_pages. */
+		UmCheckRecoveryDependencies();
+#endif
 
 		/*
 		 * Check that pg_tblspc doesn't contain any real directories. Replay

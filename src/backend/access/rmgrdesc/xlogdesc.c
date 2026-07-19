@@ -381,6 +381,19 @@ XLogRecGetBlockRefInfo(XLogReaderState *record, bool pretty,
 				}
 			}
 
+#ifdef USE_UMBRA
+			if (XLogRecBlockHasRemap(record, block_id))
+			{
+				DecodedBkpBlock *blkref = XLogRecGetBlock(record, block_id);
+
+				appendStringInfo(buf,
+								 "; remap: first_lblkno %u first_pblkno %u nblocks %u",
+								 blkref->first_lblkno,
+								 blkref->first_pblkno,
+								 blkref->nblocks);
+			}
+#endif
+
 			if (pretty)
 				appendStringInfoChar(buf, '\n');
 		}

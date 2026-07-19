@@ -64,6 +64,8 @@ tests += {
       't/053_umbra_mainfork_unlink.pl',
       't/054_umbra_identity_map.pl',
       't/059_umbra_map_page_pool.pl',
+      't/060_umbra_remap_first.pl',
+      't/061_umbra_redo_drop_restart.pl',
     ],
   },
 }

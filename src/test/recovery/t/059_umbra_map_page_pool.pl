@@ -47,6 +47,16 @@ sub write_invalid_block
 	close($fh) or BAIL_OUT("could not close \"$path\": $!");
 }
 
+sub main_entry_offset
+{
+	my ($block_size, $lblkno) = @_;
+	my $entries_per_page = int($block_size / 4);
+	my $map_block = 2 + int($lblkno / $entries_per_page);
+
+	return $map_block * $block_size
+	  + ($lblkno % $entries_per_page) * 4;
+}
+
 plan skip_all => 'requires an Umbra storage manager build'
   unless check_pg_config('^#define USE_UMBRA 1$');
 
@@ -121,21 +131,43 @@ $node->safe_psql('postgres', 'CHECKPOINT');
 is(read_hex_bytes($last_map, $main_entry_zero_offset, 4),
 	'00000000', 'checkpoint flushes the remaining dirty MAP page');
 
-# Leave heap WAL after the checkpoint, then model a crash that lost the
-# identity entry for an already-materialized data block.  Physical EOF still
-# says block 0 exists, so redo reaches MAP lookup rather than extension.
-$node->safe_psql('postgres', 'UPDATE umbra_pool_anchor SET id = 2');
+# INSERT+INIT uses RBM_ZERO_AND_LOCK during redo.  Model a crash that lost one
+# first-born entry; the page's WAL record must reinstall its exact mapping
+# before initializing the data page.
+$node->safe_psql(
+	'postgres', q{
+CREATE TABLE umbra_pool_redo_init (id integer, payload text)
+  WITH (autovacuum_enabled = false);
+CHECKPOINT;
+INSERT INTO umbra_pool_redo_init
+SELECT g, repeat('z', 400) FROM generate_series(1, 2000) AS g;
+});
+my $redo_init_path = $node->safe_psql(
+	'postgres', q{SELECT pg_relation_filepath('umbra_pool_redo_init'::regclass);});
+my $redo_init_map = $node->data_dir . "/${redo_init_path}_map";
+my $redo_init_nblocks = 0 + $node->safe_psql(
+	'postgres',
+	"SELECT pg_relation_size('umbra_pool_redo_init') / $block_size;");
+cmp_ok($redo_init_nblocks, '>', 1,
+	'post-checkpoint insert created new heap pages');
+my $redo_init_block = $redo_init_nblocks - 1;
+my $redo_init_offset = main_entry_offset($block_size, $redo_init_block);
+
 $node->stop('immediate');
-write_invalid_block($anchor_map, $main_entry_zero_offset);
-is(read_hex_bytes($anchor_map, $main_entry_zero_offset, 4),
-	'ffffffff', 'crash image has a missing identity MAP entry');
+write_invalid_block($redo_init_map, $redo_init_offset);
+is(read_hex_bytes($redo_init_map, $redo_init_offset, 4),
+	'ffffffff', 'crash image has a missing first-born MAP entry');
 
 $node->start;
-is($node->safe_psql('postgres', 'SELECT id FROM umbra_pool_anchor'),
-	'2', 'redo reads the existing block and preserves the post-checkpoint row');
+is(
+	$node->safe_psql('postgres', 'SELECT count(*) FROM umbra_pool_redo_init'),
+	'2000',
+	'redo restores an INSERT+INIT page with its WAL-recorded mapping');
 $node->safe_psql('postgres', 'CHECKPOINT');
-is(read_hex_bytes($anchor_map, $main_entry_zero_offset, 4),
-	'00000000', 'checkpoint persists the identity entry republished by redo');
+is(
+	read_hex_bytes($redo_init_map, $redo_init_offset, 4),
+	unpack('H*', pack('L', $redo_init_block)),
+	'checkpoint persists the first-born mapping replayed from WAL');
 is($node->safe_psql('postgres', 'SELECT count(*) FROM umbra_pool_churn_128'),
 	'1', 'checkpointed relation remains readable after crash restart');
 

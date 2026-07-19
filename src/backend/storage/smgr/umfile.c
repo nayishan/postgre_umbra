@@ -333,11 +333,10 @@ umfile_create(UmbraFileContext *ctx, ForkNumber forknum, bool isRedo)
  * Furthermore, it is important to remove the files from disk immediately,
  * because we may be about to reuse the same relfilenumber.
  *
- * All the above applies only to the relation's main fork; other forks can
- * just be removed immediately, since they are not needed to prevent the
- * relfilenumber from being recycled.  Also, we do not carefully
- * track whether other forks have been created or not, but just attempt to
- * unlink them unconditionally; so we should never complain about ENOENT.
+ * Mapped relation forks and their MAP are another exception.  Their
+ * checkpointed contents form one recovery unit if a crash restarts before
+ * this relation's drop record, so preserve all of those segments until the
+ * next checkpoint.  Other non-main forks can be removed immediately.
  *
  * If isRedo is true, it's unsurprising for the relation to be already gone.
  * Also, we should remove the file immediately instead of queuing a request
@@ -397,6 +396,36 @@ umfile_unlinkfork(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRed
 	Assert(umfile_forknum_is_valid(forknum));
 
 	path = umfile_relpath(rlocator, forknum);
+
+	/*
+	 * Unlike md, Umbra cannot treat the mapping and its physical target
+	 * independently.  Keep their checkpointed images together until a
+	 * checkpoint has made the relation drop part of the recovery starting
+	 * point.
+	 */
+	if (!isRedo && !IsBinaryUpgrade &&
+		(forknum == UMBRA_MAP_FORKNUM || ummap_tracks_fork(forknum)) &&
+		!RelFileLocatorBackendIsTemp(rlocator))
+	{
+		BlockNumber segno;
+
+		for (segno = 0;; segno++)
+		{
+			UmFilePathStr segpath = umfile_segpath(rlocator, forknum, segno);
+
+			if (access(segpath.str, F_OK) < 0)
+			{
+				if (errno != ENOENT)
+					ereport(WARNING,
+							(errcode_for_file_access(),
+							 errmsg("could not access file \"%s\": %m",
+									segpath.str)));
+				break;
+			}
+			umfile_register_unlink_segment(rlocator, forknum, segno);
+		}
+		return;
+	}
 
 	/*
 	 * Truncate and then unlink the first segment, or just register a request

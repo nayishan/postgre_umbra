@@ -99,6 +99,8 @@ typedef struct f_smgr
 	void		(*smgr_create) (SMgrRelation reln, ForkNumber forknum,
 								bool isRedo);
 	void		(*smgr_init_new_relation) (SMgrRelation reln, bool needs_wal);
+	void		(*smgr_redo_create) (SMgrRelation reln,
+								 ForkNumber forknum); /* may be NULL */
 	void		(*smgr_checkpoint) (void);	/* may be NULL */
 	void		(*smgr_flush_database_tablespace) (Oid dbid,
 												   Oid spcOid); /* may be NULL */
@@ -130,6 +132,10 @@ typedef struct f_smgr
 	void		(*smgr_writeback) (SMgrRelation reln, ForkNumber forknum,
 								   BlockNumber blocknum, BlockNumber nblocks);
 	BlockNumber (*smgr_nblocks) (SMgrRelation reln, ForkNumber forknum);
+	void		(*smgr_pretruncate) (SMgrRelation reln, ForkNumber forknum,
+									 BlockNumber old_blocks,
+									 BlockNumber nblocks,
+									 XLogRecPtr truncate_lsn);
 	void		(*smgr_truncate) (SMgrRelation reln, ForkNumber forknum,
 								  BlockNumber old_blocks, BlockNumber nblocks);
 	void		(*smgr_immedsync) (SMgrRelation reln, ForkNumber forknum);
@@ -155,6 +161,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_destroy = NULL,
 		.smgr_create = mdcreate,
 		.smgr_init_new_relation = NULL,
+		.smgr_redo_create = NULL,
 		.smgr_checkpoint = NULL,
 		.smgr_flush_database_tablespace = NULL,
 		.smgr_invalidate_database = NULL,
@@ -170,6 +177,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_writev = mdwritev,
 		.smgr_writeback = mdwriteback,
 		.smgr_nblocks = mdnblocks,
+		.smgr_pretruncate = NULL,
 		.smgr_truncate = mdtruncate,
 		.smgr_immedsync = mdimmedsync,
 		.smgr_registersync = mdregistersync,
@@ -185,6 +193,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_destroy = umdestroy,
 		.smgr_create = umcreate,
 		.smgr_init_new_relation = uminitnewrelation,
+		.smgr_redo_create = umredocreate,
 		.smgr_checkpoint = umcheckpoint,
 		.smgr_flush_database_tablespace = umflushdatabasetablespace,
 		.smgr_invalidate_database = uminvalidatedatabase,
@@ -200,6 +209,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_writev = umwritev,
 		.smgr_writeback = umwriteback,
 		.smgr_nblocks = umnblocks,
+		.smgr_pretruncate = umpretruncate,
 		.smgr_truncate = umtruncate,
 		.smgr_immedsync = umimmedsync,
 		.smgr_registersync = umregistersync,
@@ -556,6 +566,14 @@ smgrinitnewrelation(SMgrRelation reln, bool needs_wal)
 {
 	if (smgrsw[reln->smgr_which].smgr_init_new_relation != NULL)
 		smgrsw[reln->smgr_which].smgr_init_new_relation(reln, needs_wal);
+}
+
+/* Record replay of an authoritative SMGR CREATE, not a defensive create. */
+void
+smgrredocreate(SMgrRelation reln, ForkNumber forknum)
+{
+	if (smgrsw[reln->smgr_which].smgr_redo_create != NULL)
+		smgrsw[reln->smgr_which].smgr_redo_create(reln, forknum);
 }
 
 /*
@@ -959,6 +977,26 @@ smgrnblocks_cached(SMgrRelation reln, ForkNumber forknum)
 		return reln->smgr_cached_nblocks[forknum];
 
 	return InvalidBlockNumber;
+}
+
+/*
+ * Let a storage manager perform truncate metadata I/O before the caller
+ * enters the critical section used to discard shared buffers.
+ */
+void
+smgrpretruncate(SMgrRelation reln, ForkNumber *forknum, int nforks,
+				BlockNumber *old_nblocks, BlockNumber *nblocks,
+				XLogRecPtr truncate_lsn)
+{
+	int			i;
+
+	if (smgrsw[reln->smgr_which].smgr_pretruncate == NULL)
+		return;
+
+	for (i = 0; i < nforks; i++)
+		smgrsw[reln->smgr_which].smgr_pretruncate(reln, forknum[i],
+											 old_nblocks[i], nblocks[i],
+											 truncate_lsn);
 }
 
 /*

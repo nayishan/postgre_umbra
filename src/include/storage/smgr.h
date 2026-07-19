@@ -14,6 +14,7 @@
 #ifndef SMGR_H
 #define SMGR_H
 
+#include "access/xlogdefs.h"
 #include "lib/ilist.h"
 #include "storage/aio_types.h"
 #include "storage/block.h"
@@ -97,6 +98,7 @@ extern void smgrreleaseall(void);
 extern void smgrreleaserellocator(RelFileLocatorBackend rlocator);
 extern void smgrcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
 extern void smgrinitnewrelation(SMgrRelation reln, bool needs_wal);
+extern void smgrredocreate(SMgrRelation reln, ForkNumber forknum);
 extern void smgrcheckpoint(void);
 extern void smgrflushdatabasetablespace(Oid dbid, Oid spcOid);
 extern void smgrinvalidatedatabase(Oid dbid);
@@ -126,6 +128,10 @@ extern void smgrwriteback(SMgrRelation reln, ForkNumber forknum,
 						  BlockNumber blocknum, BlockNumber nblocks);
 extern BlockNumber smgrnblocks(SMgrRelation reln, ForkNumber forknum);
 extern BlockNumber smgrnblocks_cached(SMgrRelation reln, ForkNumber forknum);
+extern void smgrpretruncate(SMgrRelation reln, ForkNumber *forknum, int nforks,
+							BlockNumber *old_nblocks,
+							BlockNumber *nblocks,
+							XLogRecPtr truncate_lsn);
 extern void smgrtruncate(SMgrRelation reln, ForkNumber *forknum, int nforks,
 						 BlockNumber *old_nblocks,
 						 BlockNumber *nblocks);

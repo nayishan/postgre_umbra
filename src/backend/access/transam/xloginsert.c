@@ -39,6 +39,10 @@
 #include "replication/origin.h"
 #include "storage/bufmgr.h"
 #include "storage/proc.h"
+#ifdef USE_UMBRA
+#include "storage/umbra.h"
+#include "storage/ummap.h"
+#endif
 #include "utils/memutils.h"
 #include "utils/pgstat_internal.h"
 #include "utils/rel.h"
@@ -144,6 +148,10 @@ static XLogRecData *XLogRecordAssemble(RmgrId rmid, uint8 info,
 									   bool *topxid_included);
 static bool XLogCompressBackupBlock(const PageData *page, uint16 hole_offset,
 									uint16 hole_length, void *dest, uint16 *dlen);
+static XLogRecPtr log_newpage_internal(RelFileLocator *rlocator,
+									  ForkNumber forknum, BlockNumber blkno,
+									  Page page, bool page_std,
+									  bool prepare_firstborn);
 
 /*
  * Begin constructing a WAL record. This must be called before the
@@ -534,6 +542,16 @@ XLogInsert(RmgrId rmid, uint8 info)
 								  fpi_bytes, topxid_included);
 	} while (!XLogRecPtrIsValid(EndPos));
 
+#ifdef USE_UMBRA
+	/* A failure after WAL insertion must be recovered by replay. */
+	if (ummap_has_pending_ranges())
+	{
+		START_CRIT_SECTION();
+		ummap_publish_attached_ranges(EndPos);
+		END_CRIT_SECTION();
+		UmMappingPublicationDone();
+	}
+#endif
 	XLogResetInsertion();
 
 	return EndPos;
@@ -660,17 +678,27 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 	 * the headers for the block references in the scratch buffer.
 	 */
 	*fpw_lsn = InvalidXLogRecPtr;
+#ifdef USE_UMBRA
+	/* XLogRecordAssemble() can be retried after the FPW state changes. */
+	ummap_reset_wal_attachments();
+#endif
 	for (block_id = 0; block_id < max_registered_block_id; block_id++)
 	{
 		registered_buffer *regbuf = &registered_buffers[block_id];
 		bool		needs_backup;
 		bool		needs_data;
 		XLogRecordBlockHeader bkpb;
+#ifdef USE_UMBRA
+		XLogRecordBlockRemapHeader remap;
+#endif
 		XLogRecordBlockImageHeader bimg;
 		XLogRecordBlockCompressHeader cbimg = {0};
 		bool		samerel;
 		bool		is_compressed = false;
 		bool		include_image;
+#ifdef USE_UMBRA
+		bool		include_remap = false;
+#endif
 
 		if (!regbuf->in_use)
 			continue;
@@ -713,6 +741,23 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 
 		if ((regbuf->flags & REGBUF_WILL_INIT) == REGBUF_WILL_INIT)
 			bkpb.fork_flags |= BKPBLOCK_WILL_INIT;
+
+#ifdef USE_UMBRA
+		{
+			UmbraMapRange range;
+
+			if (ummap_pending_range_for_block(regbuf->rlocator,
+										  regbuf->forkno, regbuf->block,
+										  &range))
+			{
+				include_remap = true;
+				bkpb.fork_flags |= BKPBLOCK_HAS_REMAP;
+				remap.first_lblkno = range.first_lblkno;
+				remap.first_pblkno = range.first_pblkno;
+				remap.nblocks = range.nblocks;
+			}
+		}
+#endif
 
 		/*
 		 * If needs_backup is true or WAL checking is enabled for current
@@ -894,6 +939,13 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 		/* Ok, copy the header to the scratch buffer */
 		memcpy(scratch, &bkpb, SizeOfXLogRecordBlockHeader);
 		scratch += SizeOfXLogRecordBlockHeader;
+#ifdef USE_UMBRA
+		if (include_remap)
+		{
+			memcpy(scratch, &remap, SizeOfXLogRecordBlockRemapHeader);
+			scratch += SizeOfXLogRecordBlockRemapHeader;
+		}
+#endif
 		if (include_image)
 		{
 			memcpy(scratch, &bimg, SizeOfXLogRecordBlockImageHeader);
@@ -1191,6 +1243,15 @@ XLogRecPtr
 log_newpage(RelFileLocator *rlocator, ForkNumber forknum, BlockNumber blkno,
 			Page page, bool page_std)
 {
+	return log_newpage_internal(rlocator, forknum, blkno, page, page_std,
+								true);
+}
+
+static XLogRecPtr
+log_newpage_internal(RelFileLocator *rlocator, ForkNumber forknum,
+					 BlockNumber blkno, Page page, bool page_std,
+					 bool prepare_firstborn)
+{
 	int			flags;
 	XLogRecPtr	recptr;
 
@@ -1198,6 +1259,12 @@ log_newpage(RelFileLocator *rlocator, ForkNumber forknum, BlockNumber blkno,
 	if (page_std)
 		flags |= REGBUF_STANDARD;
 
+#ifdef USE_UMBRA
+	if (prepare_firstborn)
+		UmPrepareFirstbornLocator(*rlocator, forknum, blkno);
+#else
+	(void) prepare_firstborn;
+#endif
 	XLogBeginInsert();
 	XLogRegisterBlock(0, rlocator, forknum, blkno, page, flags);
 	recptr = XLogInsert(RM_XLOG_ID, XLOG_FPI);
@@ -1238,6 +1305,10 @@ log_newpages(RelFileLocator *rlocator, ForkNumber forknum, int num_pages,
 	 * batch.
 	 */
 	XLogEnsureRecordSpace(XLR_MAX_BLOCK_ID - 1, 0);
+
+#ifdef USE_UMBRA
+	UmPrepareFirstbornRangeLocator(*rlocator, forknum, num_pages, blknos);
+#endif
 
 	i = 0;
 	while (i < num_pages)
@@ -1294,7 +1365,8 @@ log_newpage_buffer(Buffer buffer, bool page_std)
 
 	BufferGetTag(buffer, &rlocator, &forknum, &blkno);
 
-	return log_newpage(&rlocator, forknum, blkno, page, page_std);
+	return log_newpage_internal(&rlocator, forknum, blkno, page, page_std,
+								false);
 }
 
 /*
@@ -1337,15 +1409,33 @@ log_newpage_range(Relation rel, ForkNumber forknum,
 	while (blkno < endblk)
 	{
 		Buffer		bufpack[XLR_MAX_BLOCK_ID];
+#ifdef USE_UMBRA
+		Buffer		zero_anchor = InvalidBuffer;
+#endif
 		XLogRecPtr	recptr;
+		BlockNumber batch_endblk = endblk;
 		int			nbufs;
 		int			i;
+#ifdef USE_UMBRA
+		BlockNumber batch_startblk = blkno;
+		BlockNumber anchor_blkno;
+		bool		zero_only;
+#endif
 
 		CHECK_FOR_INTERRUPTS();
 
+#ifdef USE_UMBRA
+		/*
+		 * Publication runs inside the caller's critical section, so keep the
+		 * mapping snapshot small enough to remain pinned in the MAP pool.
+		 */
+		if (batch_endblk - batch_startblk > (BlockNumber) XLR_MAX_BLOCK_ID)
+			batch_endblk = batch_startblk + (BlockNumber) XLR_MAX_BLOCK_ID;
+#endif
+
 		/* Collect a batch of blocks. */
 		nbufs = 0;
-		while (nbufs < XLR_MAX_BLOCK_ID && blkno < endblk)
+		while (nbufs < XLR_MAX_BLOCK_ID && blkno < batch_endblk)
 		{
 			Buffer		buf = ReadBufferExtended(rel, forknum, blkno,
 												 RBM_NORMAL, NULL);
@@ -1358,32 +1448,89 @@ log_newpage_range(Relation rel, ForkNumber forknum,
 			 * to stay empty.
 			 */
 			if (!PageIsNew(BufferGetPage(buf)))
+			{
+#ifdef USE_UMBRA
+				if (BufferIsValid(zero_anchor))
+				{
+					UnlockReleaseBuffer(zero_anchor);
+					zero_anchor = InvalidBuffer;
+				}
+#endif
 				bufpack[nbufs++] = buf;
+			}
+#ifdef USE_UMBRA
+			else if (nbufs == 0 && !BufferIsValid(zero_anchor))
+				zero_anchor = buf;
+#endif
 			else
 				UnlockReleaseBuffer(buf);
 			blkno++;
 		}
 
+#ifdef USE_UMBRA
+		/*
+		 * A completely zero batch still needs one block reference to carry its
+		 * mapping range.  Keep that page clean and do not assign it an LSN.
+		 */
+		zero_only = (nbufs == 0);
+		if (zero_only)
+		{
+			Assert(BufferIsValid(zero_anchor));
+			bufpack[nbufs++] = zero_anchor;
+		}
+
+		anchor_blkno = BufferGetBlockNumber(bufpack[0]);
+		UmLogMappingRange(rel->rd_locator, forknum, batch_startblk, blkno,
+						  anchor_blkno);
+#else
 		/* Nothing more to do if all remaining blocks were empty. */
 		if (nbufs == 0)
 			break;
+#endif
 
 		/* Write WAL record for this batch. */
+#ifdef USE_UMBRA
+		PG_TRY();
+		{
+#endif
 		XLogBeginInsert();
 
 		START_CRIT_SECTION();
 		for (i = 0; i < nbufs; i++)
 		{
+			int			buffer_flags = flags;
+
+#ifdef USE_UMBRA
+			if (zero_only)
+				buffer_flags |= REGBUF_NO_CHANGE;
+			else
+				MarkBufferDirty(bufpack[i]);
+#else
 			MarkBufferDirty(bufpack[i]);
-			XLogRegisterBuffer(i, bufpack[i], flags);
+#endif
+			XLogRegisterBuffer(i, bufpack[i], buffer_flags);
 		}
 
 		recptr = XLogInsert(RM_XLOG_ID, XLOG_FPI);
 
 		for (i = 0; i < nbufs; i++)
-			PageSetLSN(BufferGetPage(bufpack[i]), recptr);
+		{
+			if (!PageIsNew(BufferGetPage(bufpack[i])))
+				PageSetLSN(BufferGetPage(bufpack[i]), recptr);
+		}
 
 		END_CRIT_SECTION();
+#ifdef USE_UMBRA
+		}
+		PG_CATCH();
+		{
+			UmLogMappingRangeFinish();
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+
+		UmLogMappingRangeFinish();
+#endif
 
 		for (i = 0; i < nbufs; i++)
 			UnlockReleaseBuffer(bufpack[i]);
