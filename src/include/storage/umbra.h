@@ -73,6 +73,7 @@ extern void UmPrepareFirstbornRangeLocator(RelFileLocator rlocator,
 										 ForkNumber forknum, int nblocks,
 										 const BlockNumber *lblknos);
 extern bool UmWalOwnedRemapAvailable(SMgrRelation reln, ForkNumber forknum);
+extern bool UmExplicitRemapAvailable(SMgrRelation reln, ForkNumber forknum);
 extern bool UmPrepareBlockRemap(SMgrRelation reln, ForkNumber forknum,
 								BlockNumber lblkno, UmbraMapRemap *remap);
 extern void UmAbortBlockRemap(UmbraMapRemap *remap);
@@ -99,7 +100,13 @@ extern void UmLogMappingRangeFinish(bool delay_started);
 extern void UmMappingPublicationDone(void);
 extern void UmPrepareReplayMappingRange(SMgrRelation reln, ForkNumber forknum,
 									const UmbraMapRange *range,
-									BlockNumber old_pblkno, XLogRecPtr lsn);
+									BlockNumber old_pblkno, XLogRecPtr lsn,
+									bool zero_baseline);
+extern void UmReplayMappingExtend(SMgrRelation reln, ForkNumber forknum,
+								  BlockNumber first_lblkno,
+								  BlockNumber nblocks,
+								  XLogRecPtr lsn,
+								  bool fpi_images_follow);
 extern void UmSwitchReplayBlockRemap(SMgrRelation reln, ForkNumber forknum,
 									BlockNumber lblkno,
 									BlockNumber old_pblkno,

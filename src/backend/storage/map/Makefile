@@ -19,6 +19,7 @@ OBJS = \
 	mapclock.o \
 	mapflush.o \
 	mapinit.o \
+	mapreclaim.o \
 	mapsuper.o
 
 include $(top_srcdir)/src/backend/common.mk

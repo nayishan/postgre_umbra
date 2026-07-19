@@ -1,8 +1,7 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# Verify that compaction relocates the latest shared-buffer image, that its
-# exact remap WAL survives a crash, and that storage lifecycle locks are
-# released at the transaction boundaries where compaction may resume.
+# Verify resident and cold shared-buffer relocation, exact remap crash
+# recovery, and storage lifecycle lock release at transaction boundaries.
 
 use strict;
 use warnings FATAL => 'all';
@@ -341,6 +340,70 @@ ok(!$node->log_contains(
 		qr/you don't own a lock of type AccessExclusiveLock/,
 		$lifecycle_log_offset),
 	'lifecycle cleanup releases only locks still owned by the backend');
+
+# A clean restart proves the compactor can pull a cold page through shared
+# buffers.  The high-page TID lookup below makes the MAP root resident without
+# reading any of the victim pages sampled from the first extent.
+$node->safe_psql(
+	'postgres', qq{
+CREATE TABLE umbra_mapcompact_cold(id integer, payload text)
+  WITH (autovacuum_enabled = false);
+ALTER TABLE umbra_mapcompact_cold ALTER COLUMN payload SET STORAGE PLAIN;
+INSERT INTO umbra_mapcompact_cold
+SELECT g, repeat(md5(g::text), $payload_repeats)
+FROM generate_series(1, 500) AS g;
+CHECKPOINT;
+});
+my $cold_relpath = $node->safe_psql(
+	'postgres', q{SELECT pg_relation_filepath('umbra_mapcompact_cold')});
+my $cold_data_path = $node->data_dir . "/$cold_relpath";
+my $cold_map_path = "${cold_data_path}_map";
+my $cold_nblocks = 0 + $node->safe_psql(
+	'postgres', q{
+SELECT pg_relation_size('umbra_mapcompact_cold') /
+       pg_size_bytes(current_setting('block_size'));
+});
+my $cold_last_ctid = $node->safe_psql(
+	'postgres', q{SELECT ctid FROM umbra_mapcompact_cold WHERE id = 500});
+my $cold_probe_blocks = $cold_nblocks < 128 ? $cold_nblocks : 128;
+my @cold_before = map {
+	read_main_map_entry($cold_map_path, $block_size, $_)
+} 0 .. $cold_probe_blocks - 1;
+
+$node->stop;
+$node->start;
+is(
+	$node->safe_psql(
+		'postgres',
+		"SELECT id FROM umbra_mapcompact_cold WHERE ctid = '$cold_last_ctid'"),
+	'500',
+	'single high-page read makes the MAP root resident after clean restart');
+$node->safe_psql(
+	'postgres', q{
+ALTER SYSTEM SET map_compactor_enable = on;
+SELECT pg_reload_conf();
+});
+
+my $cold_moved = 0;
+for (1 .. 400)
+{
+	for my $lblkno (0 .. $cold_probe_blocks - 1)
+	{
+		if (read_main_map_entry($cold_map_path, $block_size, $lblkno) !=
+			$cold_before[$lblkno])
+		{
+			$cold_moved = 1;
+			last;
+		}
+	}
+	last if $cold_moved;
+	usleep(50_000);
+}
+ok($cold_moved,
+	'compactor relocates a cold MAIN page through the shared buffer pool');
+is($node->safe_psql(
+		'postgres', q{SELECT count(*) FROM umbra_mapcompact_cold}),
+	'500', 'cold relation remains readable after relocation');
 
 $node->stop;
 done_testing();

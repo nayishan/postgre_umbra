@@ -41,6 +41,9 @@
 #include "access/xlogutils.h"
 #include "access/xlogwait.h"
 #include "backup/basebackup.h"
+#ifdef USE_UMBRA
+#include "catalog/storage_xlog.h"
+#endif
 #include "catalog/pg_control.h"
 #include "commands/tablespace.h"
 #include "common/file_utils.h"
@@ -1927,6 +1930,11 @@ ReplayUmbraMappingRanges(XLogReaderState *xlogreader)
 	UmbraReplayMappingRange ranges[XLR_MAX_BLOCK_ID + 1];
 	int			nranges = 0;
 	int			nmerged = 0;
+	bool		mapping_extend;
+
+	mapping_extend = XLogRecGetRmid(xlogreader) == RM_SMGR_ID &&
+		(XLogRecGetInfo(xlogreader) & ~XLR_INFO_MASK) ==
+		XLOG_SMGR_UMBRA_MAP_EXTEND;
 
 	for (int block_id = 0; block_id <= XLogRecMaxBlockId(xlogreader);
 		 block_id++)
@@ -2002,12 +2010,31 @@ ReplayUmbraMappingRanges(XLogReaderState *xlogreader)
 	for (int range_no = 0; range_no < nmerged; range_no++)
 	{
 		SMgrRelation reln;
+		bool		firstborn_fpi;
+		bool		zero_baseline;
 
 		reln = smgropen(ranges[range_no].rlocator, INVALID_PROC_NUMBER);
+		firstborn_fpi = !BlockNumberIsValid(ranges[range_no].old_pblkno) &&
+			XLogRecGetRmid(xlogreader) == RM_XLOG_ID &&
+			(XLogRecGetInfo(xlogreader) & ~XLR_INFO_MASK) == XLOG_FPI;
+		zero_baseline = mapping_extend || firstborn_fpi;
 		UmPrepareReplayMappingRange(reln, ranges[range_no].forknum,
 									&ranges[range_no].range,
 									ranges[range_no].old_pblkno,
-									xlogreader->EndRecPtr);
+									xlogreader->EndRecPtr, zero_baseline);
+		if (firstborn_fpi)
+		{
+			/*
+			 * Skip-WAL newpage records can omit zero pages from any mapped fork.
+			 * Materialize the complete exact range before xlog_redo() restores the
+			 * listed FPIs; MAP publication remains deferred until the whole record
+			 * succeeds.
+			 */
+			UmReplayMappingExtend(reln, ranges[range_no].forknum,
+								  ranges[range_no].range.first_lblkno,
+								  ranges[range_no].range.nblocks,
+								  xlogreader->EndRecPtr, true);
+		}
 	}
 }
 #endif

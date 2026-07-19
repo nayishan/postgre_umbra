@@ -32,6 +32,14 @@ extern void umfile_destroy(UmbraFileContext *ctx);
 extern void umfile_create(UmbraFileContext *ctx, ForkNumber forknum,
 						  bool isRedo);
 extern bool umfile_exists(UmbraFileContext *ctx, ForkNumber forknum);
+extern bool umfile_collect_existing_segnos(RelFileLocatorBackend rlocator,
+											ForkNumber forknum,
+											BlockNumber **segnos_out,
+											int *nsegnos_out);
+extern bool umfile_segment_exists(UmbraFileContext *ctx, ForkNumber forknum,
+									  BlockNumber segno);
+extern bool umfile_unlink_segment(UmbraFileContext *ctx, ForkNumber forknum,
+								  BlockNumber segno);
 extern bool umfile_unlink(RelFileLocatorBackend rlocator, ForkNumber forknum,
 							  bool isRedo);
 extern void umfile_extend(UmbraFileContext *ctx, ForkNumber forknum,
@@ -70,10 +78,12 @@ extern void umfile_writev(UmbraFileContext *ctx, ForkNumber forknum,
 						  BlockNumber blocknum, const void **buffers,
 						  BlockNumber nblocks, bool skipFsync);
 extern void umfile_writeback(UmbraFileContext *ctx, ForkNumber forknum,
-							 BlockNumber blocknum, BlockNumber nblocks);
+								 BlockNumber blocknum, BlockNumber nblocks);
 extern BlockNumber umfile_nblocks(UmbraFileContext *ctx, ForkNumber forknum);
+extern void umfile_prepare_truncate(UmbraFileContext *ctx,
+									 ForkNumber forknum);
 extern void umfile_truncate(UmbraFileContext *ctx, ForkNumber forknum,
-							BlockNumber curnblk, BlockNumber nblocks);
+								 BlockNumber curnblk, BlockNumber nblocks);
 extern void umfile_immedsync(UmbraFileContext *ctx, ForkNumber forknum);
 extern void umfile_registersync(UmbraFileContext *ctx, ForkNumber forknum);
 extern int	umfile_fd(UmbraFileContext *ctx, ForkNumber forknum,

@@ -395,7 +395,9 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 	blkref = XLogRecGetBlock(record, block_id);
 	existing_remap = blkref->has_remap &&
 		BlockNumberIsValid(blkref->old_pblkno);
-	if (existing_remap && (willinit || zeromode))
+	if (existing_remap &&
+		(willinit != (forknum == FSM_FORKNUM ||
+					  forknum == VISIBILITYMAP_FORKNUM)))
 		elog(PANIC, "invalid Umbra existing-page remap in WAL record");
 #endif
 
@@ -425,7 +427,7 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 		 * The page may be uninitialized. If so, we can't set the LSN because
 		 * that would corrupt the page.
 		 */
-		if (!PageIsNew(page))
+		if (!willinit && !PageIsNew(page))
 		{
 			PageSetLSN(page, lsn);
 		}

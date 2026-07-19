@@ -50,7 +50,7 @@
  * shorter than the OS file size limit.  The segment size is set by the
  * RELSEG_SIZE configuration constant in pg_config.h.
  *
- * On disk, a relation must consist of consecutively numbered segment files
+ * Dense forks consist of consecutively numbered segment files
  * in the pattern
  *	-- Zero or more full segments of exactly RELSEG_SIZE blocks each
  *	-- Exactly one partial segment of size 0 <= size < RELSEG_SIZE blocks
@@ -65,6 +65,11 @@
  * file references still be valid --- else data might get written out to an
  * unlinked old copy of a segment file that will eventually disappear.
  *
+ * MAIN, FSM, and VM physical storage may instead have missing segment files.
+ * Their logical address space is defined by MAP, so reclaim may remove a
+ * segment after its last mapping disappears.  MAP storage itself remains
+ * dense and continues to use the md-style rules above.
+ *
  * RELSEG_SIZE must fit into BlockNumber; but since we expose its value
  * as an integer GUC, it actually needs to fit in signed int.  It's worth
  * having a cross-check for this since configure's --with-segsize options
@@ -76,13 +81,9 @@ StaticAssertDecl(RELSEG_SIZE > 0 && RELSEG_SIZE <= INT_MAX,
 /*
  * File descriptors are stored in the per-fork seg_fds arrays inside
  * UmbraFileContext. The length of these arrays is stored in num_open_segs.
- * Note that a fork's num_open_segs having a specific value does not
- * necessarily mean the relation doesn't have additional segments; we may
- * just not have opened the next segment yet.  (We could not have "all
- * segments are in the array" as an invariant anyway, since another backend
- * could extend the relation while we aren't looking.)  We do not have
- * entries for inactive segments, however; as soon as we find a partial
- * segment, we assume that any subsequent segments are inactive.
+ * Note that a fork's num_open_segs is the allocated slot count, not the
+ * number of descriptors currently open.  Sparse forks can have reset slots
+ * between open descriptors.  A dense fork still opens segments in order.
  *
  * The entire UmfdVec array is palloc'd in the UmFileCxt memory context.
  */
@@ -93,11 +94,15 @@ typedef struct UmfdVec
 	BlockNumber umfd_segno;		/* segment number, from 0 */
 } UmfdVec;
 
+#define UMFILE_INVALID_VFD	(-1)
+
 struct UmbraFileContext
 {
 	RelFileLocatorBackend rlocator;
 	int			num_open_segs[UMBRA_NUM_FORKS];
 	UmfdVec    *seg_fds[UMBRA_NUM_FORKS];
+	/* Refreshed by scans and advanced by successful physical writes. */
+	BlockNumber sparse_nblocks[UMBRA_NUM_FORKS];
 };
 
 static MemoryContext UmFileCxt;		/* context for all UmfdVec objects */
@@ -150,6 +155,8 @@ typedef struct UmFilePathStr
 /* local routines */
 static bool umfile_unlinkfork(RelFileLocatorBackend rlocator, ForkNumber forknum,
 								  bool isRedo);
+static bool umfile_unlinkfork_sparse(RelFileLocatorBackend rlocator,
+									 ForkNumber forknum, bool isRedo);
 static UmfdVec *umfile_openfork(UmbraFileContext *ctx, ForkNumber forknum, int behavior);
 static void umfile_register_dirty_segment(UmbraFileContext *ctx, ForkNumber forknum,
 										  UmfdVec *seg);
@@ -161,6 +168,13 @@ static void umfile_fdvec_resize(UmbraFileContext *ctx,
 								ForkNumber forknum,
 								int nseg);
 static bool umfile_forknum_is_valid(ForkNumber forknum);
+static bool umfile_fork_allows_sparse_segments(ForkNumber forknum);
+static bool umfile_seg_entry_is_open(const UmfdVec *seg);
+static void umfile_seg_entry_reset(UmfdVec *seg);
+static void umfile_note_sparse_nblocks(UmbraFileContext *ctx,
+										 ForkNumber forknum,
+										 BlockNumber nblocks);
+static int umfile_compare_blocknumbers(const void *a, const void *b);
 static RelPathStr umfile_relpath(RelFileLocatorBackend rlocator,
 								 ForkNumber forknum);
 static UmFilePathStr umfile_segpath(RelFileLocatorBackend rlocator, ForkNumber forknum,
@@ -172,6 +186,10 @@ static UmfdVec *umfile_openseg(UmbraFileContext *ctx, ForkNumber forknum,
 static UmfdVec *umfile_getseg(UmbraFileContext *ctx, ForkNumber forknum,
 							  BlockNumber blkno, bool skipFsync, int behavior);
 static BlockNumber umfile_nblocks_in_seg(UmfdVec *seg);
+static BlockNumber umfile_nblocks_sparse(UmbraFileContext *ctx,
+										 ForkNumber forknum);
+static BlockNumber umfile_nblocks_dense(UmbraFileContext *ctx,
+										ForkNumber forknum);
 static bool umfile_preallocate_fd(File fd, pgoff_t target_bytes);
 static bool umfile_preallocate_errno_is_unsupported(int err);
 static inline int umfile_open_flags(ForkNumber forknum);
@@ -219,6 +237,10 @@ umfile_init(void)
 bool
 umfile_exists(UmbraFileContext *ctx, ForkNumber forknum)
 {
+	BlockNumber *segnos = NULL;
+	int			nsegnos = 0;
+	bool		exists;
+
 	Assert(ctx != NULL);
 	Assert(umfile_forknum_is_valid(forknum));
 
@@ -230,7 +252,47 @@ umfile_exists(UmbraFileContext *ctx, ForkNumber forknum)
 	if (!InRecovery)
 		umfile_close(ctx, forknum);
 
+	if (umfile_fork_allows_sparse_segments(forknum))
+	{
+		/*
+		 * Segment zero is retained by the common case.  Probe it directly and
+		 * only scan the directory when reclaim has removed it while leaving a
+		 * higher sparse segment behind.
+		 */
+		if (umfile_openfork(ctx, forknum, EXTENSION_RETURN_NULL) != NULL)
+			return true;
+
+		if (!umfile_collect_existing_segnos(ctx->rlocator, forknum,
+											&segnos, &nsegnos))
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not scan segments for file \"%s\": %m",
+							umfile_relpath(ctx->rlocator, forknum).str)));
+		exists = nsegnos > 0;
+		if (!exists)
+			ctx->sparse_nblocks[forknum] = 0;
+		if (segnos != NULL)
+			pfree(segnos);
+		return exists;
+	}
+
 	return (umfile_openfork(ctx, forknum, EXTENSION_RETURN_NULL) != NULL);
+}
+
+bool
+umfile_segment_exists(UmbraFileContext *ctx, ForkNumber forknum,
+					  BlockNumber segno)
+{
+	UmFilePathStr path;
+
+	Assert(ctx != NULL);
+	Assert(umfile_fork_allows_sparse_segments(forknum));
+
+	path = umfile_segpath(ctx->rlocator, forknum, segno);
+	if (access(path.str, F_OK) == 0)
+		return true;
+	/* Only ENOENT proves absence; other failures must keep reclaim retryable. */
+	return errno != ENOENT;
 }
 
 /*
@@ -248,8 +310,22 @@ umfile_create(UmbraFileContext *ctx, ForkNumber forknum, bool isRedo)
 	Assert(ctx != NULL);
 	Assert(umfile_forknum_is_valid(forknum));
 
-	if (isRedo && ctx->num_open_segs[forknum] > 0)
-		return;					/* created and opened already... */
+	if (isRedo)
+	{
+		/* Sparse forks can have allocated descriptor slots that are not open. */
+		for (int i = 0; i < ctx->num_open_segs[forknum]; i++)
+		{
+			if (umfile_seg_entry_is_open(&ctx->seg_fds[forknum][i]))
+				return;				/* created and opened already... */
+		}
+	}
+	if (isRedo && umfile_fork_allows_sparse_segments(forknum))
+	{
+		if (umfile_exists(ctx, forknum))
+			return;
+		/* Drop stale descriptors before creating a new segment zero. */
+		umfile_close(ctx, forknum);
+	}
 
 	Assert(ctx->num_open_segs[forknum] == 0);
 
@@ -291,6 +367,8 @@ umfile_create(UmbraFileContext *ctx, ForkNumber forknum, bool isRedo)
 	v = &ctx->seg_fds[forknum][0];
 	v->umfd_vfd = fd;
 	v->umfd_segno = 0;
+	if (umfile_fork_allows_sparse_segments(forknum))
+		ctx->sparse_nblocks[forknum] = 0;
 
 	if (!RelFileLocatorBackendIsTemp(ctx->rlocator))
 		umfile_register_dirty_segment(ctx, forknum, v);
@@ -499,6 +577,129 @@ do_truncate(const char *path)
 	return ret;
 }
 
+/*
+ * Remove one sparse physical segment immediately.  The caller must already
+ * have established that no live mapping can reach this segment.  Truncating
+ * before unlinking releases space held by stale descriptors in other
+ * backends; forgetting the FileTag prevents a queued fsync from reopening it.
+ */
+bool
+umfile_unlink_segment(UmbraFileContext *ctx, ForkNumber forknum,
+					  BlockNumber segno)
+{
+	UmFilePathStr path;
+	int			ret;
+	int			save_errno;
+
+	Assert(ctx != NULL);
+	Assert(umfile_fork_allows_sparse_segments(forknum));
+
+	if (segno < (BlockNumber) ctx->num_open_segs[forknum])
+	{
+		UmfdVec    *v = &ctx->seg_fds[forknum][segno];
+
+		if (umfile_seg_entry_is_open(v))
+		{
+			FileClose(v->umfd_vfd);
+			umfile_seg_entry_reset(v);
+		}
+	}
+	ctx->sparse_nblocks[forknum] = 0;
+
+	path = umfile_segpath(ctx->rlocator, forknum, segno);
+	if (!RelFileLocatorBackendIsTemp(ctx->rlocator))
+	{
+		ret = do_truncate(path.str);
+		save_errno = errno;
+		umfile_register_forget_request(ctx->rlocator, forknum, segno);
+		errno = save_errno;
+		if (ret < 0)
+			return errno == ENOENT;
+	}
+
+	if (unlink(path.str) < 0)
+	{
+		if (errno == ENOENT)
+			return true;
+		save_errno = errno;
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("could not remove file \"%s\": %m", path.str)));
+		errno = save_errno;
+		return false;
+	}
+
+	return true;
+}
+
+/* Apply whole-fork unlink semantics to every existing sparse segment. */
+static bool
+umfile_unlinkfork_sparse(RelFileLocatorBackend rlocator, ForkNumber forknum,
+						 bool isRedo)
+{
+	BlockNumber *segnos = NULL;
+	int			nsegnos = 0;
+	bool		delay_mapped_unlink;
+	bool		success = true;
+	int			i;
+
+	Assert(umfile_fork_allows_sparse_segments(forknum));
+
+	if (!umfile_collect_existing_segnos(rlocator, forknum,
+										&segnos, &nsegnos))
+	{
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("could not scan segments for file \"%s\": %m",
+						umfile_relpath(rlocator, forknum).str)));
+		return false;
+	}
+
+	delay_mapped_unlink = !isRedo && !IsBinaryUpgrade &&
+		ummap_tracks_fork(forknum) &&
+		!RelFileLocatorBackendIsTemp(rlocator);
+
+	for (i = 0; i < nsegnos; i++)
+	{
+		BlockNumber segno = segnos[i];
+		UmFilePathStr path = umfile_segpath(rlocator, forknum, segno);
+		int			ret = 0;
+		int			save_errno;
+
+		if (delay_mapped_unlink)
+		{
+			umfile_register_unlink_segment(rlocator, forknum, segno);
+			continue;
+		}
+
+		if (!RelFileLocatorBackendIsTemp(rlocator))
+		{
+			ret = do_truncate(path.str);
+			if (ret < 0 && errno != ENOENT)
+				success = false;
+
+			save_errno = errno;
+			umfile_register_forget_request(rlocator, forknum, segno);
+			errno = save_errno;
+		}
+
+		if ((ret >= 0 || errno != ENOENT) && unlink(path.str) < 0 &&
+			errno != ENOENT)
+		{
+			success = false;
+			save_errno = errno;
+			ereport(WARNING,
+					(errcode_for_file_access(),
+					 errmsg("could not remove file \"%s\": %m", path.str)));
+			errno = save_errno;
+		}
+	}
+
+	if (segnos != NULL)
+		pfree(segnos);
+	return success;
+}
+
 static bool
 umfile_unlinkfork(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 {
@@ -510,6 +711,8 @@ umfile_unlinkfork(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRed
 	Assert(umfile_forknum_is_valid(forknum));
 
 	path = umfile_relpath(rlocator, forknum);
+	if (umfile_fork_allows_sparse_segments(forknum))
+		return umfile_unlinkfork_sparse(rlocator, forknum, isRedo);
 
 	/*
 	 * Unlike md, Umbra cannot treat the mapping and its physical target
@@ -724,6 +927,7 @@ umfile_extend(UmbraFileContext *ctx, ForkNumber forknum,
 
 	if (!skipFsync && !RelFileLocatorBackendIsTemp(ctx->rlocator))
 		umfile_register_dirty_segment(ctx, forknum, v);
+	umfile_note_sparse_nblocks(ctx, forknum, blocknum + 1);
 
 	Assert(umfile_nblocks_in_seg(v) <= ((BlockNumber) RELSEG_SIZE));
 }
@@ -841,6 +1045,8 @@ umfile_zeroextend(UmbraFileContext *ctx, ForkNumber forknum,
 
 		if (!skipFsync && !RelFileLocatorBackendIsTemp(ctx->rlocator))
 			umfile_register_dirty_segment(ctx, forknum, v);
+		umfile_note_sparse_nblocks(ctx, forknum,
+								  curblocknum + numblocks);
 
 		Assert(umfile_nblocks_in_seg(v) <= ((BlockNumber) RELSEG_SIZE));
 
@@ -898,6 +1104,7 @@ umfile_preallocate(UmbraFileContext *ctx, ForkNumber forknum,
 			umfile_register_dirty_segment(ctx, forknum, v);
 
 		current_nblocks = (BlockNumber) seg_end;
+		umfile_note_sparse_nblocks(ctx, forknum, current_nblocks);
 	}
 
 	return true;
@@ -1072,9 +1279,14 @@ umfile_openfork(UmbraFileContext *ctx, ForkNumber forknum, int behavior)
 	Assert(ctx != NULL);
 	Assert(umfile_forknum_is_valid(forknum));
 
-	/* No work if already open */
+	/* No work if segment zero is already open. */
 	if (ctx->num_open_segs[forknum] > 0)
-		return &ctx->seg_fds[forknum][0];
+	{
+		v = &ctx->seg_fds[forknum][0];
+		if (umfile_seg_entry_is_open(v))
+			return v;
+		Assert(umfile_fork_allows_sparse_segments(forknum));
+	}
 
 	path = umfile_relpath(ctx->rlocator, forknum);
 
@@ -1090,7 +1302,8 @@ umfile_openfork(UmbraFileContext *ctx, ForkNumber forknum, int behavior)
 				 errmsg("could not open file \"%s\": %m", path.str)));
 	}
 
-	umfile_fdvec_resize(ctx, forknum, 1);
+	if (ctx->num_open_segs[forknum] == 0)
+		umfile_fdvec_resize(ctx, forknum, 1);
 	v = &ctx->seg_fds[forknum][0];
 	v->umfd_vfd = fd;
 	v->umfd_segno = 0;
@@ -1150,10 +1363,14 @@ umfile_close(UmbraFileContext *ctx, ForkNumber forknum)
 	{
 		UmfdVec    *v = &ctx->seg_fds[forknum][nopensegs - 1];
 
-		FileClose(v->umfd_vfd);
-		umfile_fdvec_resize(ctx, forknum, nopensegs - 1);
+		if (umfile_seg_entry_is_open(v))
+		{
+			FileClose(v->umfd_vfd);
+			umfile_seg_entry_reset(v);
+		}
 		nopensegs--;
 	}
+	umfile_fdvec_resize(ctx, forknum, 0);
 }
 
 /*
@@ -1589,6 +1806,8 @@ umfile_writev(UmbraFileContext *ctx, ForkNumber forknum,
 
 		if (!skipFsync && !RelFileLocatorBackendIsTemp(ctx->rlocator))
 			umfile_register_dirty_segment(ctx, forknum, v);
+		umfile_note_sparse_nblocks(ctx, forknum,
+								  blocknum + nblocks_this_segment);
 
 		nblocks -= nblocks_this_segment;
 		buffers += nblocks_this_segment;
@@ -1655,20 +1874,91 @@ umfile_writeback(UmbraFileContext *ctx, ForkNumber forknum,
 /*
  * umfile_nblocks() -- Get the number of blocks stored in a relation.
  *
- * Important side effect: all active segments of the relation are opened
- * and added to the seg_fds array.  If this routine has not been
- * called, then only segments up to the last one actually touched
- * are present in the array.
+ * Sparse physical forks report the end of their highest existing segment;
+ * missing lower segment files do not reduce that high-water mark.  Dense MAP
+ * storage retains md's contiguous-segment calculation.
  */
 BlockNumber
 umfile_nblocks(UmbraFileContext *ctx, ForkNumber forknum)
 {
+	Assert(ctx != NULL);
+	Assert(umfile_forknum_is_valid(forknum));
+
+	if (umfile_fork_allows_sparse_segments(forknum))
+		return umfile_nblocks_sparse(ctx, forknum);
+	return umfile_nblocks_dense(ctx, forknum);
+}
+
+static BlockNumber
+umfile_nblocks_sparse(UmbraFileContext *ctx, ForkNumber forknum)
+{
+	BlockNumber *segnos = NULL;
+	int			nsegnos = 0;
+	BlockNumber nblocks;
+	UmfdVec    *v;
+	int			i;
+
+	/*
+	 * Pending mapping publication calls this after entering a critical
+	 * section.  File operations below maintain this context-local high-water,
+	 * so that path cannot allocate memory or scan a directory.
+	 */
+	if (CritSectionCount > 0)
+		return ctx->sparse_nblocks[forknum];
+
+	if (!umfile_collect_existing_segnos(ctx->rlocator, forknum,
+										&segnos, &nsegnos))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not scan segments for file \"%s\": %m",
+						umfile_relpath(ctx->rlocator, forknum).str)));
+	if (nsegnos == 0)
+	{
+		ctx->sparse_nblocks[forknum] = 0;
+		return 0;
+	}
+
+	/*
+	 * Reclaim can remove a segment after the directory snapshot.  Search from
+	 * the high end and ignore ENOENT rather than turning optional reclaim into
+	 * an unrelated foreground error.  Lower segments need not be opened.
+	 */
+	for (i = nsegnos - 1; i >= 0; i--)
+	{
+		v = umfile_openseg(ctx, forknum, segnos[i], 0);
+		if (v == NULL)
+		{
+			if (FILE_POSSIBLY_DELETED(errno))
+				continue;
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not open file \"%s\": %m",
+							umfile_segpath(ctx->rlocator, forknum,
+										   segnos[i]).str)));
+		}
+
+		nblocks = umfile_nblocks_in_seg(v);
+		if (nblocks > ((BlockNumber) RELSEG_SIZE))
+			elog(FATAL, "segment too big");
+		/* Dense truncate leaves zero-length inactive segments behind. */
+		if (nblocks == 0 && segnos[i] > 0)
+			continue;
+		nblocks += segnos[i] * ((BlockNumber) RELSEG_SIZE);
+		ctx->sparse_nblocks[forknum] = nblocks;
+		pfree(segnos);
+		return nblocks;
+	}
+	pfree(segnos);
+	ctx->sparse_nblocks[forknum] = 0;
+	return 0;
+}
+
+static BlockNumber
+umfile_nblocks_dense(UmbraFileContext *ctx, ForkNumber forknum)
+{
 	UmfdVec    *v;
 	BlockNumber nblocks;
 	BlockNumber segno;
-
-	Assert(ctx != NULL);
-	Assert(umfile_forknum_is_valid(forknum));
 
 	umfile_openfork(ctx, forknum, EXTENSION_FAIL);
 
@@ -1715,6 +2005,47 @@ umfile_nblocks(UmbraFileContext *ctx, ForkNumber forknum)
 		if (v == NULL)
 			return segno * ((BlockNumber) RELSEG_SIZE);
 	}
+}
+
+/* Open every existing segment before truncate enters its critical section. */
+void
+umfile_prepare_truncate(UmbraFileContext *ctx, ForkNumber forknum)
+{
+	BlockNumber *segnos = NULL;
+	int			nsegnos = 0;
+
+	Assert(ctx != NULL);
+	Assert(umfile_forknum_is_valid(forknum));
+
+	if (!umfile_fork_allows_sparse_segments(forknum))
+	{
+		(void) umfile_nblocks_dense(ctx, forknum);
+		return;
+	}
+	if (!umfile_collect_existing_segnos(ctx->rlocator, forknum,
+										&segnos, &nsegnos))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not scan segments for file \"%s\": %m",
+						umfile_relpath(ctx->rlocator, forknum).str)));
+
+	for (int i = 0; i < nsegnos; i++)
+	{
+		BlockNumber segno = segnos[i];
+		UmfdVec    *v;
+
+		if (segno < (BlockNumber) ctx->num_open_segs[forknum] &&
+			umfile_seg_entry_is_open(&ctx->seg_fds[forknum][segno]))
+			continue;
+		v = umfile_openseg(ctx, forknum, segno, 0);
+		if (v == NULL)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not open file \"%s\": %m",
+							umfile_segpath(ctx->rlocator, forknum, segno).str)));
+	}
+	if (segnos != NULL)
+		pfree(segnos);
 }
 
 /*
@@ -1765,6 +2096,12 @@ umfile_truncate(UmbraFileContext *ctx, ForkNumber forknum,
 		priorblocks = (curopensegs - 1) * RELSEG_SIZE;
 
 		v = &ctx->seg_fds[forknum][curopensegs - 1];
+		if (!umfile_seg_entry_is_open(v))
+		{
+			umfile_fdvec_resize(ctx, forknum, curopensegs - 1);
+			curopensegs--;
+			continue;
+		}
 
 		if (priorblocks > nblocks)
 		{
@@ -1819,6 +2156,9 @@ umfile_truncate(UmbraFileContext *ctx, ForkNumber forknum,
 
 		curopensegs--;
 	}
+	if (umfile_fork_allows_sparse_segments(forknum))
+		ctx->sparse_nblocks[forknum] =
+			Min(ctx->sparse_nblocks[forknum], nblocks);
 }
 
 /*
@@ -1832,6 +2172,39 @@ umfile_registersync(UmbraFileContext *ctx, ForkNumber forknum)
 
 	Assert(ctx != NULL);
 	Assert(!RelFileLocatorBackendIsTemp(ctx->rlocator));
+
+	if (umfile_fork_allows_sparse_segments(forknum))
+	{
+		BlockNumber *segnos = NULL;
+		int			nsegnos = 0;
+		int			i;
+
+		if (!umfile_collect_existing_segnos(ctx->rlocator, forknum,
+											&segnos, &nsegnos))
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not scan segments for file \"%s\": %m",
+							umfile_relpath(ctx->rlocator, forknum).str)));
+		for (i = 0; i < nsegnos; i++)
+		{
+			UmfdVec    *v = umfile_openseg(ctx, forknum, segnos[i], 0);
+
+			if (v == NULL)
+			{
+				if (FILE_POSSIBLY_DELETED(errno))
+					continue;
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not open file \"%s\": %m",
+								umfile_segpath(ctx->rlocator, forknum,
+											   segnos[i]).str)));
+			}
+			umfile_register_dirty_segment(ctx, forknum, v);
+		}
+		if (segnos != NULL)
+			pfree(segnos);
+		return;
+	}
 
 	/*
 	 * NOTE: umfile_nblocks makes sure we have opened all active segments, so
@@ -1885,6 +2258,44 @@ umfile_immedsync(UmbraFileContext *ctx, ForkNumber forknum)
 	int			min_inactive_seg;
 
 	Assert(ctx != NULL);
+
+	if (umfile_fork_allows_sparse_segments(forknum))
+	{
+		BlockNumber *segnos = NULL;
+		int			nsegnos = 0;
+		int			i;
+
+		if (!umfile_collect_existing_segnos(ctx->rlocator, forknum,
+											&segnos, &nsegnos))
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not scan segments for file \"%s\": %m",
+							umfile_relpath(ctx->rlocator, forknum).str)));
+		for (i = 0; i < nsegnos; i++)
+		{
+			UmfdVec    *v = umfile_openseg(ctx, forknum, segnos[i], 0);
+
+			if (v == NULL)
+			{
+				if (FILE_POSSIBLY_DELETED(errno))
+					continue;
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not open file \"%s\": %m",
+								umfile_segpath(ctx->rlocator, forknum,
+											   segnos[i]).str)));
+			}
+			if (FileSync(v->umfd_vfd,
+						 WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC) < 0)
+				ereport(data_sync_elevel(ERROR),
+						(errcode_for_file_access(),
+						 errmsg("could not fsync file \"%s\": %m",
+								FilePathName(v->umfd_vfd))));
+		}
+		if (segnos != NULL)
+			pfree(segnos);
+		return;
+	}
 
 	/*
 	 * NOTE: umfile_nblocks makes sure we have opened all active segments, so
@@ -1941,7 +2352,8 @@ umfile_fd(UmbraFileContext *ctx, ForkNumber forknum, BlockNumber blocknum,
 
 	Assert(ctx != NULL);
 
-	v = umfile_openfork(ctx, forknum, EXTENSION_FAIL);
+	if (!umfile_fork_allows_sparse_segments(forknum))
+		(void) umfile_openfork(ctx, forknum, EXTENSION_FAIL);
 
 	v = umfile_getseg(ctx, forknum, blocknum, false, EXTENSION_FAIL);
 
@@ -2041,22 +2453,25 @@ umfile_fdvec_resize(UmbraFileContext *ctx,
 					ForkNumber forknum,
 					int nseg)
 {
+	int			old_nseg = ctx->num_open_segs[forknum];
+	int			i;
+
 	Assert(umfile_forknum_is_valid(forknum));
 
 	if (nseg == 0)
 	{
-		if (ctx->num_open_segs[forknum] > 0)
+		if (old_nseg > 0)
 		{
 			pfree(ctx->seg_fds[forknum]);
 			ctx->seg_fds[forknum] = NULL;
 		}
 	}
-	else if (ctx->num_open_segs[forknum] == 0)
+	else if (old_nseg == 0)
 	{
 		ctx->seg_fds[forknum] =
 			MemoryContextAlloc(UmFileCxt, sizeof(UmfdVec) * nseg);
 	}
-	else if (nseg > ctx->num_open_segs[forknum])
+	else if (nseg > old_nseg)
 	{
 		/*
 		 * It doesn't seem worthwhile complicating the code to amortize
@@ -2076,6 +2491,12 @@ umfile_fdvec_resize(UmbraFileContext *ctx,
 		 * that a bit of space in the array is now wasted, until the next time
 		 * we add a segment and reallocate.
 		 */
+		}
+
+	if (nseg > old_nseg)
+	{
+		for (i = old_nseg; i < nseg; i++)
+			umfile_seg_entry_reset(&ctx->seg_fds[forknum][i]);
 	}
 
 	ctx->num_open_segs[forknum] = nseg;
@@ -2085,6 +2506,36 @@ static bool
 umfile_forknum_is_valid(ForkNumber forknum)
 {
 	return forknum >= 0 && (int) forknum < UMBRA_NUM_FORKS;
+}
+
+static bool
+umfile_fork_allows_sparse_segments(ForkNumber forknum)
+{
+	return forknum == MAIN_FORKNUM ||
+		forknum == FSM_FORKNUM ||
+		forknum == VISIBILITYMAP_FORKNUM;
+}
+
+static bool
+umfile_seg_entry_is_open(const UmfdVec *seg)
+{
+	return seg != NULL && seg->umfd_vfd >= 0;
+}
+
+static void
+umfile_seg_entry_reset(UmfdVec *seg)
+{
+	seg->umfd_vfd = UMFILE_INVALID_VFD;
+	seg->umfd_segno = InvalidBlockNumber;
+}
+
+static void
+umfile_note_sparse_nblocks(UmbraFileContext *ctx, ForkNumber forknum,
+						   BlockNumber nblocks)
+{
+	if (umfile_fork_allows_sparse_segments(forknum) &&
+		nblocks > ctx->sparse_nblocks[forknum])
+		ctx->sparse_nblocks[forknum] = nblocks;
 }
 
 static RelPathStr
@@ -2129,6 +2580,105 @@ umfile_segpath_perm(RelFileLocator rlocator, ForkNumber forknum,
 	return umfile_segpath(backend_rlocator, forknum, segno);
 }
 
+static int
+umfile_compare_blocknumbers(const void *a, const void *b)
+{
+	BlockNumber av = *((const BlockNumber *) a);
+	BlockNumber bv = *((const BlockNumber *) b);
+
+	return av < bv ? -1 : av > bv ? 1 : 0;
+}
+
+/* Collect the actual segment filenames; sparse forks cannot stop at a gap. */
+bool
+umfile_collect_existing_segnos(RelFileLocatorBackend rlocator,
+								ForkNumber forknum,
+								BlockNumber **segnos_out,
+								int *nsegnos_out)
+{
+	UmFilePathStr seg0path;
+	char		dirpath[MAXPGPATH];
+	char	   *slash;
+	const char *basename;
+	size_t		baselen;
+	DIR		   *dir;
+	struct dirent *de;
+	BlockNumber *segnos = NULL;
+	int			nsegnos = 0;
+	int			capacity = 0;
+
+	Assert(umfile_fork_allows_sparse_segments(forknum));
+	Assert(segnos_out != NULL);
+	Assert(nsegnos_out != NULL);
+	if (UmFileCxt == NULL)
+		umfile_init();
+
+	*segnos_out = NULL;
+	*nsegnos_out = 0;
+	seg0path = umfile_segpath(rlocator, forknum, 0);
+	strlcpy(dirpath, seg0path.str, sizeof(dirpath));
+	slash = strrchr(dirpath, '/');
+	if (slash == NULL)
+	{
+		errno = EINVAL;
+		return false;
+	}
+	*slash = '\0';
+	basename = slash + 1;
+	baselen = strlen(basename);
+
+	dir = AllocateDir(dirpath);
+	if (dir == NULL)
+		return errno == ENOENT;
+
+	while ((de = ReadDir(dir, dirpath)) != NULL)
+	{
+		const char *name = de->d_name;
+		BlockNumber segno;
+
+		if (strcmp(name, basename) == 0)
+			segno = 0;
+		else if (strncmp(name, basename, baselen) == 0 &&
+				 name[baselen] == '.')
+		{
+			char	   *endptr;
+			unsigned long parsed;
+
+			errno = 0;
+			parsed = strtoul(name + baselen + 1, &endptr, 10);
+			if (errno != 0 || endptr == name + baselen + 1 ||
+				*endptr != '\0' ||
+				parsed > MaxBlockNumber / ((BlockNumber) RELSEG_SIZE))
+				continue;
+			segno = (BlockNumber) parsed;
+		}
+		else
+			continue;
+
+		if (nsegnos == capacity)
+		{
+			int			new_capacity = capacity == 0 ? 16 : capacity * 2;
+
+			if (segnos == NULL)
+				segnos = MemoryContextAlloc(UmFileCxt,
+										  sizeof(BlockNumber) * new_capacity);
+			else
+				segnos = repalloc(segnos,
+								  sizeof(BlockNumber) * new_capacity);
+			capacity = new_capacity;
+		}
+		segnos[nsegnos++] = segno;
+	}
+	FreeDir(dir);
+
+	if (nsegnos > 1)
+		qsort(segnos, nsegnos, sizeof(BlockNumber),
+			  umfile_compare_blocknumbers);
+	*segnos_out = segnos;
+	*nsegnos_out = nsegnos;
+	return true;
+}
+
 /*
  * Open the specified segment of the relation,
  * and make an UmfdVec object for it.  Returns NULL on failure.
@@ -2140,6 +2690,14 @@ umfile_openseg(UmbraFileContext *ctx, ForkNumber forknum, BlockNumber segno,
 	UmfdVec    *v;
 	File		fd;
 	UmFilePathStr fullpath;
+	BlockNumber segblocks;
+
+	if (segno < (BlockNumber) ctx->num_open_segs[forknum])
+	{
+		v = &ctx->seg_fds[forknum][segno];
+		if (umfile_seg_entry_is_open(v))
+			return v;
+	}
 
 	fullpath = umfile_segpath(ctx->rlocator, forknum, segno);
 
@@ -2150,20 +2708,27 @@ umfile_openseg(UmbraFileContext *ctx, ForkNumber forknum, BlockNumber segno,
 	if (fd < 0)
 		return NULL;
 
-	/*
-	 * Segments are always opened in order from lowest to highest, so we must
-	 * be adding a new one at the end.
-	 */
-	Assert(segno == ctx->num_open_segs[forknum]);
-
-	umfile_fdvec_resize(ctx, forknum, segno + 1);
+	if (umfile_fork_allows_sparse_segments(forknum))
+	{
+		if (segno >= (BlockNumber) ctx->num_open_segs[forknum])
+			umfile_fdvec_resize(ctx, forknum, segno + 1);
+	}
+	else
+	{
+		/* Dense forks are opened in increasing segment order. */
+		Assert(segno == ctx->num_open_segs[forknum]);
+		umfile_fdvec_resize(ctx, forknum, segno + 1);
+	}
 
 	/* fill the entry */
 	v = &ctx->seg_fds[forknum][segno];
 	v->umfd_vfd = fd;
 	v->umfd_segno = segno;
 
-	Assert(umfile_nblocks_in_seg(v) <= ((BlockNumber) RELSEG_SIZE));
+	segblocks = umfile_nblocks_in_seg(v);
+	Assert(segblocks <= ((BlockNumber) RELSEG_SIZE));
+	umfile_note_sparse_nblocks(ctx, forknum,
+							 segno * ((BlockNumber) RELSEG_SIZE) + segblocks);
 
 	/* all done */
 	return v;
@@ -2196,12 +2761,42 @@ umfile_getseg(UmbraFileContext *ctx, ForkNumber forknum, BlockNumber blkno,
 	if (targetseg < ctx->num_open_segs[forknum])
 	{
 		v = &ctx->seg_fds[forknum][targetseg];
-		return v;
+		if (!umfile_fork_allows_sparse_segments(forknum) ||
+			umfile_seg_entry_is_open(v))
+			return v;
 	}
 
 	/* The caller only wants the segment if we already had it open. */
 	if (behavior & EXTENSION_DONT_OPEN)
 		return NULL;
+
+	/*
+	 * A mapped physical fork may have reclaimed lower segment files.  Open or
+	 * create the requested segment directly; MAP, not segment continuity,
+	 * determines whether the physical block is reachable.
+	 */
+	if (umfile_fork_allows_sparse_segments(forknum))
+	{
+		int			flags = 0;
+
+		if ((behavior & EXTENSION_CREATE) ||
+			(InRecovery && (behavior & EXTENSION_CREATE_RECOVERY)))
+			flags = O_CREAT;
+
+		v = umfile_openseg(ctx, forknum, targetseg, flags);
+		if (v == NULL)
+		{
+			if ((behavior & EXTENSION_RETURN_NULL) &&
+				FILE_POSSIBLY_DELETED(errno))
+				return NULL;
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not open file \"%s\" (target block %u): %m",
+							umfile_segpath(ctx->rlocator, forknum, targetseg).str,
+							blkno)));
+		}
+		return v;
+	}
 
 	/*
 	 * The target segment is not yet open. Iterate over all the segments
@@ -2368,10 +2963,16 @@ int
 umfileunlinkfiletag(const FileTag *ftag, char *path)
 {
 	UmFilePathStr p;
+	int			result;
 
 	/* Compute the path. */
 	p = umfile_segpath_perm(ftag->rlocator, ftag->forknum, ftag->segno);
 	strlcpy(path, p.str, MAXPGPATH);
+
+	/* Release space held through stale descriptors before removing the name. */
+	result = pg_truncate(path, 0);
+	if (result < 0 && errno != ENOENT)
+		return -1;
 
 	/* Try to unlink the file. */
 	return unlink(path);

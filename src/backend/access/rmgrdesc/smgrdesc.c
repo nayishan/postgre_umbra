@@ -38,6 +38,19 @@ smgr_desc(StringInfo buf, XLogReaderState *record)
 						 relpathperm(xlrec->rlocator, MAIN_FORKNUM).str,
 						 xlrec->blkno, xlrec->flags);
 	}
+#ifdef USE_UMBRA
+	else if (info == XLOG_SMGR_UMBRA_MAP_EXTEND)
+	{
+		DecodedBkpBlock *block = XLogRecGetBlock(record, 0);
+
+		appendStringInfo(buf, "%s logical %u..%u physical %u..%u",
+						 relpathperm(block->rlocator, block->forknum).str,
+						 block->first_lblkno,
+						 block->first_lblkno + block->nblocks - 1,
+						 block->first_pblkno,
+						 block->first_pblkno + block->nblocks - 1);
+	}
+#endif
 }
 
 const char *
@@ -53,6 +66,11 @@ smgr_identify(uint8 info)
 		case XLOG_SMGR_TRUNCATE:
 			id = "TRUNCATE";
 			break;
+#ifdef USE_UMBRA
+		case XLOG_SMGR_UMBRA_MAP_EXTEND:
+			id = "UMBRA_MAP_EXTEND";
+			break;
+#endif
 	}
 
 	return id;

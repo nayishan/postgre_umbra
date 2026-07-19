@@ -1,6 +1,7 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 # Verify repeated redo when an earlier attempt already replayed relation DROP.
+# The later DROP must resolve both MAIN old-P and auxiliary hint-page scratch.
 
 use strict;
 use warnings FATAL => 'all';

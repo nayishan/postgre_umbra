@@ -29,6 +29,10 @@
 /* XLOG gives us high 4 bits */
 #define XLOG_SMGR_CREATE	0x10
 #define XLOG_SMGR_TRUNCATE	0x20
+#ifdef USE_UMBRA
+/* Publish an exact first-born mapping for a zeroed extension range. */
+#define XLOG_SMGR_UMBRA_MAP_EXTEND	0x30
+#endif
 
 typedef struct xl_smgr_create
 {

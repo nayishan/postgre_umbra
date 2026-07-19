@@ -39,11 +39,17 @@ extern void MapFlushRelation(UmbraFileContext *ctx,
 							 RelFileLocatorBackend rlocator);
 extern void MapFlushDatabaseTablespace(Oid dbid, Oid spcOid);
 extern void MapCheckpoint(void);
+extern void MapReclaimBackendInit(void);
+extern void MapReclaimCheckpointStart(void);
+extern void MapReclaimCheckpointComplete(void);
 extern int MapPageBgWriterFlush(int max_pages);
 extern uint32 MapPageTakeRecentAllocations(void);
 extern void MapStrategyNotifyWriter(int mapwriter_procno);
 extern void MapWakeWriter(void);
+extern void MapStrategyNotifyCompactor(int mapcompactor_procno);
+extern void MapWakeCompactor(void);
 extern int MapPreallocStep(int max_relations);
+extern int MapReclaimStep(int max_tasks);
 
 extern PGDLLIMPORT bool map_compactor_enable;
 extern PGDLLIMPORT int map_compactor_extent_blocks;

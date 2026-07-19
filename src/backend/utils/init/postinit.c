@@ -49,6 +49,9 @@
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/lmgr.h"
+#ifdef USE_UMBRA
+#include "storage/map.h"
+#endif
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "storage/procnumber.h"
@@ -658,6 +661,9 @@ BaseInit(void)
 	 * try to insert XLOG.
 	 */
 	InitXLogInsert();
+#ifdef USE_UMBRA
+	MapReclaimBackendInit();
+#endif
 
 	/* Initialize lock manager's local structs */
 	InitLockManagerAccess();

@@ -32,6 +32,7 @@
 #include "storage/freespace.h"
 #ifdef USE_UMBRA
 #include "storage/lmgr.h"
+#include "storage/umbra.h"
 #endif
 #include "storage/proc.h"
 #include "storage/smgr.h"
@@ -1120,8 +1121,11 @@ smgr_redo(XLogReaderState *record)
 	XLogRecPtr	lsn = record->EndRecPtr;
 	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
 
-	/* Backup blocks are not used in smgr records */
-	Assert(!XLogRecHasAnyBlockRefs(record));
+	/* Only Umbra's mapping-extension record carries a block reference. */
+#ifdef USE_UMBRA
+	if (info != XLOG_SMGR_UMBRA_MAP_EXTEND)
+#endif
+		Assert(!XLogRecHasAnyBlockRefs(record));
 
 	if (info == XLOG_SMGR_CREATE)
 	{
@@ -1231,6 +1235,28 @@ smgr_redo(XLogReaderState *record)
 
 		FreeFakeRelcacheEntry(rel);
 	}
+#ifdef USE_UMBRA
+	else if (info == XLOG_SMGR_UMBRA_MAP_EXTEND)
+	{
+		DecodedBkpBlock *block;
+		SMgrRelation reln;
+
+		if (!XLogRecHasBlockRef(record, 0) || XLogRecMaxBlockId(record) != 0)
+			elog(PANIC, "invalid Umbra mapping extend record");
+		block = XLogRecGetBlock(record, 0);
+		if (!block->has_remap || BlockNumberIsValid(block->old_pblkno) ||
+			!ummap_tracks_fork(block->forknum) ||
+			block->blkno != block->first_lblkno ||
+			(block->flags & BKPBLOCK_WILL_INIT) == 0 ||
+			block->has_image || block->has_data ||
+			XLogRecGetDataLen(record) != 0)
+			elog(PANIC, "invalid Umbra mapping extension range");
+
+		reln = smgropen(block->rlocator, INVALID_PROC_NUMBER);
+		UmReplayMappingExtend(reln, block->forknum,
+							  block->first_lblkno, block->nblocks, lsn, false);
+	}
+#endif
 	else
 		elog(PANIC, "smgr_redo: unknown op code %u", info);
 }

@@ -42,6 +42,9 @@
 #include "storage/bulk_write.h"
 #include "storage/proc.h"
 #include "storage/smgr.h"
+#ifdef USE_UMBRA
+#include "storage/ummap.h"
+#endif
 #include "utils/rel.h"
 
 #define MAX_PENDING_WRITES XLR_MAX_BLOCK_ID
@@ -249,6 +252,26 @@ smgr_bulk_flush(BulkWriteState *bulkstate)
 
 	if (npending > 1)
 		qsort(pending_writes, npending, sizeof(PendingWrite), buffer_cmp);
+
+	/*
+	 * Umbra mapping publication must precede WAL that refers to a new logical
+	 * page.  Extending the whole pending range first gives MAIN page WAL an
+	 * existing first-born claim and emits the structural mapping WAL required
+	 * by auxiliary forks before log_newpages().
+	 */
+#ifdef USE_UMBRA
+	if (bulkstate->use_wal && ummap_tracks_fork(bulkstate->forknum))
+	{
+		BlockNumber maxblk = pending_writes[npending - 1].blkno;
+
+		while (bulkstate->relsize <= maxblk)
+		{
+			smgrextend(bulkstate->smgr, bulkstate->forknum,
+					   bulkstate->relsize, &zero_buffer, true);
+			bulkstate->relsize++;
+		}
+	}
+#endif
 
 	if (bulkstate->use_wal)
 	{

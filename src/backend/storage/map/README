@@ -83,11 +83,11 @@ sector.
 
 During normal execution, smgrnblocks reads the resident logical EOF directly.
 The same backend can extend that value with its own contiguous unpublished
-range.  A different backend waits if a shared first-born barrier starts at the
-current EOF, then rereads the root after that barrier disappears.  This is a
-transient publication overlay, not a scan of the canonical MAP tail.  MAP
-entries above the resident EOF are otherwise unreachable allocation or abort
-orphans until a later valid publication reaches them.
+range.  It never waits for another backend's pending range.  Buffered zero
+extension emits its structural mapping WAL and publishes MAP plus root before
+releasing PostgreSQL's relation extension lock, so a later extender observes
+the new resident EOF.  MAP entries above that EOF are otherwise unreachable
+allocation or abort orphans until a later valid publication reaches them.
 
 A missing MAP entry below a normal root EOF is corruption.  Normal execution
 does not infer L -> L from the root.
@@ -110,12 +110,27 @@ Truncation clears every entry in [new logical EOF, old logical EOF), so a later
 extension cannot make an old tail visible again merely by filling its first
 entry.
 
-Normal first-born publication has two backend-local stages.  Before WAL, a
-pending range owns its ordinary MAP pins and a foreign-visible shared barrier.
-After XLogInsertRecord returns an EndRecPtr, the critical publication path marks
-already pinned MAP entries canonical and advances an already-resident root.  It
-cannot allocate, attach shared state, or perform file I/O.  Once MAP and root
-are published, it clears the pending bits and releases the pins and barrier.
+Before WAL, a first-born range owns its ordinary MAP pins and a shared
+visibility barrier.  After XLogInsertRecord returns an EndRecPtr, the critical
+publication path marks already pinned MAP entries canonical and advances an
+already-resident root.  It cannot allocate, attach shared state, or perform file
+I/O.  Once MAP and root are published, it clears the pending bits and releases
+the pins and barrier.
+
+Buffered zero extension for MAIN, FSM, and VM attaches that range to a small
+SMGR record with no page image and completes publication inside the storage
+callback.  This is required before the relation extension lock is released,
+and FSM may have no later page WAL at all.  Redo gives this record exclusive
+ownership of the zero baseline: it locks and clears the logical shared buffers,
+overwrites the exact target P range, and publishes the mapping only at record
+end.  Direct MAIN extension may instead attach its already-materialized range
+to the page WAL that initializes it.
+
+First-born XLOG_FPI records can omit all-zero pages from MAIN, FSM, or VM while
+one mapping header still owns the complete range.  Redo therefore establishes
+the same complete zero baseline for every mapped fork before restoring the
+listed images.  This also makes repeated recovery discard page state left by
+WAL records later than that first-born record.
 
 UmMappingPublicationDone runs outside a critical section.  It completes any MAP
 publication that first required file I/O, advances the resident root while the
@@ -210,6 +225,60 @@ dependency is disposable.  Redo CREATE installs the new generation marker and
 subsequent exact mappings rebuild its storage.
 
 
+Physical Segment Reclaim
+------------------------
+
+Truncating a MAP entry records its old physical segment as a reclaim candidate
+before the reference disappears.  Existing-page remap publication instead
+runs inside WAL insertion's critical section, where it may only re-age an
+existing hash entry without allocation; the compactor's complete MAP scan
+rediscovers a candidate that was not already present.
+Candidates are deduplicated by relation, fork, and segment in a dynamic shared
+hash.  A candidate carries the immutable relation generation and the checkpoint
+epoch in which it was retired or discovered; it is not authority to remove the
+file.
+
+The candidate hash is intentionally volatile.  While examining a resident
+root, the compactor also builds a live-segment set from one complete MAP scan
+and compares it with the existing sparse segment filenames.  An unreferenced
+complete segment below the append-only frontier is rediscovered with the same
+generation and enters the normal checkpoint-aging queue.  An incomplete scan
+or a logical EOF change fails closed.  Rediscovery does not re-age an existing
+candidate, so repeated compactor rounds cannot postpone it indefinitely.
+
+A successful checkpoint only advances the completed reclaim epoch and wakes
+the mapcompactor worker.  The worker processes a bounded candidate batch and
+conditionally takes transaction-level database lifecycle and relation-storage
+locks, followed by the relation MAP extension lock.  It then cancels a
+generation mismatch and rechecks canonical MAP runs, shared pending ranges, and
+active reservations.  First-born allocation registers its relation/fork marker
+while still holding the extension lock and before advancing the physical
+frontier;
+the marker remains through transaction end.  Existing-page remap instead keeps
+the extension lock from reservation until its shared pending range records both
+source P and target P.  A live or reserved P re-ages the candidate, and lock
+failure delays it until the next successful checkpoint.  Thus source-P needed
+by checkpoint capture and unpublished allocation targets cannot be removed by
+current-MAP observation alone, and optional scans or file errors cannot fail an
+already completed checkpoint.
+
+Only a complete segment below the append-only physical frontier can be
+removed.  The segment containing the frontier remains present even when it has
+no live MAP entries, because another backend may retain an FD and allocate a
+later P in that same segment.
+
+Reservation accounting is fail-closed.  If its bounded DSA cannot record a
+marker, foreground allocation continues, but shared state disables physical
+reclaim until restart.  Optional space recovery therefore cannot turn memory
+pressure into a DML availability failure.
+
+Segment unlink is a primary-only space optimization.  WAL and recovery never
+depend on it, and this patch does not WAL-log reclaim for standby space parity.
+A standby may retain historical dead segments.  After promotion, loading the
+relation root lets the local compactor reconstruct those candidates.  There is
+no global startup scan of roots that have not become resident.
+
+
 Lifecycle
 ---------
 
@@ -224,10 +293,10 @@ Relation, database, and tablespace invalidation discard matching page slots and
 root entries before their files can be removed or copied.
 
 Logical truncation lowers the root EOF and clears every stale MAP entry in the
-truncated range.  MAIN physical storage remains append-only in this patch, so
-MAIN truncation does not lower its physical frontier or remove its old physical
-tail.  Transaction and subtransaction abort do not roll back a published
-storage EOF.  DROP removes the entire private MAP fork, including its root.
+truncated range.  Mapped MAIN, FSM, and VM storage remains append-only, so
+truncation does not lower a physical frontier or remove an old physical tail.
+Transaction and subtransaction abort do not roll back a published storage EOF.
+DROP removes the entire private MAP fork, including its root.
 
 
 Deliberate Limits
@@ -245,21 +314,30 @@ reached.  This is an explicit RFC limitation rather than a claim of unbounded
 relation cardinality.  Each entry stores only the opaque 64-byte root image;
 disk root I/O transfers one zero-padded 512-byte sector.
 
-The map writer preallocates capacity only for permanent MAIN forks.  FSM and VM
-remain on foreground extension because they do not yet have an independent
-physical-allocation lifecycle.
+The map writer preallocates permanent MAIN, FSM, and VM forks from independent
+low-water, foreground hard-water, and batch settings.  Capacity preallocation
+does not reserve a P or publish a mapping; allocation still advances each
+fork's append-only physical frontier.
 
-The optional map compactor counts live P references by extent and relocates
-resident permanent MAIN buffers from sparse extents, while skipping the newest
-live extent.  It never copies old-P directly: an exclusive shared-buffer lock
-captures the latest page and a deliberate full-page relocation record carries
-both that image and the exact old-P/new-P transition.  This is distinct from
-the normal data-WAL path, where exact old-P remap replaces an otherwise needed
-FPW and redo applies the record's logical delta.  Compactor work is bounded per
-round by relation visits and relocation count, and runs in a short transaction
-so checkpoint-delay processing can see a valid VXID.  Collecting the resident
-root snapshot still scans all resident roots.
+The optional map compactor counts live P references independently for MAIN,
+FSM, and VM and relocates shared buffers from sparse extents while skipping the
+newest live extent.  Both resident and cold pages pass through the PostgreSQL
+shared buffer pool; the compactor never copies old-P directly.  Every fork uses
+a normal buffer read because image-preserving relocation does not take over the
+FSM or VM repair policy.  A validation error fails the move instead of
+synthesizing a different authoritative image.  After taking a conditional
+exclusive buffer lock, it rechecks old-P and emits a deliberate full-image remap
+carrying the exact old-P/new-P transition.  The normal automatic data-WAL remap
+remains MAIN-only.
+Compactor work is bounded per round by relation visits and relocation count,
+uses a bulk-read buffer strategy, and rotates the first fork after each complete
+resident-root pass so a one-move budget cannot permanently starve FSM or VM.
+Bounded reclaim and relocation run in one short worker transaction so
+checkpoint-delay processing can see a valid VXID.  Collecting the resident root
+snapshot still scans all resident roots.
 
-Compaction does not reclaim or reuse retired physical blocks, unlink physical
-segments, or scan FSM and VM.  CRC detects an invalid root but does not provide
-a duplicate root or repair arbitrary storage corruption.
+The reclaim queue uses a fixed 512 KiB in-place DSA, and the worker examines at
+most eight eligible tasks per round.  Exhaustion drops optional retirement work
+or disables reclaim until restart; it never blocks foreground allocation and
+never reuses physical block numbers.  CRC detects an invalid root but does not
+provide a duplicate root or repair arbitrary storage corruption.

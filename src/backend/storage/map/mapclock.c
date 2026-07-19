@@ -100,6 +100,7 @@ MapPagePoolShmemInit(void)
 	MapPagePoolCtlData->nslots = MapPageBufferCount;
 	MapPagePoolCtlData->first_free = 0;
 	MapPagePoolCtlData->mapwriter_procno = INVALID_PROC_NUMBER;
+	MapPagePoolCtlData->mapcompactor_procno = INVALID_PROC_NUMBER;
 	pg_atomic_init_u64(&MapPagePoolCtlData->next_victim, 0);
 	pg_atomic_init_u32(&MapPagePoolCtlData->num_allocs, 0);
 	pg_atomic_init_u32(&MapPagePoolCtlData->pending_reservations, 0);

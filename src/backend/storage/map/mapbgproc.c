@@ -53,6 +53,29 @@ MapWakeWriter(void)
 		SetLatch(&ProcGlobal->allProcs[mapwriter_procno].procLatch);
 }
 
+void
+MapStrategyNotifyCompactor(int mapcompactor_procno)
+{
+	SpinLockAcquire(&MapPagePoolCtlData->strategy_lock);
+	MapPagePoolCtlData->mapcompactor_procno = mapcompactor_procno;
+	SpinLockRelease(&MapPagePoolCtlData->strategy_lock);
+}
+
+void
+MapWakeCompactor(void)
+{
+	int			mapcompactor_procno;
+
+	SpinLockAcquire(&MapPagePoolCtlData->strategy_lock);
+	mapcompactor_procno = MapPagePoolCtlData->mapcompactor_procno;
+	if (mapcompactor_procno != INVALID_PROC_NUMBER)
+		MapPagePoolCtlData->mapcompactor_procno = INVALID_PROC_NUMBER;
+	SpinLockRelease(&MapPagePoolCtlData->strategy_lock);
+
+	if (mapcompactor_procno != INVALID_PROC_NUMBER)
+		SetLatch(&ProcGlobal->allProcs[mapcompactor_procno].procLatch);
+}
+
 int
 MapPreallocStep(int max_relations)
 {
@@ -78,8 +101,12 @@ MapPreallocStep(int max_relations)
 
 		if (RelFileLocatorBackendIsTemp(rlocator))
 			continue;
-		if (ummap_maybe_preallocate(NULL, rlocator, MAIN_FORKNUM, true))
-			operations++;
+		for (ForkNumber forknum = MAIN_FORKNUM;
+			 forknum <= VISIBILITYMAP_FORKNUM; forknum++)
+		{
+			if (ummap_maybe_preallocate(NULL, rlocator, forknum, true))
+				operations++;
+		}
 	}
 
 	scan_start = (scan_start + visited) % count;

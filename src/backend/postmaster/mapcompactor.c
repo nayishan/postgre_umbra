@@ -21,6 +21,7 @@
 #include "postmaster/bgwriter.h"
 #include "postmaster/interrupt.h"
 #include "postmaster/mapcompactor.h"
+#include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/map.h"
 #include "storage/procsignal.h"
@@ -29,9 +30,18 @@
 #include "utils/wait_event.h"
 
 #define MAPCOMPACTOR_HIBERNATE_FACTOR 50
+#define MAPCOMPACTOR_RECLAIM_TASKS 8
 
 int			MapCompactorDelay = 200;
 int			MapCompactorMaxRelations = 8;
+
+static void
+MapCompactorExitCallback(int code, Datum arg)
+{
+	(void) code;
+	(void) arg;
+	MapStrategyNotifyCompactor(INVALID_PROC_NUMBER);
+}
 
 void
 MapCompactorRegister(void)
@@ -59,6 +69,7 @@ MapCompactorMain(Datum arg)
 	bool		previously_idle = false;
 
 	(void) arg;
+	before_shmem_exit(MapCompactorExitCallback, 0);
 
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGINT, SIG_IGN);
@@ -74,35 +85,37 @@ MapCompactorMain(Datum arg)
 	for (;;)
 	{
 		int			moves = 0;
+		int			reclaimed = 0;
 		bool		idle;
 		int			rc;
 
 		ResetLatch(MyLatch);
+		MapStrategyNotifyCompactor(MyProcNumber);
 		ProcessMainLoopInterrupts();
 
-		if (map_compactor_enable && MapCompactorMaxRelations > 0)
+		PG_TRY();
 		{
-			PG_TRY();
-			{
-				StartTransactionCommand();
+			StartTransactionCommand();
+			reclaimed = MapReclaimStep(MAPCOMPACTOR_RECLAIM_TASKS);
+			if (map_compactor_enable && MapCompactorMaxRelations > 0)
 				moves = MapCompactorStep(MapCompactorMaxRelations);
-				CommitTransactionCommand();
-			}
-			PG_CATCH();
-			{
-				HOLD_INTERRUPTS();
-				EmitErrorReport();
-				AbortOutOfAnyTransaction();
-				FlushErrorState();
-				MemoryContextSwitchTo(mapcompactor_context);
-				MemoryContextReset(mapcompactor_context);
-				moves = 0;
-				RESUME_INTERRUPTS();
-			}
-			PG_END_TRY();
+			CommitTransactionCommand();
 		}
+		PG_CATCH();
+		{
+			HOLD_INTERRUPTS();
+			EmitErrorReport();
+			AbortOutOfAnyTransaction();
+			FlushErrorState();
+			MemoryContextSwitchTo(mapcompactor_context);
+			MemoryContextReset(mapcompactor_context);
+			moves = 0;
+			reclaimed = 0;
+			RESUME_INTERRUPTS();
+		}
+		PG_END_TRY();
 
-		idle = moves == 0;
+		idle = moves == 0 && reclaimed == 0;
 		if (FirstCallSinceLastCheckpoint())
 			smgrdestroyall();
 		MemoryContextSwitchTo(mapcompactor_context);
@@ -114,9 +127,10 @@ MapCompactorMain(Datum arg)
 					   WAIT_EVENT_MAPCOMPACTOR_MAIN);
 		if (rc == WL_TIMEOUT && idle && previously_idle)
 			(void) WaitLatch(MyLatch,
-							 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-							 MapCompactorDelay * MAPCOMPACTOR_HIBERNATE_FACTOR,
-							 WAIT_EVENT_MAPCOMPACTOR_HIBERNATE);
+								 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+								 MapCompactorDelay * MAPCOMPACTOR_HIBERNATE_FACTOR,
+								 WAIT_EVENT_MAPCOMPACTOR_HIBERNATE);
+		MapStrategyNotifyCompactor(INVALID_PROC_NUMBER);
 		previously_idle = idle;
 	}
 }

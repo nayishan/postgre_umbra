@@ -195,8 +195,9 @@ command_like(
 	qr/fork main blk 0[^\n]*; remap: \Q$mapping_details\E/,
 	'pg_waldump decodes the exact first-born mapping range');
 
-# The first post-truncate data WAL record owns the new mapping.  An immediate
-# stop leaves recovery to install that exact mapping before replaying data WAL.
+# Buffered extension publishes a structural MAP_EXTEND record before its data
+# page becomes visible.  An immediate stop leaves recovery to rebuild that
+# exact zero baseline before replaying the later data WAL.
 $node->stop('immediate');
 $node->start;
 
@@ -365,14 +366,9 @@ INSERT INTO umbra_firstborn_concurrent VALUES (1, repeat('owner', 200));
 ));
 	$node->wait_for_event(
 		'client backend', 'umbra-buffered-extend-after-unlock');
-	pass('first extender pauses after installing its first-born MAP barrier');
+	pass('first extender pauses immediately after releasing the extension lock');
 
 	my $waiter = $node->background_psql('postgres');
-	$waiter->query_safe(q{
-SELECT injection_points_set_local();
-SELECT injection_points_attach('umbra-firstborn-foreign-pending', 'wait');
-SELECT injection_points_load('umbra-firstborn-foreign-pending');
-});
 	$waiter->query_until(
 		qr/starting_firstborn_waiter/,
 		q(
@@ -381,17 +377,15 @@ INSERT INTO umbra_firstborn_concurrent VALUES (2, repeat('waiter', 200));
 \echo firstborn_waiter_done
 \q
 ));
-	$node->wait_for_event(
-		'client backend', 'umbra-firstborn-foreign-pending');
-	pass('next extender waits for the foreign first-born owner');
+	# The published EOF makes block 0 visible, so the waiter reaches the owner's
+	# still-in-progress buffer instead of trying to extend block 0 again.
+	$node->wait_for_event('client backend', 'BufferIo');
+	pass('next backend sees the published EOF while the first backend is paused');
 
 	$node->safe_psql(
 		'postgres',
 		q{SELECT injection_points_wakeup('umbra-buffered-extend-after-unlock')});
 	$owner->{run}->finish;
-	$node->safe_psql(
-		'postgres',
-		q{SELECT injection_points_wakeup('umbra-firstborn-foreign-pending')});
 	$waiter->{run}->finish;
 
 	is(
@@ -400,7 +394,7 @@ INSERT INTO umbra_firstborn_concurrent VALUES (2, repeat('waiter', 200));
 			q{SELECT string_agg(id::text, ',' ORDER BY id)
 			  FROM umbra_firstborn_concurrent;}),
 		'1,2',
-		'both extenders complete after the owner publishes its mapping');
+		'both extenders complete without a foreign-pending wait');
 
 	$node->stop('immediate');
 	$node->start;

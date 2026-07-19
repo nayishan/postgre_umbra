@@ -90,6 +90,9 @@
 #include "storage/ipc.h"
 #include "storage/large_object.h"
 #include "storage/latch.h"
+#ifdef USE_UMBRA
+#include "storage/map.h"
+#endif
 #include "storage/predicate.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
@@ -7458,6 +7461,8 @@ CreateCheckPoint(int flags)
 	INJECTION_POINT("create-checkpoint-initial", NULL);
 	INJECTION_POINT_LOAD("create-checkpoint-run");
 #ifdef USE_UMBRA
+	/* Reclaim must age from before checkpoint buffer capture. */
+	MapReclaimCheckpointStart();
 	INJECTION_POINT_LOAD("umbra-checkpoint-after-capture-before-redo");
 	CheckPointBuffersCaptureBegin();
 	INJECTION_POINT_CACHED("umbra-checkpoint-after-capture-before-redo", NULL);
@@ -7861,6 +7866,9 @@ CreateCheckPoint(int flags)
 	 * Let smgr do post-checkpoint cleanup (eg, deleting old files).
 	 */
 	SyncPostCheckpoint();
+#ifdef USE_UMBRA
+	MapReclaimCheckpointComplete();
+#endif
 
 	/*
 	 * Update the average distance between checkpoints if the prior checkpoint
@@ -9191,7 +9199,11 @@ xlog_redo(XLogReaderState *record)
 				continue;
 			}
 
-			if (XLogReadBufferForRedo(record, block_id, &buffer) != BLK_RESTORED)
+			if (XLogReadBufferForRedoExtended(record, block_id,
+										  (XLogRecGetBlock(record, block_id)->flags &
+										   BKPBLOCK_WILL_INIT) != 0 ?
+										  RBM_ZERO_AND_LOCK : RBM_NORMAL,
+										  false, &buffer) != BLK_RESTORED)
 				elog(ERROR, "unexpected XLogReadBufferForRedo result when restoring backup block");
 			UnlockReleaseBuffer(buffer);
 		}

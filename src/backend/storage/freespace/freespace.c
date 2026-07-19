@@ -25,6 +25,7 @@
 
 #include "access/htup_details.h"
 #include "access/xloginsert.h"
+#include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
 #include "miscadmin.h"
 #include "storage/freespace.h"
@@ -222,17 +223,39 @@ XLogRecordPageWithFreeSpace(RelFileLocator rlocator, BlockNumber heapBlk,
 	addr = fsm_get_location(heapBlk, &slot);
 	blkno = fsm_logical_to_physical(addr);
 
+#ifdef USE_UMBRA
+	/*
+	 * An FSM update derived from heap WAL is only a hint.  Before the exact
+	 * auxiliary birth record has been replayed, Umbra has no canonical L -> P
+	 * for a page beyond the current FSM EOF.  Do not instantiate a shared
+	 * buffer for that virtual page; a later VACUUM can reconstruct the hint.
+	 */
+	{
+		SMgrRelation smgr = smgropen(rlocator, INVALID_PROC_NUMBER);
+
+		smgrprepareredo(smgr, GetCurrentReplayRecPtr(NULL));
+		if (smgrnblocks(smgr, FSM_FORKNUM) <= blkno)
+			return;
+	}
+#endif
+
 	/* If the page doesn't exist already, extend */
 	buf = XLogReadBufferExtended(rlocator, FSM_FORKNUM, blkno,
-								 RBM_ZERO_ON_ERROR, InvalidBuffer);
+									 RBM_ZERO_ON_ERROR, InvalidBuffer);
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 
 	page = BufferGetPage(buf);
 	if (PageIsNew(page))
 		PageInit(page, BLCKSZ, 0);
 
+	/*
+	 * FSM pages are reconstructible and zeroed after checksum failures, so
+	 * recovery does not need the torn-page protection used for ordinary hint
+	 * updates.  MarkBufferDirtyHint() can decline to dirty a recovery buffer
+	 * when checksums are enabled, which would silently lose this FSM update.
+	 */
 	if (fsm_set_avail(page, slot, new_cat))
-		MarkBufferDirtyHint(buf, false);
+		MarkBufferDirty(buf);
 	UnlockReleaseBuffer(buf);
 }
 

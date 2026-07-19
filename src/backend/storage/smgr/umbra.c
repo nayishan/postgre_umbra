@@ -25,7 +25,9 @@
 #include "access/xlogutils.h"
 #include "catalog/pg_control.h"
 #include "catalog/storage.h"
+#include "catalog/storage_xlog.h"
 #include "miscadmin.h"
+#include "storage/aio.h"
 #include "storage/bufmgr.h"
 #include "storage/map.h"
 #include "storage/map_internal.h"
@@ -78,6 +80,16 @@ static void um_prepare_firstborn_target(SMgrRelation reln,
 										ForkNumber forknum,
 										BlockNumber target_lblkno,
 										BlockNumber anchor_lblkno);
+static void um_log_mapping_extend(SMgrRelation reln, ForkNumber forknum,
+								  BlockNumber anchor_lblkno);
+static void um_zero_replay_physical_range(UmbraFileContext *ctx,
+										  ForkNumber forknum,
+										  const UmbraMapRange *range);
+static BlockNumber um_recovery_mapping_write_limit(SMgrRelation reln,
+												   ForkNumber forknum,
+												   BlockNumber blocknum,
+												   BlockNumber maxblocks,
+												   bool *discard);
 static void um_ensure_physical_capacity(UmbraFileContext *ctx,
 											RelFileLocatorBackend rlocator,
 											ForkNumber forknum,
@@ -384,10 +396,21 @@ umexists(SMgrRelation reln, ForkNumber forknum)
 void
 umunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 {
+	if (forknum == InvalidForkNumber || forknum == MAIN_FORKNUM)
+	{
+		/* Relation removal resolves deferred redo for every MAP-owned fork. */
+		um_forget_redo_create(rlocator.locator);
+		for (int forkidx = 0; forkidx <= MAX_FORKNUM; forkidx++)
+		{
+			ForkNumber tracked_fork = (ForkNumber) forkidx;
+
+			if (ummap_tracks_fork(tracked_fork))
+				ummap_forget_recovery_scratch(rlocator, tracked_fork, 0);
+		}
+	}
+
 	if (forknum == InvalidForkNumber)
 	{
-		um_forget_redo_create(rlocator.locator);
-		ummap_forget_recovery_scratch(rlocator, MAIN_FORKNUM, 0);
 		MapInvalidateRelation(rlocator);
 		umfile_unlink(rlocator, forknum, isRedo);
 		return;
@@ -395,8 +418,6 @@ umunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 
 	if (forknum == MAIN_FORKNUM)
 	{
-		um_forget_redo_create(rlocator.locator);
-		ummap_forget_recovery_scratch(rlocator, MAIN_FORKNUM, 0);
 		ummap_unlink(rlocator, isRedo);
 	}
 
@@ -422,27 +443,6 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		umfile_extend(ctx, forknum, blocknum, buffer, skipFsync);
 		return;
 	}
-	if (forknum != MAIN_FORKNUM)
-	{
-		logical_nblocks = um_get_logical_nblocks(reln, forknum);
-		if (blocknum < logical_nblocks)
-		{
-			const void *buffers[1] = {buffer};
-
-			umfile_writev(ctx, forknum, blocknum, buffers, 1, skipFsync);
-			return;
-		}
-		umfile_extend(ctx, forknum, blocknum, buffer, skipFsync);
-		ummap_publish_mapping_run(ctx, reln->smgr_rlocator, forknum,
-								  logical_nblocks, logical_nblocks,
-								  blocknum - logical_nblocks + 1,
-								  InvalidXLogRecPtr, skipFsync);
-		ummap_root_advance(ctx, reln->smgr_rlocator, forknum, blocknum + 1,
-							 blocknum + 1, InvalidXLogRecPtr,
-							 skipFsync);
-		return;
-	}
-
 retry_firstborn:
 	retry_needed = false;
 
@@ -473,6 +473,43 @@ retry_firstborn:
 	}
 
 	logical_nblocks = um_get_logical_nblocks(reln, forknum);
+	if (InRecovery)
+	{
+		UmbraMapRange replay_range;
+		bool		replay_physical_ready;
+		bool		replay_zero_baseline;
+
+		if (ummap_replay_range_for_extension(reln->smgr_rlocator, forknum,
+										 blocknum, 1, &replay_range,
+										 &replay_physical_ready,
+										 &replay_zero_baseline))
+		{
+			if (!replay_physical_ready)
+			{
+				if (replay_zero_baseline)
+					elog(PANIC,
+						 "Umbra zero-baseline replay reached generic page extension before materialization");
+				um_ensure_physical_capacity(ctx, reln->smgr_rlocator,
+											forknum, replay_range.first_pblkno,
+											replay_range.nblocks, skipFsync);
+				ummap_mark_replay_range_physical(reln->smgr_rlocator,
+											 forknum, &replay_range);
+			}
+			pblkno = ummap_lookup_block(ctx, reln->smgr_rlocator, forknum,
+									 blocknum);
+			{
+				const void *buffers[1] = {buffer};
+
+				umfile_writev(ctx, forknum, pblkno, buffers, 1, skipFsync);
+			}
+			return;
+		}
+
+		if (blocknum >= logical_nblocks)
+			elog(PANIC,
+				 "missing Umbra WAL mapping for recovery extension at logical block %u",
+				 blocknum);
+	}
 	if (blocknum < logical_nblocks)
 	{
 		const void *buffers[1] = {buffer};
@@ -483,10 +520,6 @@ retry_firstborn:
 		um_end_mapping_checkpoint_delay_if_idle();
 		return;
 	}
-	if (InRecovery)
-		elog(PANIC,
-			 "missing Umbra WAL mapping for recovery extension at logical block %u",
-			 blocknum);
 
 	uses_wal = !IsBootstrapProcessingMode() &&
 		!RelFileLocatorSkippingWAL(reln->smgr_rlocator.locator);
@@ -519,10 +552,12 @@ retry_firstborn:
 								 InvalidXLogRecPtr, skipFsync);
 		}
 		else if (!ummap_prepare_firstborn_range(ctx, reln->smgr_rlocator,
-												 forknum, logical_nblocks,
-												 physical_nblocks, nblocks,
-												 InvalidBlockNumber, true))
+											 forknum, logical_nblocks,
+											 physical_nblocks, nblocks,
+											 InvalidBlockNumber, true))
 			retry_needed = true;
+		else if (forknum != MAIN_FORKNUM)
+			um_log_mapping_extend(reln, forknum, logical_nblocks);
 	}
 	PG_CATCH();
 	{
@@ -569,25 +604,6 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		umfile_zeroextend(ctx, forknum, blocknum, nblocks, skipFsync);
 		return;
 	}
-	if (forknum != MAIN_FORKNUM)
-	{
-		logical_nblocks = um_get_logical_nblocks(reln, forknum);
-		if (blocknum < logical_nblocks)
-			elog(ERROR,
-				 "cannot zero-extend Umbra fork %d from block %u below logical EOF %u",
-				 (int) forknum, blocknum, logical_nblocks);
-		umfile_zeroextend(ctx, forknum, blocknum, nblocks, skipFsync);
-		ummap_publish_mapping_run(ctx, reln->smgr_rlocator, forknum,
-								  logical_nblocks, logical_nblocks,
-								  blocknum - logical_nblocks + nblocks,
-								  InvalidXLogRecPtr, skipFsync);
-		ummap_root_advance(ctx, reln->smgr_rlocator, forknum,
-							 blocknum + (BlockNumber) nblocks,
-							 blocknum + (BlockNumber) nblocks, InvalidXLogRecPtr,
-							 skipFsync);
-		return;
-	}
-
 	if (InRecovery)
 	{
 		BlockNumber done = 0;
@@ -595,12 +611,15 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		UmbraMapRange replay_range;
 		bool		have_replay_range;
 		bool		replay_physical_ready;
+		bool		replay_zero_baseline;
+		bool		discard_precreate;
 
 		logical_nblocks = um_get_logical_nblocks(reln, forknum);
 		scratch_end = blocknum + (BlockNumber) nblocks;
+		discard_precreate = UmRedoDiscardingPrecreateRecords(reln);
 		have_replay_range = ummap_replay_range_for_extension(
 			reln->smgr_rlocator, forknum, blocknum, (BlockNumber) nblocks,
-			&replay_range, &replay_physical_ready);
+			&replay_range, &replay_physical_ready, &replay_zero_baseline);
 		if (have_replay_range && replay_range.first_lblkno < scratch_end)
 		{
 			/*
@@ -618,22 +637,25 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 			/*
 			 * This path runs after bufmgr has protected every logical block in
-			 * the extension chunk with BM_IO_IN_PROGRESS.  A missing exact WAL
-			 * range can therefore be represented as non-persistent recovery
-			 * scratch until a later DROP or TRUNCATE proves it disposable.
+			 * the extension chunk with BM_IO_IN_PROGRESS.  A missing pre-CREATE
+			 * range can therefore remain recovery scratch until a later DROP or
+			 * TRUNCATE resolves it.  This also covers repeated recovery after the
+			 * previous attempt already removed a relation whose earlier FSM/VM WAL
+			 * is replayed again.  Once redo has seen CREATE below, missing exact
+			 * first-birth metadata is an immediate error.
 			 */
+			recovery_nblocks = scratch_end - logical_nblocks;
 			if (um_redo_create_seen(reln->smgr_rlocator.locator,
-								MAIN_FORKNUM))
+									MAIN_FORKNUM))
 				elog(PANIC,
 					 "missing Umbra WAL mapping after redo create for relation %u/%u/%u block %u",
 					 reln->smgr_rlocator.locator.spcOid,
 					 reln->smgr_rlocator.locator.dbOid,
 					 reln->smgr_rlocator.locator.relNumber, blocknum);
 
-			recovery_nblocks = scratch_end - logical_nblocks;
 			XLogRecordInvalidPage(reln->smgr_rlocator.locator, forknum,
 								  logical_nblocks, false,
-								  UmRedoDiscardingPrecreateRecords(reln));
+								  discard_precreate);
 			first_pblkno = ummap_next_physical_block(ctx,
 											 reln->smgr_rlocator, forknum);
 			um_ensure_physical_capacity(ctx, reln->smgr_rlocator, forknum,
@@ -642,15 +664,24 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 			pending_range.first_lblkno = logical_nblocks;
 			pending_range.first_pblkno = first_pblkno;
 			pending_range.nblocks = recovery_nblocks;
-			ummap_prepare_recovery_scratch_range(ctx, reln->smgr_rlocator,
+			ummap_prepare_recovery_scratch_range(ctx,
+											 reln->smgr_rlocator,
 											 forknum, &pending_range);
 			reln->smgr_cached_nblocks[forknum] = InvalidBlockNumber;
 		}
 		if (have_replay_range && !replay_physical_ready)
 		{
+			/*
+			 * A zero-baseline record owns shared-buffer clearing and the exact
+			 * new-P overwrite.  Generic extension may materialize an ordinary
+			 * data-WAL first birth, but cannot publish this barrier early.
+			 */
+			if (replay_zero_baseline)
+				elog(PANIC,
+					 "Umbra zero-baseline replay reached generic zero extension before materialization");
 			um_ensure_physical_capacity(ctx, reln->smgr_rlocator, forknum,
-									replay_range.first_pblkno,
-									replay_range.nblocks, skipFsync);
+								replay_range.first_pblkno,
+								replay_range.nblocks, skipFsync);
 			ummap_mark_replay_range_physical(reln->smgr_rlocator, forknum,
 										  &replay_range);
 		}
@@ -714,11 +745,6 @@ retry_firstborn:
 		nblocks -= logical_nblocks - blocknum;
 		blocknum = logical_nblocks;
 	}
-	range_nblocks = blocknum - logical_nblocks + nblocks;
-	first_pblkno = ummap_reserve_physical_run(ctx, reln->smgr_rlocator,
-											  forknum, range_nblocks,
-											  skipFsync);
-
 	uses_wal = !IsBootstrapProcessingMode() &&
 		!RelFileLocatorSkippingWAL(reln->smgr_rlocator.locator);
 	if (uses_wal && !um_mapping_delay_held)
@@ -728,8 +754,12 @@ retry_firstborn:
 	}
 	PG_TRY();
 	{
+		range_nblocks = blocknum - logical_nblocks + nblocks;
+		first_pblkno = ummap_reserve_physical_run(ctx,
+										  reln->smgr_rlocator, forknum,
+										  range_nblocks, skipFsync);
 		um_ensure_physical_capacity(ctx, reln->smgr_rlocator, forknum,
-									 first_pblkno, range_nblocks,
+								 first_pblkno, range_nblocks,
 								 skipFsync);
 		if (!uses_wal)
 		{
@@ -743,10 +773,12 @@ retry_firstborn:
 								 InvalidXLogRecPtr, skipFsync);
 		}
 		else if (!ummap_prepare_firstborn_range(ctx, reln->smgr_rlocator,
-												 forknum, logical_nblocks,
-												 first_pblkno, range_nblocks,
-												 InvalidBlockNumber, true))
+											 forknum, logical_nblocks,
+											 first_pblkno, range_nblocks,
+											 InvalidBlockNumber, true))
 			retry_needed = true;
+		else
+			um_log_mapping_extend(reln, forknum, logical_nblocks);
 	}
 	PG_CATCH();
 	{
@@ -862,7 +894,7 @@ UmPrepareFirstbornLocator(RelFileLocator rlocator, ForkNumber forknum,
 
 void
 UmPrepareFirstbornRangeLocator(RelFileLocator rlocator, ForkNumber forknum,
-							   int nblocks, const BlockNumber *lblknos)
+								   int nblocks, const BlockNumber *lblknos)
 {
 	SMgrRelation reln;
 	BlockNumber logical_nblocks;
@@ -911,6 +943,13 @@ UmWalOwnedRemapAvailable(SMgrRelation reln, ForkNumber forknum)
 }
 
 bool
+UmExplicitRemapAvailable(SMgrRelation reln, ForkNumber forknum)
+{
+	return reln != NULL && !InRecovery && ummap_tracks_fork(forknum) &&
+		um_fork_uses_map(reln, forknum);
+}
+
+bool
 UmPrepareBlockRemap(SMgrRelation reln, ForkNumber forknum,
 					BlockNumber lblkno, UmbraMapRemap *remap)
 {
@@ -918,7 +957,7 @@ UmPrepareBlockRemap(SMgrRelation reln, ForkNumber forknum,
 
 	Assert(reln != NULL);
 	Assert(remap != NULL);
-	if (!UmWalOwnedRemapAvailable(reln, forknum))
+	if (!UmExplicitRemapAvailable(reln, forknum))
 		return false;
 	state = reln->smgr_private;
 	return ummap_prepare_remap(um_get_filectx(reln), reln->smgr_rlocator,
@@ -978,6 +1017,7 @@ UmRelocateBufferedBlock(SMgrRelation reln, Buffer buffer, ForkNumber forknum,
 	ForkNumber buffer_forknum;
 	BlockNumber buffer_lblkno;
 	XLogRecPtr	recptr;
+	uint8		register_flags;
 
 	Assert(reln != NULL);
 	Assert(BufferIsValid(buffer));
@@ -996,7 +1036,8 @@ UmRelocateBufferedBlock(SMgrRelation reln, Buffer buffer, ForkNumber forknum,
 	 */
 	XLogBeginInsert();
 	/* Compaction can move non-standard AM pages, so retain every page byte. */
-	if (!XLogRegisterBufferForRemap(0, buffer, 0,
+	register_flags = forknum == MAIN_FORKNUM ? 0 : REGBUF_WILL_INIT;
+	if (!XLogRegisterBufferForRemap(0, buffer, register_flags,
 								 expected_old_pblkno))
 	{
 		XLogResetInsertion();
@@ -1006,7 +1047,13 @@ UmRelocateBufferedBlock(SMgrRelation reln, Buffer buffer, ForkNumber forknum,
 	START_CRIT_SECTION();
 	MarkBufferDirty(buffer);
 	recptr = XLogInsert(RM_XLOG_ID, XLOG_FPI);
-	PageSetLSN(BufferGetPage(buffer), recptr);
+	/*
+	 * Relocation WAL preserves every auxiliary byte, including its page header.
+	 * An all-zero MAIN page has no initialized header either.  Do not synthesize
+	 * an LSN in either case; the image itself is the recovery authority.
+	 */
+	if (forknum == MAIN_FORKNUM && !PageIsNew(BufferGetPage(buffer)))
+		PageSetLSN(BufferGetPage(buffer), recptr);
 	END_CRIT_SECTION();
 	return true;
 }
@@ -1055,7 +1102,7 @@ UmLogMappingRange(RelFileLocator rlocator, ForkNumber forknum,
 				 errmsg("invalid Umbra WAL mapping range")));
 	if (!RelFileLocatorSkippingWAL(rlocator))
 		return false;
-	if (forknum != MAIN_FORKNUM)
+	if (!ummap_tracks_fork(forknum))
 		return false;
 
 	reln = smgropen(rlocator, INVALID_PROC_NUMBER);
@@ -1124,7 +1171,8 @@ UmMappingPublicationDone(void)
 void
 UmPrepareReplayMappingRange(SMgrRelation reln, ForkNumber forknum,
 									const UmbraMapRange *range,
-									BlockNumber old_pblkno, XLogRecPtr lsn)
+									BlockNumber old_pblkno, XLogRecPtr lsn,
+									bool zero_baseline)
 {
 	UmbraFileContext *ctx;
 	BlockNumber logical_nblocks;
@@ -1132,7 +1180,7 @@ UmPrepareReplayMappingRange(SMgrRelation reln, ForkNumber forknum,
 
 	Assert(InRecovery);
 	Assert(range != NULL);
-	if (forknum != MAIN_FORKNUM)
+	if (!ummap_tracks_fork(forknum))
 		return;
 	smgrprepareredo(reln, lsn);
 	smgrcreate(reln, forknum, true);
@@ -1140,8 +1188,11 @@ UmPrepareReplayMappingRange(SMgrRelation reln, ForkNumber forknum,
 		return;
 	ctx = um_get_filectx(reln);
 	logical_nblocks = um_get_logical_nblocks(reln, forknum);
-	physical_ready = BlockNumberIsValid(old_pblkno) ||
-		logical_nblocks >= range->first_lblkno;
+	if (zero_baseline)
+		physical_ready = false;
+	else
+		physical_ready = BlockNumberIsValid(old_pblkno) ||
+			logical_nblocks >= range->first_lblkno;
 	if (BlockNumberIsValid(old_pblkno))
 		um_ensure_physical_capacity(ctx, reln->smgr_rlocator, forknum,
 								 old_pblkno, 1, false);
@@ -1150,7 +1201,8 @@ UmPrepareReplayMappingRange(SMgrRelation reln, ForkNumber forknum,
 								 range->first_pblkno,
 									range->nblocks, false);
 	ummap_prepare_replay_range(ctx, reln->smgr_rlocator, forknum, range,
-								  old_pblkno, lsn, physical_ready);
+								  old_pblkno, lsn, physical_ready,
+								  zero_baseline);
 	reln->smgr_cached_nblocks[forknum] = InvalidBlockNumber;
 }
 
@@ -1163,6 +1215,109 @@ UmSwitchReplayBlockRemap(SMgrRelation reln, ForkNumber forknum,
 	Assert(reln != NULL);
 	ummap_switch_replay_remap(reln->smgr_rlocator, forknum, lblkno,
 							  old_pblkno, new_pblkno);
+}
+
+void
+UmReplayMappingExtend(SMgrRelation reln, ForkNumber forknum,
+					  BlockNumber first_lblkno, BlockNumber nblocks,
+					  XLogRecPtr lsn, bool fpi_images_follow)
+{
+	UmbraFileContext *ctx;
+	UmbraMapRange replay_range;
+	BlockNumber done = 0;
+	bool		physical_ready;
+	bool		zero_baseline;
+
+	Assert(InRecovery);
+	Assert(reln != NULL);
+	Assert(ummap_tracks_fork(forknum));
+	ctx = um_get_filectx(reln);
+	if (!ummap_replay_range_for_extension(reln->smgr_rlocator, forknum,
+										first_lblkno, nblocks, &replay_range,
+										&physical_ready, &zero_baseline) ||
+		replay_range.first_lblkno != first_lblkno ||
+		replay_range.nblocks != nblocks)
+		elog(PANIC, "missing exact Umbra mapping extension replay range");
+
+	if (physical_ready || !zero_baseline)
+		elog(PANIC, "invalid Umbra zero-baseline mapping extension state");
+
+	/* The exact P may still be referenced by an interrupted earlier replay. */
+	Assert(XLogRecPtrIsValid(lsn));
+	XLogFlush(lsn);
+	um_ensure_physical_capacity(ctx, reln->smgr_rlocator, forknum,
+								replay_range.first_pblkno,
+								replay_range.nblocks, false);
+	if (fpi_images_follow)
+	{
+		/*
+		 * First-born FPI WAL can omit all-zero pages.  Establish their durable
+		 * baseline before admitting writes through the private replay barrier.  The
+		 * canonical MAP is still unpublished until the complete FPI record has
+		 * replayed.
+		 */
+		um_zero_replay_physical_range(ctx, forknum, &replay_range);
+		ummap_mark_replay_range_physical(reln->smgr_rlocator, forknum,
+										 &replay_range);
+	}
+
+	/*
+	 * An interrupted earlier replay may already have left a logical
+	 * buffer behind.  Take every shared-buffer lock and establish this record's
+	 * zero baseline; there is no synthetic P to copy.  For FPI WAL the physical
+	 * baseline above makes the barrier writable first, so any racing flush is
+	 * waited out by this lock and then overwritten before the images replay.
+	 */
+	while (done < replay_range.nblocks)
+	{
+		Buffer		buffer;
+
+		buffer = ReadBufferWithoutRelcache(reln->smgr_rlocator.locator,
+										 forknum,
+										 replay_range.first_lblkno + done,
+										 RBM_ZERO_AND_LOCK, NULL, true);
+		MemSet(BufferGetPage(buffer), 0, BLCKSZ);
+		MarkBufferDirty(buffer);
+		UnlockReleaseBuffer(buffer);
+		done++;
+	}
+
+	if (!fpi_images_follow)
+	{
+		/*
+		 * MAP_EXTEND keeps the barrier non-writable while the shared buffers are
+		 * cleared.  Overwrite new-P only after those locks have waited out any I/O,
+		 * then make the exact range available to logical buffer writes.
+		 */
+		um_zero_replay_physical_range(ctx, forknum, &replay_range);
+		ummap_mark_replay_range_physical(reln->smgr_rlocator, forknum,
+										 &replay_range);
+	}
+}
+
+static void
+um_zero_replay_physical_range(UmbraFileContext *ctx, ForkNumber forknum,
+								  const UmbraMapRange *range)
+{
+	PGIOAlignedBlock zero_page;
+	const void *zero_buffers[PG_IOV_MAX];
+	BlockNumber done = 0;
+
+	MemSet(&zero_page, 0, sizeof(zero_page));
+	for (int i = 0; i < lengthof(zero_buffers); i++)
+		zero_buffers[i] = &zero_page;
+	while (done < range->nblocks)
+	{
+		BlockNumber chunk = Min(range->nblocks - done,
+								(BlockNumber) lengthof(zero_buffers));
+		BlockNumber segment_remaining = RELSEG_SIZE -
+			((range->first_pblkno + done) % ((BlockNumber) RELSEG_SIZE));
+
+		chunk = Min(chunk, segment_remaining);
+		umfile_writev(ctx, forknum, range->first_pblkno + done,
+						  zero_buffers, chunk, false);
+		done += chunk;
+	}
 }
 
 void
@@ -1204,7 +1359,7 @@ umprefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	Assert(nblocks > 0);
 	if (!um_fork_uses_map(reln, forknum))
 		return umfile_prefetch(um_get_filectx(reln), forknum, blocknum,
-							   nblocks);
+									   nblocks);
 
 	remblocks = nblocks;
 	while (remblocks > 0)
@@ -1237,6 +1392,9 @@ ummaxcombine(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
 
 	if (!um_fork_uses_map(reln, forknum))
 		return umfile_maxcombine(ctx, forknum, blocknum);
+	if (RecoveryInProgress() &&
+		(forknum == FSM_FORKNUM || forknum == VISIBILITYMAP_FORKNUM))
+		return 1;
 
 	logical_nblocks = um_get_logical_nblocks(reln, forknum);
 	if (blocknum >= logical_nblocks)
@@ -1270,8 +1428,8 @@ umreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	while (nblocks > 0)
 	{
 		run_blocks = ummap_lookup_run(um_get_filectx(reln),
-										  reln->smgr_rlocator, forknum,
-										  blocknum, nblocks, &pblkno);
+											  reln->smgr_rlocator, forknum,
+											  blocknum, nblocks, &pblkno);
 		umfile_readv(um_get_filectx(reln), forknum, pblkno, buffers,
 					 run_blocks);
 
@@ -1297,7 +1455,6 @@ umstartreadv(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknum,
 								   buffers, nblocks);
 		return;
 	}
-
 	run_blocks = ummap_lookup_run(um_get_filectx(reln),
 								  reln->smgr_rlocator, forknum, blocknum,
 								  nblocks, &pblkno);
@@ -1324,9 +1481,21 @@ umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 	while (nblocks > 0)
 	{
+		BlockNumber io_blocks;
+		bool		discard;
+
+		io_blocks = um_recovery_mapping_write_limit(reln, forknum, blocknum,
+												  nblocks, &discard);
+		if (discard)
+		{
+			blocknum += io_blocks;
+			buffers += io_blocks;
+			nblocks -= io_blocks;
+			continue;
+		}
 		run_blocks = ummap_lookup_write_run(um_get_filectx(reln),
-											reln->smgr_rlocator, forknum,
-											blocknum, nblocks, &pblkno);
+												reln->smgr_rlocator, forknum,
+												blocknum, io_blocks, &pblkno);
 		um_write_mapped_run(um_get_filectx(reln), forknum, pblkno, buffers,
 							run_blocks, skipFsync);
 
@@ -1390,9 +1559,20 @@ umwriteback(SMgrRelation reln, ForkNumber forknum,
 
 	while (nblocks > 0)
 	{
+		BlockNumber io_blocks;
+		bool		discard;
+
+		io_blocks = um_recovery_mapping_write_limit(reln, forknum, blocknum,
+												  nblocks, &discard);
+		if (discard)
+		{
+			blocknum += io_blocks;
+			nblocks -= io_blocks;
+			continue;
+		}
 		run_blocks = ummap_lookup_write_run(um_get_filectx(reln),
-											reln->smgr_rlocator, forknum,
-											blocknum, nblocks, &pblkno);
+												reln->smgr_rlocator, forknum,
+												blocknum, io_blocks, &pblkno);
 		umfile_writeback(um_get_filectx(reln), forknum, pblkno, run_blocks);
 
 		blocknum += run_blocks;
@@ -1408,23 +1588,27 @@ umnblocks(SMgrRelation reln, ForkNumber forknum)
 
 void
 umpretruncate(SMgrRelation reln, ForkNumber forknum,
-			  BlockNumber old_blocks, BlockNumber nblocks,
-			  XLogRecPtr truncate_lsn)
+					  BlockNumber old_blocks, BlockNumber nblocks,
+					  XLogRecPtr truncate_lsn)
 {
 	if (!um_fork_uses_map(reln, forknum))
+	{
+		if (nblocks < old_blocks)
+			umfile_prepare_truncate(um_get_filectx(reln), forknum);
 		return;
+	}
 
 	if (InRecovery)
 		ummap_forget_recovery_scratch(reln->smgr_rlocator, forknum, nblocks);
 	ummap_truncate(um_get_filectx(reln), reln->smgr_rlocator, forknum,
-					 old_blocks, nblocks, truncate_lsn, false);
+							 old_blocks, nblocks, truncate_lsn, false);
 }
 
 void
 umtruncate(SMgrRelation reln, ForkNumber forknum,
 		   BlockNumber old_blocks, BlockNumber nblocks)
 {
-	if (um_fork_uses_map(reln, forknum) && forknum == MAIN_FORKNUM)
+	if (um_fork_uses_map(reln, forknum))
 	{
 		/* umpretruncate() already cleared the logical MAP; P is append-only. */
 		return;
@@ -1634,6 +1818,54 @@ retry_firstborn:
 		pg_usleep(1000L);
 		goto retry_firstborn;
 	}
+}
+
+/*
+ * Buffered extension must make its zero baseline and exact L -> P birth
+ * recoverable before releasing PostgreSQL's relation extension lock.  The
+ * same record covers reconstructible FSM/VM direct extensions that may have
+ * no later page WAL.  MAIN direct extensions continue to attach their mapping
+ * to the page WAL that initializes them.
+ */
+static void
+um_log_mapping_extend(SMgrRelation reln, ForkNumber forknum,
+					  BlockNumber anchor_lblkno)
+{
+	PGAlignedBlock zero_page;
+
+	Assert(ummap_tracks_fork(forknum));
+	MemSet(&zero_page, 0, sizeof(zero_page));
+	XLogBeginInsert();
+	XLogRegisterBlock(0, &reln->smgr_rlocator.locator, forknum,
+					  anchor_lblkno, (Page) &zero_page,
+					  REGBUF_NO_IMAGE | REGBUF_WILL_INIT);
+	(void) XLogInsert(RM_SMGR_ID,
+					  XLOG_SMGR_UMBRA_MAP_EXTEND | XLR_SPECIAL_REL_UPDATE);
+}
+
+/* Do not let recovery write a logical buffer before its target P is ready. */
+static BlockNumber
+um_recovery_mapping_write_limit(SMgrRelation reln, ForkNumber forknum,
+								BlockNumber blocknum, BlockNumber maxblocks,
+								bool *discard)
+{
+	BlockNumber io_blocks;
+	bool		physical_ready;
+
+	Assert(maxblocks > 0);
+	Assert(discard != NULL);
+	*discard = false;
+	if (!RecoveryInProgress())
+		return maxblocks;
+
+	if (ummap_shared_pending_for_block(reln->smgr_rlocator, forknum,
+											 blocknum, maxblocks, &io_blocks,
+											 &physical_ready))
+	{
+		*discard = !physical_ready;
+		return io_blocks;
+	}
+	return maxblocks;
 }
 
 static bool

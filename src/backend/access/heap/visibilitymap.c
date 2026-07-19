@@ -100,6 +100,7 @@
 #include "access/heapam_xlog.h"
 #include "access/visibilitymap.h"
 #include "access/xloginsert.h"
+#include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
 #include "miscadmin.h"
 #include "port/pg_bitutils.h"
@@ -198,7 +199,9 @@ visibilitymap_clear(Relation rel, BlockNumber heapBlk, Buffer vmbuf, uint8 flags
  * relation. On return, *vmbuf is a valid buffer with the map page containing
  * the bit for heapBlk.
  *
- * If the page doesn't exist in the map file yet, it is extended.
+ * If the page doesn't exist in the map file yet, it is extended.  During
+ * Umbra recovery, clearing a page before its exact auxiliary birth is a no-op
+ * and can leave *vmbuf invalid.
  */
 void
 visibilitymap_pin(Relation rel, BlockNumber heapBlk, Buffer *vmbuf)
@@ -545,6 +548,11 @@ vm_readbuf(Relation rel, BlockNumber blkno, bool extend)
 	 */
 	reln = RelationGetSmgr(rel);
 
+#ifdef USE_UMBRA
+	if (InRecovery)
+		smgrprepareredo(reln, GetCurrentReplayRecPtr(NULL));
+#endif
+
 	/*
 	 * If we haven't cached the size of the visibility map fork yet, check it
 	 * first.
@@ -556,6 +564,18 @@ vm_readbuf(Relation rel, BlockNumber blkno, bool extend)
 		else
 			reln->smgr_cached_nblocks[VISIBILITYMAP_FORKNUM] = 0;
 	}
+
+#ifdef USE_UMBRA
+	/*
+	 * Clearing a missing VM bit during redo is already satisfied by zero.  An
+	 * Umbra page beyond the canonical VM EOF has no L -> P until its exact
+	 * auxiliary birth record, so recovery must not create a virtual buffer for
+	 * it.  Redo callers treat InvalidBuffer as a completed no-op.
+	 */
+	if (InRecovery && extend &&
+		blkno >= reln->smgr_cached_nblocks[VISIBILITYMAP_FORKNUM])
+		return InvalidBuffer;
+#endif
 
 	/*
 	 * For reading we use ZERO_ON_ERROR mode, and initialize the page if

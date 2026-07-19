@@ -55,9 +55,12 @@ typedef struct MapPagePendingRange
 	/* Exact target hidden behind a transaction or recovery barrier. */
 	UmbraMapRange range;
 	BlockNumber old_pblkno;
+	/* Existing-page remap target not yet present in the canonical MAP. */
+	BlockNumber reserved_pblkno;
 	ForkNumber	forknum;
 	bool		physical_ready;
 	bool		use_old_pblkno;
+	bool		reserved_pblkno_valid;
 	bool		recovery_replay;
 	bool		recovery_exact;
 	bool		valid;
@@ -89,6 +92,7 @@ typedef struct MapPagePoolCtl
 	slock_t		strategy_lock;
 	int			first_free;
 	int			mapwriter_procno;
+	int			mapcompactor_procno;
 	int			nslots;
 } MapPagePoolCtl;
 
@@ -184,6 +188,61 @@ extern int MapSuperCollectTags(Oid dbid, Oid spcOid, MapSuperTag **tags);
 extern void MapSuperTableShmemRequest(void);
 extern void MapSuperTableShmemInit(void);
 extern void MapSuperTableShmemAttach(void);
+
+typedef struct MapReclaimTag
+{
+	RelFileLocatorBackend rlocator;
+	ForkNumber	forknum;
+	BlockNumber segno;
+} MapReclaimTag;
+
+typedef struct MapReclaimDesc
+{
+	MapReclaimTag tag;
+	XLogRecPtr	generation_lsn;
+	uint64		retired_epoch;
+	uint64		retirement_sequence;
+} MapReclaimDesc;
+
+typedef struct MapReservationTag
+{
+	RelFileLocatorBackend rlocator;
+	ForkNumber	forknum;
+	int			owner_procno;
+} MapReservationTag;
+
+typedef struct MapReservationDesc
+{
+	MapReservationTag tag;
+} MapReservationDesc;
+
+typedef struct MapReclaimCtl
+{
+	void	   *raw_dsa_area;
+	dshash_table_handle hash_handle;
+	dshash_table_handle reservation_hash_handle;
+	pg_atomic_uint64 checkpoint_started;
+	pg_atomic_uint64 checkpoint_completed;
+	pg_atomic_uint64 retirement_sequence;
+	pg_atomic_uint32 reservation_unreliable;
+} MapReclaimCtl;
+
+extern MapReclaimCtl *MapReclaimCtlData;
+extern void MapReclaimRetirePhysicalBlock(RelFileLocatorBackend rlocator,
+										  ForkNumber forknum,
+										  BlockNumber pblkno,
+										  XLogRecPtr generation_lsn);
+extern void MapReclaimDiscoverSegment(RelFileLocatorBackend rlocator,
+									  ForkNumber forknum,
+									  BlockNumber segno,
+									  XLogRecPtr generation_lsn);
+extern bool MapReclaimRegisterReservation(RelFileLocatorBackend rlocator,
+									  ForkNumber forknum);
+extern void MapReclaimForgetRelation(RelFileLocatorBackend rlocator);
+extern void MapReclaimForgetDatabase(Oid dbid, Oid spcOid);
+extern void MapReclaimShmemRequest(void);
+extern void MapReclaimShmemInit(void);
+extern void MapReclaimShmemAttach(void);
 
 extern void ummap_root_load_image(UmbraFileContext *ctx, char *image);
 extern void ummap_root_write_image(UmbraFileContext *ctx, const char *image,

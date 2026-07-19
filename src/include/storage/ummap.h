@@ -34,6 +34,12 @@ typedef struct UmbraMapRange
 extern PGDLLIMPORT int map_prealloc_main_low;
 extern PGDLLIMPORT int map_prealloc_main_hard;
 extern PGDLLIMPORT int map_prealloc_main_batch;
+extern PGDLLIMPORT int map_prealloc_fsm_low;
+extern PGDLLIMPORT int map_prealloc_fsm_hard;
+extern PGDLLIMPORT int map_prealloc_fsm_batch;
+extern PGDLLIMPORT int map_prealloc_vm_low;
+extern PGDLLIMPORT int map_prealloc_vm_hard;
+extern PGDLLIMPORT int map_prealloc_vm_batch;
 
 /* Fixed-size ownership token for one WAL-owned existing-page remap. */
 typedef struct UmbraMapRemap
@@ -43,6 +49,7 @@ typedef struct UmbraMapRemap
 	BlockNumber lblkno;
 	BlockNumber old_pblkno;
 	BlockNumber new_pblkno;
+	XLogRecPtr	generation_lsn;
 	int			map_slot_id;
 	bool		map_pinned;
 	bool		pending_registered;
@@ -176,6 +183,12 @@ extern bool ummap_pending_range_for_target(RelFileLocatorBackend rlocator,
 										 BlockNumber lblkno,
 										 UmbraMapRange *range,
 										 bool *wal_ready);
+extern bool ummap_shared_pending_for_block(RelFileLocatorBackend rlocator,
+										  ForkNumber forknum,
+										  BlockNumber lblkno,
+										  BlockNumber maxblocks,
+										  BlockNumber *nblocks,
+										  bool *physical_ready);
 extern void ummap_reset_wal_attachments(void);
 extern void ummap_publish_attached_ranges(XLogRecPtr lsn);
 extern void ummap_mark_range_physical(RelFileLocatorBackend rlocator,
@@ -195,7 +208,8 @@ extern void ummap_prepare_replay_range(UmbraFileContext *ctx,
 									   const UmbraMapRange *range,
 									   BlockNumber old_pblkno,
 									   XLogRecPtr lsn,
-									   bool physical_ready);
+									   bool physical_ready,
+									   bool zero_baseline);
 extern void ummap_switch_replay_remap(RelFileLocatorBackend rlocator,
 									 ForkNumber forknum, BlockNumber lblkno,
 									 BlockNumber old_pblkno,
@@ -203,7 +217,7 @@ extern void ummap_switch_replay_remap(RelFileLocatorBackend rlocator,
 extern bool ummap_replay_range_for_extension(
 	RelFileLocatorBackend rlocator, ForkNumber forknum,
 	BlockNumber first_lblkno, BlockNumber nblocks,
-	UmbraMapRange *range, bool *physical_ready);
+	UmbraMapRange *range, bool *physical_ready, bool *zero_baseline);
 extern void ummap_mark_replay_range_physical(
 	RelFileLocatorBackend rlocator, ForkNumber forknum,
 	const UmbraMapRange *range);

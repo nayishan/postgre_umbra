@@ -35,6 +35,7 @@ static int MapPageBgWriterNextSlot = 0;
 void
 MapInvalidateRelation(RelFileLocatorBackend rlocator)
 {
+	MapReclaimForgetRelation(rlocator);
 	MapPageInvalidateRelation(rlocator);
 	if (MapSuperCacheCtlData != NULL)
 	{
@@ -47,6 +48,7 @@ MapInvalidateRelation(RelFileLocatorBackend rlocator)
 void
 MapInvalidateDatabase(Oid dbid)
 {
+	MapReclaimForgetDatabase(dbid, InvalidOid);
 	MapPageInvalidateDatabase(dbid, InvalidOid);
 	MapSuperInvalidateMatching(dbid, InvalidOid);
 }
@@ -55,6 +57,7 @@ void
 MapInvalidateDatabaseTablespace(Oid dbid, Oid spcOid)
 {
 	Assert(OidIsValid(spcOid));
+	MapReclaimForgetDatabase(dbid, spcOid);
 	MapPageInvalidateDatabase(dbid, spcOid);
 	MapSuperInvalidateMatching(dbid, spcOid);
 }

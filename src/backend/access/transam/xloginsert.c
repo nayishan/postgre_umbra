@@ -385,17 +385,21 @@ XLogRegisterBufferForRemap(uint8 block_id, Buffer buffer, uint8 flags,
 	BlockNumber current_pblkno;
 
 	Assert(BlockNumberIsValid(expected_old_pblkno));
-	Assert((flags & (REGBUF_FORCE_IMAGE | REGBUF_NO_IMAGE |
-					 REGBUF_NO_CHANGE | REGBUF_WILL_INIT)) == 0);
+	Assert(flags == 0 || flags == REGBUF_WILL_INIT);
 
-	/* Preparation happens before the caller marks the unchanged page dirty. */
+	/*
+	 * Preparation happens before the caller marks the unchanged page dirty.
+	 * WILL_INIT implies NO_IMAGE in the public flag encoding, so an auxiliary
+	 * relocation cannot also carry REGBUF_FORCE_IMAGE here.  force_remap below
+	 * makes XLogRecordAssemble() include the complete image unconditionally.
+	 */
 	XLogRegisterBuffer(block_id, buffer,
-					   flags | REGBUF_FORCE_IMAGE | REGBUF_NO_CHANGE);
+					   flags | REGBUF_NO_CHANGE);
 	regbuf = &registered_buffers[block_id];
 	reln = smgrlookup(regbuf->rlocator, INVALID_PROC_NUMBER);
 	if (reln == NULL ||
 		!LocalTransactionIdIsValid(MyProc->vxid.lxid) ||
-		!UmWalOwnedRemapAvailable(reln, regbuf->forkno) ||
+		!UmExplicitRemapAvailable(reln, regbuf->forkno) ||
 		!UmGetBlockPhysical(reln, regbuf->forkno, regbuf->block,
 							&current_pblkno) ||
 		current_pblkno != expected_old_pblkno ||
@@ -408,7 +412,7 @@ XLogRegisterBufferForRemap(uint8 block_id, Buffer buffer, uint8 flags,
 		UmAbortBlockRemap(&regbuf->remap);
 		return false;
 	}
-	regbuf->flags = flags | REGBUF_FORCE_IMAGE;
+	regbuf->flags = flags;
 	regbuf->force_remap = true;
 	return true;
 }

@@ -1841,7 +1841,9 @@ DecodeXLogRecord(XLogReaderState *state,
 				COPY_HEADER_FIELD(&blk->first_pblkno, sizeof(BlockNumber));
 				COPY_HEADER_FIELD(&blk->nblocks, sizeof(BlockNumber));
 
-				if (blk->forknum != MAIN_FORKNUM ||
+				if ((blk->forknum != MAIN_FORKNUM &&
+					 blk->forknum != FSM_FORKNUM &&
+					 blk->forknum != VISIBILITYMAP_FORKNUM) ||
 					!BlockNumberIsValid(blk->first_lblkno) ||
 					!BlockNumberIsValid(blk->first_pblkno) ||
 					blk->nblocks == 0 ||
@@ -1972,7 +1974,9 @@ DecodeXLogRecord(XLogReaderState *state,
 				(blk->first_lblkno != blk->blkno || blk->nblocks != 1 ||
 				 blk->first_pblkno == blk->old_pblkno ||
 				 blk->has_image != blk->apply_image ||
-				 (blk->flags & BKPBLOCK_WILL_INIT) != 0))
+				 (((blk->flags & BKPBLOCK_WILL_INIT) != 0) !=
+				  (blk->forknum == FSM_FORKNUM ||
+				   blk->forknum == VISIBILITYMAP_FORKNUM))))
 			{
 				report_invalid_record(state,
 								  "invalid Umbra existing-page remap for block %u at %X/%08X",

@@ -30,6 +30,7 @@ MapShmemRequest(void *arg)
 {
 	MapPagePoolShmemRequest();
 	MapSuperTableShmemRequest();
+	MapReclaimShmemRequest();
 }
 
 static void
@@ -37,6 +38,7 @@ MapShmemInit(void *arg)
 {
 	MapPagePoolShmemInit();
 	MapSuperTableShmemInit();
+	MapReclaimShmemInit();
 }
 
 static void
@@ -44,4 +46,5 @@ MapShmemAttach(void *arg)
 {
 	MapPagePoolShmemAttach();
 	MapSuperTableShmemAttach();
+	MapReclaimShmemAttach();
 }
