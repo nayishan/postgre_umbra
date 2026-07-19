@@ -66,10 +66,10 @@ extern void UmPrepareFirstbornLocator(RelFileLocator rlocator,
 extern void UmPrepareFirstbornRangeLocator(RelFileLocator rlocator,
 										 ForkNumber forknum, int nblocks,
 										 const BlockNumber *lblknos);
-extern void UmLogMappingRange(RelFileLocator rlocator, ForkNumber forknum,
+extern bool UmLogMappingRange(RelFileLocator rlocator, ForkNumber forknum,
 							  BlockNumber startblk, BlockNumber endblk,
 							  BlockNumber anchor_lblkno);
-extern void UmLogMappingRangeFinish(void);
+extern void UmLogMappingRangeFinish(bool delay_started);
 extern void UmMappingPublicationDone(void);
 extern void UmPrepareReplayMappingRange(SMgrRelation reln, ForkNumber forknum,
 									const UmbraMapRange *range, XLogRecPtr lsn);

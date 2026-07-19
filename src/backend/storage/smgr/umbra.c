@@ -26,6 +26,7 @@
 #include "catalog/storage.h"
 #include "miscadmin.h"
 #include "storage/map.h"
+#include "storage/proc.h"
 #include "storage/smgr.h"
 #include "storage/umfile.h"
 #include "storage/ummap.h"
@@ -55,6 +56,9 @@ static UmbraFileContext *um_get_filectx(SMgrRelation reln);
 static bool um_fork_uses_map(SMgrRelation reln, ForkNumber forknum);
 static BlockNumber um_get_logical_nblocks(SMgrRelation reln,
 										  ForkNumber forknum);
+static bool um_begin_checkpoint_delay(void);
+static void um_end_checkpoint_delay(bool delay_started);
+static void um_end_mapping_checkpoint_delay_if_idle(void);
 static void um_mapping_xact_callback(XactEvent event, void *arg);
 static void um_mapping_subxact_callback(SubXactEvent event,
 										SubTransactionId mySubid,
@@ -73,6 +77,7 @@ static void um_forget_redo_create(RelFileLocator rlocator);
 static void um_forget_redo_create_database(Oid dbid, Oid spcOid);
 
 static bool um_xact_callbacks_registered = false;
+static bool um_mapping_delay_held = false;
 static HTAB *um_redo_create_hash = NULL;
 
 void
@@ -257,6 +262,7 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	BlockNumber	physical_nblocks;
 	BlockNumber	pblkno;
 	bool		pending_wal_ready;
+	volatile bool delay_started = false;
 	bool		uses_wal;
 
 	if (!um_fork_uses_map(reln, forknum))
@@ -329,6 +335,12 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 	uses_wal = !IsBootstrapProcessingMode() &&
 		!RelFileLocatorSkippingWAL(reln->smgr_rlocator.locator);
+	if (uses_wal && !um_mapping_delay_held)
+	{
+		delay_started = um_begin_checkpoint_delay();
+		um_mapping_delay_held = delay_started;
+	}
+	PG_TRY();
 	{
 		BlockNumber nblocks = blocknum - logical_nblocks + 1;
 
@@ -346,6 +358,16 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 												 physical_nblocks, nblocks,
 												 InvalidBlockNumber, true);
 	}
+	PG_CATCH();
+	{
+		if (delay_started && !ummap_has_pending_ranges())
+		{
+			um_end_checkpoint_delay(true);
+			um_mapping_delay_held = false;
+		}
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
 
 void
@@ -357,6 +379,7 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	BlockNumber	first_pblkno;
 	BlockNumber	range_nblocks;
 	UmbraMapRange pending_range;
+	volatile bool delay_started = false;
 	bool		pending_wal_ready;
 	bool		uses_wal;
 
@@ -497,18 +520,36 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 	uses_wal = !IsBootstrapProcessingMode() &&
 		!RelFileLocatorSkippingWAL(reln->smgr_rlocator.locator);
-	um_ensure_physical_capacity(ctx, forknum, first_pblkno, range_nblocks,
+	if (uses_wal && !um_mapping_delay_held)
+	{
+		delay_started = um_begin_checkpoint_delay();
+		um_mapping_delay_held = delay_started;
+	}
+	PG_TRY();
+	{
+		um_ensure_physical_capacity(ctx, forknum, first_pblkno, range_nblocks,
 								 skipFsync);
-	if (!uses_wal)
-		ummap_publish_mapping_run(ctx, reln->smgr_rlocator, forknum,
+		if (!uses_wal)
+			ummap_publish_mapping_run(ctx, reln->smgr_rlocator, forknum,
 									  logical_nblocks, first_pblkno,
 									  range_nblocks, InvalidXLogRecPtr,
 									  skipFsync);
-	else
-		ummap_prepare_firstborn_range(ctx, reln->smgr_rlocator,
+		else
+			ummap_prepare_firstborn_range(ctx, reln->smgr_rlocator,
 												 forknum, logical_nblocks,
 												 first_pblkno, range_nblocks,
 												 InvalidBlockNumber, true);
+	}
+	PG_CATCH();
+	{
+		if (delay_started && !ummap_has_pending_ranges())
+		{
+			um_end_checkpoint_delay(true);
+			um_mapping_delay_held = false;
+		}
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
 
 static bool
@@ -611,7 +652,7 @@ UmPrepareFirstbornRangeLocator(RelFileLocator rlocator, ForkNumber forknum,
 								anchor_lblkno);
 }
 
-void
+bool
 UmLogMappingRange(RelFileLocator rlocator, ForkNumber forknum,
 				  BlockNumber startblk, BlockNumber endblk,
 				  BlockNumber anchor_lblkno)
@@ -620,6 +661,7 @@ UmLogMappingRange(RelFileLocator rlocator, ForkNumber forknum,
 	UmbraFileContext *ctx;
 	BlockNumber pblkno;
 	BlockNumber run_blocks;
+	bool		delay_started;
 
 	Assert(!InRecovery);
 	if (startblk >= endblk || anchor_lblkno < startblk ||
@@ -628,28 +670,41 @@ UmLogMappingRange(RelFileLocator rlocator, ForkNumber forknum,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("invalid Umbra WAL mapping range")));
 	if (!RelFileLocatorSkippingWAL(rlocator))
-		return;
+		return false;
 	if (forknum != MAIN_FORKNUM)
-		return;
+		return false;
 
 	reln = smgropen(rlocator, INVALID_PROC_NUMBER);
 	if (!um_fork_uses_map(reln, forknum))
-		return;
+		return false;
 	ctx = um_get_filectx(reln);
-	run_blocks = ummap_lookup_run(ctx, reln->smgr_rlocator, forknum,
+	delay_started = um_begin_checkpoint_delay();
+	PG_TRY();
+	{
+		run_blocks = ummap_lookup_run(ctx, reln->smgr_rlocator, forknum,
 									  startblk, endblk - startblk, &pblkno);
-	if (run_blocks != endblk - startblk)
-		ereport(ERROR,
+		if (run_blocks != endblk - startblk)
+			ereport(ERROR,
 					(errmsg("Umbra skip-WAL mapping range is not physically contiguous")));
-	ummap_prepare_wal_range(ctx, reln->smgr_rlocator, forknum,
+		ummap_prepare_wal_range(ctx, reln->smgr_rlocator, forknum,
 								startblk, pblkno, run_blocks,
 								anchor_lblkno);
+	}
+	PG_CATCH();
+	{
+		um_end_checkpoint_delay(delay_started);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	return delay_started;
 }
 
 void
-UmLogMappingRangeFinish(void)
+UmLogMappingRangeFinish(bool delay_started)
 {
 	UmMappingPublicationDone();
+	um_end_checkpoint_delay(delay_started);
 }
 
 void
@@ -658,7 +713,10 @@ UmMappingPublicationDone(void)
 	MemoryContext oldcontext = CurrentMemoryContext;
 
 	if (CritSectionCount > 0)
+	{
+		um_end_mapping_checkpoint_delay_if_idle();
 		return;
+	}
 
 	PG_TRY();
 	{
@@ -676,6 +734,7 @@ UmMappingPublicationDone(void)
 		pg_unreachable();
 	}
 	PG_END_TRY();
+	um_end_mapping_checkpoint_delay_if_idle();
 }
 
 void
@@ -1011,6 +1070,7 @@ um_prepare_firstborn_target(SMgrRelation reln, ForkNumber forknum,
 	BlockNumber first_pblkno;
 	BlockNumber nblocks;
 	bool		pending_wal_ready;
+	volatile bool delay_started = false;
 
 	if (!BlockNumberIsValid(target_lblkno) ||
 		!BlockNumberIsValid(anchor_lblkno))
@@ -1030,12 +1090,63 @@ um_prepare_firstborn_target(SMgrRelation reln, ForkNumber forknum,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("Umbra WAL anchor is outside its first-born range")));
 
-	first_pblkno = ummap_next_physical_block(ctx, reln->smgr_rlocator,
+	if (!um_mapping_delay_held)
+	{
+		delay_started = um_begin_checkpoint_delay();
+		um_mapping_delay_held = delay_started;
+	}
+	PG_TRY();
+	{
+		first_pblkno = ummap_next_physical_block(ctx, reln->smgr_rlocator,
 												forknum);
-	nblocks = target_lblkno - logical_nblocks + 1;
-	ummap_prepare_firstborn_range(ctx, reln->smgr_rlocator, forknum,
+		nblocks = target_lblkno - logical_nblocks + 1;
+		ummap_prepare_firstborn_range(ctx, reln->smgr_rlocator, forknum,
 									logical_nblocks, first_pblkno, nblocks,
 									anchor_lblkno, false);
+	}
+	PG_CATCH();
+	{
+		if (delay_started && !ummap_has_pending_ranges())
+		{
+			um_end_checkpoint_delay(true);
+			um_mapping_delay_held = false;
+		}
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+}
+
+static bool
+um_begin_checkpoint_delay(void)
+{
+	/*
+	 * Keep checkpoint start out of the interval in which mapping WAL can
+	 * already precede the checkpoint redo point but canonical MAP state is not
+	 * yet visible to checkpoint writeback.  Publication correctness itself is
+	 * owned by the pending-range path; this flag only protects that boundary.
+	 */
+	if (InRecovery || (MyProc->delayChkptFlags & DELAY_CHKPT_START) != 0)
+		return false;
+
+	MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+	return true;
+}
+
+static void
+um_end_checkpoint_delay(bool delay_started)
+{
+	if (delay_started)
+		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+}
+
+static void
+um_end_mapping_checkpoint_delay_if_idle(void)
+{
+	if (um_mapping_delay_held && !ummap_has_pending_ranges())
+	{
+		um_end_checkpoint_delay(true);
+		um_mapping_delay_held = false;
+	}
 }
 
 static void
@@ -1050,17 +1161,26 @@ um_mapping_xact_callback(XactEvent event, void *arg)
 		UmMappingPublicationDone();
 		if (ummap_has_pending_ranges())
 			elog(PANIC, "Umbra mapping reached commit before publication");
+		um_end_mapping_checkpoint_delay_if_idle();
 		return;
 	}
 
 	if (event == XACT_EVENT_ABORT || event == XACT_EVENT_PARALLEL_ABORT)
+	{
 		ummap_abort_pending_ranges(InvalidSubTransactionId);
+		if (um_mapping_delay_held)
+		{
+			um_end_checkpoint_delay(true);
+			um_mapping_delay_held = false;
+		}
+	}
 	else if (event == XACT_EVENT_COMMIT ||
 			 event == XACT_EVENT_PARALLEL_COMMIT ||
 			 event == XACT_EVENT_PREPARE)
 	{
 		if (ummap_has_pending_ranges())
 			elog(PANIC, "Umbra mapping survived transaction completion");
+		um_end_mapping_checkpoint_delay_if_idle();
 	}
 }
 
@@ -1074,7 +1194,10 @@ um_mapping_subxact_callback(SubXactEvent event,
 	if (event == SUBXACT_EVENT_COMMIT_SUB)
 		ummap_reparent_pending_ranges(mySubid, parentSubid);
 	else if (event == SUBXACT_EVENT_ABORT_SUB)
+	{
 		ummap_abort_pending_ranges(mySubid);
+		um_end_mapping_checkpoint_delay_if_idle();
+	}
 }
 
 static void

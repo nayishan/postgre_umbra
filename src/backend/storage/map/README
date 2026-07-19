@@ -84,6 +84,23 @@ failed output leaves both available for retry.  Changes that have no WAL
 dependency use InvalidXLogRecPtr.
 
 
+Checkpoint Start Barrier
+------------------------
+
+WAL-backed mapping publication uses PostgreSQL's DELAY_CHKPT_START flag to keep
+checkpoint start out of the interval between mapping WAL insertion and
+checkpoint-visible MAP state.  If a checkpoint observes the backend before the
+flag is set, the mapping WAL has not been inserted and will follow that
+checkpoint's redo point.  If it observes the flag, it waits.  After the flag is
+cleared, the existing publication path has made the canonical MAP entry visible
+and dirty before checkpoint writeback begins.
+
+The barrier does not define or validate the WAL payload, MAP publication, redo,
+or root durability protocols.  Those are preconditions owned by their existing
+paths.  It also does not wait for MAP fsync; checkpoint writeback and the WAL
+flush frontier above own persistence after the MAP state is visible.
+
+
 Lifecycle
 ---------
 

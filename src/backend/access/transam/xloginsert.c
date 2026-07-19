@@ -42,6 +42,7 @@
 #ifdef USE_UMBRA
 #include "storage/umbra.h"
 #include "storage/ummap.h"
+#include "utils/injection_point.h"
 #endif
 #include "utils/memutils.h"
 #include "utils/pgstat_internal.h"
@@ -137,6 +138,9 @@ static int	num_rdatas;			/* entries currently used */
 static int	max_rdatas;			/* allocated size */
 
 static bool begininsert_called = false;
+#ifdef USE_UMBRA
+static bool curinsert_has_umbra_remap = false;
+#endif
 
 /* Memory context to hold the registered buffer and data references. */
 static MemoryContext xloginsert_cxt;
@@ -243,6 +247,9 @@ XLogResetInsertion(void)
 	mainrdata_len = 0;
 	mainrdata_last = (XLogRecData *) &mainrdata_head;
 	curinsert_flags = 0;
+#ifdef USE_UMBRA
+	curinsert_has_umbra_remap = false;
+#endif
 	begininsert_called = false;
 }
 
@@ -547,6 +554,12 @@ XLogInsert(RmgrId rmid, uint8 info)
 	if (ummap_has_pending_ranges())
 	{
 		START_CRIT_SECTION();
+		if (curinsert_has_umbra_remap)
+		{
+			/* The test must preload this point outside the critical section. */
+			INJECTION_POINT_CACHED("umbra-mapping-after-wal-before-publish",
+								   NULL);
+		}
 		ummap_publish_attached_ranges(EndPos);
 		END_CRIT_SECTION();
 		UmMappingPublicationDone();
@@ -680,6 +693,7 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 	*fpw_lsn = InvalidXLogRecPtr;
 #ifdef USE_UMBRA
 	/* XLogRecordAssemble() can be retried after the FPW state changes. */
+	curinsert_has_umbra_remap = false;
 	ummap_reset_wal_attachments();
 #endif
 	for (block_id = 0; block_id < max_registered_block_id; block_id++)
@@ -751,6 +765,7 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 										  &range))
 			{
 				include_remap = true;
+				curinsert_has_umbra_remap = true;
 				bkpb.fork_flags |= BKPBLOCK_HAS_REMAP;
 				remap.first_lblkno = range.first_lblkno;
 				remap.first_pblkno = range.first_pblkno;
@@ -1420,6 +1435,7 @@ log_newpage_range(Relation rel, ForkNumber forknum,
 		BlockNumber batch_startblk = blkno;
 		BlockNumber anchor_blkno;
 		bool		zero_only;
+		bool		umbra_delay_started;
 #endif
 
 		CHECK_FOR_INTERRUPTS();
@@ -1480,8 +1496,9 @@ log_newpage_range(Relation rel, ForkNumber forknum,
 		}
 
 		anchor_blkno = BufferGetBlockNumber(bufpack[0]);
-		UmLogMappingRange(rel->rd_locator, forknum, batch_startblk, blkno,
-						  anchor_blkno);
+		umbra_delay_started = UmLogMappingRange(rel->rd_locator, forknum,
+											batch_startblk, blkno,
+											anchor_blkno);
 #else
 		/* Nothing more to do if all remaining blocks were empty. */
 		if (nbufs == 0)
@@ -1524,12 +1541,12 @@ log_newpage_range(Relation rel, ForkNumber forknum,
 		}
 		PG_CATCH();
 		{
-			UmLogMappingRangeFinish();
+			UmLogMappingRangeFinish(umbra_delay_started);
 			PG_RE_THROW();
 		}
 		PG_END_TRY();
 
-		UmLogMappingRangeFinish();
+		UmLogMappingRangeFinish(umbra_delay_started);
 #endif
 
 		for (i = 0; i < nbufs; i++)
