@@ -126,11 +126,11 @@ my ($checkpoint_result, $checkpoint_stdout, $checkpoint_stderr) =
 	'postgres',
 	q{SET statement_timeout = '30s'; CHECKPOINT;});
 is($checkpoint_result, 0,
-	'published MAP with a pending root hint does not delay checkpoint');
+	'published MAP and resident root release the checkpoint delay');
 $idle_xact->query_safe('ROLLBACK;');
 $idle_xact->quit;
 is($node->safe_psql('postgres', 'SELECT count(*) FROM umbra_root_abort_t;'),
-	'0', 'top-level abort discards only the deferred root update');
+	'0', 'top-level abort does not roll back the published storage EOF');
 my $abort_main_path = $node->safe_psql(
 	'postgres', q{SELECT pg_relation_filepath('umbra_root_abort_t'::regclass);});
 my $abort_physical_blocks =
@@ -138,8 +138,8 @@ my $abort_physical_blocks =
 my $abort_super = read_map_super($node, "${abort_main_path}_map");
 cmp_ok($abort_physical_blocks, '>', 0,
 	'aborted extension leaves append-only physical storage');
-is(u32_at($abort_super, MAP_LOGICAL_MAIN_OFFSET), 0,
-	'root may remain a stale lower-bound hint after abort');
+cmp_ok(u32_at($abort_super, MAP_LOGICAL_MAIN_OFFSET), '>', 0,
+	'aborted extension remains covered by the authoritative root');
 
 my ($subabort_result, $subabort_stdout, $subabort_stderr) = $node->psql(
 	'postgres', q{
@@ -150,7 +150,7 @@ ROLLBACK TO umbra_root_savepoint;
 COMMIT;
 });
 is($subabort_result, 0,
-	'subtransaction abort discards only its deferred root update');
+	'subtransaction abort keeps the published storage EOF');
 is($node->safe_psql('postgres', 'SELECT count(*) FROM umbra_root_subabort_t;'),
 	'0', 'relation remains readable after subtransaction abort');
 
@@ -249,7 +249,7 @@ is(unpack('H*', read_map_super($node, $map_path)), $remapped_super_hex,
 is($node->safe_psql('postgres', 'SELECT id FROM umbra_super_t;'),
 	'2000', 'data remains readable after immediate restart');
 is($node->safe_psql('postgres', 'SELECT count(*) FROM umbra_root_abort_t;'),
-	'0', 'stale root remains readable from canonical MAP after restart');
+	'0', 'authoritative root remains readable after restart');
 
 my $map_file = $node->data_dir . "/$map_path";
 $node->stop('fast');

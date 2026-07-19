@@ -67,6 +67,7 @@
 #ifdef USE_UMBRA
 #include "storage/umbra.h"
 #endif
+#include "utils/injection_point.h"
 #include "utils/memdebug.h"
 #include "utils/ps_status.h"
 #include "utils/rel.h"
@@ -3019,7 +3020,12 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	 * take noticeable time.
 	 */
 	if (!(flags & EB_SKIP_EXTENSION_LOCK))
+	{
 		UnlockRelationForExtension(bmr.rel, ExclusiveLock);
+#ifdef USE_UMBRA
+		INJECTION_POINT("umbra-buffered-extend-after-unlock", NULL);
+#endif
+	}
 
 	pgstat_count_io_op_time(IOOBJECT_RELATION, io_context, IOOP_EXTEND,
 							io_start, 1, extend_by * BLCKSZ);

@@ -305,5 +305,76 @@ SELECT count(*) FROM umbra_remap_spgist WHERE ir @> 1000;
 	'10',
 	'SP-GiST index reads through the recovered mapping');
 
+if (($ENV{enable_injection_points} // '') eq 'yes' &&
+	$node->check_extension('injection_points'))
+{
+	$node->safe_psql('postgres', 'CREATE EXTENSION injection_points');
+	$node->safe_psql('postgres', q{
+CREATE TABLE umbra_firstborn_concurrent(id integer, payload text)
+  WITH (autovacuum_enabled = false);
+});
+
+	my $owner = $node->background_psql('postgres');
+	$owner->query_safe(q{
+SELECT injection_points_set_local();
+SELECT injection_points_attach('umbra-buffered-extend-after-unlock', 'wait');
+SELECT injection_points_load('umbra-buffered-extend-after-unlock');
+});
+	$owner->query_until(
+		qr/starting_firstborn_owner/,
+		q(
+\echo starting_firstborn_owner
+INSERT INTO umbra_firstborn_concurrent VALUES (1, repeat('owner', 200));
+\echo firstborn_owner_done
+\q
+));
+	$node->wait_for_event(
+		'client backend', 'umbra-buffered-extend-after-unlock');
+	pass('first extender pauses after installing its first-born MAP barrier');
+
+	my $waiter = $node->background_psql('postgres');
+	$waiter->query_safe(q{
+SELECT injection_points_set_local();
+SELECT injection_points_attach('umbra-firstborn-foreign-pending', 'wait');
+SELECT injection_points_load('umbra-firstborn-foreign-pending');
+});
+	$waiter->query_until(
+		qr/starting_firstborn_waiter/,
+		q(
+\echo starting_firstborn_waiter
+INSERT INTO umbra_firstborn_concurrent VALUES (2, repeat('waiter', 200));
+\echo firstborn_waiter_done
+\q
+));
+	$node->wait_for_event(
+		'client backend', 'umbra-firstborn-foreign-pending');
+	pass('next extender waits for the foreign first-born owner');
+
+	$node->safe_psql(
+		'postgres',
+		q{SELECT injection_points_wakeup('umbra-buffered-extend-after-unlock')});
+	$owner->{run}->finish;
+	$node->safe_psql(
+		'postgres',
+		q{SELECT injection_points_wakeup('umbra-firstborn-foreign-pending')});
+	$waiter->{run}->finish;
+
+	is(
+		$node->safe_psql(
+			'postgres',
+			q{SELECT string_agg(id::text, ',' ORDER BY id)
+			  FROM umbra_firstborn_concurrent;}),
+		'1,2',
+		'both extenders complete after the owner publishes its mapping');
+
+	$node->stop('immediate');
+	$node->start;
+	is(
+		$node->safe_psql(
+			'postgres', 'SELECT count(*) FROM umbra_firstborn_concurrent;'),
+		'2',
+		'concurrent first-born publication survives crash recovery');
+}
+
 $node->stop;
 done_testing();

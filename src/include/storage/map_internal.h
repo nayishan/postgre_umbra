@@ -13,6 +13,7 @@
 #ifndef MAP_INTERNAL_H
 #define MAP_INTERNAL_H
 
+#include "lib/dshash.h"
 #include "port/atomics.h"
 #include "storage/map.h"
 #include "storage/spin.h"
@@ -38,6 +39,10 @@
 #define MAP_PAGE_FREENEXT_NOT_IN_LIST (-2)
 #define MAP_PAGE_PENDING_WORDS \
 	((BLCKSZ / sizeof(BlockNumber) + 63) / 64)
+
+/* Opaque root bytes interpreted only by ummap.c. */
+#define UMMAP_ROOT_IMAGE_SIZE 64
+#define UMMAP_ROOT_SECTOR_SIZE 512
 
 typedef struct MapPageTag
 {
@@ -131,5 +136,43 @@ extern void MapPageFlushDatabase(Oid dbid, Oid spcOid);
 extern void MapPageFlushAll(void);
 extern void MapPageInvalidateRelation(RelFileLocatorBackend rlocator);
 extern void MapPageInvalidateDatabase(Oid dbid, Oid spcOid);
+
+typedef struct MapSuperTag
+{
+	RelFileLocatorBackend rlocator;
+} MapSuperTag;
+
+struct MapSuperDesc
+{
+	MapSuperTag tag;
+	LWLock		content_lock;
+	bool		valid;
+	bool		dirty;
+	bool		needs_fsync;
+	XLogRecPtr	wal_flush_lsn;
+	char		data[UMMAP_ROOT_IMAGE_SIZE];
+};
+
+typedef struct MapSuperCacheCtl
+{
+	void	   *raw_dsa_area;
+	dshash_table_handle hash_handle;
+} MapSuperCacheCtl;
+
+extern MapSuperCacheCtl *MapSuperCacheCtlData;
+
+extern void MapSuperEnsureInitialized(void);
+extern bool MapSuperFindEntryLocked(const MapSuperTag *tag, LWLockMode mode,
+									MapSuperDesc **desc);
+extern void MapSuperDeleteEntry(const MapSuperTag *tag);
+extern void MapSuperFlushLocked(MapSuperDesc *desc, UmbraFileContext *ctx);
+extern int MapSuperCollectTags(Oid dbid, Oid spcOid, MapSuperTag **tags);
+extern void MapSuperTableShmemRequest(void);
+extern void MapSuperTableShmemInit(void);
+extern void MapSuperTableShmemAttach(void);
+
+extern void ummap_root_load_image(UmbraFileContext *ctx, char *image);
+extern void ummap_root_write_image(UmbraFileContext *ctx, const char *image,
+								   bool skipFsync);
 
 #endif							/* MAP_INTERNAL_H */

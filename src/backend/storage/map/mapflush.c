@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * mapflush.c
- *	  Flush and invalidation for ordinary Umbra MAP page buffers.
+ *	  Flush and invalidation for Umbra MAP page and root buffers.
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
@@ -27,17 +27,27 @@ static void MapPageInvalidateMatching(const RelFileLocatorBackend *rlocator,
 static void MapPageInvalidateSlot(int slot_id,
 								  const RelFileLocatorBackend *rlocator,
 								  Oid dbid, Oid spcOid);
+static MapSuperTag MapSuperMakeTag(RelFileLocatorBackend rlocator);
+static void MapSuperFlushMatching(Oid dbid, Oid spcOid);
+static void MapSuperInvalidateMatching(Oid dbid, Oid spcOid);
 
 void
 MapInvalidateRelation(RelFileLocatorBackend rlocator)
 {
 	MapPageInvalidateRelation(rlocator);
+	if (MapSuperCacheCtlData != NULL)
+	{
+		MapSuperTag tag = MapSuperMakeTag(rlocator);
+
+		MapSuperDeleteEntry(&tag);
+	}
 }
 
 void
 MapInvalidateDatabase(Oid dbid)
 {
 	MapPageInvalidateDatabase(dbid, InvalidOid);
+	MapSuperInvalidateMatching(dbid, InvalidOid);
 }
 
 void
@@ -45,12 +55,25 @@ MapInvalidateDatabaseTablespace(Oid dbid, Oid spcOid)
 {
 	Assert(OidIsValid(spcOid));
 	MapPageInvalidateDatabase(dbid, spcOid);
+	MapSuperInvalidateMatching(dbid, spcOid);
 }
 
 void
 MapFlushRelation(UmbraFileContext *ctx, RelFileLocatorBackend rlocator)
 {
+	MapSuperDesc *desc;
+	MapSuperTag tag;
+
 	MapPageFlushRelation(ctx, rlocator);
+	if (MapSuperCacheCtlData == NULL)
+		return;
+
+	MapSuperEnsureInitialized();
+	tag = MapSuperMakeTag(rlocator);
+	if (!MapSuperFindEntryLocked(&tag, LW_EXCLUSIVE, &desc))
+		return;
+	MapSuperFlushLocked(desc, ctx);
+	LWLockRelease(&desc->content_lock);
 }
 
 void
@@ -59,12 +82,71 @@ MapFlushDatabaseTablespace(Oid dbid, Oid spcOid)
 	Assert(OidIsValid(dbid));
 	Assert(OidIsValid(spcOid));
 	MapPageFlushDatabase(dbid, spcOid);
+	MapSuperFlushMatching(dbid, spcOid);
 }
 
 void
 MapCheckpoint(void)
 {
 	MapPageFlushAll();
+	MapSuperFlushMatching(InvalidOid, InvalidOid);
+
+	/*
+	 * A non-WAL MAP update can dirty a page after the first scan has passed
+	 * its slot, then advance a root that this checkpoint writes.  Scan again
+	 * so a completed checkpoint cannot leave that root ahead of canonical MAP.
+	 */
+	MapPageFlushAll();
+}
+
+static MapSuperTag
+MapSuperMakeTag(RelFileLocatorBackend rlocator)
+{
+	MapSuperTag tag = {0};
+
+	tag.rlocator = rlocator;
+	return tag;
+}
+
+static void
+MapSuperFlushMatching(Oid dbid, Oid spcOid)
+{
+	MapSuperTag *tags;
+	int			count;
+	int			i;
+
+	if (MapSuperCacheCtlData == NULL)
+		return;
+
+	count = MapSuperCollectTags(dbid, spcOid, &tags);
+	for (i = 0; i < count; i++)
+	{
+		MapSuperDesc *desc;
+
+		if (!MapSuperFindEntryLocked(&tags[i], LW_EXCLUSIVE, &desc))
+			continue;
+		MapSuperFlushLocked(desc, NULL);
+		LWLockRelease(&desc->content_lock);
+	}
+	if (tags != NULL)
+		pfree(tags);
+}
+
+static void
+MapSuperInvalidateMatching(Oid dbid, Oid spcOid)
+{
+	MapSuperTag *tags;
+	int			count;
+	int			i;
+
+	if (MapSuperCacheCtlData == NULL)
+		return;
+
+	count = MapSuperCollectTags(dbid, spcOid, &tags);
+	for (i = 0; i < count; i++)
+		MapSuperDeleteEntry(&tags[i]);
+	if (tags != NULL)
+		pfree(tags);
 }
 
 void

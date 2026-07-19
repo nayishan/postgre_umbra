@@ -25,6 +25,7 @@
 #include "catalog/storage.h"
 #include "miscadmin.h"
 #include "storage/map.h"
+#include "storage/map_internal.h"
 #include "storage/proc.h"
 #include "storage/smgr.h"
 #include "storage/umfile.h"
@@ -42,6 +43,8 @@ typedef struct UmbraSmgrRelationState
 	 * umfile.c owns the physical segment descriptors below this context.
 	 */
 	UmbraFileContext *filectx;
+	/* Root entries are not replaced while their relation remains live. */
+	MapSuperDesc *root_desc;
 	bool		uses_map;
 } UmbraSmgrRelationState;
 
@@ -52,6 +55,8 @@ typedef struct UmbraRedoCreateState
 } UmbraRedoCreateState;
 
 static UmbraFileContext *um_get_filectx(SMgrRelation reln);
+static void um_cache_root_desc(UmbraSmgrRelationState *state,
+								RelFileLocatorBackend rlocator);
 static bool um_fork_uses_map(SMgrRelation reln, ForkNumber forknum);
 static BlockNumber um_get_logical_nblocks(SMgrRelation reln,
 										  ForkNumber forknum);
@@ -68,6 +73,7 @@ static void um_prepare_firstborn_target(SMgrRelation reln,
 										BlockNumber target_lblkno,
 										BlockNumber anchor_lblkno);
 static void um_ensure_physical_capacity(UmbraFileContext *ctx,
+										RelFileLocatorBackend rlocator,
 										ForkNumber forknum,
 										BlockNumber first_pblkno,
 										BlockNumber nblocks, bool skipFsync);
@@ -95,6 +101,8 @@ void
 umopen(SMgrRelation reln)
 {
 	UmbraSmgrRelationState *state;
+	BlockNumber logical_eof;
+	BlockNumber physical_frontier;
 
 	Assert(reln->smgr_private == NULL);
 
@@ -103,6 +111,14 @@ umopen(SMgrRelation reln)
 	state->filectx = umfile_open(reln);
 	/* Existing MAP storage is the durable policy marker on reopen. */
 	state->uses_map = !SmgrIsTemp(reln) && ummap_exists(state->filectx);
+	if (state->uses_map)
+	{
+		um_cache_root_desc(state, reln->smgr_rlocator);
+		if (!InRecovery)
+			ummap_root_read_frontiers(state->filectx, reln->smgr_rlocator,
+									   MAIN_FORKNUM, &logical_eof,
+									   &physical_frontier);
+	}
 	reln->smgr_private = state;
 }
 
@@ -148,6 +164,7 @@ umcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 		state->uses_map = true;
 		if (!ummap_exists(ctx))
 			ummap_create(ctx, reln->smgr_rlocator, true);
+		um_cache_root_desc(state, reln->smgr_rlocator);
 	}
 
 	if (state->uses_map && forknum != MAIN_FORKNUM &&
@@ -172,8 +189,12 @@ uminitnewrelation(SMgrRelation reln, bool needs_wal)
 
 	Assert(state != NULL);
 	state->uses_map = needs_wal;
+	state->root_desc = NULL;
 	if (needs_wal)
+	{
 		ummap_create(state->filectx, reln->smgr_rlocator, false);
+		um_cache_root_desc(state, reln->smgr_rlocator);
+	}
 }
 
 void
@@ -292,6 +313,7 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	BlockNumber	pblkno;
 	bool		pending_wal_ready;
 	volatile bool delay_started = false;
+	volatile bool retry_needed = false;
 	bool		uses_wal;
 
 	if (!um_fork_uses_map(reln, forknum))
@@ -320,6 +342,9 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		return;
 	}
 
+retry_firstborn:
+	retry_needed = false;
+
 	/* A WAL-before-extend reservation is not a visible existing page yet. */
 	if (ummap_pending_range_for_target(reln->smgr_rlocator, forknum,
 									 blocknum, &pending_range,
@@ -334,15 +359,11 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 			START_CRIT_SECTION();
 			critical_started = true;
 		}
-		physical_nblocks = umfile_nblocks(ctx, forknum);
-		if (pblkno < physical_nblocks)
 		{
 			const void *buffers[1] = {buffer};
 
 			umfile_writev(ctx, forknum, pblkno, buffers, 1, skipFsync);
 		}
-		else
-			umfile_extend(ctx, forknum, pblkno, buffer, skipFsync);
 		ummap_mark_range_physical(reln->smgr_rlocator, forknum, blocknum);
 		if (critical_started)
 			END_CRIT_SECTION();
@@ -358,6 +379,7 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		pblkno = ummap_lookup_block(ctx, reln->smgr_rlocator, forknum,
 								 blocknum);
 		umfile_writev(ctx, forknum, pblkno, buffers, 1, skipFsync);
+		um_end_mapping_checkpoint_delay_if_idle();
 		return;
 	}
 	if (InRecovery)
@@ -376,10 +398,15 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	{
 		BlockNumber nblocks = blocknum - logical_nblocks + 1;
 
-		physical_nblocks = ummap_next_physical_block(ctx,
-												 reln->smgr_rlocator, forknum);
+		physical_nblocks = ummap_reserve_physical_run(ctx,
+											  reln->smgr_rlocator, forknum,
+											  nblocks, skipFsync);
 		pblkno = physical_nblocks + (blocknum - logical_nblocks);
-		umfile_extend(ctx, forknum, pblkno, buffer, skipFsync);
+		{
+			const void *buffers[1] = {buffer};
+
+			umfile_writev(ctx, forknum, pblkno, buffers, 1, skipFsync);
+		}
 		if (!uses_wal)
 		{
 			ummap_publish_mapping_run(ctx, reln->smgr_rlocator, forknum,
@@ -390,11 +417,11 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 								 umfile_nblocks(ctx, forknum),
 								 InvalidXLogRecPtr, skipFsync);
 		}
-		else
-			ummap_prepare_firstborn_range(ctx, reln->smgr_rlocator,
+		else if (!ummap_prepare_firstborn_range(ctx, reln->smgr_rlocator,
 												 forknum, logical_nblocks,
 												 physical_nblocks, nblocks,
-												 InvalidBlockNumber, true);
+												 InvalidBlockNumber, true))
+			retry_needed = true;
 	}
 	PG_CATCH();
 	{
@@ -406,6 +433,18 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	if (retry_needed)
+	{
+		if (delay_started && !ummap_has_pending_ranges())
+		{
+			um_end_checkpoint_delay(true);
+			um_mapping_delay_held = false;
+			delay_started = false;
+		}
+		CHECK_FOR_INTERRUPTS();
+		pg_usleep(1000L);
+		goto retry_firstborn;
+	}
 }
 
 void
@@ -418,7 +457,9 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	BlockNumber	range_nblocks;
 	UmbraMapRange pending_range;
 	volatile bool delay_started = false;
+	volatile bool retry_needed = false;
 	bool		pending_wal_ready;
+	bool		retrying = false;
 	bool		uses_wal;
 
 	Assert(nblocks > 0);
@@ -493,7 +534,8 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 							  logical_nblocks, false);
 			first_pblkno = ummap_next_physical_block(ctx,
 											 reln->smgr_rlocator, forknum);
-			um_ensure_physical_capacity(ctx, forknum, first_pblkno,
+			um_ensure_physical_capacity(ctx, reln->smgr_rlocator, forknum,
+									 first_pblkno,
 									 recovery_nblocks, skipFsync);
 			pending_range.first_lblkno = logical_nblocks;
 			pending_range.first_pblkno = first_pblkno;
@@ -504,7 +546,7 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		}
 		if (have_replay_range && !replay_physical_ready)
 		{
-			um_ensure_physical_capacity(ctx, forknum,
+			um_ensure_physical_capacity(ctx, reln->smgr_rlocator, forknum,
 									replay_range.first_pblkno,
 									replay_range.nblocks, skipFsync);
 			ummap_mark_replay_range_physical(reln->smgr_rlocator, forknum,
@@ -520,12 +562,16 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 										 blocknum + done,
 										 (BlockNumber) nblocks - done,
 										 &pblkno);
-			um_ensure_physical_capacity(ctx, forknum, pblkno, run_blocks,
+			um_ensure_physical_capacity(ctx, reln->smgr_rlocator, forknum,
+									 pblkno, run_blocks,
 								 skipFsync);
 			done += run_blocks;
 		}
 		return;
 	}
+
+retry_firstborn:
+	retry_needed = false;
 
 	if (ummap_pending_range_for_target(reln->smgr_rlocator, forknum,
 									 blocknum, &pending_range,
@@ -541,7 +587,7 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 			START_CRIT_SECTION();
 			critical_started = true;
 		}
-		um_ensure_physical_capacity(ctx, forknum,
+		um_ensure_physical_capacity(ctx, reln->smgr_rlocator, forknum,
 								 pending_range.first_pblkno + offset,
 								 (BlockNumber) nblocks, skipFsync);
 		ummap_mark_range_physical(reln->smgr_rlocator, forknum, blocknum);
@@ -553,12 +599,23 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 	logical_nblocks = um_get_logical_nblocks(reln, forknum);
 	if (blocknum < logical_nblocks)
-		elog(ERROR,
-			 "cannot zero-extend Umbra fork %d from block %u below logical EOF %u",
-			 (int) forknum, blocknum, logical_nblocks);
+	{
+		if (!retrying)
+			elog(ERROR,
+				 "cannot zero-extend Umbra fork %d from block %u below logical EOF %u",
+				 (int) forknum, blocknum, logical_nblocks);
+		if ((uint64) blocknum + (BlockNumber) nblocks <= logical_nblocks)
+		{
+			um_end_mapping_checkpoint_delay_if_idle();
+			return;
+		}
+		nblocks -= logical_nblocks - blocknum;
+		blocknum = logical_nblocks;
+	}
 	range_nblocks = blocknum - logical_nblocks + nblocks;
-	first_pblkno = ummap_next_physical_block(ctx, reln->smgr_rlocator,
-											 forknum);
+	first_pblkno = ummap_reserve_physical_run(ctx, reln->smgr_rlocator,
+											  forknum, range_nblocks,
+											  skipFsync);
 
 	uses_wal = !IsBootstrapProcessingMode() &&
 		!RelFileLocatorSkippingWAL(reln->smgr_rlocator.locator);
@@ -569,7 +626,8 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	}
 	PG_TRY();
 	{
-		um_ensure_physical_capacity(ctx, forknum, first_pblkno, range_nblocks,
+		um_ensure_physical_capacity(ctx, reln->smgr_rlocator, forknum,
+									 first_pblkno, range_nblocks,
 								 skipFsync);
 		if (!uses_wal)
 		{
@@ -582,11 +640,11 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 								 umfile_nblocks(ctx, forknum),
 								 InvalidXLogRecPtr, skipFsync);
 		}
-		else
-			ummap_prepare_firstborn_range(ctx, reln->smgr_rlocator,
+		else if (!ummap_prepare_firstborn_range(ctx, reln->smgr_rlocator,
 												 forknum, logical_nblocks,
 												 first_pblkno, range_nblocks,
-												 InvalidBlockNumber, true);
+												 InvalidBlockNumber, true))
+			retry_needed = true;
 	}
 	PG_CATCH();
 	{
@@ -598,6 +656,19 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	if (retry_needed)
+	{
+		if (delay_started && !ummap_has_pending_ranges())
+		{
+			um_end_checkpoint_delay(true);
+			um_mapping_delay_held = false;
+			delay_started = false;
+		}
+		retrying = true;
+		CHECK_FOR_INTERRUPTS();
+		pg_usleep(1000L);
+		goto retry_firstborn;
+	}
 }
 
 static bool
@@ -804,7 +875,8 @@ UmPrepareReplayMappingRange(SMgrRelation reln, ForkNumber forknum,
 	logical_nblocks = um_get_logical_nblocks(reln, forknum);
 	physical_ready = logical_nblocks >= range->first_lblkno;
 	if (physical_ready)
-		um_ensure_physical_capacity(ctx, forknum, range->first_pblkno,
+		um_ensure_physical_capacity(ctx, reln->smgr_rlocator, forknum,
+								 range->first_pblkno,
 									range->nblocks, false);
 	ummap_prepare_replay_range(ctx, reln->smgr_rlocator, forknum, range, lsn,
 							  physical_ready);
@@ -822,8 +894,6 @@ UmCheckRecoveryDependencies(void)
 {
 	if (ummap_has_replay_ranges())
 		elog(PANIC, "Umbra exact replay mapping survived its WAL record");
-	if (ummap_has_root_updates())
-		elog(PANIC, "Umbra normal mapping root update entered recovery");
 	if (ummap_has_recovery_scratch())
 		elog(PANIC,
 			 "WAL ended with unresolved Umbra recovery mappings");
@@ -1094,7 +1164,7 @@ um_get_logical_nblocks(SMgrRelation reln, ForkNumber forknum)
 	if (um_fork_uses_map(reln, forknum))
 	{
 		if (!InRecovery && CritSectionCount == 0 &&
-			(ummap_has_pending_ranges() || ummap_has_root_updates()))
+			ummap_has_pending_ranges())
 			UmMappingPublicationDone();
 		return ummap_nblocks(um_get_filectx(reln), reln->smgr_rlocator,
 								 forknum);
@@ -1115,6 +1185,22 @@ um_get_filectx(SMgrRelation reln)
 }
 
 static void
+um_cache_root_desc(UmbraSmgrRelationState *state,
+				   RelFileLocatorBackend rlocator)
+{
+	MapSuperBuffer buffer;
+
+	Assert(state != NULL);
+	Assert(state->filectx != NULL);
+	Assert(state->uses_map);
+	Assert(CritSectionCount == 0);
+
+	buffer = MapSuperBufferRead(state->filectx, rlocator, LW_SHARED);
+	state->root_desc = buffer.desc;
+	MapSuperReleaseBuffer(buffer);
+}
+
+static void
 um_prepare_firstborn_target(SMgrRelation reln, ForkNumber forknum,
 							BlockNumber target_lblkno,
 							BlockNumber anchor_lblkno)
@@ -1126,12 +1212,15 @@ um_prepare_firstborn_target(SMgrRelation reln, ForkNumber forknum,
 	BlockNumber nblocks;
 	bool		pending_wal_ready;
 	volatile bool delay_started = false;
+	volatile bool retry_needed = false;
 
 	if (!BlockNumberIsValid(target_lblkno) ||
 		!BlockNumberIsValid(anchor_lblkno))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("invalid Umbra first-born logical block")));
+retry_firstborn:
+	retry_needed = false;
 	if (ummap_pending_range_for_target(reln->smgr_rlocator, forknum,
 									 target_lblkno, &pending_range,
 									 &pending_wal_ready))
@@ -1139,7 +1228,12 @@ um_prepare_firstborn_target(SMgrRelation reln, ForkNumber forknum,
 
 	logical_nblocks = um_get_logical_nblocks(reln, forknum);
 	if (target_lblkno < logical_nblocks)
+	{
+		um_end_mapping_checkpoint_delay_if_idle();
 		return;
+	}
+	if (anchor_lblkno < logical_nblocks)
+		anchor_lblkno = target_lblkno;
 	if (anchor_lblkno < logical_nblocks || anchor_lblkno > target_lblkno)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -1152,12 +1246,14 @@ um_prepare_firstborn_target(SMgrRelation reln, ForkNumber forknum,
 	}
 	PG_TRY();
 	{
-		first_pblkno = ummap_next_physical_block(ctx, reln->smgr_rlocator,
-												forknum);
 		nblocks = target_lblkno - logical_nblocks + 1;
-		ummap_prepare_firstborn_range(ctx, reln->smgr_rlocator, forknum,
-									logical_nblocks, first_pblkno, nblocks,
-									anchor_lblkno, false);
+		first_pblkno = ummap_reserve_physical_run(ctx,
+											  reln->smgr_rlocator, forknum,
+											  nblocks, false);
+		if (!ummap_prepare_firstborn_range(ctx, reln->smgr_rlocator, forknum,
+										 logical_nblocks, first_pblkno, nblocks,
+										 anchor_lblkno, false))
+			retry_needed = true;
 	}
 	PG_CATCH();
 	{
@@ -1169,6 +1265,18 @@ um_prepare_firstborn_target(SMgrRelation reln, ForkNumber forknum,
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	if (retry_needed)
+	{
+		if (delay_started && !ummap_has_pending_ranges())
+		{
+			um_end_checkpoint_delay(true);
+			um_mapping_delay_held = false;
+			delay_started = false;
+		}
+		CHECK_FOR_INTERRUPTS();
+		pg_usleep(1000L);
+		goto retry_firstborn;
+	}
 }
 
 static bool
@@ -1214,7 +1322,7 @@ um_mapping_xact_callback(XactEvent event, void *arg)
 		event == XACT_EVENT_PRE_PREPARE)
 	{
 		UmMappingPublicationDone();
-		if (ummap_has_pending_ranges() || ummap_has_root_updates())
+		if (ummap_has_pending_ranges())
 			elog(PANIC, "Umbra mapping reached commit before publication");
 		um_end_mapping_checkpoint_delay_if_idle();
 		return;
@@ -1233,7 +1341,7 @@ um_mapping_xact_callback(XactEvent event, void *arg)
 			 event == XACT_EVENT_PARALLEL_COMMIT ||
 			 event == XACT_EVENT_PREPARE)
 	{
-		if (ummap_has_pending_ranges() || ummap_has_root_updates())
+		if (ummap_has_pending_ranges())
 			elog(PANIC, "Umbra mapping survived transaction completion");
 		um_end_mapping_checkpoint_delay_if_idle();
 	}
@@ -1259,12 +1367,14 @@ um_mapping_subxact_callback(SubXactEvent event,
 }
 
 static void
-um_ensure_physical_capacity(UmbraFileContext *ctx, ForkNumber forknum,
+um_ensure_physical_capacity(UmbraFileContext *ctx,
+							RelFileLocatorBackend rlocator, ForkNumber forknum,
 							BlockNumber first_pblkno, BlockNumber nblocks,
 							bool skipFsync)
 {
 	BlockNumber physical_nblocks;
 	uint64		required_nblocks;
+	LWLock	   *extension_lock;
 
 	Assert(nblocks > 0);
 	required_nblocks = (uint64) first_pblkno + nblocks;
@@ -1272,14 +1382,10 @@ um_ensure_physical_capacity(UmbraFileContext *ctx, ForkNumber forknum,
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("cannot materialize Umbra physical mapping range")));
+	extension_lock = MapPageExtensionLock(rlocator);
+	LWLockAcquire(extension_lock, LW_EXCLUSIVE);
 	physical_nblocks = umfile_nblocks(ctx, forknum);
-	if ((uint64) physical_nblocks >= required_nblocks)
-		return;
-
-	/*
-	 * Redo may revisit P after a prior recovery already restored its data.
-	 * Only extend the physical capacity; never zero or rewrite existing P.
-	 */
+	/* Never zero or rewrite a P restored by an earlier recovery attempt. */
 	while ((uint64) physical_nblocks < required_nblocks)
 	{
 		uint64		remaining = required_nblocks - physical_nblocks;
@@ -1288,4 +1394,5 @@ um_ensure_physical_capacity(UmbraFileContext *ctx, ForkNumber forknum,
 		umfile_zeroextend(ctx, forknum, physical_nblocks, chunk, skipFsync);
 		physical_nblocks += chunk;
 	}
+	LWLockRelease(extension_lock);
 }

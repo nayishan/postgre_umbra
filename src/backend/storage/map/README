@@ -5,9 +5,12 @@ Umbra stores logical-to-physical translations in a relation-local private MAP
 fork.  Block 0 is a versioned, CRC-protected relation root.  The remaining
 blocks are ordinary MAP pages served by the small shared pool in this
 directory.  `ummap.c` owns both disk formats and interprets their contents;
-the ordinary page pool owns residency, concurrency, and writeback only for
-whole ordinary MAP pages.  The disk root uses direct, full-block I/O in this
-patch and is not admitted to the ordinary page pool.
+the ordinary page pool owns residency, concurrency, and writeback for whole
+ordinary MAP pages.  A separate relation-keyed cache owns root residency,
+content locking, dirty state, and writeback ordering without interpreting the
+root bytes.  The cache stores the 64-byte root payload; `ummap.c` transfers a
+zero-padded 512-byte sector while retaining BLCKSZ addressing for later MAP
+pages.
 
 The pool deliberately follows the core ownership and replacement rules of the
 PostgreSQL shared buffer pool.  It is not a second general-purpose buffer
@@ -63,28 +66,34 @@ alternative representation of an unmapped page.
 Disk Root Authority
 -------------------
 
-The root stores a logical EOF and a physical frontier for each tracked fork.
-The logical EOF is a CRC-protected lower-bound hint and may lag canonical MAP
-state.  The physical frontier is a monotonic high-water mark; MAIN physical
-storage is append-only in this patch.  The root never supplies a physical block
-for an individual logical block: the ordinary MAP entry remains the sole
-authority for each exact L -> P translation.
+The root stores the authoritative normal-runtime logical EOF and a physical
+frontier for each tracked fork.  The physical frontier is a monotonic next-free
+high-water mark; it can advance before the corresponding physical capacity is
+materialized.  Reserving from it does not authorize an L -> P translation: the
+ordinary MAP entry remains the sole authority for each exact mapping.
 
-During normal execution, smgrnblocks reads a root logical EOF, then scans the
-canonical MAP tail from that lower bound to the first InvalidBlockNumber.  The
-scan overlays this backend's contiguous pending ranges and waits if it meets a
-foreign pending barrier.  It rereads the root after the scan and retries if the
-hint changed.  The returned size is the MAP-derived EOF, not the root value.
-Thus a deferred or aborted root update costs a longer tail scan but cannot
-authorize reuse of a logical block that already has a canonical MAP entry.
+Normal relation open makes the root resident.  A miss reads and validates one
+512-byte sector, reconciles the physical frontier with data-fork EOF, and
+publishes only the opaque 64-byte payload to the cache.  An update refreshes the
+payload CRC while holding the entry content lock and marks the entry dirty; it
+does not immediately rewrite the sector.
+
+During normal execution, smgrnblocks reads the resident logical EOF directly.
+The same backend can extend that value with its own contiguous unpublished
+range.  A different backend waits if a shared first-born barrier starts at the
+current EOF, then rereads the root after that barrier disappears.  This is a
+transient publication overlay, not a scan of the canonical MAP tail.  MAP
+entries above the resident EOF are otherwise unreachable allocation or abort
+orphans until a later valid publication reaches them.
 
 A missing MAP entry below a normal root EOF is corruption.  Normal execution
 does not infer L -> L from the root.
 
-Recovery does not use the root to decide whether a WAL target exists or which
-physical block it names.  It continues to use canonical MAP state, the exact P
-recorded in WAL, and record-scoped exact or scratch barriers.  Successful redo
-updates the root as an output of replay; recovery scratch never advances it.
+Recovery does not use logical EOF to decide whether a WAL target exists or which
+physical block it names.  It scans canonical and scratch mappings, uses the
+exact P recorded in WAL, and installs record-scoped exact or scratch barriers.
+Successful redo updates the root as an output of replay; recovery scratch never
+advances it.
 
 
 Mapping Publication
@@ -98,19 +107,20 @@ Truncation clears every entry in [new logical EOF, old logical EOF), so a later
 extension cannot make an old tail visible again merely by filling its first
 entry.
 
-Normal first-born publication has two backend-local stages.  Before WAL, a
-pending range owns its ordinary MAP pins and a foreign-visible shared barrier.
-After XLogInsertRecord returns an EndRecPtr, the critical publication path can
-mark already pinned MAP entries canonical, but it cannot allocate or perform
-root I/O.  Once the MAP is canonical, it clears the pending bits, releases the
-pins and barrier, and moves the same preallocated node to a backend-local root
-update queue.  This state transition allocates no memory.
+Normal first-born publication starts with backend-local pending state.  Before
+WAL, a pending range owns its ordinary MAP pins and a foreign-visible shared
+barrier.
+After XLogInsertRecord returns an EndRecPtr, the critical publication path marks
+already pinned MAP entries canonical and advances an already-resident root.  It
+cannot allocate, attach shared state, or perform file I/O.  Once MAP and root
+are published, it clears the pending bits and releases the pins and barrier.
 
-UmMappingPublicationDone performs work only outside a critical section.  It
-first completes MAP publication that required I/O, then drains the root update
-queue.  A caller's outer critical section can defer the latter step until the
-next safe call or pre-commit.  During that interval the root may lag, while the
-canonical MAP remains visible and authoritative.
+UmMappingPublicationDone runs outside a critical section.  It completes any MAP
+publication that first required file I/O, advances the resident root while the
+shared MAP barrier is still visible, and only then releases that barrier and the
+checkpoint delay.  Publication therefore makes the canonical MAP and
+authoritative resident EOF visible as one protected storage transition; disk
+writeback remains deferred.
 
 
 WAL Ordering
@@ -122,41 +132,45 @@ that LSN.  Successful output clears both the dirty state and the retained LSN;
 failed output leaves both available for retry.  Changes that have no WAL
 dependency use InvalidXLogRecPtr.
 
-For direct root output, UmMappingPublicationDone first flushes the root update
-queue's EndRecPtr without holding a root LWLock.  It then performs the root
-read-modify-write.  Thus neither ordinary MAP output nor the root can reach
-durable storage ahead of the WAL that selected P.
+Each dirty root entry likewise retains the greatest WAL LSN associated with
+its unflushed mapping changes.  A next-free reservation has no WAL dependency
+because it publishes no mapping and may safely persist as an allocation hole.
+Publication updates the resident image but does not flush WAL or write the root
+sector.  Checkpoint or relation sync flushes any retained LSN before writing the
+latest 512-byte root sector.  Successful output clears the dirty state and
+watermark; failed output leaves both for retry.
 
-DELAY_CHKPT_START covers the WAL-to-canonical-MAP publication window.  It is
-released when the pending list is empty, even if a root update remains queued.
-At that point each dirty MAP page retains its WAL dependency, so checkpoint
-writeback performs its own XLogFlush().  A root update is not a checkpoint
-barrier because the root is allowed to lag the MAP.
+DELAY_CHKPT_START covers the WAL-to-canonical-MAP-to-resident-root publication
+window.  It is released only after the pending list is empty.  Dirty MAP pages
+and roots retain their own WAL dependencies, so later checkpoint writeback
+performs the required XLogFlush().
 
 Before WAL insertion, transaction or subtransaction abort can discard a
-pending mapping and leave an unreachable physical orphan.  Once a pending
-range has an EndRecPtr and its MAP entry is canonical, abort leaves that MAP in
-place but may discard its deferred root update.  This matches PostgreSQL
+pending mapping and leave an unreachable physical orphan or an unmaterialized
+allocation hole.  Once a pending range has an EndRecPtr, publication leaves
+both its MAP and resident EOF in place.  This matches PostgreSQL
 relation-extension behavior: tuple visibility rolls back, storage extension
-does not.  The next normal size lookup scans forward from the stale root, and a
-later root advance catches up.  Abort cleanup never attempts root I/O.
+does not.  Abort cleanup never attempts root I/O.
 
 
-Root Locking
-------------
+Root Cache Locking
+------------------
 
-Direct root reads and writes use the relation-keyed MAP extension lock: shared
-for reads and exclusive for bootstrap or read-modify-write.  Root output never
-runs while an ordinary MAP descriptor content, I/O, or mapping-partition lock
-is held.  MAP publication first releases its descriptor locks, pins, and
-barrier; root completion then performs WAL flush, root lock, root I/O, and root
-unlock.
+The root cache has its own dshash mapping lock and a content lock in each
+relation entry.  Lookup acquires the content lock before releasing the dshash
+lock, so invalidation cannot free an entry while a caller uses it.  Shared
+content locking protects reads; exclusive locking serializes frontier updates,
+load, flush, and invalidation.
 
-Code holding the root/extension lock must not call MapPageBufferRead.  Loading
-or extending an ordinary MAP page can acquire the same relation-keyed extension
-lock and would self-deadlock.  A normal size lookup releases the root lock
-before scanning the ordinary MAP tail, then rereads the root to verify that its
-starting hint remained stable.
+Root output never runs while an ordinary MAP descriptor content, I/O, or
+mapping-partition lock is held.  Critical publication may update an
+already-resident root after releasing the MAP content lock, but it cannot attach
+the root DSA, create a root entry, or load the root from disk.  A normal size
+lookup reads the authoritative EOF while holding the root content lock.
+
+Root bootstrap writes its 512-byte sector under the relation-keyed MAP extension
+lock, then extends the file to preserve one BLCKSZ root slot.  The cache is used
+only after block 0 exists.
 
 
 Checkpoint Start Barrier
@@ -181,17 +195,19 @@ Lifecycle
 
 The selected storage manager receives generic checkpoint and database lifecycle
 events from core.  Umbra translates them into private MAP operations.  A
-checkpoint flushes dirty MAP pages.  Immediate and registered relation syncs
-flush matching MAP pages before syncing their relation storage.  Relation,
-database, and tablespace invalidation discard matching slots before their files
-can be removed or copied.
+checkpoint flushes dirty ordinary MAP pages, dirty resident roots, and then
+ordinary MAP pages again.  The second scan catches a non-WAL MAP update that
+the first scan passed before its root was written; an update after root output
+leaves the disk root behind and is safe.  Immediate and registered relation
+syncs flush matching pages and roots before syncing their relation storage.
+Relation, database, and tablespace invalidation discard matching page slots and
+root entries before their files can be removed or copied.
 
 Logical truncation lowers the root EOF and clears every stale MAP entry in the
 truncated range.  MAIN physical storage remains append-only in this patch, so
 MAIN truncation does not lower its physical frontier or remove its old physical
-tail.  Transaction and subtransaction abort may leave a stale root behind a
-canonical MAP prefix.  DROP removes the entire private MAP fork, including its
-root.
+tail.  Transaction and subtransaction abort do not roll back a published
+storage EOF.  DROP removes the entire private MAP fork, including its root.
 
 
 Deliberate Limits
@@ -201,13 +217,17 @@ The pool size is fixed at postmaster startup as max(16, NBuffers / 128).  It
 has no access-strategy ring, local MAP buffer pool, pin-count waiter, or
 background mapwriter.
 
-There is no resident root cache; that is a separate later review unit.  This
-patch also does not split next-free allocation from physical capacity, replace
-an existing visible mapping, suppress a full-page image, reclaim or reuse
-physical blocks, preallocate capacity, run a background mapwriter, or handle
-relation generations.  CRC detects an invalid root but does not provide a
-duplicate root or repair arbitrary storage corruption.
+The root cache uses a 2 MiB in-place DSA and can grow under the postmaster to a
+hard 64 MiB limit.  It has no replacement policy: entries remain until relation
+or database invalidation, and a new insertion reports an error if the limit is
+reached.  This is an explicit RFC limitation rather than a claim of unbounded
+relation cardinality.  Each entry stores only the opaque 64-byte root image;
+disk root I/O transfers one zero-padded 512-byte sector.
 
-The lower-bound root contract relies on this patch's append-only physical
-allocation and the allocator's check of the actual data-fork EOF.  A later
-patch that reclaims or reuses physical blocks must revisit that contract.
+This patch can reserve next-free ownership ahead of physical capacity, but it
+does not replace an existing visible mapping, suppress a full-page image,
+reclaim or reuse physical blocks, preallocate capacity in the background, run a
+background mapwriter, or handle relation generations.  CRC detects an invalid
+root but does not provide a duplicate root or repair arbitrary storage
+corruption.  The authoritative runtime EOF contract and append-only physical
+frontier must be revisited before physical blocks can be reclaimed or reused.

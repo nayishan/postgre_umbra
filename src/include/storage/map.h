@@ -20,11 +20,17 @@
 
 typedef struct UmbraFileContext UmbraFileContext;
 typedef struct MapPageDesc MapPageDesc;
+typedef struct MapSuperDesc MapSuperDesc;
 
 typedef struct MapPageBuffer
 {
 	MapPageDesc *desc;
 } MapPageBuffer;
+
+typedef struct MapSuperBuffer
+{
+	MapSuperDesc *desc;
+} MapSuperBuffer;
 
 extern void MapInvalidateRelation(RelFileLocatorBackend rlocator);
 extern void MapInvalidateDatabase(Oid dbid);
@@ -43,5 +49,13 @@ extern char *MapPageBufferGetData(MapPageBuffer buffer);
 extern void MapPageMarkBufferDirty(MapPageBuffer buffer, bool skipFsync,
 								   XLogRecPtr wal_flush_lsn);
 extern void MapPageReleaseBuffer(MapPageBuffer buffer);
+
+extern MapSuperBuffer MapSuperBufferRead(UmbraFileContext *ctx,
+										 RelFileLocatorBackend rlocator,
+										 LWLockMode mode);
+extern char *MapSuperBufferGetData(MapSuperBuffer buffer);
+extern void MapSuperMarkBufferDirty(MapSuperBuffer buffer, bool skipFsync,
+									XLogRecPtr wal_flush_lsn);
+extern void MapSuperReleaseBuffer(MapSuperBuffer buffer);
 
 #endif							/* MAP_H */

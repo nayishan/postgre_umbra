@@ -16,6 +16,7 @@ OBJS = \
 	mapbuf.o \
 	mapclock.o \
 	mapflush.o \
-	mapinit.o
+	mapinit.o \
+	mapsuper.o
 
 include $(top_srcdir)/src/backend/common.mk

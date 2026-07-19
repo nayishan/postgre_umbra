@@ -390,6 +390,8 @@ BufferMapping	"Waiting to associate a data block with a buffer in the buffer poo
 MapPageMapping	"Waiting to associate an Umbra MAP page with a buffer pool slot."
 MapPageContent	"Waiting to read, write, or replace an Umbra MAP page buffer."
 MapPageExtension	"Waiting to extend an Umbra MAP file with initialized pages."
+MapSuperMapping	"Waiting to associate an Umbra MAP root with a resident cache entry."
+MapSuperContent	"Waiting to read or write a resident Umbra MAP root."
 LockManager	"Waiting to read or update information about <quote>heavyweight</quote> locks."
 PredicateLockManager	"Waiting to access predicate lock information used by serializable transactions."
 ParallelHashJoin	"Waiting to synchronize workers during Parallel Hash Join plan execution."

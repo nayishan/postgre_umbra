@@ -99,7 +99,12 @@ extern void ummap_publish_mapping_run(UmbraFileContext *ctx,
 									  BlockNumber nblocks,
 									  XLogRecPtr wal_flush_lsn,
 									  bool skipFsync);
-extern void ummap_prepare_firstborn_range(UmbraFileContext *ctx,
+extern BlockNumber ummap_reserve_physical_run(UmbraFileContext *ctx,
+											RelFileLocatorBackend rlocator,
+											ForkNumber forknum,
+											BlockNumber nblocks,
+											bool skipFsync);
+extern bool ummap_prepare_firstborn_range(UmbraFileContext *ctx,
 										  RelFileLocatorBackend rlocator,
 										  ForkNumber forknum,
 										  BlockNumber first_lblkno,
@@ -135,7 +140,6 @@ extern void ummap_abort_pending_ranges(SubTransactionId subxid);
 extern void ummap_reparent_pending_ranges(SubTransactionId mySubid,
 										  SubTransactionId parentSubid);
 extern bool ummap_has_pending_ranges(void);
-extern bool ummap_has_root_updates(void);
 extern void ummap_publish_ready_ranges(void);
 extern void ummap_prepare_replay_range(UmbraFileContext *ctx,
 									   RelFileLocatorBackend rlocator,
