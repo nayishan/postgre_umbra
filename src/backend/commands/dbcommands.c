@@ -1664,6 +1664,7 @@ createdb_failure_callback(int code, Datum arg)
 	if (fparms->strategy == CREATEDB_WAL_LOG)
 	{
 		DropDatabaseBuffers(fparms->dest_dboid);
+		smgrinvalidatedatabase(fparms->dest_dboid);
 		ForgetDatabaseSyncRequests(fparms->dest_dboid);
 
 		/* Release lock on the target database. */
@@ -1874,6 +1875,7 @@ dropdb(const char *dbname, bool missing_ok, bool force)
 	 * dirty buffer to the dead database later...
 	 */
 	DropDatabaseBuffers(db_id);
+	smgrinvalidatedatabase(db_id);
 
 	/*
 	 * Tell checkpointer to forget any pending fsync and unlink requests for
@@ -2165,6 +2167,7 @@ movedb(const char *dbname, const char *tblspcname)
 	 * src_tblspcoid, but bufmgr.c presently provides no API for that.
 	 */
 	DropDatabaseBuffers(db_id);
+	smgrinvalidatedatabasetablespace(db_id, src_tblspcoid);
 
 	/*
 	 * Check for existence of files in the target directory, i.e., objects of
@@ -3371,6 +3374,8 @@ dbase_redo(XLogReaderState *record)
 		 * up-to-date for the copy.
 		 */
 		FlushDatabaseBuffers(xlrec->src_db_id);
+		smgrflushdatabasetablespace(xlrec->src_db_id,
+									xlrec->src_tablespace_id);
 
 		/* Close all smgr fds in all backends. */
 		WaitForProcSignalBarrier(EmitProcSignalBarrier(PROCSIGNAL_BARRIER_SMGRRELEASE));
@@ -3432,6 +3437,7 @@ dbase_redo(XLogReaderState *record)
 
 		/* Drop pages for this database that are in the shared buffer cache */
 		DropDatabaseBuffers(xlrec->db_id);
+		smgrinvalidatedatabase(xlrec->db_id);
 
 		/* Also, clean out any fsync requests that might be pending in md.c */
 		ForgetDatabaseSyncRequests(xlrec->db_id);

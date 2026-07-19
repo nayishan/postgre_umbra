@@ -42,9 +42,11 @@ extern void ummap_registersync_if_exists(UmbraFileContext *ctx);
 extern void ummap_unlink(RelFileLocatorBackend rlocator, bool isRedo);
 
 extern BlockNumber ummap_lookup_block(UmbraFileContext *ctx,
+									  RelFileLocatorBackend rlocator,
 									  ForkNumber forknum,
 									  BlockNumber lblkno);
 extern BlockNumber ummap_lookup_run(UmbraFileContext *ctx,
+									RelFileLocatorBackend rlocator,
 									ForkNumber forknum,
 									BlockNumber lblkno,
 									BlockNumber maxblocks,
@@ -54,10 +56,12 @@ extern BlockNumber ummap_identity_run_limit(ForkNumber forknum,
 											BlockNumber maxblocks,
 											BlockNumber *pblkno);
 extern BlockNumber ummap_set_identity_block(UmbraFileContext *ctx,
+											RelFileLocatorBackend rlocator,
 											ForkNumber forknum,
 											BlockNumber lblkno,
 											bool skipFsync);
 extern BlockNumber ummap_set_identity_run(UmbraFileContext *ctx,
+										  RelFileLocatorBackend rlocator,
 										  ForkNumber forknum,
 										  BlockNumber lblkno,
 										  BlockNumber maxblocks,

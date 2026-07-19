@@ -20,6 +20,7 @@
  */
 #include "postgres.h"
 
+#include "storage/map.h"
 #include "storage/smgr.h"
 #include "storage/umfile.h"
 #include "storage/ummap.h"
@@ -120,6 +121,30 @@ uminitnewrelation(SMgrRelation reln, bool needs_wal)
 		ummap_create(state->filectx, false);
 }
 
+void
+umcheckpoint(void)
+{
+	MapCheckpoint();
+}
+
+void
+umflushdatabasetablespace(Oid dbid, Oid spcOid)
+{
+	MapFlushDatabaseTablespace(dbid, spcOid);
+}
+
+void
+uminvalidatedatabase(Oid dbid)
+{
+	MapInvalidateDatabase(dbid);
+}
+
+void
+uminvalidatedatabasetablespace(Oid dbid, Oid spcOid)
+{
+	MapInvalidateDatabaseTablespace(dbid, spcOid);
+}
+
 bool
 umexists(SMgrRelation reln, ForkNumber forknum)
 {
@@ -131,6 +156,7 @@ umunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 {
 	if (forknum == InvalidForkNumber)
 	{
+		MapInvalidateRelation(rlocator);
 		umfile_unlink(rlocator, forknum, isRedo);
 		return;
 	}
@@ -175,10 +201,11 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		BlockNumber run_blocks;
 
 		run_blocks = ummap_identity_run_limit(forknum, lblkno,
-											 blocknum - lblkno + 1, &pblkno);
-		published_blocks = ummap_set_identity_run(ctx, forknum, lblkno,
-											  run_blocks, &published_pblkno,
-											  skipFsync);
+											  blocknum - lblkno + 1, &pblkno);
+		published_blocks = ummap_set_identity_run(ctx, reln->smgr_rlocator,
+												  forknum, lblkno,
+												  run_blocks, &published_pblkno,
+												  skipFsync);
 		if (published_blocks != run_blocks || published_pblkno != pblkno)
 			elog(ERROR,
 				 "identity Umbra map run for fork %d block %u published %u blocks at physical block %u",
@@ -213,7 +240,8 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		run_blocks = ummap_identity_run_limit(forknum, blocknum, remblocks,
 											  &pblkno);
 		umfile_zeroextend(ctx, forknum, pblkno, run_blocks, skipFsync);
-		published_blocks = ummap_set_identity_run(ctx, forknum,
+		published_blocks = ummap_set_identity_run(ctx, reln->smgr_rlocator,
+												  forknum,
 												  blocknum, run_blocks,
 												  &published_pblkno,
 												  skipFsync);
@@ -244,7 +272,8 @@ umprefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	{
 		BlockNumber run_blocks;
 
-		run_blocks = ummap_lookup_run(um_get_filectx(reln), forknum,
+		run_blocks = ummap_lookup_run(um_get_filectx(reln),
+									  reln->smgr_rlocator, forknum,
 									  blocknum, remblocks, &pblkno);
 		if (!umfile_prefetch(um_get_filectx(reln), forknum, pblkno,
 							 run_blocks))
@@ -278,7 +307,8 @@ ummaxcombine(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
 	logical_run = Min(RELSEG_SIZE -
 					  (blocknum % ((BlockNumber) RELSEG_SIZE)),
 					  logical_nblocks - blocknum);
-	map_run = ummap_lookup_run(ctx, forknum, blocknum, logical_run, &pblkno);
+	map_run = ummap_lookup_run(ctx, reln->smgr_rlocator, forknum, blocknum,
+							   logical_run, &pblkno);
 	file_run = umfile_maxcombine(ctx, forknum, pblkno);
 
 	return Min(map_run, (BlockNumber) file_run);
@@ -300,7 +330,8 @@ umreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 	while (nblocks > 0)
 	{
-		run_blocks = ummap_lookup_run(um_get_filectx(reln), forknum,
+		run_blocks = ummap_lookup_run(um_get_filectx(reln),
+									  reln->smgr_rlocator, forknum,
 									  blocknum, nblocks, &pblkno);
 		umfile_readv(um_get_filectx(reln), forknum, pblkno, buffers,
 					 run_blocks);
@@ -328,7 +359,8 @@ umstartreadv(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknum,
 		return;
 	}
 
-	run_blocks = ummap_lookup_run(um_get_filectx(reln), forknum, blocknum,
+	run_blocks = ummap_lookup_run(um_get_filectx(reln),
+								  reln->smgr_rlocator, forknum, blocknum,
 								  nblocks, &pblkno);
 	Assert(run_blocks == nblocks);
 	pgaio_io_set_target_smgr(ioh, reln, forknum, blocknum, run_blocks,
@@ -353,7 +385,8 @@ umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 	while (nblocks > 0)
 	{
-		run_blocks = ummap_lookup_run(um_get_filectx(reln), forknum,
+		run_blocks = ummap_lookup_run(um_get_filectx(reln),
+									  reln->smgr_rlocator, forknum,
 									  blocknum, nblocks, &pblkno);
 		umfile_writev(um_get_filectx(reln), forknum, pblkno, buffers,
 					  run_blocks, skipFsync);
@@ -379,7 +412,8 @@ umwriteback(SMgrRelation reln, ForkNumber forknum,
 
 	while (nblocks > 0)
 	{
-		run_blocks = ummap_lookup_run(um_get_filectx(reln), forknum,
+		run_blocks = ummap_lookup_run(um_get_filectx(reln),
+									  reln->smgr_rlocator, forknum,
 									  blocknum, nblocks, &pblkno);
 		umfile_writeback(um_get_filectx(reln), forknum, pblkno, run_blocks);
 
@@ -406,6 +440,8 @@ umimmedsync(SMgrRelation reln, ForkNumber forknum)
 {
 	UmbraFileContext *ctx = um_get_filectx(reln);
 
+	if (um_fork_uses_map(reln, forknum))
+		MapFlushRelation(ctx, reln->smgr_rlocator);
 	umfile_immedsync(ctx, forknum);
 	if (um_fork_uses_map(reln, forknum))
 		ummap_immedsync_if_exists(ctx);
@@ -416,6 +452,8 @@ umregistersync(SMgrRelation reln, ForkNumber forknum)
 {
 	UmbraFileContext *ctx = um_get_filectx(reln);
 
+	if (um_fork_uses_map(reln, forknum))
+		MapFlushRelation(ctx, reln->smgr_rlocator);
 	umfile_registersync(ctx, forknum);
 	if (um_fork_uses_map(reln, forknum))
 		ummap_registersync_if_exists(ctx);
@@ -427,7 +465,8 @@ umfd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint32 *off)
 	BlockNumber	pblkno;
 
 	if (um_fork_uses_map(reln, forknum))
-		pblkno = ummap_lookup_block(um_get_filectx(reln), forknum, blocknum);
+		pblkno = ummap_lookup_block(um_get_filectx(reln),
+									reln->smgr_rlocator, forknum, blocknum);
 	else
 		pblkno = blocknum;
 	return umfile_fd(um_get_filectx(reln), forknum, pblkno, off);

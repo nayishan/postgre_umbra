@@ -19,7 +19,9 @@
 
 #include <stdio.h>
 
+#include "access/xlogutils.h"
 #include "common/relpath.h"
+#include "storage/map.h"
 #include "storage/umfile.h"
 #include "storage/ummap.h"
 
@@ -40,11 +42,6 @@
 StaticAssertDecl((BLCKSZ % sizeof(BlockNumber)) == 0,
 				 "BLCKSZ must be a multiple of BlockNumber");
 
-static void ummap_init_page(char *page);
-static void ummap_read_page(UmbraFileContext *ctx, BlockNumber map_blkno,
-							char *page);
-static void ummap_write_page(UmbraFileContext *ctx, BlockNumber map_blkno,
-							 char *page, bool skipFsync);
 static BlockNumber ummap_fork_page_index_to_map_blkno(ForkNumber forknum,
 													  BlockNumber fork_page_idx);
 static BlockNumber ummap_map_blkno(ForkNumber forknum, BlockNumber lblkno);
@@ -101,25 +98,27 @@ ummap_registersync_if_exists(UmbraFileContext *ctx)
 void
 ummap_unlink(RelFileLocatorBackend rlocator, bool isRedo)
 {
+	MapInvalidateRelation(rlocator);
 	umfile_unlink(rlocator, UMBRA_MAP_FORKNUM, isRedo);
 }
 
 BlockNumber
-ummap_lookup_block(UmbraFileContext *ctx, ForkNumber forknum,
+ummap_lookup_block(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
+				   ForkNumber forknum,
 				   BlockNumber lblkno)
 {
 	BlockNumber pblkno;
 
-	(void) ummap_lookup_run(ctx, forknum, lblkno, 1, &pblkno);
+	(void) ummap_lookup_run(ctx, rlocator, forknum, lblkno, 1, &pblkno);
 	return pblkno;
 }
 
 BlockNumber
-ummap_lookup_run(UmbraFileContext *ctx, ForkNumber forknum,
+ummap_lookup_run(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
+				 ForkNumber forknum,
 				 BlockNumber lblkno, BlockNumber maxblocks,
 				 BlockNumber *pblkno)
 {
-	PGIOAlignedBlock page;
 	BlockNumber map_nblocks;
 	BlockNumber run_blocks = 0;
 
@@ -142,15 +141,29 @@ ummap_lookup_run(UmbraFileContext *ctx, ForkNumber forknum,
 		BlockNumber page_lblkno = lblkno + run_blocks;
 		BlockNumber map_blkno;
 		BlockNumber page_limit;
+		MapPageBuffer buffer;
+		char	   *page;
 		int			entry_idx;
 
 		map_blkno = ummap_map_blkno(forknum, page_lblkno);
 		if (map_blkno >= map_nblocks)
+		{
+			if (InRecovery)
+			{
+				if (run_blocks > 0)
+					return run_blocks;
+				return ummap_set_identity_run(ctx, rlocator, forknum,
+											  page_lblkno, maxblocks, pblkno,
+											  false);
+			}
 			elog(ERROR,
 				 "missing Umbra map page %u for fork %d block %u",
 				 map_blkno, (int) forknum, page_lblkno);
+		}
 
-		ummap_read_page(ctx, map_blkno, page.data);
+		buffer = MapPageBufferRead(ctx, rlocator, map_blkno, false, false,
+								   LW_SHARED);
+		page = MapPageBufferGetData(buffer);
 		entry_idx = ummap_entry_index(page_lblkno);
 		page_limit = ummap_page_run_limit(page_lblkno,
 										  maxblocks - run_blocks);
@@ -160,19 +173,34 @@ ummap_lookup_run(UmbraFileContext *ctx, ForkNumber forknum,
 			BlockNumber entry_lblkno = page_lblkno + i;
 			BlockNumber entry_pblkno;
 
-			entry_pblkno = ummap_page_get_entry(page.data, entry_idx + i);
+			entry_pblkno = ummap_page_get_entry(page, entry_idx + i);
 			if (!BlockNumberIsValid(entry_pblkno))
+			{
+				MapPageReleaseBuffer(buffer);
+				if (InRecovery)
+				{
+					if (run_blocks > 0)
+						return run_blocks;
+					return ummap_set_identity_run(ctx, rlocator, forknum,
+												  entry_lblkno, maxblocks,
+												  pblkno, false);
+				}
 				elog(ERROR, "missing Umbra map entry for fork %d block %u",
 					 (int) forknum, entry_lblkno);
+			}
 
 			if (run_blocks == 0)
 				*pblkno = entry_pblkno;
 			else if ((uint64) entry_pblkno !=
 					 (uint64) *pblkno + run_blocks)
+			{
+				MapPageReleaseBuffer(buffer);
 				return run_blocks;
+			}
 
 			run_blocks++;
 		}
+		MapPageReleaseBuffer(buffer);
 	}
 
 	return run_blocks;
@@ -193,25 +221,27 @@ ummap_identity_run_limit(ForkNumber forknum, BlockNumber lblkno,
 }
 
 BlockNumber
-ummap_set_identity_block(UmbraFileContext *ctx, ForkNumber forknum,
+ummap_set_identity_block(UmbraFileContext *ctx,
+						 RelFileLocatorBackend rlocator, ForkNumber forknum,
 						 BlockNumber lblkno, bool skipFsync)
 {
 	BlockNumber pblkno;
 
-	(void) ummap_set_identity_run(ctx, forknum, lblkno, 1, &pblkno,
+	(void) ummap_set_identity_run(ctx, rlocator, forknum, lblkno, 1, &pblkno,
 								  skipFsync);
 	return pblkno;
 }
 
 BlockNumber
-ummap_set_identity_run(UmbraFileContext *ctx, ForkNumber forknum,
+ummap_set_identity_run(UmbraFileContext *ctx,
+					   RelFileLocatorBackend rlocator, ForkNumber forknum,
 					   BlockNumber lblkno, BlockNumber maxblocks,
 					   BlockNumber *pblkno, bool skipFsync)
 {
-	PGIOAlignedBlock page;
 	BlockNumber map_blkno;
-	BlockNumber nblocks;
 	BlockNumber run_limit;
+	MapPageBuffer buffer;
+	char	   *page;
 	bool		dirty = false;
 	int			entry_idx;
 
@@ -229,53 +259,46 @@ ummap_set_identity_run(UmbraFileContext *ctx, ForkNumber forknum,
 			 (int) forknum, lblkno);
 
 	map_blkno = ummap_map_blkno(forknum, lblkno);
-	nblocks = umfile_nblocks(ctx, UMBRA_MAP_FORKNUM);
 	entry_idx = ummap_entry_index(lblkno);
 	run_limit = ummap_identity_run_limit(forknum, lblkno, maxblocks, pblkno);
 
-	while (nblocks < map_blkno)
-	{
-		ummap_init_page(page.data);
-		umfile_extend(ctx, UMBRA_MAP_FORKNUM, nblocks, page.data, skipFsync);
-		nblocks++;
-	}
-
-	if (nblocks == map_blkno)
-	{
-		ummap_init_page(page.data);
-
-		for (BlockNumber i = 0; i < run_limit; i++)
-			ummap_page_set_entry(page.data, entry_idx + i, lblkno + i);
-
-		umfile_extend(ctx, UMBRA_MAP_FORKNUM, map_blkno, page.data,
-					  skipFsync);
-		return run_limit;
-	}
-
-	ummap_read_page(ctx, map_blkno, page.data);
+	buffer = MapPageBufferRead(ctx, rlocator, map_blkno, true, skipFsync,
+							   LW_EXCLUSIVE);
+	page = MapPageBufferGetData(buffer);
 
 	for (BlockNumber i = 0; i < run_limit; i++)
 	{
 		BlockNumber entry_lblkno = lblkno + i;
 		BlockNumber entry_pblkno;
 
-		entry_pblkno = ummap_page_get_entry(page.data, entry_idx + i);
+		entry_pblkno = ummap_page_get_entry(page, entry_idx + i);
 		if (BlockNumberIsValid(entry_pblkno))
 		{
 			if (entry_pblkno != entry_lblkno)
+			{
+				MapPageReleaseBuffer(buffer);
 				elog(ERROR,
 					 "non-identity Umbra map entry for fork %d block %u points to %u",
 					 (int) forknum, entry_lblkno, entry_pblkno);
+			}
 			continue;
 		}
 
-		ummap_page_set_entry(page.data, entry_idx + i, entry_lblkno);
 		dirty = true;
 	}
 
 	if (dirty)
-		ummap_write_page(ctx, map_blkno, page.data, skipFsync);
+	{
+		for (BlockNumber i = 0; i < run_limit; i++)
+		{
+			if (!BlockNumberIsValid(
+									ummap_page_get_entry(page, entry_idx + i)))
+				ummap_page_set_entry(page, entry_idx + i, lblkno + i);
+		}
+		MapPageMarkBufferDirty(buffer, skipFsync);
+	}
 
+	MapPageReleaseBuffer(buffer);
 	return run_limit;
 }
 
@@ -285,34 +308,6 @@ ummap_tracks_fork(ForkNumber forknum)
 	return forknum == MAIN_FORKNUM ||
 		forknum == FSM_FORKNUM ||
 		forknum == VISIBILITYMAP_FORKNUM;
-}
-
-static void
-ummap_init_page(char *page)
-{
-	BlockNumber *entries = (BlockNumber *) page;
-
-	for (int i = 0; i < UMMAP_ENTRIES_PER_PAGE; i++)
-		entries[i] = InvalidBlockNumber;
-}
-
-static void
-ummap_read_page(UmbraFileContext *ctx, BlockNumber map_blkno, char *page)
-{
-	void	   *buffers[1];
-
-	buffers[0] = page;
-	umfile_readv(ctx, UMBRA_MAP_FORKNUM, map_blkno, buffers, 1);
-}
-
-static void
-ummap_write_page(UmbraFileContext *ctx, BlockNumber map_blkno, char *page,
-				 bool skipFsync)
-{
-	const void *buffers[1];
-
-	buffers[0] = page;
-	umfile_writev(ctx, UMBRA_MAP_FORKNUM, map_blkno, buffers, 1, skipFsync);
 }
 
 static BlockNumber

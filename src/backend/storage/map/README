@@ -1,0 +1,80 @@
+Ordinary Umbra MAP Page Pool
+============================
+
+Umbra stores logical-to-physical translations in a relation-local private MAP
+fork.  This directory implements a small shared pool for ordinary MAP pages.
+`ummap.c` owns the MAP layout and interprets entries; the pool owns residency,
+concurrency, and writeback of whole ordinary MAP pages.
+
+The pool deliberately follows the core ownership and replacement rules of the
+PostgreSQL shared buffer pool.  It is not a second general-purpose buffer
+manager: it caches only Umbra MAP metadata, not relation data pages.
+
+
+Tags, Pins, and Content Locks
+-----------------------------
+
+Each pool entry is tagged with a RelFileLocatorBackend and a MAP block number.
+A partitioned mapping lock protects the tag-to-slot hash table.  A lookup that
+finds a tag increments the slot's pin count before releasing that mapping lock.
+Once pinned, the slot cannot be recycled for another MAP page.  This is the
+same handoff rule used by shared buffers.
+
+A pin protects the slot identity and page memory.  The content lock protects
+the page contents.  Callers hold a pin and a shared content lock to inspect
+entries, or an exclusive content lock to modify them.  Pins and input I/O
+ownership are registered with the current ResourceOwner, so ERROR and
+subtransaction cleanup cannot leave a slot pinned or an input I/O owner
+behind.
+
+Input publishes a tagged slot as I/O in progress before reading it.  The slot
+becomes valid only after the read completes.  A failed input removes the hash
+entry and tag before the slot can be reused.  Thus a hash lookup never grants
+access to a page whose input failed.
+
+
+Replacement and Writeback
+-------------------------
+
+The pool has a freelist and a clock sweep.  A clock candidate is claimed by
+atomically changing its pin count from zero to one before it is returned to a
+caller.  A dirty victim is written before its tag can be reused.  The old and
+new mapping partitions are locked in partition-number order while a tag is
+replaced.
+
+Output holds the I/O and exclusive content locks.  A successful write clears
+the dirty state.  An error leaves the page dirty for a later retry and releases
+the locks through the normal ERROR path.
+
+
+MAP Page Format
+---------------
+
+An ordinary MAP entry that has no mapping is InvalidBlockNumber.  When this
+patch extends the MAP fork, every newly created ordinary MAP page, including
+intermediate gap pages, is written as 0xFF.  Consequently an all-zero ordinary
+MAP page is corruption, not an alternative representation of an unmapped page.
+
+
+Lifecycle
+---------
+
+The selected storage manager receives generic checkpoint and database lifecycle
+events from core.  Umbra translates them into private MAP operations.  A
+checkpoint flushes dirty MAP pages.  Immediate and registered relation syncs
+flush matching MAP pages before syncing their relation storage.  Relation,
+database, and tablespace invalidation discard matching slots before their files
+can be removed or copied.
+
+
+Deliberate Limits
+-----------------
+
+The pool size is fixed at postmaster startup as max(16, NBuffers / 128).  It
+has no access-strategy ring, local MAP buffer pool, pin-count waiter, or
+background mapwriter.
+
+The current identity format fixes logical block L to physical block L.  It has
+no MAP page LSN and no WAL-before-MAP write rule.  The first non-identity
+mapping patch must add the WAL record, redo rule, and exact WAL flush ordering
+needed before a dirty MAP page can reach disk.

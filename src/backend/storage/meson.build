@@ -8,5 +8,8 @@ subdir('ipc')
 subdir('large_object')
 subdir('lmgr')
 subdir('page')
+if get_option('umbra')
+  subdir('map')
+endif
 subdir('smgr')
 subdir('sync')
