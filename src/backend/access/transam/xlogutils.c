@@ -403,6 +403,15 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 	if (XLogRecBlockImageApply(record, block_id))
 	{
 		Assert(XLogRecHasBlockImage(record, block_id));
+#ifdef USE_UMBRA
+		if (existing_remap)
+		{
+			remap_reln = smgropen(rlocator, INVALID_PROC_NUMBER);
+			UmSwitchReplayBlockRemap(remap_reln, forknum, blkno,
+								 blkref->old_pblkno,
+								 blkref->first_pblkno);
+		}
+#endif
 		*buf = XLogReadBufferExtended(rlocator, forknum, blkno,
 									  get_cleanup_lock ? RBM_ZERO_AND_CLEANUP_LOCK : RBM_ZERO_AND_LOCK,
 									  prefetch_buffer);

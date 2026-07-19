@@ -7457,6 +7457,11 @@ CreateCheckPoint(int flags)
 	/* Run these points outside the critical section. */
 	INJECTION_POINT("create-checkpoint-initial", NULL);
 	INJECTION_POINT_LOAD("create-checkpoint-run");
+#ifdef USE_UMBRA
+	INJECTION_POINT_LOAD("umbra-checkpoint-after-capture-before-redo");
+	CheckPointBuffersCaptureBegin();
+	INJECTION_POINT_CACHED("umbra-checkpoint-after-capture-before-redo", NULL);
+#endif
 
 	/*
 	 * Use a critical section to force system panic if we have trouble.
@@ -7502,6 +7507,9 @@ CreateCheckPoint(int flags)
 		if (last_important_lsn == ControlFile->checkPoint)
 		{
 			END_CRIT_SECTION();
+#ifdef USE_UMBRA
+			CheckPointBuffersAbort();
+#endif
 			ereport(DEBUG1,
 					(errmsg_internal("checkpoint skipped because system is idle")));
 			return false;
@@ -8068,6 +8076,11 @@ CreateOverwriteContrecordRecord(XLogRecPtr aborted_lsn, XLogRecPtr pagePtr,
 static void
 CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 {
+#ifdef USE_UMBRA
+	VirtualTransactionId *umbra_vxids = NULL;
+	int			umbra_nvxids;
+#endif
+
 	CheckPointRelationMap();
 	CheckPointReplicationSlots(flags & CHECKPOINT_IS_SHUTDOWN);
 	CheckPointSnapBuild();
@@ -8082,8 +8095,43 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 	CheckPointSUBTRANS();
 	CheckPointMultiXact();
 	CheckPointPredicate();
+#ifdef USE_UMBRA
+	PG_TRY();
+	{
+		/* Capture is already visible; now take a fresh delay snapshot. */
+		INJECTION_POINT_LOAD("umbra-checkpoint-after-capture");
+		INJECTION_POINT_CACHED("umbra-checkpoint-after-capture", NULL);
+		umbra_vxids = GetVirtualXIDsDelayingChkpt(&umbra_nvxids,
+												 DELAY_CHKPT_START);
+		while (umbra_nvxids > 0 &&
+			   HaveVirtualXIDsDelayingChkpt(umbra_vxids, umbra_nvxids,
+										 DELAY_CHKPT_START))
+		{
+			AbsorbSyncRequests();
+			pgstat_report_wait_start(WAIT_EVENT_CHECKPOINT_DELAY_START);
+			pg_usleep(10000L);
+			pgstat_report_wait_end();
+		}
+		pfree(umbra_vxids);
+		umbra_vxids = NULL;
+
+		/* Select buffers before MAP checkpoint can publish new P values. */
+		CheckPointBuffersPrepare(flags);
+		smgrcheckpoint();
+		CheckPointBuffers(flags);
+	}
+	PG_CATCH();
+	{
+		if (umbra_vxids != NULL)
+			pfree(umbra_vxids);
+		CheckPointBuffersAbort();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+#else
 	smgrcheckpoint();
 	CheckPointBuffers(flags);
+#endif
 
 	/* Perform all queued up fsyncs */
 	TRACE_POSTGRESQL_BUFFER_CHECKPOINT_SYNC_START();
@@ -8225,6 +8273,9 @@ CreateRestartPoint(int flags)
 	 * during recovery this is just pro forma, because no WAL insertions are
 	 * happening.
 	 */
+#ifdef USE_UMBRA
+	CheckPointBuffersCaptureBegin();
+#endif
 	WALInsertLockAcquireExclusive();
 	RedoRecPtr = XLogCtl->Insert.RedoRecPtr = lastCheckPoint.redo;
 	WALInsertLockRelease();

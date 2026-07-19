@@ -1971,7 +1971,7 @@ DecodeXLogRecord(XLogReaderState *state,
 			if (blk->has_remap && BlockNumberIsValid(blk->old_pblkno) &&
 				(blk->first_lblkno != blk->blkno || blk->nblocks != 1 ||
 				 blk->first_pblkno == blk->old_pblkno ||
-				 blk->has_image ||
+				 blk->has_image != blk->apply_image ||
 				 (blk->flags & BKPBLOCK_WILL_INIT) != 0))
 			{
 				report_invalid_record(state,

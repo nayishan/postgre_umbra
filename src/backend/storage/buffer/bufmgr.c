@@ -637,6 +637,7 @@ static bool PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy,
 static void PinBuffer_Locked(BufferDesc *buf);
 static void UnpinBuffer(BufferDesc *buf);
 static void UnpinBufferNoOwner(BufferDesc *buf);
+static int	BufferSyncPrepare(int flags);
 static void BufferSync(int flags);
 static int	SyncOneBuffer(int buf_id, bool skip_recently_used,
 						  WritebackContext *wb_context);
@@ -662,6 +663,15 @@ static void FlushUnlockedBuffer(BufferDesc *buf, SMgrRelation reln,
 								IOObject io_object, IOContext io_context);
 static void FlushBuffer(BufferDesc *buf, SMgrRelation reln,
 						IOObject io_object, IOContext io_context);
+#ifdef USE_UMBRA
+#define CKPT_BUFFER_EPOCH_ACTIVE	(UINT64CONST(1) << 63)
+#define CKPT_BUFFER_EPOCH_MASK	(~CKPT_BUFFER_EPOCH_ACTIVE)
+static bool CkptBufferIdsPrepared = false;
+static int	CkptBufferIdsPreparedCount = 0;
+static uint64 CheckpointBufferActiveEpoch(void);
+static void CheckpointBufferCaptureBegin(void);
+static void CheckpointBufferCaptureEnd(void);
+#endif
 static void FindAndDropRelationBuffers(RelFileLocator rlocator,
 									   ForkNumber forkNum,
 									   BlockNumber nForkBlock,
@@ -3547,31 +3557,19 @@ TrackNewBufferPin(Buffer buf)
 #define ST_DEFINE
 #include "lib/sort_template.h"
 
-/*
- * BufferSync -- Write out all dirty buffers in the pool.
- *
- * This is called at checkpoint time to write out all dirty shared buffers.
- * The checkpoint request flags should be passed in.  If CHECKPOINT_FAST is
- * set, we disable delays between writes; if CHECKPOINT_IS_SHUTDOWN,
- * CHECKPOINT_END_OF_RECOVERY or CHECKPOINT_FLUSH_UNLOGGED is set, we write
- * even unlogged buffers, which are otherwise skipped.  The remaining flags
- * currently have no effect here.
- */
-static void
-BufferSync(int flags)
+/* Select this checkpoint's buffers before storage metadata is flushed. */
+static int
+BufferSyncPrepare(int flags)
 {
 	uint64		buf_state;
 	int			buf_id;
-	int			num_to_scan;
-	int			num_spaces;
-	int			num_processed;
-	int			num_written;
-	CkptTsStatus *per_ts_stat = NULL;
-	Oid			last_tsid;
-	binaryheap *ts_heap;
-	int			i;
+	int			num_to_scan = 0;
 	uint64		mask = BM_DIRTY;
-	WritebackContext wb_context;
+
+#ifdef USE_UMBRA
+	if (CheckpointBufferActiveEpoch() == 0)
+		CheckpointBufferCaptureBegin();
+#endif
 
 	/*
 	 * Unless this is a shutdown checkpoint or we have been explicitly told,
@@ -3598,7 +3596,6 @@ BufferSync(int flags)
 	 * BM_CHECKPOINT_NEEDED still set.  This is OK since any such buffer would
 	 * certainly need to be written for the next checkpoint attempt, too.
 	 */
-	num_to_scan = 0;
 	for (buf_id = 0; buf_id < NBuffers; buf_id++)
 	{
 		BufferDesc *bufHdr = GetBufferDescriptor(buf_id);
@@ -3633,8 +3630,51 @@ BufferSync(int flags)
 			ProcessProcSignalBarrier();
 	}
 
+	return num_to_scan;
+}
+
+/*
+ * BufferSync -- Write out all dirty buffers in the pool.
+ *
+ * This is called at checkpoint time to write out all dirty shared buffers.
+ * The checkpoint request flags should be passed in.  If CHECKPOINT_FAST is
+ * set, we disable delays between writes; if CHECKPOINT_IS_SHUTDOWN,
+ * CHECKPOINT_END_OF_RECOVERY or CHECKPOINT_FLUSH_UNLOGGED is set, we write
+ * even unlogged buffers, which are otherwise skipped.  The remaining flags
+ * currently have no effect here.
+ */
+static void
+BufferSync(int flags)
+{
+	int			buf_id;
+	int			num_to_scan;
+	int			num_spaces;
+	int			num_processed;
+	int			num_written;
+	CkptTsStatus *per_ts_stat = NULL;
+	Oid			last_tsid;
+	binaryheap *ts_heap;
+	int			i;
+	WritebackContext wb_context;
+
+#ifdef USE_UMBRA
+	if (CkptBufferIdsPrepared)
+	{
+		num_to_scan = CkptBufferIdsPreparedCount;
+		CkptBufferIdsPrepared = false;
+		CkptBufferIdsPreparedCount = 0;
+	}
+	else
+#endif
+		num_to_scan = BufferSyncPrepare(flags);
+
 	if (num_to_scan == 0)
+	{
+#ifdef USE_UMBRA
+		CheckpointBufferCaptureEnd();
+#endif
 		return;					/* nothing to do */
+	}
 
 	WritebackContextInit(&wb_context, &checkpoint_flush_after);
 
@@ -3823,7 +3863,75 @@ BufferSync(int flags)
 	CheckpointStats.ckpt_bufs_written += num_written;
 
 	TRACE_POSTGRESQL_BUFFER_SYNC_DONE(NBuffers, num_written, num_to_scan);
+
+#ifdef USE_UMBRA
+	CheckpointBufferCaptureEnd();
+#endif
 }
+
+#ifdef USE_UMBRA
+void
+CheckPointBuffersPrepare(int flags)
+{
+	CkptBufferIdsPreparedCount = BufferSyncPrepare(flags);
+	CkptBufferIdsPrepared = true;
+}
+
+void
+CheckPointBuffersCaptureBegin(void)
+{
+	CheckpointBufferCaptureBegin();
+}
+
+bool
+CheckpointBufferCaptureIsActive(void)
+{
+	return CheckpointBufferActiveEpoch() != 0;
+}
+
+void
+CheckPointBuffersAbort(void)
+{
+	CkptBufferIdsPrepared = false;
+	CkptBufferIdsPreparedCount = 0;
+	CheckpointBufferCaptureEnd();
+}
+
+static void
+CheckpointBufferCaptureBegin(void)
+{
+	uint64		epoch_state;
+	uint64		epoch;
+
+	epoch_state = pg_atomic_read_u64(CkptBufferCaptureEpoch);
+	epoch = (epoch_state & CKPT_BUFFER_EPOCH_MASK) + 1;
+	if (epoch == 0 || epoch > CKPT_BUFFER_EPOCH_MASK)
+		epoch = 1;
+	pg_atomic_write_u64(CkptBufferCaptureEpoch,
+						CKPT_BUFFER_EPOCH_ACTIVE | epoch);
+}
+
+static void
+CheckpointBufferCaptureEnd(void)
+{
+	uint64		epoch_state;
+
+	epoch_state = pg_atomic_read_u64(CkptBufferCaptureEpoch);
+	pg_atomic_write_u64(CkptBufferCaptureEpoch,
+						epoch_state & CKPT_BUFFER_EPOCH_MASK);
+}
+
+static uint64
+CheckpointBufferActiveEpoch(void)
+{
+	uint64		epoch_state;
+
+	epoch_state = pg_atomic_read_u64(CkptBufferCaptureEpoch);
+	if ((epoch_state & CKPT_BUFFER_EPOCH_ACTIVE) == 0)
+		return 0;
+	return epoch_state & CKPT_BUFFER_EPOCH_MASK;
+}
+#endif
 
 /*
  * BgBufferSync -- Write out some dirty buffers in the pool.
