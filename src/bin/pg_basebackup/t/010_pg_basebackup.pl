@@ -889,6 +889,11 @@ like(slurp_file("$tempdir/backup_dbname_R/postgresql.auto.conf"),
 
 rmtree("$tempdir/backup_dbname_R");
 
+SKIP:
+{
+	skip 'Umbra mapped forks use logical checksum block identities', 10
+	  if check_pg_config('^#define USE_UMBRA 1$');
+
 # create tables to corrupt and get their relfilenodes
 my $file_corrupt1 = $node->safe_psql('postgres',
 	q{CREATE TABLE corrupt1 AS SELECT a FROM generate_series(1,10000) AS a; ALTER TABLE corrupt1 SET (autovacuum_enabled=false); SELECT pg_relation_filepath('corrupt1')}
@@ -954,6 +959,7 @@ rmtree("$tempdir/backup_corrupt4");
 
 $node->safe_psql('postgres', "DROP TABLE corrupt1;");
 $node->safe_psql('postgres', "DROP TABLE corrupt2;");
+}
 
 note "Testing pg_basebackup with compression methods";
 
