@@ -1,6 +1,6 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# Verify the no-superblock Umbra identity MAP introduced by this patch.
+# Verify Umbra identity MAP entries and private-fork lifecycle.
 
 use strict;
 use warnings FATAL => 'all';
@@ -12,7 +12,8 @@ use Test::More;
 plan skip_all => 'requires an Umbra storage manager build'
   unless check_pg_config('^#define USE_UMBRA 1$');
 
-# Patch 3 layout: [FSM page][VM page][8192 MAIN pages].
+# Root layout: [superblock][FSM page][VM page][8192 MAIN pages].
+use constant MAP_FIRST_GROUP_BLOCK => 1;
 use constant MAP_GROUP_MAIN_PAGES => 8192;
 use constant MAP_GROUP_TOTAL_PAGES => 8194;
 
@@ -27,15 +28,15 @@ sub map_block_number
 {
 	my ($fork, $fork_page) = @_;
 
-	return $fork_page * MAP_GROUP_TOTAL_PAGES
+	return MAP_FIRST_GROUP_BLOCK + $fork_page * MAP_GROUP_TOTAL_PAGES
 	  if $fork eq 'fsm';
-	return $fork_page * MAP_GROUP_TOTAL_PAGES + 1
+	return MAP_FIRST_GROUP_BLOCK + $fork_page * MAP_GROUP_TOTAL_PAGES + 1
 	  if $fork eq 'vm';
 
 	if ($fork eq 'main')
 	{
 		my $group = int($fork_page / MAP_GROUP_MAIN_PAGES);
-		return $group * MAP_GROUP_TOTAL_PAGES + 2
+		return MAP_FIRST_GROUP_BLOCK + $group * MAP_GROUP_TOTAL_PAGES + 2
 		  + ($fork_page % MAP_GROUP_MAIN_PAGES);
 	}
 
@@ -196,8 +197,8 @@ is(
 		'SELECT COALESCE((pg_stat_file('
 		  . sql_literal($map_path)
 		  . ', true)).size, -1);'),
-	0,
-	'new identity MAP fork has no superblock and is empty');
+	$block_size,
+	'new identity MAP fork contains one superblock page');
 
 # A PLAIN tuple slightly larger than half a page guarantees one heap tuple
 # per page.  This crosses the first MAIN MAP page with about 16MB on an 8KB
@@ -231,8 +232,8 @@ my $map_size = 0 + $node->safe_psql(
 	'SELECT (pg_stat_file('
 	  . sql_literal($map_path)
 	  . ', false)).size;');
-cmp_ok($map_size / $block_size, '>=', 4,
-	'MAP contains FSM, VM, and two MAIN map pages');
+cmp_ok($map_size / $block_size, '>=', 5,
+	'MAP contains its superblock, FSM, VM, and two MAIN map pages');
 
 check_identity_maps(
 	$node, $map_path, $block_size, $entries_per_page,

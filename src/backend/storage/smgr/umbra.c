@@ -7,10 +7,9 @@
  * relation fork operations first pass through Umbra's access boundary, then
  * use Umbra's md-style physical segment file layer in umfile.c.
  *
- * The access boundary currently uses the private map fork in identity mode:
- * extension paths materialize new map entries as logical block L -> physical
- * block L.  Later MAP/remap work can replace that identity publication while
- * keeping smgr callbacks separate from physical segment I/O.
+ * The access boundary uses a private map fork whose entries own exact L -> P
+ * translations.  Its disk root summarizes logical EOF and the append-only
+ * physical frontier without replacing per-block MAP authority.
  *
  * Relation-local private map fork handling lives in ummap.c.
  *
@@ -148,7 +147,21 @@ umcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 	{
 		state->uses_map = true;
 		if (!ummap_exists(ctx))
-			ummap_create(ctx, true);
+			ummap_create(ctx, reln->smgr_rlocator, true);
+	}
+
+	if (state->uses_map && forknum != MAIN_FORKNUM &&
+		ummap_tracks_fork(forknum))
+	{
+		BlockNumber logical_eof;
+		BlockNumber physical_frontier;
+
+		ummap_root_read_frontiers(ctx, reln->smgr_rlocator, forknum,
+								   &logical_eof, &physical_frontier);
+		if (!BlockNumberIsValid(logical_eof))
+			ummap_root_set_logical(ctx, reln->smgr_rlocator, forknum, 0,
+								   umfile_nblocks(ctx, forknum),
+								   InvalidXLogRecPtr, false);
 	}
 }
 
@@ -160,7 +173,7 @@ uminitnewrelation(SMgrRelation reln, bool needs_wal)
 	Assert(state != NULL);
 	state->uses_map = needs_wal;
 	if (needs_wal)
-		ummap_create(state->filectx, false);
+		ummap_create(state->filectx, reln->smgr_rlocator, false);
 }
 
 void
@@ -227,7 +240,23 @@ uminvalidatedatabasetablespace(Oid dbid, Oid spcOid)
 bool
 umexists(SMgrRelation reln, ForkNumber forknum)
 {
-	return umfile_exists(um_get_filectx(reln), forknum);
+	UmbraFileContext *ctx = um_get_filectx(reln);
+
+	if (!umfile_exists(ctx, forknum))
+		return false;
+	if (um_fork_uses_map(reln, forknum))
+	{
+		BlockNumber logical_eof;
+		BlockNumber physical_frontier;
+
+		if (!ummap_exists(ctx))
+			return false;
+		ummap_root_read_frontiers(ctx, reln->smgr_rlocator, forknum,
+								   &logical_eof, &physical_frontier);
+		return BlockNumberIsValid(logical_eof) &&
+			BlockNumberIsValid(physical_frontier);
+	}
+	return true;
 }
 
 void
@@ -285,6 +314,9 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 								  logical_nblocks, logical_nblocks,
 								  blocknum - logical_nblocks + 1,
 								  InvalidXLogRecPtr, skipFsync);
+		ummap_root_advance(ctx, reln->smgr_rlocator, forknum, blocknum + 1,
+							 umfile_nblocks(ctx, forknum), InvalidXLogRecPtr,
+							 skipFsync);
 		return;
 	}
 
@@ -349,9 +381,15 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		pblkno = physical_nblocks + (blocknum - logical_nblocks);
 		umfile_extend(ctx, forknum, pblkno, buffer, skipFsync);
 		if (!uses_wal)
+		{
 			ummap_publish_mapping_run(ctx, reln->smgr_rlocator, forknum,
 									  logical_nblocks, physical_nblocks,
 									  nblocks, InvalidXLogRecPtr, skipFsync);
+			ummap_root_advance(ctx, reln->smgr_rlocator, forknum,
+								 logical_nblocks + nblocks,
+								 umfile_nblocks(ctx, forknum),
+								 InvalidXLogRecPtr, skipFsync);
+		}
 		else
 			ummap_prepare_firstborn_range(ctx, reln->smgr_rlocator,
 												 forknum, logical_nblocks,
@@ -401,6 +439,10 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 								  logical_nblocks, logical_nblocks,
 								  blocknum - logical_nblocks + nblocks,
 								  InvalidXLogRecPtr, skipFsync);
+		ummap_root_advance(ctx, reln->smgr_rlocator, forknum,
+							 blocknum + (BlockNumber) nblocks,
+							 umfile_nblocks(ctx, forknum), InvalidXLogRecPtr,
+							 skipFsync);
 		return;
 	}
 
@@ -530,10 +572,16 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		um_ensure_physical_capacity(ctx, forknum, first_pblkno, range_nblocks,
 								 skipFsync);
 		if (!uses_wal)
+		{
 			ummap_publish_mapping_run(ctx, reln->smgr_rlocator, forknum,
 									  logical_nblocks, first_pblkno,
 									  range_nblocks, InvalidXLogRecPtr,
 									  skipFsync);
+			ummap_root_advance(ctx, reln->smgr_rlocator, forknum,
+								 logical_nblocks + range_nblocks,
+								 umfile_nblocks(ctx, forknum),
+								 InvalidXLogRecPtr, skipFsync);
+		}
 		else
 			ummap_prepare_firstborn_range(ctx, reln->smgr_rlocator,
 												 forknum, logical_nblocks,
@@ -774,6 +822,8 @@ UmCheckRecoveryDependencies(void)
 {
 	if (ummap_has_replay_ranges())
 		elog(PANIC, "Umbra exact replay mapping survived its WAL record");
+	if (ummap_has_root_updates())
+		elog(PANIC, "Umbra normal mapping root update entered recovery");
 	if (ummap_has_recovery_scratch())
 		elog(PANIC,
 			 "WAL ended with unresolved Umbra recovery mappings");
@@ -1042,8 +1092,13 @@ static BlockNumber
 um_get_logical_nblocks(SMgrRelation reln, ForkNumber forknum)
 {
 	if (um_fork_uses_map(reln, forknum))
+	{
+		if (!InRecovery && CritSectionCount == 0 &&
+			(ummap_has_pending_ranges() || ummap_has_root_updates()))
+			UmMappingPublicationDone();
 		return ummap_nblocks(um_get_filectx(reln), reln->smgr_rlocator,
-							 forknum);
+								 forknum);
+	}
 
 	return umfile_nblocks(um_get_filectx(reln), forknum);
 }
@@ -1159,7 +1214,7 @@ um_mapping_xact_callback(XactEvent event, void *arg)
 		event == XACT_EVENT_PRE_PREPARE)
 	{
 		UmMappingPublicationDone();
-		if (ummap_has_pending_ranges())
+		if (ummap_has_pending_ranges() || ummap_has_root_updates())
 			elog(PANIC, "Umbra mapping reached commit before publication");
 		um_end_mapping_checkpoint_delay_if_idle();
 		return;
@@ -1178,7 +1233,7 @@ um_mapping_xact_callback(XactEvent event, void *arg)
 			 event == XACT_EVENT_PARALLEL_COMMIT ||
 			 event == XACT_EVENT_PREPARE)
 	{
-		if (ummap_has_pending_ranges())
+		if (ummap_has_pending_ranges() || ummap_has_root_updates())
 			elog(PANIC, "Umbra mapping survived transaction completion");
 		um_end_mapping_checkpoint_delay_if_idle();
 	}
@@ -1192,7 +1247,10 @@ um_mapping_subxact_callback(SubXactEvent event,
 	(void) arg;
 
 	if (event == SUBXACT_EVENT_COMMIT_SUB)
+	{
+		UmMappingPublicationDone();
 		ummap_reparent_pending_ranges(mySubid, parentSubid);
+	}
 	else if (event == SUBXACT_EVENT_ABORT_SUB)
 	{
 		ummap_abort_pending_ranges(mySubid);

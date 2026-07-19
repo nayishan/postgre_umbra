@@ -3,10 +3,10 @@
  * ummap.c
  *	  Umbra private map fork container.
  *
- * This file owns the private relation-local map fork used by Umbra.  MAP
- * canonical entries are authoritative logical-to-physical translations.
- * Without a superblock, a fork's logical EOF is the first invalid entry in
- * its contiguous MAP prefix.
+ * This file owns the private relation-local map fork used by Umbra.  Block 0
+ * stores a relation-wide disk root, and ordinary MAP pages follow it.  MAP
+ * canonical entries remain the authoritative logical-to-physical
+ * translations; the root stores only logical and physical frontiers.
  *
  * WAL recovery may hold an exact mapping or a disposable scratch mapping
  * behind a pinned visibility barrier.  Neither is canonical: exact mappings
@@ -25,23 +25,34 @@
 #include <stdio.h>
 
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
 #include "common/relpath.h"
 #include "miscadmin.h"
+#include "port/pg_crc32c.h"
 #include "storage/map.h"
 #include "storage/map_internal.h"
 #include "storage/umfile.h"
 #include "storage/ummap.h"
 #include "utils/memutils.h"
 
+#define UMMAP_ROOT_MAGIC		0x554D4252U	/* "UMBR" */
+#define UMMAP_ROOT_VERSION		1U
+#define UMMAP_ROOT_FLAG_FORMAT_V1 0x00000001U
+#define UMMAP_ROOT_PAYLOAD_SIZE	64
+#define UMMAP_ROOT_SECTOR_SIZE	512
+
+#define UMMAP_BLOCK_ROOT			0
+#define UMMAP_BLOCK_FIRST_GROUP	1
+
 #define UMMAP_ENTRIES_PER_PAGE	(BLCKSZ / sizeof(BlockNumber))
 
 /*
- * Fixed no-superblock map layout, following the rebase branch's proportional
- * grouping but starting at map block 0:
+ * Fixed map layout, following the rebase branch's proportional grouping:
  *
- *	[FSM map page][VM map page][8192 MAIN map pages]
+ *	block 0: disk root
+ *	block 1..: [FSM map page][VM map page][8192 MAIN map pages]
  */
 #define UMMAP_GROUP_FSM_PAGES	1
 #define UMMAP_GROUP_VM_PAGES	1
@@ -51,6 +62,34 @@
 
 StaticAssertDecl((BLCKSZ % sizeof(BlockNumber)) == 0,
 				 "BLCKSZ must be a multiple of BlockNumber");
+StaticAssertDecl(BLCKSZ >= UMMAP_ROOT_SECTOR_SIZE,
+				 "BLCKSZ must hold an Umbra MAP root sector");
+StaticAssertDecl(UMMAP_ROOT_SECTOR_SIZE >= UMMAP_ROOT_PAYLOAD_SIZE,
+				 "Umbra MAP root sector must hold its payload");
+
+/* The CRC covers this fixed 64-byte payload; block padding remains zero. */
+typedef struct pg_attribute_packed() UmbraMapRootData
+{
+	uint32		magic;
+	uint32		version;
+	uint32		blcksz;
+	uint32		flags;
+
+	BlockNumber logical_eof_main;
+	BlockNumber logical_eof_fsm;
+	BlockNumber logical_eof_vm;
+	BlockNumber physical_frontier_main;
+	BlockNumber physical_frontier_fsm;
+	BlockNumber physical_frontier_vm;
+
+	uint8		reserved[20];
+	pg_crc32c	crc;
+} UmbraMapRootData;
+
+StaticAssertDecl(sizeof(UmbraMapRootData) == UMMAP_ROOT_PAYLOAD_SIZE,
+				 "Umbra MAP root payload size is wrong");
+StaticAssertDecl(offsetof(UmbraMapRootData, crc) == 60,
+				 "Umbra MAP root CRC offset is wrong");
 
 typedef struct UmbraMapPendingPage
 {
@@ -74,6 +113,7 @@ typedef struct UmbraMapPendingRange
 	bool		wal_ready;
 	XLogRecPtr	wal_lsn;
 	bool		physical_ready;
+	bool		map_published;
 	bool		in_record;
 	int			npages;
 	int			npinned;
@@ -98,12 +138,31 @@ typedef struct UmbraMapRecoveryPending
 } UmbraMapRecoveryPending;
 
 static UmbraMapPendingRange *ummap_pending_ranges = NULL;
+static UmbraMapPendingRange *ummap_root_updates = NULL;
 static UmbraMapRecoveryPending *ummap_replay_ranges = NULL;
 static UmbraMapRecoveryPending *ummap_recovery_scratch = NULL;
 static ResourceOwner ummap_recovery_resowner = NULL;
 
+static void ummap_root_init(PGIOAlignedBlock *page);
+static void ummap_root_refresh_crc(UmbraMapRootData *root);
+static bool ummap_root_is_valid(const UmbraMapRootData *root);
+static void ummap_root_read_locked(UmbraFileContext *ctx,
+									RelFileLocatorBackend rlocator,
+									PGIOAlignedBlock *page);
+static void ummap_root_write_locked(UmbraFileContext *ctx,
+									 RelFileLocatorBackend rlocator,
+									 PGIOAlignedBlock *page,
+									 bool skipFsync);
+static void ummap_root_get_frontiers(const UmbraMapRootData *root,
+									 ForkNumber forknum,
+									 BlockNumber *logical_eof,
+									 BlockNumber *physical_frontier);
+static void ummap_root_set_frontiers(UmbraMapRootData *root,
+									 ForkNumber forknum,
+									 BlockNumber logical_eof,
+									 BlockNumber physical_frontier);
 static BlockNumber ummap_fork_page_index_to_map_blkno(ForkNumber forknum,
-												  BlockNumber fork_page_idx);
+											  BlockNumber fork_page_idx);
 static uint64 ummap_existing_fork_pages(ForkNumber forknum,
 										BlockNumber map_nblocks);
 static BlockNumber ummap_map_blkno(ForkNumber forknum, BlockNumber lblkno);
@@ -132,12 +191,19 @@ static void ummap_prepare_pending_range(UmbraFileContext *ctx,
 	BlockNumber anchor_lblkno, bool wal_only, bool physical_ready,
 	bool install_entries);
 static void ummap_release_pending_range(UmbraMapPendingRange *pending,
-													bool publish, XLogRecPtr lsn);
+												bool publish);
+static void ummap_release_pending_state(UmbraMapPendingRange *pending,
+	bool publish);
+static void ummap_publish_pending_range(UmbraMapPendingRange *pending);
+static void ummap_flush_root_updates(void);
 static bool ummap_has_earlier_pending_range(UmbraMapPendingRange *pending);
 static uint64 ummap_pending_pin_count(void);
 static void ummap_publish_ready_ranges_internal(bool include_local);
 static BlockNumber ummap_advance_local_pending_eof(
 	RelFileLocatorBackend rlocator, ForkNumber forknum, BlockNumber eof);
+static BlockNumber ummap_scan_nblocks(UmbraFileContext *ctx,
+	RelFileLocatorBackend rlocator, ForkNumber forknum,
+	BlockNumber logical_nblocks);
 static bool ummap_lookup_local_pending(RelFileLocatorBackend rlocator,
 	ForkNumber forknum, BlockNumber lblkno, BlockNumber maxblocks,
 	BlockNumber *pblkno, BlockNumber *nblocks, bool *physical_ready);
@@ -192,9 +258,289 @@ ummap_exists(UmbraFileContext *ctx)
 }
 
 void
-ummap_create(UmbraFileContext *ctx, bool isRedo)
+ummap_create(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
+			 bool isRedo)
 {
+	LWLock	   *root_lock;
+
+	MapPageEnsureInitialized();
+	root_lock = MapPageExtensionLock(rlocator);
+	LWLockAcquire(root_lock, LW_EXCLUSIVE);
 	umfile_create(ctx, UMBRA_MAP_FORKNUM, isRedo);
+	if (umfile_nblocks(ctx, UMBRA_MAP_FORKNUM) == 0)
+	{
+		PGIOAlignedBlock page;
+
+		ummap_root_init(&page);
+		umfile_write_bytes(ctx, UMBRA_MAP_FORKNUM, UMMAP_BLOCK_ROOT,
+						   page.data, UMMAP_ROOT_SECTOR_SIZE, false);
+	}
+	LWLockRelease(root_lock);
+}
+
+void
+ummap_root_read_frontiers(UmbraFileContext *ctx,
+						  RelFileLocatorBackend rlocator, ForkNumber forknum,
+						  BlockNumber *logical_eof,
+						  BlockNumber *physical_frontier)
+{
+	PGIOAlignedBlock page;
+	LWLock	   *root_lock;
+
+	Assert(logical_eof != NULL);
+	Assert(physical_frontier != NULL);
+	MapPageEnsureInitialized();
+	root_lock = MapPageExtensionLock(rlocator);
+	LWLockAcquire(root_lock, LW_SHARED);
+	ummap_root_read_locked(ctx, rlocator, &page);
+	ummap_root_get_frontiers((UmbraMapRootData *) page.data, forknum,
+							 logical_eof, physical_frontier);
+	LWLockRelease(root_lock);
+}
+
+/* Advance both frontiers monotonically after flushing their WAL dependency. */
+void
+ummap_root_advance(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
+				   ForkNumber forknum, BlockNumber logical_end,
+				   BlockNumber physical_end, XLogRecPtr wal_flush_lsn,
+				   bool skipFsync)
+{
+	PGIOAlignedBlock page;
+	UmbraMapRootData *root;
+	BlockNumber old_logical;
+	BlockNumber old_physical;
+	LWLock	   *root_lock;
+	bool		dirty = false;
+
+	Assert(BlockNumberIsValid(logical_end));
+	Assert(BlockNumberIsValid(physical_end));
+	if (XLogRecPtrIsValid(wal_flush_lsn))
+		XLogFlush(wal_flush_lsn);
+	MapPageEnsureInitialized();
+	root_lock = MapPageExtensionLock(rlocator);
+	LWLockAcquire(root_lock, LW_EXCLUSIVE);
+	ummap_root_read_locked(ctx, rlocator, &page);
+	root = (UmbraMapRootData *) page.data;
+	ummap_root_get_frontiers(root, forknum, &old_logical,
+							 &old_physical);
+	if (!BlockNumberIsValid(old_logical) || logical_end > old_logical)
+	{
+		old_logical = logical_end;
+		dirty = true;
+	}
+	if (!BlockNumberIsValid(old_physical) || physical_end > old_physical)
+	{
+		old_physical = physical_end;
+		dirty = true;
+	}
+	if (dirty)
+	{
+		ummap_root_set_frontiers(root, forknum, old_logical, old_physical);
+		ummap_root_write_locked(ctx, rlocator, &page, skipFsync);
+	}
+	LWLockRelease(root_lock);
+}
+
+/* Set logical EOF exactly, while keeping the physical frontier monotonic. */
+void
+ummap_root_set_logical(UmbraFileContext *ctx,
+					   RelFileLocatorBackend rlocator, ForkNumber forknum,
+					   BlockNumber logical_eof,
+					   BlockNumber physical_floor,
+					   XLogRecPtr wal_flush_lsn, bool skipFsync)
+{
+	PGIOAlignedBlock page;
+	UmbraMapRootData *root;
+	BlockNumber old_logical;
+	BlockNumber old_physical;
+	LWLock	   *root_lock;
+	bool		dirty;
+
+	Assert(BlockNumberIsValid(logical_eof));
+	Assert(BlockNumberIsValid(physical_floor));
+	if (XLogRecPtrIsValid(wal_flush_lsn))
+		XLogFlush(wal_flush_lsn);
+	MapPageEnsureInitialized();
+	root_lock = MapPageExtensionLock(rlocator);
+	LWLockAcquire(root_lock, LW_EXCLUSIVE);
+	ummap_root_read_locked(ctx, rlocator, &page);
+	root = (UmbraMapRootData *) page.data;
+	ummap_root_get_frontiers(root, forknum, &old_logical,
+							 &old_physical);
+	dirty = logical_eof != old_logical;
+	if (!BlockNumberIsValid(old_physical) ||
+		physical_floor > old_physical)
+	{
+		old_physical = physical_floor;
+		dirty = true;
+	}
+	if (dirty)
+	{
+		ummap_root_set_frontiers(root, forknum, logical_eof, old_physical);
+		ummap_root_write_locked(ctx, rlocator, &page, skipFsync);
+	}
+	LWLockRelease(root_lock);
+}
+
+static void
+ummap_root_init(PGIOAlignedBlock *page)
+{
+	UmbraMapRootData *root;
+
+	Assert(page != NULL);
+	MemSet(page->data, 0, BLCKSZ);
+	root = (UmbraMapRootData *) page->data;
+	root->magic = UMMAP_ROOT_MAGIC;
+	root->version = UMMAP_ROOT_VERSION;
+	root->blcksz = BLCKSZ;
+	root->flags = UMMAP_ROOT_FLAG_FORMAT_V1;
+	root->logical_eof_main = 0;
+	root->logical_eof_fsm = InvalidBlockNumber;
+	root->logical_eof_vm = InvalidBlockNumber;
+	root->physical_frontier_main = 0;
+	root->physical_frontier_fsm = InvalidBlockNumber;
+	root->physical_frontier_vm = InvalidBlockNumber;
+	ummap_root_refresh_crc(root);
+}
+
+static void
+ummap_root_refresh_crc(UmbraMapRootData *root)
+{
+	pg_crc32c	crc;
+
+	Assert(root != NULL);
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, root, offsetof(UmbraMapRootData, crc));
+	FIN_CRC32C(crc);
+	root->crc = crc;
+}
+
+static bool
+ummap_root_is_valid(const UmbraMapRootData *root)
+{
+	pg_crc32c	crc;
+
+	Assert(root != NULL);
+	if (root->magic != UMMAP_ROOT_MAGIC ||
+		root->version != UMMAP_ROOT_VERSION ||
+		root->blcksz != BLCKSZ ||
+		root->flags != UMMAP_ROOT_FLAG_FORMAT_V1 ||
+		!pg_memory_is_all_zeros(root->reserved, sizeof(root->reserved)) ||
+		!BlockNumberIsValid(root->logical_eof_main) ||
+		!BlockNumberIsValid(root->physical_frontier_main) ||
+		BlockNumberIsValid(root->logical_eof_fsm) !=
+		BlockNumberIsValid(root->physical_frontier_fsm) ||
+		BlockNumberIsValid(root->logical_eof_vm) !=
+		BlockNumberIsValid(root->physical_frontier_vm))
+		return false;
+
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, root, offsetof(UmbraMapRootData, crc));
+	FIN_CRC32C(crc);
+	return crc == root->crc;
+}
+
+static void
+ummap_root_read_locked(UmbraFileContext *ctx,
+					   RelFileLocatorBackend rlocator,
+					   PGIOAlignedBlock *page)
+{
+	Assert(ctx != NULL);
+	Assert(page != NULL);
+	Assert(LWLockHeldByMe(MapPageExtensionLock(rlocator)));
+	if (umfile_nblocks(ctx, UMBRA_MAP_FORKNUM) <= UMMAP_BLOCK_ROOT)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("missing Umbra map superblock")));
+
+	MemSet(page->data, 0, BLCKSZ);
+	umfile_read_bytes(ctx, UMBRA_MAP_FORKNUM, UMMAP_BLOCK_ROOT,
+					  page->data, UMMAP_ROOT_SECTOR_SIZE);
+	if (!pg_memory_is_all_zeros(page->data + UMMAP_ROOT_PAYLOAD_SIZE,
+								UMMAP_ROOT_SECTOR_SIZE -
+								UMMAP_ROOT_PAYLOAD_SIZE) ||
+		!ummap_root_is_valid((UmbraMapRootData *) page->data))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("Umbra map superblock is corrupted")));
+}
+
+static void
+ummap_root_write_locked(UmbraFileContext *ctx,
+						RelFileLocatorBackend rlocator,
+						PGIOAlignedBlock *page, bool skipFsync)
+{
+	Assert(ctx != NULL);
+	Assert(page != NULL);
+	Assert(LWLockHeldByMeInMode(MapPageExtensionLock(rlocator),
+									 LW_EXCLUSIVE));
+	ummap_root_refresh_crc((UmbraMapRootData *) page->data);
+	Assert(pg_memory_is_all_zeros(page->data + UMMAP_ROOT_PAYLOAD_SIZE,
+								  UMMAP_ROOT_SECTOR_SIZE -
+								  UMMAP_ROOT_PAYLOAD_SIZE));
+	umfile_write_bytes(ctx, UMBRA_MAP_FORKNUM, UMMAP_BLOCK_ROOT,
+					   page->data, UMMAP_ROOT_SECTOR_SIZE, skipFsync);
+}
+
+static void
+ummap_root_get_frontiers(const UmbraMapRootData *root, ForkNumber forknum,
+						 BlockNumber *logical_eof,
+						 BlockNumber *physical_frontier)
+{
+	BlockNumber logical;
+	BlockNumber physical;
+
+	Assert(root != NULL);
+	switch (forknum)
+	{
+		case MAIN_FORKNUM:
+			logical = root->logical_eof_main;
+			physical = root->physical_frontier_main;
+			break;
+		case FSM_FORKNUM:
+			logical = root->logical_eof_fsm;
+			physical = root->physical_frontier_fsm;
+			break;
+		case VISIBILITYMAP_FORKNUM:
+			logical = root->logical_eof_vm;
+			physical = root->physical_frontier_vm;
+			break;
+		default:
+			elog(ERROR, "unsupported fork number for Umbra MAP root: %d",
+				 (int) forknum);
+	}
+	if (logical_eof != NULL)
+		*logical_eof = logical;
+	if (physical_frontier != NULL)
+		*physical_frontier = physical;
+}
+
+static void
+ummap_root_set_frontiers(UmbraMapRootData *root, ForkNumber forknum,
+						 BlockNumber logical_eof,
+						 BlockNumber physical_frontier)
+{
+	Assert(root != NULL);
+	Assert(BlockNumberIsValid(logical_eof));
+	Assert(BlockNumberIsValid(physical_frontier));
+	switch (forknum)
+	{
+		case MAIN_FORKNUM:
+			root->logical_eof_main = logical_eof;
+			root->physical_frontier_main = physical_frontier;
+			break;
+		case FSM_FORKNUM:
+			root->logical_eof_fsm = logical_eof;
+			root->physical_frontier_fsm = physical_frontier;
+			break;
+		case VISIBILITYMAP_FORKNUM:
+			root->logical_eof_vm = logical_eof;
+			root->physical_frontier_vm = physical_frontier;
+			break;
+		default:
+			elog(ERROR, "unsupported fork number for Umbra MAP root: %d",
+				 (int) forknum);
+	}
 }
 
 void
@@ -464,8 +810,26 @@ ummap_mark_range_physical(RelFileLocatorBackend rlocator, ForkNumber forknum,
 void
 ummap_abort_pending_ranges(SubTransactionId subxid)
 {
+	UmbraMapPendingRange **root_prev_next = &ummap_root_updates;
 	UmbraMapPendingRange **prev_next = &ummap_pending_ranges;
 	UmbraMapPendingRange *pending;
+
+	/*
+	 * A published MAP remains valid across transaction abort.  The root is only
+	 * a lower-bound hint, so discard an unfinished root advance rather than
+	 * turning an ordinary abort into PANIC.
+	 */
+	while ((pending = *root_prev_next) != NULL)
+	{
+		if (subxid != InvalidSubTransactionId && pending->subxid != subxid)
+		{
+			root_prev_next = &pending->next;
+			continue;
+		}
+		Assert(pending->map_published);
+		*root_prev_next = pending->next;
+		pfree(pending);
+	}
 
 	while ((pending = *prev_next) != NULL)
 	{
@@ -477,7 +841,7 @@ ummap_abort_pending_ranges(SubTransactionId subxid)
 		if (pending->wal_ready)
 			elog(PANIC, "Umbra mapping WAL reached abort before publication");
 		*prev_next = pending->next;
-		ummap_release_pending_range(pending, false, InvalidXLogRecPtr);
+		ummap_release_pending_range(pending, false);
 	}
 }
 
@@ -491,7 +855,11 @@ ummap_reparent_pending_ranges(SubTransactionId mySubid,
 		 pending = pending->next)
 	{
 		if (pending->subxid == mySubid)
+		{
+			if (pending->wal_ready)
+				elog(PANIC, "Umbra mapping WAL reached subcommit before publication");
 			pending->subxid = parentSubid;
+		}
 	}
 }
 
@@ -499,6 +867,12 @@ bool
 ummap_has_pending_ranges(void)
 {
 	return ummap_pending_ranges != NULL;
+}
+
+bool
+ummap_has_root_updates(void)
+{
+	return ummap_root_updates != NULL;
 }
 
 void
@@ -523,19 +897,53 @@ ummap_publish_ready_ranges_internal(bool include_local)
 			UmbraMapPendingRange *next;
 
 			if (!pending->wal_ready || !pending->physical_ready ||
-				(!include_local && !pending->entries_installed) ||
 				ummap_has_earlier_pending_range(pending))
 			{
 				prev_next = &pending->next;
 				continue;
 			}
+			if (!pending->map_published)
+			{
+				if (!include_local && !pending->entries_installed)
+				{
+					prev_next = &pending->next;
+					continue;
+				}
+				ummap_publish_pending_range(pending);
+			}
 			next = pending->next;
-			ummap_release_pending_range(pending, true, pending->wal_lsn);
+			ummap_release_pending_state(pending, true);
 			*prev_next = next;
+			pending->next = ummap_root_updates;
+			ummap_root_updates = pending;
 			progress = true;
 		}
 	}
 	while (progress);
+
+	if (include_local)
+		ummap_flush_root_updates();
+}
+
+static void
+ummap_flush_root_updates(void)
+{
+	UmbraMapPendingRange *pending;
+
+	while ((pending = ummap_root_updates) != NULL)
+	{
+		BlockNumber logical_end = pending->range.first_lblkno +
+			pending->range.nblocks;
+		BlockNumber physical_end = Max(pending->range.first_pblkno +
+			pending->range.nblocks,
+			umfile_nblocks(pending->ctx, pending->forknum));
+
+		ummap_root_advance(pending->ctx, pending->rlocator,
+							 pending->forknum, logical_end, physical_end,
+							 pending->wal_lsn, false);
+		ummap_root_updates = pending->next;
+		pfree(pending);
+	}
 }
 
 static bool
@@ -570,10 +978,21 @@ ummap_pending_pin_count(void)
 
 BlockNumber
 ummap_next_physical_block(UmbraFileContext *ctx,
-						  RelFileLocatorBackend rlocator, ForkNumber forknum)
+							  RelFileLocatorBackend rlocator, ForkNumber forknum)
 {
 	UmbraMapPendingRange *pending;
 	uint64		next_pblkno = umfile_nblocks(ctx, forknum);
+
+	if (!InRecovery)
+	{
+		BlockNumber logical_eof;
+		BlockNumber physical_frontier;
+
+		ummap_root_read_frontiers(ctx, rlocator, forknum, &logical_eof,
+								   &physical_frontier);
+		if (BlockNumberIsValid(physical_frontier))
+			next_pblkno = Max(next_pblkno, (uint64) physical_frontier);
+	}
 
 	for (pending = ummap_pending_ranges; pending != NULL;
 		 pending = pending->next)
@@ -784,9 +1203,20 @@ ummap_publish_replay_ranges(void)
 	Assert(InRecovery);
 	for (pending = ummap_replay_ranges; pending != NULL;
 		 pending = pending->next)
+	{
+		BlockNumber logical_end = pending->range.first_lblkno +
+			pending->range.nblocks;
+		BlockNumber physical_end = Max(pending->range.first_pblkno +
+			pending->range.nblocks,
+			umfile_nblocks(pending->ctx, pending->forknum));
+
 		ummap_replay_mapping_range(pending->ctx, pending->rlocator,
 								   pending->forknum, &pending->range,
 								   pending->lsn);
+		ummap_root_advance(pending->ctx, pending->rlocator,
+							 pending->forknum, logical_end, physical_end,
+							 pending->lsn, false);
+	}
 
 	while ((pending = ummap_replay_ranges) != NULL)
 	{
@@ -1264,7 +1694,7 @@ ummap_range_contains(const UmbraMapRange *range, BlockNumber lblkno)
 
 static BlockNumber
 ummap_advance_local_pending_eof(RelFileLocatorBackend rlocator,
-							   ForkNumber forknum, BlockNumber eof)
+								   ForkNumber forknum, BlockNumber eof)
 {
 	for (;;)
 	{
@@ -1299,7 +1729,7 @@ ummap_advance_local_pending_eof(RelFileLocatorBackend rlocator,
 		for (pending = ummap_pending_ranges; pending != NULL;
 			 pending = pending->next)
 		{
-			if (!pending->entries_installed && pending->forknum == forknum &&
+			if (pending->forknum == forknum &&
 				pending->range.first_lblkno == eof &&
 				RelFileLocatorBackendEquals(pending->rlocator, rlocator))
 			{
@@ -1792,18 +2222,82 @@ ummap_prepare_pending_range(UmbraFileContext *ctx,
 	Assert(pending->npinned == pending->npages);
 }
 
+/*
+ * Make a ready pending range canonical.  The WAL insertion path calls this
+ * for already-pinned pages while in a critical section, so that path must
+ * neither allocate nor perform I/O.  Its caller releases the pending state
+ * immediately after this returns.
+ */
 static void
-ummap_release_pending_range(UmbraMapPendingRange *pending, bool publish,
-								XLogRecPtr lsn)
+ummap_publish_pending_range(UmbraMapPendingRange *pending)
 {
 	if (!pending->entries_installed)
 	{
-		if (publish)
-			ummap_publish_mapping_run(pending->ctx, pending->rlocator,
-									  pending->forknum,
-									  pending->range.first_lblkno,
-									  pending->range.first_pblkno,
-									  pending->range.nblocks, lsn, false);
+		ummap_publish_mapping_run(pending->ctx, pending->rlocator,
+								  pending->forknum,
+								  pending->range.first_lblkno,
+								  pending->range.first_pblkno,
+								  pending->range.nblocks,
+								  pending->wal_lsn, false);
+		pending->map_published = true;
+		return;
+	}
+
+	for (int page_no = 0; page_no < pending->npinned; page_no++)
+	{
+		UmbraMapPendingPage *pending_page = &pending->pages[page_no];
+		MapPageBuffer buffer =
+		{
+			.desc = &MapPageDescriptors[pending_page->slot_id],
+		};
+		BlockNumber map_blkno = ummap_map_blkno(pending->forknum,
+											 pending_page->first_lblkno);
+		char	   *page;
+		int			entry_idx = ummap_entry_index(pending_page->first_lblkno);
+
+		MapPageLockBuffer(buffer, LW_EXCLUSIVE);
+		if (buffer.desc->tag.map_blkno != map_blkno ||
+			!RelFileLocatorBackendEquals(buffer.desc->tag.rlocator,
+									 pending->rlocator))
+			elog(PANIC, "Umbra pending MAP buffer changed before publication");
+		page = MapPageBufferGetData(buffer);
+		for (BlockNumber i = 0; i < pending_page->nblocks; i++)
+		{
+			BlockNumber lblkno = pending_page->first_lblkno + i;
+			BlockNumber expected = pending->range.first_pblkno +
+				(lblkno - pending->range.first_lblkno);
+			BlockNumber current = ummap_page_get_entry(page, entry_idx + i);
+			int			word_idx = (entry_idx + i) / 64;
+			uint64		entry_mask = UINT64CONST(1) <<
+				((entry_idx + i) % 64);
+
+			if ((buffer.desc->pending_bits[word_idx] & entry_mask) == 0)
+				elog(PANIC,
+					 "Umbra pending MAP bit disappeared before publication");
+			if (current != expected)
+				elog(PANIC,
+					 "Umbra pending MAP entry changed for fork %d block %u",
+					 (int) pending->forknum, lblkno);
+		}
+		MapPageMarkBufferDirty(buffer, false, pending->wal_lsn);
+		MapPageUnlockBufferKeepPin(buffer);
+	}
+	pending->map_published = true;
+}
+
+static void
+ummap_release_pending_range(UmbraMapPendingRange *pending, bool publish)
+{
+	ummap_release_pending_state(pending, publish);
+	pfree(pending);
+}
+
+static void
+ummap_release_pending_state(UmbraMapPendingRange *pending, bool publish)
+{
+	Assert(!publish || pending->map_published);
+	if (!pending->entries_installed)
+	{
 		if (pending->barrier_installed)
 		{
 			UmbraMapPendingPage *pending_page = &pending->pages[0];
@@ -1836,7 +2330,6 @@ ummap_release_pending_range(UmbraMapPendingRange *pending, bool publish,
 				   sizeof(buffer.desc->pending_range));
 			MapPageReleasePendingBufferOwned(buffer, pending->pin_owner);
 		}
-		pfree(pending);
 		return;
 	}
 
@@ -1878,25 +2371,55 @@ ummap_release_pending_range(UmbraMapPendingRange *pending, bool publish,
 				ummap_page_clear_entry(page, entry_idx + i);
 			buffer.desc->pending_bits[word_idx] &= ~entry_mask;
 		}
-		if (publish)
-			MapPageMarkBufferDirty(buffer, false, lsn);
 		MapPageReleasePendingBufferOwned(buffer, pending->pin_owner);
 	}
-	pfree(pending);
 }
 
-/*
- * Derive logical EOF from the contiguous valid MAP prefix.
- *
- * This scan is deliberately the only relation-size authority in the
- * no-superblock format.  A later root may cache the result, but must not
- * change what makes an entry visible.
- */
 BlockNumber
 ummap_nblocks(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
-			  ForkNumber forknum)
+				  ForkNumber forknum)
 {
-	BlockNumber logical_nblocks = 0;
+	BlockNumber logical_eof;
+	BlockNumber physical_frontier;
+	BlockNumber map_eof;
+
+	if (!ummap_tracks_fork(forknum))
+		return umfile_nblocks(ctx, forknum);
+	if (InRecovery)
+		return ummap_scan_nblocks(ctx, rlocator, forknum, 0);
+	if (!umfile_exists(ctx, UMBRA_MAP_FORKNUM))
+		elog(ERROR, "missing Umbra map fork for fork %d", (int) forknum);
+
+retry:
+	ummap_root_read_frontiers(ctx, rlocator, forknum, &logical_eof,
+								   &physical_frontier);
+	if (!BlockNumberIsValid(logical_eof) ||
+		!BlockNumberIsValid(physical_frontier))
+		elog(ERROR, "missing Umbra map root state for fork %d", (int) forknum);
+
+	map_eof = ummap_scan_nblocks(ctx, rlocator, forknum, logical_eof);
+
+	/* Verify that the lower-bound hint stayed stable during the MAP tail scan. */
+	{
+		BlockNumber current_eof;
+		BlockNumber current_physical;
+
+		ummap_root_read_frontiers(ctx, rlocator, forknum, &current_eof,
+									   &current_physical);
+		if (current_eof != logical_eof ||
+			current_physical != physical_frontier)
+			goto retry;
+	}
+
+	return map_eof;
+}
+
+/* Scan forward from a trusted lower bound to the first missing MAP entry. */
+static BlockNumber
+ummap_scan_nblocks(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
+					 ForkNumber forknum, BlockNumber logical_nblocks)
+{
+	BlockNumber scan_start = logical_nblocks;
 	BlockNumber map_nblocks;
 
 	if (!ummap_tracks_fork(forknum))
@@ -1943,7 +2466,7 @@ ummap_nblocks(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 				MapPageReleaseBuffer(buffer);
 				CHECK_FOR_INTERRUPTS();
 				pg_usleep(1000L);
-				logical_nblocks = 0;
+				logical_nblocks = scan_start;
 				resume_after_pending = true;
 				break;
 			}
@@ -2259,7 +2782,10 @@ ummap_set_identity_run(UmbraFileContext *ctx,
 
 	run_limit = ummap_identity_run_limit(forknum, lblkno, maxblocks, pblkno);
 	ummap_publish_mapping_run(ctx, rlocator, forknum, lblkno, lblkno,
-							  run_limit, InvalidXLogRecPtr, skipFsync);
+								  run_limit, InvalidXLogRecPtr, skipFsync);
+	ummap_root_advance(ctx, rlocator, forknum, lblkno + run_limit,
+					   Max(lblkno + run_limit, umfile_nblocks(ctx, forknum)),
+					   InvalidXLogRecPtr, skipFsync);
 	return run_limit;
 }
 
@@ -2287,9 +2813,6 @@ ummap_truncate(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 		(uint64) UMMAP_ENTRIES_PER_PAGE;
 	end_lblkno = logical_capacity >= (uint64) InvalidBlockNumber ?
 		InvalidBlockNumber : (BlockNumber) logical_capacity;
-	if (new_nblocks >= end_lblkno)
-		return;
-
 	/*
 	 * Clear every materialized MAP page tail, not just the current contiguous
 	 * prefix.  A prior truncate attempt may have persisted a low cleared page
@@ -2342,6 +2865,10 @@ ummap_truncate(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 		MapPageReleaseBuffer(buffer);
 		end_lblkno = first_lblkno;
 	}
+
+	ummap_root_set_logical(ctx, rlocator, forknum, new_nblocks,
+						   umfile_nblocks(ctx, forknum), wal_flush_lsn,
+						   skipFsync);
 }
 
 bool
@@ -2355,8 +2882,15 @@ ummap_tracks_fork(ForkNumber forknum)
 static uint64
 ummap_existing_fork_pages(ForkNumber forknum, BlockNumber map_nblocks)
 {
-	uint64		full_groups = (uint64) map_nblocks / UMMAP_GROUP_TOTAL_PAGES;
-	uint64		partial_pages = (uint64) map_nblocks % UMMAP_GROUP_TOTAL_PAGES;
+	uint64		ordinary_pages;
+	uint64		full_groups;
+	uint64		partial_pages;
+
+	if (map_nblocks <= UMMAP_BLOCK_FIRST_GROUP)
+		return 0;
+	ordinary_pages = (uint64) map_nblocks - UMMAP_BLOCK_FIRST_GROUP;
+	full_groups = ordinary_pages / UMMAP_GROUP_TOTAL_PAGES;
+	partial_pages = ordinary_pages % UMMAP_GROUP_TOTAL_PAGES;
 
 	switch (forknum)
 	{
@@ -2386,19 +2920,22 @@ ummap_fork_page_index_to_map_blkno(ForkNumber forknum,
 	{
 		case FSM_FORKNUM:
 			group_no = (uint64) fork_page_idx;
-			blkno64 = group_no * (uint64) UMMAP_GROUP_TOTAL_PAGES;
+			blkno64 = UMMAP_BLOCK_FIRST_GROUP +
+				group_no * (uint64) UMMAP_GROUP_TOTAL_PAGES;
 			break;
 
 		case VISIBILITYMAP_FORKNUM:
 			group_no = (uint64) fork_page_idx;
-			blkno64 = group_no * (uint64) UMMAP_GROUP_TOTAL_PAGES +
+			blkno64 = UMMAP_BLOCK_FIRST_GROUP +
+				group_no * (uint64) UMMAP_GROUP_TOTAL_PAGES +
 				(uint64) UMMAP_GROUP_FSM_PAGES;
 			break;
 
 		case MAIN_FORKNUM:
 			group_no = (uint64) fork_page_idx /
 				(uint64) UMMAP_GROUP_MAIN_PAGES;
-			blkno64 = group_no * (uint64) UMMAP_GROUP_TOTAL_PAGES +
+			blkno64 = UMMAP_BLOCK_FIRST_GROUP +
+				group_no * (uint64) UMMAP_GROUP_TOTAL_PAGES +
 				(uint64) UMMAP_GROUP_FSM_PAGES +
 				(uint64) UMMAP_GROUP_VM_PAGES +
 				((uint64) fork_page_idx %

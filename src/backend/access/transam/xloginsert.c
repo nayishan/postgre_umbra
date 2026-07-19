@@ -551,7 +551,7 @@ XLogInsert(RmgrId rmid, uint8 info)
 
 #ifdef USE_UMBRA
 	/* A failure after WAL insertion must be recovered by replay. */
-	if (ummap_has_pending_ranges())
+	if (ummap_has_pending_ranges() || ummap_has_root_updates())
 	{
 		START_CRIT_SECTION();
 		if (curinsert_has_umbra_remap)

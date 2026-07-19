@@ -1,6 +1,6 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# Verify the first non-identity mapping in the no-superblock MAP layout.
+# Verify the first non-identity mapping below the MAP superblock root.
 
 use strict;
 use warnings FATAL => 'all';
@@ -34,7 +34,7 @@ sub main_map_entry_offset
 	my $entries_per_page = int($block_size / 4);
 	my $fork_page = int($lblkno / $entries_per_page);
 	my $group = int($fork_page / MAP_GROUP_MAIN_PAGES);
-	my $map_block = $group * MAP_GROUP_TOTAL_PAGES + 2
+	my $map_block = 1 + $group * MAP_GROUP_TOTAL_PAGES + 2
 	  + ($fork_page % MAP_GROUP_MAIN_PAGES);
 
 	return $map_block * $block_size

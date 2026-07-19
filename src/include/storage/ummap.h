@@ -4,7 +4,7 @@
  *	  Umbra private map fork declarations.
  *
  * This header describes Umbra's relation-local private map fork container.
- * It does not define the MAP page format or superblock contents.
+ * The MAP page and disk-root formats remain private to ummap.c.
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
@@ -43,11 +43,30 @@ extern RelPathStr ummap_relpath(RelFileLocatorBackend rlocator);
 
 extern bool ummap_tracks_fork(ForkNumber forknum);
 extern bool ummap_exists(UmbraFileContext *ctx);
-extern void ummap_create(UmbraFileContext *ctx, bool isRedo);
+extern void ummap_create(UmbraFileContext *ctx,
+						 RelFileLocatorBackend rlocator, bool isRedo);
 extern void ummap_close(UmbraFileContext *ctx);
 extern void ummap_immedsync_if_exists(UmbraFileContext *ctx);
 extern void ummap_registersync_if_exists(UmbraFileContext *ctx);
 extern void ummap_unlink(RelFileLocatorBackend rlocator, bool isRedo);
+
+extern void ummap_root_read_frontiers(UmbraFileContext *ctx,
+									  RelFileLocatorBackend rlocator,
+									  ForkNumber forknum,
+									  BlockNumber *logical_eof,
+									  BlockNumber *physical_frontier);
+extern void ummap_root_advance(UmbraFileContext *ctx,
+								RelFileLocatorBackend rlocator,
+								ForkNumber forknum, BlockNumber logical_end,
+								BlockNumber physical_end,
+								XLogRecPtr wal_flush_lsn, bool skipFsync);
+extern void ummap_root_set_logical(UmbraFileContext *ctx,
+									RelFileLocatorBackend rlocator,
+									ForkNumber forknum,
+									BlockNumber logical_eof,
+									BlockNumber physical_floor,
+									XLogRecPtr wal_flush_lsn,
+									bool skipFsync);
 
 extern BlockNumber ummap_nblocks(UmbraFileContext *ctx,
 								  RelFileLocatorBackend rlocator,
@@ -116,6 +135,7 @@ extern void ummap_abort_pending_ranges(SubTransactionId subxid);
 extern void ummap_reparent_pending_ranges(SubTransactionId mySubid,
 										  SubTransactionId parentSubid);
 extern bool ummap_has_pending_ranges(void);
+extern bool ummap_has_root_updates(void);
 extern void ummap_publish_ready_ranges(void);
 extern void ummap_prepare_replay_range(UmbraFileContext *ctx,
 									   RelFileLocatorBackend rlocator,

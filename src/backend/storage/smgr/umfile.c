@@ -169,7 +169,7 @@ static UmfdVec *umfile_openseg(UmbraFileContext *ctx, ForkNumber forknum,
 static UmfdVec *umfile_getseg(UmbraFileContext *ctx, ForkNumber forknum,
 							  BlockNumber blkno, bool skipFsync, int behavior);
 static BlockNumber umfile_nblocks_in_seg(UmfdVec *seg);
-static inline int umfile_open_flags(void);
+static inline int umfile_open_flags(ForkNumber forknum);
 
 static PgAioResult umfile_readv_complete(PgAioHandle *ioh, PgAioResult prior_result, uint8 cb_data);
 static void umfile_readv_report(PgAioResult result, const PgAioTargetData *td, int elevel);
@@ -181,11 +181,12 @@ const PgAioHandleCallbacks aio_umfile_readv_cb = {
 
 
 static inline int
-umfile_open_flags(void)
+umfile_open_flags(ForkNumber forknum)
 {
 	int			flags = O_RDWR | PG_BINARY;
 
-	if (io_direct_flags & IO_DIRECT_DATA)
+	/* The MAP root uses sector-sized I/O, so keep its private file buffered. */
+	if ((io_direct_flags & IO_DIRECT_DATA) && forknum != UMBRA_MAP_FORKNUM)
 		flags |= PG_O_DIRECT;
 
 	return flags;
@@ -262,14 +263,15 @@ umfile_create(UmbraFileContext *ctx, ForkNumber forknum, bool isRedo)
 
 	path = umfile_relpath(ctx->rlocator, forknum);
 
-	fd = PathNameOpenFile(path.str, umfile_open_flags() | O_CREAT | O_EXCL);
+	fd = PathNameOpenFile(path.str,
+						  umfile_open_flags(forknum) | O_CREAT | O_EXCL);
 
 	if (fd < 0)
 	{
 		int			save_errno = errno;
 
 		if (isRedo)
-			fd = PathNameOpenFile(path.str, umfile_open_flags());
+			fd = PathNameOpenFile(path.str, umfile_open_flags(forknum));
 		if (fd < 0)
 		{
 			/* be sure to report the error reported by create, not open */
@@ -286,6 +288,105 @@ umfile_create(UmbraFileContext *ctx, ForkNumber forknum, bool isRedo)
 	v->umfd_segno = 0;
 
 	if (!RelFileLocatorBackendIsTemp(ctx->rlocator))
+		umfile_register_dirty_segment(ctx, forknum, v);
+}
+
+/*
+ * Read or write a sector-sized prefix of one private MAP block.  A first
+ * write also establishes the surrounding BLCKSZ slot without transferring
+ * the unused bytes; ordinary MAP pages remain BLCKSZ-addressed.
+ */
+void
+umfile_read_bytes(UmbraFileContext *ctx, ForkNumber forknum,
+				  BlockNumber blocknum, void *buffer, int nbytes)
+{
+	pgoff_t		seekpos;
+	int			readbytes;
+	UmfdVec    *v;
+
+	Assert(ctx != NULL);
+	Assert(forknum == UMBRA_MAP_FORKNUM);
+	Assert(buffer != NULL);
+	Assert(nbytes > 0 && nbytes <= BLCKSZ);
+
+	v = umfile_getseg(ctx, forknum, blocknum, false, EXTENSION_FAIL);
+	seekpos = (pgoff_t) BLCKSZ *
+		(blocknum % ((BlockNumber) RELSEG_SIZE));
+	readbytes = FileRead(v->umfd_vfd, buffer, nbytes, seekpos,
+						 WAIT_EVENT_DATA_FILE_READ);
+	if (readbytes != nbytes)
+	{
+		if (readbytes < 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not read file \"%s\": %m",
+							FilePathName(v->umfd_vfd))));
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("could not read file \"%s\": read only %d of %d bytes at block %u",
+						FilePathName(v->umfd_vfd), readbytes, nbytes,
+						blocknum)));
+	}
+}
+
+void
+umfile_write_bytes(UmbraFileContext *ctx, ForkNumber forknum,
+				   BlockNumber blocknum, const void *buffer, int nbytes,
+				   bool skipFsync)
+{
+	pgoff_t		block_end;
+	pgoff_t		file_size;
+	pgoff_t		seekpos;
+	int			written;
+	UmfdVec    *v;
+
+	Assert(ctx != NULL);
+	Assert(forknum == UMBRA_MAP_FORKNUM);
+	Assert(buffer != NULL);
+	Assert(nbytes > 0 && nbytes <= BLCKSZ);
+
+	v = umfile_getseg(ctx, forknum, blocknum, skipFsync, EXTENSION_FAIL);
+	seekpos = (pgoff_t) BLCKSZ *
+		(blocknum % ((BlockNumber) RELSEG_SIZE));
+	written = FileWrite(v->umfd_vfd, buffer, nbytes, seekpos,
+						WAIT_EVENT_DATA_FILE_WRITE);
+	if (written != nbytes)
+	{
+		if (written < 0)
+		{
+			bool		enospc = errno == ENOSPC;
+
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not write file \"%s\": %m",
+							FilePathName(v->umfd_vfd)),
+					 enospc ? errhint("Check free disk space.") : 0));
+		}
+		ereport(ERROR,
+				(errcode(ERRCODE_DISK_FULL),
+				 errmsg("could not write file \"%s\": wrote only %d of %d bytes at block %u",
+						FilePathName(v->umfd_vfd), written, nbytes,
+						blocknum),
+				 errhint("Check free disk space.")));
+	}
+
+	/* Keep block accounting exact even though only its root sector is written. */
+	block_end = seekpos + BLCKSZ;
+	file_size = FileSize(v->umfd_vfd);
+	if (file_size < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not seek to end of file \"%s\": %m",
+						FilePathName(v->umfd_vfd))));
+	if (file_size < block_end &&
+		FileTruncate(v->umfd_vfd, block_end,
+					 WAIT_EVENT_DATA_FILE_TRUNCATE) < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not extend file \"%s\" to one block: %m",
+						FilePathName(v->umfd_vfd))));
+
+	if (!skipFsync && !RelFileLocatorBackendIsTemp(ctx->rlocator))
 		umfile_register_dirty_segment(ctx, forknum, v);
 }
 
@@ -741,7 +842,7 @@ umfile_openfork(UmbraFileContext *ctx, ForkNumber forknum, int behavior)
 
 	path = umfile_relpath(ctx->rlocator, forknum);
 
-	fd = PathNameOpenFile(path.str, umfile_open_flags());
+	fd = PathNameOpenFile(path.str, umfile_open_flags(forknum));
 
 	if (fd < 0)
 	{
@@ -1807,7 +1908,8 @@ umfile_openseg(UmbraFileContext *ctx, ForkNumber forknum, BlockNumber segno,
 	fullpath = umfile_segpath(ctx->rlocator, forknum, segno);
 
 	/* open the file */
-	fd = PathNameOpenFile(fullpath.str, umfile_open_flags() | oflags);
+	fd = PathNameOpenFile(fullpath.str,
+						  umfile_open_flags(forknum) | oflags);
 
 	if (fd < 0)
 		return NULL;
@@ -2001,7 +2103,7 @@ umfilesyncfiletag(const FileTag *ftag, char *path)
 	p = umfile_segpath_perm(ftag->rlocator, ftag->forknum, ftag->segno);
 	strlcpy(path, p.str, MAXPGPATH);
 
-	file = PathNameOpenFile(path, umfile_open_flags());
+	file = PathNameOpenFile(path, umfile_open_flags(ftag->forknum));
 	if (file < 0)
 		return -1;
 

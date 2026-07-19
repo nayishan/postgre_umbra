@@ -1,7 +1,7 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 # Verify replacement, persistence, and recovery for ordinary identity MAP
-# pages in the no-superblock layout.
+# pages below the superblock root.
 
 use strict;
 use warnings FATAL => 'all';
@@ -51,7 +51,7 @@ sub main_entry_offset
 {
 	my ($block_size, $lblkno) = @_;
 	my $entries_per_page = int($block_size / 4);
-	my $map_block = 2 + int($lblkno / $entries_per_page);
+	my $map_block = 3 + int($lblkno / $entries_per_page);
 
 	return $map_block * $block_size
 	  + ($lblkno % $entries_per_page) * 4;
@@ -94,16 +94,16 @@ my $block_size = $node->safe_psql(
 	'postgres',
 	q{SELECT setting::int FROM pg_settings WHERE name = 'block_size'});
 
-# Patch 4 retains Patch 3's [FSM][VM][8192 MAIN] layout.  MAIN entry 0 is
-# therefore the first uint32 in map block 2.
-my $main_entry_zero_offset = 2 * $block_size;
+# The root precedes the [FSM][VM][8192 MAIN] groups.  MAIN entry 0 is
+# therefore the first uint32 in map block 3.
+my $main_entry_zero_offset = 3 * $block_size;
 
 $node->safe_psql('postgres', 'CHECKPOINT');
 $node->safe_psql('postgres', 'INSERT INTO umbra_pool_anchor VALUES (1)');
 
-is(read_hex_bytes($anchor_map, 0, 4),
-	'ffffffff', 'FSM gap page is initialized to 0xFF');
 is(read_hex_bytes($anchor_map, $block_size, 4),
+	'ffffffff', 'FSM gap page is initialized to 0xFF');
+is(read_hex_bytes($anchor_map, 2 * $block_size, 4),
 	'ffffffff', 'VM gap page is initialized to 0xFF');
 is(read_hex_bytes($anchor_map, $main_entry_zero_offset, 4),
 	'ffffffff', 'new target MAP page remains unchanged on disk while dirty');
