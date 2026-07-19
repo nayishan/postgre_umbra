@@ -107,9 +107,8 @@ Truncation clears every entry in [new logical EOF, old logical EOF), so a later
 extension cannot make an old tail visible again merely by filling its first
 entry.
 
-Normal first-born publication starts with backend-local pending state.  Before
-WAL, a pending range owns its ordinary MAP pins and a foreign-visible shared
-barrier.
+Normal first-born publication has two backend-local stages.  Before WAL, a
+pending range owns its ordinary MAP pins and a foreign-visible shared barrier.
 After XLogInsertRecord returns an EndRecPtr, the critical publication path marks
 already pinned MAP entries canonical and advances an already-resident root.  It
 cannot allocate, attach shared state, or perform file I/O.  Once MAP and root
@@ -147,10 +146,10 @@ performs the required XLogFlush().
 
 Before WAL insertion, transaction or subtransaction abort can discard a
 pending mapping and leave an unreachable physical orphan or an unmaterialized
-allocation hole.  Once a pending range has an EndRecPtr, publication leaves
-both its MAP and resident EOF in place.  This matches PostgreSQL
-relation-extension behavior: tuple visibility rolls back, storage extension
-does not.  Abort cleanup never attempts root I/O.
+allocation hole.  Once a pending range has an EndRecPtr, publication leaves both
+its MAP and resident EOF in place.  This matches PostgreSQL relation-extension
+behavior: tuple visibility rolls back, storage extension does not.  Abort
+cleanup never attempts root I/O.
 
 
 Root Cache Locking

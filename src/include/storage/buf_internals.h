@@ -394,6 +394,7 @@ typedef struct PendingWriteback
 {
 	/* could store different types of pending flushes here */
 	BufferTag	tag;
+	BlockNumber pblkno;
 } PendingWriteback;
 
 /* struct forward declared in bufmgr.h */
@@ -414,6 +415,8 @@ extern PGDLLIMPORT BufferDescPadded *BufferDescriptors;
 extern PGDLLIMPORT ConditionVariableMinimallyPadded *BufferIOCVArray;
 extern PGDLLIMPORT WritebackContext BackendWritebackContext;
 #ifdef USE_UMBRA
+extern PGDLLIMPORT BlockNumber *CkptBufferPblks;
+extern PGDLLIMPORT uint64 *CkptBufferPblkEpochs;
 extern PGDLLIMPORT pg_atomic_uint64 *CkptBufferCaptureEpoch;
 #endif
 
@@ -553,7 +556,8 @@ ResourceOwnerForgetBufferIO(ResourceOwner owner, Buffer buffer)
 extern void WritebackContextInit(WritebackContext *context, int *max_pending);
 extern void IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context);
 extern void ScheduleBufferTagForWriteback(WritebackContext *wb_context,
-										  IOContext io_context, BufferTag *tag);
+										  IOContext io_context, BufferTag *tag,
+										  BlockNumber pblkno);
 
 extern void TrackNewBufferPin(Buffer buf);
 

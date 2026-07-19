@@ -609,7 +609,7 @@ smgrsetgeneration(SMgrRelation reln, ForkNumber forknum,
 /* Replay an authoritative CREATE, as distinct from defensive smgrcreate(). */
 void
 smgrredocreate(SMgrRelation reln, ForkNumber forknum,
-				   XLogRecPtr generation_lsn)
+			   XLogRecPtr generation_lsn)
 {
 	if (smgrsw[reln->smgr_which].smgr_redo_create != NULL)
 		smgrsw[reln->smgr_which].smgr_redo_create(reln, forknum,
@@ -631,7 +631,7 @@ smgrredogenerationahead(SMgrRelation reln, XLogRecPtr replay_lsn)
 	if (smgrsw[reln->smgr_which].smgr_redo_generation_ahead == NULL)
 		return false;
 	return smgrsw[reln->smgr_which].smgr_redo_generation_ahead(reln,
-													 replay_lsn);
+														 replay_lsn);
 }
 
 /*

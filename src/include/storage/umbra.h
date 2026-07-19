@@ -77,6 +77,13 @@ extern bool UmPrepareBlockRemap(SMgrRelation reln, ForkNumber forknum,
 extern void UmAbortBlockRemap(UmbraMapRemap *remap);
 extern void UmReleaseBlockRemapOnExit(UmbraMapRemap *remap);
 extern void UmPublishBlockRemap(UmbraMapRemap *remap, XLogRecPtr lsn);
+extern bool UmGetBlockPhysical(SMgrRelation reln, ForkNumber forknum,
+							   BlockNumber lblkno, BlockNumber *pblkno);
+extern void UmCheckpointWritePblk(SMgrRelation reln, ForkNumber forknum,
+								  BlockNumber lblkno, BlockNumber pblkno,
+								  const void *buffer);
+extern void UmCheckpointWritebackPblk(SMgrRelation reln, ForkNumber forknum,
+									  BlockNumber pblkno);
 extern bool UmLogMappingRange(RelFileLocator rlocator, ForkNumber forknum,
 							  BlockNumber startblk, BlockNumber endblk,
 							  BlockNumber anchor_lblkno);

@@ -95,6 +95,7 @@ typedef struct
 	/* buffer to store a compressed version of backup block image */
 	char		compressed_page[COMPRESS_BUFSIZE];
 #ifdef USE_UMBRA
+	Buffer		buffer;
 	bool		from_shared_buffer;
 	bool		remap_in_record;
 	UmbraMapRemap remap;
@@ -277,6 +278,7 @@ XLogResetInsertion(void)
 	{
 		registered_buffers[i].in_use = false;
 #ifdef USE_UMBRA
+		registered_buffers[i].buffer = InvalidBuffer;
 		registered_buffers[i].from_shared_buffer = false;
 		registered_buffers[i].remap_in_record = false;
 		MemSet(&registered_buffers[i].remap, 0,
@@ -338,6 +340,7 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
 	regbuf->rdata_tail = (XLogRecData *) &regbuf->rdata_head;
 	regbuf->rdata_len = 0;
 #ifdef USE_UMBRA
+	regbuf->buffer = buffer;
 	regbuf->from_shared_buffer = true;
 	regbuf->remap_in_record = false;
 	MemSet(&regbuf->remap, 0, sizeof(regbuf->remap));
@@ -396,6 +399,7 @@ XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator, ForkNumber forknum,
 	regbuf->rdata_tail = (XLogRecData *) &regbuf->rdata_head;
 	regbuf->rdata_len = 0;
 #ifdef USE_UMBRA
+	regbuf->buffer = InvalidBuffer;
 	regbuf->from_shared_buffer = false;
 	regbuf->remap_in_record = false;
 	MemSet(&regbuf->remap, 0, sizeof(regbuf->remap));
@@ -1221,6 +1225,7 @@ XLogPublishBlockRemaps(XLogRecPtr record_endptr)
 		if (!regbuf->in_use || !regbuf->remap_in_record)
 			continue;
 		Assert(regbuf->remap.prepared);
+		BufferSaveCheckpointPblk(regbuf->buffer, regbuf->remap.old_pblkno);
 		UmPublishBlockRemap(&regbuf->remap, record_endptr);
 		regbuf->remap_in_record = false;
 	}

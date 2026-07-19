@@ -293,6 +293,7 @@ extern void CheckPointBuffersCaptureBegin(void);
 extern void CheckPointBuffersPrepare(int flags);
 extern void CheckPointBuffersAbort(void);
 extern bool CheckpointBufferCaptureIsActive(void);
+extern void BufferSaveCheckpointPblk(Buffer buffer, BlockNumber pblkno);
 #endif
 extern void CheckPointBuffers(int flags);
 extern BlockNumber BufferGetBlockNumber(Buffer buffer);

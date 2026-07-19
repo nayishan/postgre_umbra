@@ -76,10 +76,10 @@ static void um_prepare_firstborn_target(SMgrRelation reln,
 										BlockNumber target_lblkno,
 										BlockNumber anchor_lblkno);
 static void um_ensure_physical_capacity(UmbraFileContext *ctx,
-										RelFileLocatorBackend rlocator,
-										ForkNumber forknum,
-										BlockNumber first_pblkno,
-										BlockNumber nblocks, bool skipFsync);
+											RelFileLocatorBackend rlocator,
+											ForkNumber forknum,
+											BlockNumber first_pblkno,
+											BlockNumber nblocks, bool skipFsync);
 static void um_write_mapped_run(UmbraFileContext *ctx, ForkNumber forknum,
 								BlockNumber pblkno, const void **buffers,
 								BlockNumber nblocks, bool skipFsync);
@@ -126,7 +126,7 @@ umopen(SMgrRelation reln)
 	{
 		um_cache_root_desc(state, reln->smgr_rlocator);
 		state->generation_lsn = ummap_get_generation_lsn(state->filectx,
-												  reln->smgr_rlocator);
+											  reln->smgr_rlocator);
 	}
 	if (state->uses_map && !InRecovery)
 		ummap_root_read_frontiers(state->filectx, reln->smgr_rlocator,
@@ -179,7 +179,7 @@ umcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 		ummap_create(ctx, reln->smgr_rlocator, true);
 		um_cache_root_desc(state, reln->smgr_rlocator);
 		state->generation_lsn = ummap_get_generation_lsn(ctx,
-												  reln->smgr_rlocator);
+											  reln->smgr_rlocator);
 	}
 
 	if (state->uses_map && forknum != MAIN_FORKNUM &&
@@ -266,8 +266,8 @@ umredocreate(SMgrRelation reln, ForkNumber forknum,
 		elog(PANIC,
 			 "Umbra redo CREATE encountered unresolved recovery mapping for relation %u/%u/%u",
 			 reln->smgr_rlocator.locator.spcOid,
-			 reln->smgr_rlocator.locator.dbOid,
-			 reln->smgr_rlocator.locator.relNumber);
+				 reln->smgr_rlocator.locator.dbOid,
+				 reln->smgr_rlocator.locator.relNumber);
 	if (forknum == MAIN_FORKNUM)
 	{
 		ummap_set_generation_lsn(state->filectx, reln->smgr_rlocator,
@@ -629,8 +629,8 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 			recovery_nblocks = scratch_end - logical_nblocks;
 			XLogRecordInvalidPage(reln->smgr_rlocator.locator, forknum,
-							  logical_nblocks, false,
-							  UmRedoDiscardingPrecreateRecords(reln));
+								  logical_nblocks, false,
+								  UmRedoDiscardingPrecreateRecords(reln));
 			first_pblkno = ummap_next_physical_block(ctx,
 											 reln->smgr_rlocator, forknum);
 			um_ensure_physical_capacity(ctx, reln->smgr_rlocator, forknum,
@@ -897,7 +897,7 @@ UmPrepareFirstbornRangeLocator(RelFileLocator rlocator, ForkNumber forknum,
 
 	/* One WAL header covers this batch and any zero-filled logical gaps. */
 	um_prepare_firstborn_target(reln, forknum, lblknos[nblocks - 1],
-								anchor_lblkno);
+									anchor_lblkno);
 }
 
 bool
@@ -939,6 +939,44 @@ void
 UmPublishBlockRemap(UmbraMapRemap *remap, XLogRecPtr lsn)
 {
 	ummap_publish_remap(remap, lsn);
+}
+
+bool
+UmGetBlockPhysical(SMgrRelation reln, ForkNumber forknum,
+				   BlockNumber lblkno, BlockNumber *pblkno)
+{
+	Assert(reln != NULL);
+	Assert(pblkno != NULL);
+	if (!um_fork_uses_map(reln, forknum))
+		return false;
+	*pblkno = ummap_lookup_block(um_get_filectx(reln),
+								reln->smgr_rlocator, forknum, lblkno);
+	return true;
+}
+
+void
+UmCheckpointWritePblk(SMgrRelation reln, ForkNumber forknum,
+						  BlockNumber lblkno, BlockNumber pblkno,
+					  const void *buffer)
+{
+	const void *buffers[1] = {buffer};
+
+	Assert(reln != NULL);
+	Assert(buffer != NULL);
+	Assert(BlockNumberIsValid(lblkno));
+	Assert(BlockNumberIsValid(pblkno));
+	Assert(um_fork_uses_map(reln, forknum));
+	umfile_writev(um_get_filectx(reln), forknum, pblkno, buffers, 1, false);
+}
+
+void
+UmCheckpointWritebackPblk(SMgrRelation reln, ForkNumber forknum,
+							 BlockNumber pblkno)
+{
+	Assert(reln != NULL);
+	Assert(BlockNumberIsValid(pblkno));
+	Assert(um_fork_uses_map(reln, forknum));
+	umfile_writeback(um_get_filectx(reln), forknum, pblkno, 1);
 }
 
 bool
@@ -1028,8 +1066,8 @@ UmMappingPublicationDone(void)
 
 void
 UmPrepareReplayMappingRange(SMgrRelation reln, ForkNumber forknum,
-								const UmbraMapRange *range,
-								BlockNumber old_pblkno, XLogRecPtr lsn)
+									const UmbraMapRange *range,
+									BlockNumber old_pblkno, XLogRecPtr lsn)
 {
 	UmbraFileContext *ctx;
 	BlockNumber logical_nblocks;
@@ -1055,7 +1093,7 @@ UmPrepareReplayMappingRange(SMgrRelation reln, ForkNumber forknum,
 								 range->first_pblkno,
 									range->nblocks, false);
 	ummap_prepare_replay_range(ctx, reln->smgr_rlocator, forknum, range,
-							  old_pblkno, lsn, physical_ready);
+								  old_pblkno, lsn, physical_ready);
 	reln->smgr_cached_nblocks[forknum] = InvalidBlockNumber;
 }
 
