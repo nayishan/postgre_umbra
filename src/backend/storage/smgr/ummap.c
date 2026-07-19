@@ -1252,6 +1252,145 @@ ummap_prepare_remap(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 	return true;
 }
 
+/*
+ * Claim one existing-page remap outside a critical section.
+ *
+ * Hint WAL cannot fall back to an old-P full-page image after the page has
+ * changed.  Unlike the WAL insertion prepass above, this path may wait for
+ * locks, load the MAP page, and wait for a descriptor-wide pending barrier.
+ * The data buffer lock held by the caller prevents a competing remap of the
+ * same logical block while this claim is prepared.
+ */
+void
+ummap_prepare_remap_blocking(UmbraFileContext *ctx,
+							 RelFileLocatorBackend rlocator,
+							 MapSuperDesc *root_desc, ForkNumber forknum,
+							 BlockNumber lblkno, UmbraMapRemap *remap)
+{
+	MapPageBuffer buffer;
+	MapSuperBuffer root_buffer;
+	UmbraMapRootData *root;
+	BlockNumber current;
+	BlockNumber map_blkno;
+	LWLock	   *extension_lock;
+	int			entry_idx;
+	int			word_idx;
+	uint64		entry_mask;
+	bool		extension_held = false;
+
+	Assert(ctx != NULL);
+	Assert(root_desc != NULL);
+	Assert(remap != NULL);
+	Assert(!remap->prepared && !remap->map_pinned);
+	Assert(CritSectionCount == 0);
+	if (!ummap_tracks_fork(forknum))
+		elog(ERROR, "cannot remap unsupported Umbra fork %d", (int) forknum);
+
+	MapPageEnsureInitialized();
+	map_blkno = ummap_map_blkno(forknum, lblkno);
+	entry_idx = ummap_entry_index(lblkno);
+	word_idx = entry_idx / 64;
+	entry_mask = UINT64CONST(1) << (entry_idx % 64);
+
+	/* Pin the target before taking the extension lock to preserve lock order. */
+	buffer = MapPageBufferReadBlocking(ctx, rlocator, map_blkno, LW_EXCLUSIVE);
+	MapPageUnlockBufferKeepPin(buffer);
+
+	extension_lock = MapPageExtensionLock(rlocator);
+	LWLockAcquire(extension_lock, LW_EXCLUSIVE);
+	extension_held = true;
+	{
+		(void) MapReclaimRegisterReservation(rlocator, forknum);
+		LWLockAcquire(&root_desc->content_lock, LW_EXCLUSIVE);
+		if (!root_desc->valid ||
+			!RelFileLocatorBackendEquals(root_desc->tag.rlocator, rlocator))
+		{
+			LWLockRelease(&root_desc->content_lock);
+			elog(ERROR, "Umbra resident MAP root changed during remap claim");
+		}
+		root_buffer.desc = root_desc;
+		root = (UmbraMapRootData *) MapSuperBufferGetData(root_buffer);
+		if (!ummap_root_reserve_buffer(root_buffer, forknum,
+									   InvalidBlockNumber, 1, false,
+									   &remap->new_pblkno))
+		{
+			LWLockRelease(&root_desc->content_lock);
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("cannot reserve another Umbra physical block")));
+		}
+		remap->generation_lsn = root->generation_lsn;
+		LWLockRelease(&root_desc->content_lock);
+		MapWakeWriter();
+
+		for (;;)
+		{
+			MapPageLockBuffer(buffer, LW_EXCLUSIVE);
+			if (buffer.desc->tag.map_blkno != map_blkno ||
+				!RelFileLocatorBackendEquals(buffer.desc->tag.rlocator,
+										 rlocator))
+				elog(PANIC, "Umbra remap target changed while pinned");
+			current = ummap_page_get_entry(MapPageBufferGetData(buffer),
+										   entry_idx);
+			if (!BlockNumberIsValid(current))
+			{
+				MapPageReleaseBuffer(buffer);
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("missing Umbra mapping for fork %d block %u",
+								(int) forknum, lblkno)));
+			}
+
+			if ((buffer.desc->pending_bits[word_idx] & entry_mask) != 0 ||
+				ummap_pending_replay_uses_slot(buffer.desc->slot_id) ||
+				buffer.desc->pending_range.valid ||
+				!MapPageRegisterPendingPin(buffer.desc))
+			{
+				/* Preserve the admission cap's one non-pending victim. */
+				MapPageReleaseBuffer(buffer);
+				LWLockRelease(extension_lock);
+				extension_held = false;
+				CHECK_FOR_INTERRUPTS();
+				pg_usleep(1000L);
+				buffer = MapPageBufferReadBlocking(ctx, rlocator, map_blkno,
+											   LW_EXCLUSIVE);
+				MapPageUnlockBufferKeepPin(buffer);
+				LWLockAcquire(extension_lock, LW_EXCLUSIVE);
+				extension_held = true;
+				continue;
+			}
+
+			remap->rlocator = rlocator;
+			remap->forknum = forknum;
+			remap->lblkno = lblkno;
+			remap->old_pblkno = current;
+			remap->map_slot_id = buffer.desc->slot_id;
+			remap->map_pinned = true;
+			remap->pending_registered = true;
+			buffer.desc->pending_bits[word_idx] |= entry_mask;
+			buffer.desc->pending_range.range.first_lblkno = lblkno;
+			buffer.desc->pending_range.range.first_pblkno = current;
+			buffer.desc->pending_range.range.nblocks = 1;
+			buffer.desc->pending_range.old_pblkno = InvalidBlockNumber;
+			buffer.desc->pending_range.reserved_pblkno = remap->new_pblkno;
+			buffer.desc->pending_range.forknum = forknum;
+			buffer.desc->pending_range.physical_ready = true;
+			buffer.desc->pending_range.reserved_pblkno_valid = true;
+			buffer.desc->pending_range.recovery_replay = false;
+			buffer.desc->pending_range.recovery_exact = false;
+			buffer.desc->pending_range.valid = true;
+
+			/* XLogResetInsertion() now owns this pin and pending slot. */
+			MapPageForgetBufferPin(buffer, CurrentResourceOwner);
+			MapPageUnlockBufferKeepPin(buffer);
+			remap->prepared = true;
+			break;
+		}
+	}
+	if (extension_held)
+		LWLockRelease(extension_lock);
+}
+
 void
 ummap_abort_remap(UmbraMapRemap *remap)
 {

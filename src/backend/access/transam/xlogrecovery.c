@@ -1854,6 +1854,13 @@ PerformWalRecovery(void)
 		RmgrCleanup();
 
 #ifdef USE_UMBRA
+		/*
+		 * Crash recovery has no minRecoveryPoint, so it never reaches the
+		 * consistency transition that normally checks invalid pages.  Umbra redo
+		 * can defer a missing old-P baseline to a later DROP or TRUNCATE; require
+		 * that lifecycle record to have resolved every such dependency.
+		 */
+		XLogCheckInvalidPages();
 		UmCheckRecoveryDependencies();
 		UmRecoveryEnd();
 #endif

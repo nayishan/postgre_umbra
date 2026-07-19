@@ -120,6 +120,7 @@ extern int	MapPageCacheInsert(const MapPageTag *tag, uint32 hashcode,
 extern void MapPageCacheDelete(const MapPageTag *tag, uint32 hashcode,
 							   int slot_id);
 extern LWLock *MapPageExtensionLock(RelFileLocatorBackend rlocator);
+extern int	MapPageClockTryGetBuffer(void);
 extern int	MapPageClockGetBuffer(void);
 extern void MapPageClockFreeBuffer(int slot_id);
 extern void MapPageRecordAllocation(void);
@@ -132,6 +133,8 @@ extern void MapPageRememberPin(int slot_id);
 extern void MapPageTransferBufferPin(MapPageBuffer buffer,
 									 ResourceOwner old_owner,
 									 ResourceOwner new_owner);
+extern void MapPageForgetBufferPin(MapPageBuffer buffer,
+								   ResourceOwner owner);
 extern void MapPageLockBuffer(MapPageBuffer buffer, LWLockMode mode);
 extern void MapPageUnlockBufferKeepPin(MapPageBuffer buffer);
 extern void MapPageReleaseBufferOwned(MapPageBuffer buffer,

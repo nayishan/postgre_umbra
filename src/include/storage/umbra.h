@@ -76,6 +76,10 @@ extern bool UmWalOwnedRemapAvailable(SMgrRelation reln, ForkNumber forknum);
 extern bool UmExplicitRemapAvailable(SMgrRelation reln, ForkNumber forknum);
 extern bool UmPrepareBlockRemap(SMgrRelation reln, ForkNumber forknum,
 								BlockNumber lblkno, UmbraMapRemap *remap);
+extern void UmPrepareBlockRemapBlocking(SMgrRelation reln,
+										ForkNumber forknum,
+										BlockNumber lblkno,
+										UmbraMapRemap *remap);
 extern void UmAbortBlockRemap(UmbraMapRemap *remap);
 extern void UmReleaseBlockRemapOnExit(UmbraMapRemap *remap);
 extern void UmPublishBlockRemap(UmbraMapRemap *remap, XLogRecPtr lsn);

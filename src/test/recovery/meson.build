@@ -76,6 +76,7 @@ tests += {
       't/067_umbra_aux_map.pl',
       't/068_umbra_reclaim_checkpoint.pl',
       't/069_umbra_aux_maintenance.pl',
+      't/070_umbra_hint_delta.pl',
     ],
   },
 }

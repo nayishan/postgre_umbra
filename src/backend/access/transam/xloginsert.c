@@ -98,6 +98,7 @@ typedef struct
 	Buffer		buffer;
 	bool		from_shared_buffer;
 	bool		force_remap;
+	bool		hint_delta_remap;
 	bool		remap_in_record;
 	UmbraMapRemap remap;
 #endif
@@ -282,6 +283,7 @@ XLogResetInsertion(void)
 		registered_buffers[i].buffer = InvalidBuffer;
 		registered_buffers[i].from_shared_buffer = false;
 		registered_buffers[i].force_remap = false;
+		registered_buffers[i].hint_delta_remap = false;
 		registered_buffers[i].remap_in_record = false;
 		MemSet(&registered_buffers[i].remap, 0,
 			   sizeof(registered_buffers[i].remap));
@@ -345,6 +347,7 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
 	regbuf->buffer = buffer;
 	regbuf->from_shared_buffer = true;
 	regbuf->force_remap = false;
+	regbuf->hint_delta_remap = false;
 	regbuf->remap_in_record = false;
 	MemSet(&regbuf->remap, 0, sizeof(regbuf->remap));
 #endif
@@ -416,6 +419,70 @@ XLogRegisterBufferForRemap(uint8 block_id, Buffer buffer, uint8 flags,
 	regbuf->force_remap = true;
 	return true;
 }
+
+/* Interlock checkpoint start and claim a remap if this hint needs WAL. */
+bool
+XLogPrepareBufferHintDelta(Buffer buffer)
+{
+	registered_buffer *regbuf;
+
+	Assert(CritSectionCount == 0);
+	XLogBeginInsert();
+	XLogRegisterBuffer(0, buffer, REGBUF_NO_IMAGE | REGBUF_NO_CHANGE);
+	regbuf = &registered_buffers[0];
+	if (regbuf->forkno != MAIN_FORKNUM)
+	{
+		XLogResetInsertion();
+		elog(ERROR, "cannot prepare Umbra hint delta for fork %d",
+			 (int) regbuf->forkno);
+	}
+	if (!LocalTransactionIdIsValid(MyProc->vxid.lxid))
+	{
+		XLogResetInsertion();
+		elog(ERROR, "cannot prepare Umbra hint delta outside a transaction");
+	}
+	if ((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0)
+	{
+		MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+		curinsert_remap_delay_started = true;
+	}
+
+	/*
+	 * The checkpoint interlock stays set until the caller marks the page
+	 * dirty.  Therefore a page newer than the current redo point needs no
+	 * hint WAL even if a checkpoint starts before the caller finishes.
+	 */
+	if (PageGetLSN(regbuf->page) > GetRedoRecPtr())
+		return false;
+
+	PG_TRY();
+	{
+		SMgrRelation reln;
+
+		reln = smgropen(regbuf->rlocator, INVALID_PROC_NUMBER);
+		UmPrepareBlockRemapBlocking(reln, regbuf->forkno, regbuf->block,
+									&regbuf->remap);
+	}
+	PG_CATCH();
+	{
+		XLogResetInsertion();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	regbuf->flags = REGBUF_NO_IMAGE;
+	regbuf->hint_delta_remap = true;
+	return true;
+}
+
+XLogRecPtr
+XLogInsertPreparedHintDelta(const void *data, uint32 len)
+{
+	Assert(data != NULL);
+	Assert(len > 0);
+	XLogRegisterBufData(0, data, len);
+	return XLogInsert(RM_XLOG2_ID, XLOG2_HINT_DELTA);
+}
 #endif
 
 /*
@@ -449,6 +516,7 @@ XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator, ForkNumber forknum,
 	regbuf->buffer = InvalidBuffer;
 	regbuf->from_shared_buffer = false;
 	regbuf->force_remap = false;
+	regbuf->hint_delta_remap = false;
 	regbuf->remap_in_record = false;
 	MemSet(&regbuf->remap, 0, sizeof(regbuf->remap));
 #endif
@@ -869,7 +937,13 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 
 		/* Determine if this block needs to be backed up */
 #ifdef USE_UMBRA
-		if (regbuf->force_remap)
+		if (regbuf->hint_delta_remap)
+		{
+			Assert(regbuf->remap.prepared);
+			needs_backup = false;
+			needs_remap = true;
+		}
+		else if (regbuf->force_remap)
 		{
 			Assert(regbuf->remap.prepared);
 			needs_backup = true;
@@ -1282,8 +1356,10 @@ XLogPublishBlockRemaps(XLogRecPtr record_endptr)
 		if (!regbuf->in_use || !regbuf->remap_in_record)
 			continue;
 		Assert(regbuf->remap.prepared);
-		BufferSaveCheckpointPblk(regbuf->buffer, regbuf->remap.old_pblkno);
+		if (!regbuf->hint_delta_remap)
+			BufferSaveCheckpointPblk(regbuf->buffer, regbuf->remap.old_pblkno);
 		UmPublishBlockRemap(&regbuf->remap, record_endptr);
+		regbuf->hint_delta_remap = false;
 		regbuf->remap_in_record = false;
 	}
 	curinsert_has_existing_remap = false;
@@ -1300,6 +1376,7 @@ XLogAbortBlockRemaps(void)
 
 		if (regbuf->remap.prepared || regbuf->remap.map_pinned)
 			UmAbortBlockRemap(&regbuf->remap);
+		regbuf->hint_delta_remap = false;
 		regbuf->remap_in_record = false;
 	}
 	curinsert_has_existing_remap = false;
@@ -1320,6 +1397,7 @@ XLogReleaseBlockRemapsAtExit(int code, Datum arg)
 
 			if (regbuf->remap.map_pinned)
 				UmReleaseBlockRemapOnExit(&regbuf->remap);
+			regbuf->hint_delta_remap = false;
 			regbuf->remap_in_record = false;
 		}
 	}
@@ -1367,7 +1445,8 @@ XLogPrepareBlockRemaps(RmgrId rmid, uint8 info,
 	{
 		registered_buffer *regbuf = &registered_buffers[block_id];
 
-		if (!regbuf->in_use || !regbuf->force_remap)
+		if (!regbuf->in_use ||
+			(!regbuf->force_remap && !regbuf->hint_delta_remap))
 			continue;
 		Assert(regbuf->remap.prepared);
 		prepared = true;

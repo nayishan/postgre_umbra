@@ -226,7 +226,7 @@ MapPageExtensionLock(RelFileLocatorBackend rlocator)
 }
 
 int
-MapPageClockGetBuffer(void)
+MapPageClockTryGetBuffer(void)
 {
 	int			trycounter;
 
@@ -297,8 +297,19 @@ MapPageClockGetBuffer(void)
 		}
 
 		if (--trycounter == 0)
-			elog(ERROR, "no unpinned Umbra MAP page buffers are available");
+			return -1;
 	}
+}
+
+int
+MapPageClockGetBuffer(void)
+{
+	int			slot_id;
+
+	slot_id = MapPageClockTryGetBuffer();
+	if (slot_id < 0)
+		elog(ERROR, "no unpinned Umbra MAP page buffers are available");
+	return slot_id;
 }
 
 void

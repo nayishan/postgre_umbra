@@ -23,6 +23,7 @@
 #include "access/xlogrecovery.h"
 #include "access/xlog_internal.h"
 #include "access/xlogutils.h"
+#include "catalog/pg_control.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
 #include "storage/smgr.h"
@@ -370,6 +371,7 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 #ifdef USE_UMBRA
 	DecodedBkpBlock *blkref;
 	bool		existing_remap;
+	bool		hint_delta;
 	SMgrRelation remap_reln = NULL;
 #endif
 
@@ -395,9 +397,14 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 	blkref = XLogRecGetBlock(record, block_id);
 	existing_remap = blkref->has_remap &&
 		BlockNumberIsValid(blkref->old_pblkno);
+	hint_delta = XLogRecGetRmid(record) == RM_XLOG2_ID &&
+		(XLogRecGetInfo(record) & ~XLR_INFO_MASK) == XLOG2_HINT_DELTA;
+	if (hint_delta && forknum != MAIN_FORKNUM)
+		elog(PANIC, "Umbra hint delta record references non-main fork");
 	if (existing_remap &&
-		(willinit != (forknum == FSM_FORKNUM ||
-					  forknum == VISIBILITYMAP_FORKNUM)))
+		(willinit != (!hint_delta &&
+					  (forknum == FSM_FORKNUM ||
+					   forknum == VISIBILITYMAP_FORKNUM))))
 		elog(PANIC, "invalid Umbra existing-page remap in WAL record");
 #endif
 

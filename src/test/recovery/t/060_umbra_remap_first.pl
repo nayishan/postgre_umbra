@@ -76,6 +76,7 @@ $node->init;
 $node->append_conf(
 	'postgresql.conf', qq{
 autovacuum = off
+bgwriter_lru_maxpages = 0
 checkpoint_timeout = '1h'
 fsync = on
 full_page_writes = on
@@ -104,8 +105,9 @@ $node->safe_psql(
 INSERT INTO umbra_remap_first
 SELECT g, repeat(md5(g::text), $payload_repeats)
 FROM generate_series(1, $row_count) AS g;
-CHECKPOINT;
 });
+my $logical_before = visible_heap_blocks($node);
+$node->safe_psql('postgres', 'CHECKPOINT');
 
 my $relpath = $node->safe_psql(
 	'postgres',
@@ -118,7 +120,6 @@ my $map_path = "${data_path}_map";
 # pg_relation_size() reports the retained physical fork size in Umbra.  This
 # relation stores one visible tuple per page, so its highest ctid observes the
 # logical range exercised by this test instead.
-my $logical_before = visible_heap_blocks($node);
 my $physical_before = file_blocks($data_path, $block_size);
 
 cmp_ok($logical_before, '>', $entries_per_page,
@@ -179,21 +180,38 @@ my $mapping_wal_end = $node->safe_psql(
 
 my $logical_after = visible_heap_blocks($node);
 my $physical_after = file_blocks($data_path, $block_size);
-my $mapping_details =
-  "first_lblkno 0 first_pblkno $physical_before nblocks $logical_after";
 
 cmp_ok($logical_after, '>', 0, 're-extension advances the logical EOF');
 cmp_ok($physical_after, '>', $physical_before,
 	're-extension appends beyond the retained physical EOF');
-command_like(
+my ($mapping_wal, $mapping_wal_stderr) = run_command(
 	[
 		'pg_waldump', '--bkp-details',
 		'--path' => $node->data_dir . '/pg_wal',
 		'--start' => $mapping_wal_start,
 		'--end' => $mapping_wal_end,
-	],
-	qr/fork main blk 0[^\n]*; remap: \Q$mapping_details\E/,
+	]);
+is($mapping_wal_stderr, '', 'pg_waldump reads first-born mapping WAL');
+my @mapping_records = grep {
+	/rel \d+\/\d+\/$filenode fork main blk 0/
+} split(/\n/, $mapping_wal);
+my @firstborn_pblknos;
+foreach my $record (@mapping_records)
+{
+	push @firstborn_pblknos, 0 + $1
+	  if $record =~
+	  /; remap: first_lblkno 0 first_pblkno (\d+) nblocks $logical_after\b/;
+}
+is(scalar(@firstborn_pblknos), 1,
 	'pg_waldump decodes the exact first-born mapping range');
+@firstborn_pblknos == 1
+  or BAIL_OUT('could not identify the first-born physical block');
+my $firstborn_pblkno = $firstborn_pblknos[0];
+
+# A failed remap claim can leave a physical reservation unused, so the next
+# first-born range need not begin exactly at the current physical EOF.
+cmp_ok($firstborn_pblkno, '>=', $physical_before,
+	'first-born mapping starts at or beyond the retained physical EOF');
 
 # Buffered extension publishes a structural MAP_EXTEND record before its data
 # page becomes visible.  An immediate stop leaves recovery to rebuild that
@@ -201,6 +219,10 @@ command_like(
 $node->stop('immediate');
 $node->start;
 
+is(
+	read_main_map_entry($map_path, $block_size, 0),
+	$firstborn_pblkno,
+	'crash recovery publishes the exact first-born mapping');
 is(
 	$node->safe_psql(
 		'postgres',
@@ -213,11 +235,9 @@ is(file_blocks($data_path, $block_size), $physical_after,
 	'crash recovery preserves the exact physical EOF');
 
 $node->safe_psql('postgres', 'CHECKPOINT');
-is(
-	read_main_map_entry($map_path, $block_size, 0),
-	$physical_before,
-	'logical block 0 maps to the first block after the old physical EOF');
-isnt(read_main_map_entry($map_path, $block_size, 0), 0,
+my $existing_old_pblkno = read_main_map_entry($map_path, $block_size, 0);
+my $physical_before_existing = file_blocks($data_path, $block_size);
+isnt($existing_old_pblkno, 0,
 	're-extension produces an L != P mapping');
 
 # After this checkpoint, the first update remaps the existing page instead of
@@ -240,7 +260,7 @@ my $existing_wal_end = $node->safe_psql(
 my $physical_after_existing = file_blocks($data_path, $block_size);
 
 is($updated_block, '0', 'existing-page remap stays on logical block 0');
-is($physical_after_existing, $physical_after,
+is($physical_after_existing, $physical_before_existing,
 	'existing-page WAL reservation does not extend the physical file');
 my ($existing_wal, $existing_wal_stderr) = run_command(
 	[
@@ -252,7 +272,7 @@ is($existing_wal_stderr, '', 'pg_waldump reads existing-page remap WAL');
 my @existing_records = grep {
 	/rel \d+\/\d+\/$filenode fork main blk 0/
 } split(/\n/, $existing_wal);
-ok(grep(/; remap: lblkno 0 old_pblkno $physical_before new_pblkno $physical_after/,
+ok(grep(/; remap: lblkno 0 old_pblkno $existing_old_pblkno new_pblkno $physical_before_existing/,
 		@existing_records),
 	'existing-page WAL names the exact old and new physical blocks');
 ok(!grep(/\bFPW\b/, @existing_records),
@@ -261,16 +281,16 @@ ok(!grep(/\bFPW\b/, @existing_records),
 $node->stop('immediate');
 $node->start;
 is(
+	read_main_map_entry($map_path, $block_size, 0),
+	$physical_before_existing,
+	'old-P delta redo publishes the new physical mapping');
+is(
 	$node->safe_psql(
 		'postgres',
 		q{SELECT id::text || '|' || payload FROM umbra_remap_first;}),
 	'99|after-remap',
 	'old-P delta redo updates the existing non-identity page');
-is(
-	read_main_map_entry($map_path, $block_size, 0),
-	$physical_after,
-	'old-P delta redo publishes the new physical mapping');
-cmp_ok(file_blocks($data_path, $block_size), '>', $physical_after,
+cmp_ok(file_blocks($data_path, $block_size), '>', $physical_before_existing,
 	'old-P delta redo materializes the reserved physical block');
 
 # New permanent relations can skip incremental WAL under wal_level=minimal.

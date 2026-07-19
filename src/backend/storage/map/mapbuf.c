@@ -39,6 +39,12 @@ static bool MapPageDiscardFailedLoad(MapPageDesc *desc,
 									 uint32 hashcode);
 static void MapPageRememberIO(int slot_id);
 static void MapPageForgetIO(int slot_id);
+static MapPageBuffer MapPageBufferReadInternal(UmbraFileContext *ctx,
+											   RelFileLocatorBackend rlocator,
+											   BlockNumber map_blkno,
+											   bool extend, bool skipFsync,
+											   LWLockMode mode,
+											   bool wait_for_victim);
 
 static const ResourceOwnerDesc map_page_resowner_desc =
 {
@@ -62,6 +68,25 @@ MapPageBuffer
 MapPageBufferRead(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 				  BlockNumber map_blkno, bool extend, bool skipFsync,
 				  LWLockMode mode)
+{
+	return MapPageBufferReadInternal(ctx, rlocator, map_blkno, extend,
+								 skipFsync, mode, false);
+}
+
+MapPageBuffer
+MapPageBufferReadBlocking(UmbraFileContext *ctx,
+					  RelFileLocatorBackend rlocator, BlockNumber map_blkno,
+					  LWLockMode mode)
+{
+	return MapPageBufferReadInternal(ctx, rlocator, map_blkno, false, false,
+								 mode, true);
+}
+
+static MapPageBuffer
+MapPageBufferReadInternal(UmbraFileContext *ctx,
+						  RelFileLocatorBackend rlocator,
+						  BlockNumber map_blkno, bool extend, bool skipFsync,
+						  LWLockMode mode, bool wait_for_victim)
 {
 	MapPageTag	tag = {0};
 	uint32		hashcode;
@@ -125,7 +150,14 @@ MapPageBufferRead(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 			continue;
 		}
 
-		slot_id = MapPageClockGetBuffer();
+		slot_id = wait_for_victim ? MapPageClockTryGetBuffer() :
+			MapPageClockGetBuffer();
+		if (slot_id < 0)
+		{
+			CHECK_FOR_INTERRUPTS();
+			pg_usleep(1000L);
+			continue;
+		}
 		desc = &MapPageDescriptors[slot_id];
 		state = pg_atomic_read_u64(&desc->state);
 		if ((state & MAP_PAGE_DIRTY) != 0 &&
@@ -492,6 +524,19 @@ MapPageTransferBufferPin(MapPageBuffer buffer, ResourceOwner old_owner,
 						&map_page_resowner_desc);
 	ResourceOwnerRemember(new_owner, Int32GetDatum(desc->slot_id),
 						  &map_page_resowner_desc);
+}
+
+/* Transfer a resource-owned pin to code that will release it explicitly. */
+void
+MapPageForgetBufferPin(MapPageBuffer buffer, ResourceOwner owner)
+{
+	MapPageDesc *desc = buffer.desc;
+
+	Assert(desc != NULL);
+	Assert(owner != NULL);
+	Assert(LWLockHeldByMe(&desc->content_lock));
+	ResourceOwnerForget(owner, Int32GetDatum(desc->slot_id),
+						&map_page_resowner_desc);
 }
 
 void

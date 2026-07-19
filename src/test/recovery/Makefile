@@ -9,7 +9,8 @@
 #
 #-------------------------------------------------------------------------
 
-EXTRA_INSTALL=contrib/pg_buffercache \
+EXTRA_INSTALL=contrib/pageinspect \
+	contrib/pg_buffercache \
 	contrib/pg_prewarm \
 	contrib/pg_stat_statements \
 	contrib/test_decoding \

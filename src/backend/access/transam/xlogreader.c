@@ -32,6 +32,7 @@
 #include "catalog/pg_control.h"
 #include "common/pg_lzcompress.h"
 #include "replication/origin.h"
+#include "storage/bufpage.h"
 
 #ifndef FRONTEND
 #include "pgstat.h"
@@ -53,6 +54,10 @@ static bool ValidXLogRecordHeader(XLogReaderState *state, XLogRecPtr RecPtr,
 static bool ValidXLogRecord(XLogReaderState *state, XLogRecord *record,
 							XLogRecPtr recptr);
 static void ResetDecoder(XLogReaderState *state);
+#ifdef USE_UMBRA
+static bool ValidateHintDeltaRecord(XLogReaderState *state,
+									DecodedXLogRecord *decoded);
+#endif
 static void WALOpenSegmentInit(WALOpenSegment *seg, WALSegmentContext *segcxt,
 							   int segsize, const char *waldir);
 
@@ -82,6 +87,61 @@ report_invalid_record(XLogReaderState *state, const char *fmt,...)
 
 	state->errormsg_deferred = true;
 }
+
+#ifdef USE_UMBRA
+/* Validate before recovery can prepare the record's physical mapping. */
+static bool
+ValidateHintDeltaRecord(XLogReaderState *state, DecodedXLogRecord *decoded)
+{
+	DecodedBkpBlock *block;
+	const char *ptr;
+	Size		remaining;
+	uint32		previous_end = 0;
+	int			fragments = 0;
+
+	if (decoded->main_data_len != 0 || decoded->max_block_id != 0)
+		goto invalid;
+	block = &decoded->blocks[0];
+	if (!block->in_use || block->forknum != MAIN_FORKNUM ||
+		(block->flags & BKPBLOCK_WILL_INIT) != 0 ||
+		!block->has_remap || !BlockNumberIsValid(block->old_pblkno) ||
+		block->has_image || !block->has_data || block->data_len == 0 ||
+		block->data_len >= BLCKSZ)
+		goto invalid;
+
+	ptr = block->data;
+	remaining = block->data_len;
+	while (remaining > 0)
+	{
+		xl_hint_delta_fragment fragment;
+		uint32		fragment_end;
+
+		if (remaining < SizeOfXLogHintDeltaFragment)
+			goto invalid;
+		memcpy(&fragment, ptr, SizeOfXLogHintDeltaFragment);
+		ptr += SizeOfXLogHintDeltaFragment;
+		remaining -= SizeOfXLogHintDeltaFragment;
+		fragment_end = (uint32) fragment.offset + fragment.length;
+		if (fragment.length == 0 ||
+			fragment.offset < offsetof(PageHeaderData, pd_flags) ||
+			fragment.offset < previous_end ||
+			fragment_end > BLCKSZ || remaining < fragment.length)
+			goto invalid;
+		ptr += fragment.length;
+		remaining -= fragment.length;
+		previous_end = fragment_end;
+		fragments++;
+	}
+	if (fragments > 0)
+		return true;
+
+invalid:
+	report_invalid_record(state,
+						  "invalid Umbra hint delta record at %X/%08X",
+						  LSN_FORMAT_ARGS(state->ReadRecPtr));
+	return false;
+}
+#endif
 
 /*
  * Set the size of the decoding buffer.  A pointer to a caller supplied memory
@@ -1722,6 +1782,9 @@ DecodeXLogRecord(XLogReaderState *state,
 	uint32		datatotal;
 	RelFileLocator *rlocator = NULL;
 	uint8		block_id;
+#ifdef USE_UMBRA
+	bool		hint_delta;
+#endif
 
 	decoded->header = *record;
 	decoded->lsn = lsn;
@@ -1731,6 +1794,10 @@ DecodeXLogRecord(XLogReaderState *state,
 	decoded->main_data = NULL;
 	decoded->main_data_len = 0;
 	decoded->max_block_id = -1;
+#ifdef USE_UMBRA
+	hint_delta = record->xl_rmid == RM_XLOG2_ID &&
+		(record->xl_info & ~XLR_INFO_MASK) == XLOG2_HINT_DELTA;
+#endif
 	ptr = (char *) record;
 	ptr += SizeOfXLogRecord;
 	remaining = record->xl_tot_len - SizeOfXLogRecord;
@@ -1975,8 +2042,10 @@ DecodeXLogRecord(XLogReaderState *state,
 				 blk->first_pblkno == blk->old_pblkno ||
 				 blk->has_image != blk->apply_image ||
 				 (((blk->flags & BKPBLOCK_WILL_INIT) != 0) !=
-				  (blk->forknum == FSM_FORKNUM ||
-				   blk->forknum == VISIBILITYMAP_FORKNUM))))
+				  (!hint_delta &&
+				   (blk->forknum == FSM_FORKNUM ||
+					blk->forknum == VISIBILITYMAP_FORKNUM))) ||
+				 (hint_delta && (blk->has_image || !blk->has_data))))
 			{
 				report_invalid_record(state,
 								  "invalid Umbra existing-page remap for block %u at %X/%08X",
@@ -2046,6 +2115,11 @@ DecodeXLogRecord(XLogReaderState *state,
 		ptr += decoded->main_data_len;
 		out += decoded->main_data_len;
 	}
+
+#ifdef USE_UMBRA
+	if (hint_delta && !ValidateHintDeltaRecord(state, decoded))
+		goto err;
+#endif
 
 	/* Report the actual size we used. */
 	decoded->size = MAXALIGN(out - (char *) decoded);

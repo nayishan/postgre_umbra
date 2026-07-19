@@ -62,6 +62,10 @@ extern MapPageBuffer MapPageBufferRead(UmbraFileContext *ctx,
 									   BlockNumber map_blkno,
 									   bool extend, bool skipFsync,
 									   LWLockMode mode);
+extern MapPageBuffer MapPageBufferReadBlocking(UmbraFileContext *ctx,
+										   RelFileLocatorBackend rlocator,
+										   BlockNumber map_blkno,
+										   LWLockMode mode);
 extern char *MapPageBufferGetData(MapPageBuffer buffer);
 extern void MapPageMarkBufferDirty(MapPageBuffer buffer, bool skipFsync,
 								   XLogRecPtr wal_flush_lsn);

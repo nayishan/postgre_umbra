@@ -52,6 +52,8 @@ extern void XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags);
 extern bool XLogRegisterBufferForRemap(uint8 block_id, Buffer buffer,
 									  uint8 flags,
 									  BlockNumber expected_old_pblkno);
+extern bool XLogPrepareBufferHintDelta(Buffer buffer);
+extern XLogRecPtr XLogInsertPreparedHintDelta(const void *data, uint32 len);
 #endif
 extern void XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator,
 							  ForkNumber forknum, BlockNumber blknum, const PageData *page,

@@ -156,6 +156,12 @@ extern bool ummap_prepare_remap(UmbraFileContext *ctx,
 									MapSuperDesc *root_desc, ForkNumber forknum,
 									BlockNumber lblkno,
 									UmbraMapRemap *remap);
+extern void ummap_prepare_remap_blocking(UmbraFileContext *ctx,
+										RelFileLocatorBackend rlocator,
+										MapSuperDesc *root_desc,
+										ForkNumber forknum,
+										BlockNumber lblkno,
+										UmbraMapRemap *remap);
 extern void ummap_abort_remap(UmbraMapRemap *remap);
 extern void ummap_release_remap_on_exit(UmbraMapRemap *remap);
 extern void ummap_publish_remap(UmbraMapRemap *remap, XLogRecPtr lsn);

@@ -160,15 +160,18 @@ is(read_hex_bytes($redo_init_map, $redo_init_offset, 4),
 	'ffffffff', 'crash image has a missing first-born MAP entry');
 
 $node->start;
-is(
-	$node->safe_psql('postgres', 'SELECT count(*) FROM umbra_pool_redo_init'),
-	'2000',
-	'redo restores an INSERT+INIT page with its WAL-recorded mapping');
+
+# Check the replayed mapping before reading the relation.  A heap scan may set
+# commit hint bits and legitimately remap the page again.
 $node->safe_psql('postgres', 'CHECKPOINT');
 is(
 	read_hex_bytes($redo_init_map, $redo_init_offset, 4),
 	unpack('H*', pack('L', $redo_init_block)),
 	'checkpoint persists the first-born mapping replayed from WAL');
+is(
+	$node->safe_psql('postgres', 'SELECT count(*) FROM umbra_pool_redo_init'),
+	'2000',
+	'redo restores an INSERT+INIT page with its WAL-recorded mapping');
 is($node->safe_psql('postgres', 'SELECT count(*) FROM umbra_pool_churn_128'),
 	'1', 'checkpointed relation remains readable after crash restart');
 

@@ -1411,6 +1411,7 @@ btvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 static BlockNumber
 btvacuumpage(BTVacState *vstate, Buffer buf)
 {
+	BufferHintDeltaContext hint_delta;
 	IndexVacuumInfo *info = vstate->info;
 	IndexBulkDeleteResult *stats = vstate->stats;
 	IndexBulkDeleteCallback callback = vstate->callback;
@@ -1655,15 +1656,18 @@ backtrack:
 			 * takes care of this.)  This ensures we won't process the page
 			 * again.
 			 *
-			 * We treat this like a hint-bit update because there's no need to
-			 * WAL-log it.
+			 * We treat this like a hint-bit update because it needs no semantic
+			 * WAL, although hint-write protection may emit WAL.
 			 */
 			Assert(nhtidsdead == 0);
 			if (vstate->cycleid != 0 &&
 				opaque->btpo_cycleid == vstate->cycleid)
 			{
-				opaque->btpo_cycleid = 0;
-				MarkBufferDirtyHint(buf, true);
+				if (BufferBeginHintDelta(buf, &hint_delta))
+				{
+					opaque->btpo_cycleid = 0;
+					BufferFinishHintDelta(&hint_delta, true, true);
+				}
 			}
 		}
 

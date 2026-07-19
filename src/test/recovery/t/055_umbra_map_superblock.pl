@@ -220,6 +220,17 @@ is(substr($identity_super, MAP_PAYLOAD_SIZE,
 check_root_crc($node, $identity_super, 'identity phase');
 
 $node->safe_psql('postgres', 'DELETE FROM umbra_super_t;');
+$node->safe_psql('postgres', 'CHECKPOINT;');
+
+# DELETE remaps clean pages for WAL changes, and VACUUM can remap hint changes.
+# Save durable pre-truncation lower bounds rather than assuming identity P.
+my $pretruncate_blocks = raw_main_blocks($node, $main_path, $block_size);
+my $pretruncate_super = read_map_super($node, $map_path);
+my $pretruncate_physical =
+  u32_at($pretruncate_super, MAP_PHYSICAL_MAIN_OFFSET);
+my $pretruncate_capacity =
+  u32_at($pretruncate_super, MAP_CAPACITY_MAIN_OFFSET);
+
 $node->safe_psql(
 	'postgres',
 	'VACUUM (TRUNCATE TRUE, DISABLE_PAGE_SKIPPING) umbra_super_t;');
@@ -228,18 +239,23 @@ $node->safe_psql('postgres', 'CHECKPOINT;');
 my $truncated_blocks = raw_main_blocks($node, $main_path, $block_size);
 my $truncated_super = read_map_super($node, $map_path);
 
-is($truncated_blocks, $identity_blocks,
+cmp_ok($truncated_blocks, '>=', $pretruncate_blocks,
 	'logical truncate retains the append-only physical fork');
 is(u32_at($truncated_super, MAP_LOGICAL_MAIN_OFFSET), 0,
 	'truncate lowers the root logical EOF to zero');
-is(u32_at($truncated_super, MAP_PHYSICAL_MAIN_OFFSET), $identity_blocks,
+cmp_ok(u32_at($truncated_super, MAP_PHYSICAL_MAIN_OFFSET), '>=',
+	$pretruncate_physical,
 	'truncate does not rewind the physical frontier');
-is(u32_at($truncated_super, MAP_CAPACITY_MAIN_OFFSET), $identity_blocks,
+cmp_ok(u32_at($truncated_super, MAP_CAPACITY_MAIN_OFFSET), '>=',
+	$pretruncate_capacity,
 	'truncate does not rewind physical capacity');
 check_root_crc($node, $truncated_super, 'truncated phase');
 
 $node->safe_psql(
 	'postgres', q{INSERT INTO umbra_super_t VALUES (2000, 'remapped');});
+# Set the commit hint before capturing the final checkpoint root image.
+is($node->safe_psql('postgres', 'SELECT id FROM umbra_super_t;'),
+	'2000', 'remapped relation remains readable');
 $node->safe_psql('postgres', 'CHECKPOINT;');
 
 my $remapped_blocks = raw_main_blocks($node, $main_path, $block_size);
@@ -247,7 +263,7 @@ my $remapped_super = read_map_super($node, $map_path);
 my $logical_after = u32_at($remapped_super, MAP_LOGICAL_MAIN_OFFSET);
 my $physical_after = u32_at($remapped_super, MAP_PHYSICAL_MAIN_OFFSET);
 
-cmp_ok($remapped_blocks, '>', $identity_blocks,
+cmp_ok($remapped_blocks, '>', $truncated_blocks,
 	're-extension appends beyond retained physical EOF');
 cmp_ok($logical_after, '>', 0, 're-extension advances logical EOF');
 cmp_ok($logical_after, '<', $physical_after,
@@ -258,8 +274,6 @@ is(u32_at($remapped_super, MAP_CAPACITY_MAIN_OFFSET), $remapped_blocks,
 	'physical capacity follows materialized allocation');
 is(u32_at($remapped_super, 12), MAP_FORMAT_V2,
 	'root flags remain limited to the format marker');
-is($node->safe_psql('postgres', 'SELECT id FROM umbra_super_t;'),
-	'2000', 'remapped relation remains readable');
 check_root_crc($node, $remapped_super, 'remapped phase');
 
 my $remapped_super_hex = unpack('H*', $remapped_super);

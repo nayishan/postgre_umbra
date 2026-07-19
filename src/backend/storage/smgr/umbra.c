@@ -966,6 +966,24 @@ UmPrepareBlockRemap(SMgrRelation reln, ForkNumber forknum,
 }
 
 void
+UmPrepareBlockRemapBlocking(SMgrRelation reln, ForkNumber forknum,
+							BlockNumber lblkno, UmbraMapRemap *remap)
+{
+	UmbraSmgrRelationState *state;
+
+	Assert(reln != NULL);
+	Assert(remap != NULL);
+	Assert(CritSectionCount == 0);
+	if (!UmExplicitRemapAvailable(reln, forknum))
+		elog(ERROR, "Umbra remap is unavailable for fork %d", (int) forknum);
+	state = reln->smgr_private;
+	if (state->root_desc == NULL)
+		um_cache_root_desc(state, reln->smgr_rlocator);
+	ummap_prepare_remap_blocking(um_get_filectx(reln), reln->smgr_rlocator,
+								 state->root_desc, forknum, lblkno, remap);
+}
+
+void
 UmAbortBlockRemap(UmbraMapRemap *remap)
 {
 	ummap_abort_remap(remap);
