@@ -140,8 +140,8 @@ my @target_remap_records = grep {
 } split(/\n/, $wal_dump);
 cmp_ok(scalar(@target_remap_records), '>=', 1,
 	'update after MAP flush uses old-P remap WAL');
-ok(!grep(!/\bFPW\b/, @target_remap_records),
-	'checkpoint-overlap remap keeps an image for torn source-P recovery');
+ok(!grep(/\bFPW\b/, @target_remap_records),
+	'checkpoint-overlap remap is image-free');
 
 $node->stop('immediate');
 $node->start;
@@ -212,8 +212,8 @@ my @chain_records = grep {
 } split(/\n/, $chain_wal);
 cmp_ok(scalar(@chain_records), '>=', 1,
 	'checkpoint-overlap WAL contains the remap step');
-ok(!grep(!/\bFPW\b/, @chain_records),
-	'checkpoint-overlap remap keeps its full-page image');
+ok(!grep(/\bFPW\b/, @chain_records),
+	'checkpoint-overlap remap is image-free');
 
 $node->stop('immediate');
 $node->start;
@@ -371,8 +371,8 @@ my @epoch_remap_records = grep {
 } split(/\n/, $epoch_wal);
 is(scalar(@epoch_remap_records), 1,
 	'C2 emits one remap record for the target block');
-ok(!grep(!/\bFPW\b/, @epoch_remap_records),
-	'C2 remap and its full-page image are in the same WAL record');
+ok(!grep(/\bFPW\b/, @epoch_remap_records),
+	'C2 remap is image-free');
 
 $node->stop('immediate');
 $node->start;

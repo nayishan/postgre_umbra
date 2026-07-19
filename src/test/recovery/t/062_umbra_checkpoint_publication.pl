@@ -205,8 +205,8 @@ my @early_remap_records = grep {
 } split(/\n/, $early_wal);
 cmp_ok(scalar(@early_remap_records), '>=', 1,
 	'early-capture update emits remap WAL for the target block');
-ok(!grep(!/\bFPW\b/, @early_remap_records),
-	'early-capture remap retains its full-page image');
+ok(!grep(/\bFPW\b/, @early_remap_records),
+	'early-capture remap is image-free');
 
 $node->safe_psql(
 	'postgres',

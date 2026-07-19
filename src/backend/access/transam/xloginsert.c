@@ -162,7 +162,6 @@ static XLogRecData *XLogRecordAssemble(RmgrId rmid, uint8 info,
 									   XLogRecPtr RedoRecPtr, bool doPageWrites,
 #ifdef USE_UMBRA
 									   XLogRecPtr remapRecPtr,
-									   bool remapNeedsImage,
 #endif
 									   XLogRecPtr *fpw_lsn, int *num_fpi,
 									   uint64 *fpi_bytes,
@@ -179,8 +178,7 @@ static bool XLogBlockRemapEligible(registered_buffer *regbuf,
 								  SMgrRelation *reln);
 static bool XLogPrepareBlockRemaps(RmgrId rmid, uint8 info,
 								  XLogRecPtr RedoRecPtr, bool doPageWrites,
-								  XLogRecPtr *remapRecPtr,
-								  bool *remapNeedsImage);
+								  XLogRecPtr *remapRecPtr);
 static void XLogPublishBlockRemaps(XLogRecPtr record_endptr);
 static void XLogAbortBlockRemaps(void);
 static void XLogReleaseBlockRemapsAtExit(int code, Datum arg);
@@ -704,7 +702,6 @@ XLogInsert(RmgrId rmid, uint8 info)
 		uint64		fpi_bytes = 0;
 #ifdef USE_UMBRA
 		XLogRecPtr	remapRecPtr = InvalidXLogRecPtr;
-		bool		remapNeedsImage = false;
 		bool		remap_critical = false;
 #endif
 
@@ -719,15 +716,14 @@ XLogInsert(RmgrId rmid, uint8 info)
 		PG_TRY();
 		{
 			if (XLogPrepareBlockRemaps(rmid, info, RedoRecPtr,
-									 doPageWrites, &remapRecPtr,
-									 &remapNeedsImage) &&
+									 doPageWrites, &remapRecPtr) &&
 				(MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0)
 			{
 				MyProc->delayChkptFlags |= DELAY_CHKPT_START;
 				curinsert_remap_delay_started = true;
 			}
 			rdt = XLogRecordAssemble(rmid, info, RedoRecPtr, doPageWrites,
-									 remapRecPtr, remapNeedsImage,
+									 remapRecPtr,
 									 &fpw_lsn, &num_fpi, &fpi_bytes,
 									 &topxid_included);
 		}
@@ -860,7 +856,7 @@ static XLogRecData *
 XLogRecordAssemble(RmgrId rmid, uint8 info,
 				   XLogRecPtr RedoRecPtr, bool doPageWrites,
 #ifdef USE_UMBRA
-				   XLogRecPtr remapRecPtr, bool remapNeedsImage,
+				   XLogRecPtr remapRecPtr,
 #endif
 				   XLogRecPtr *fpw_lsn, int *num_fpi, uint64 *fpi_bytes,
 				   bool *topxid_included)
@@ -972,8 +968,8 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 				XLogRecPtrIsValid(remapRecPtr) && page_lsn <= remapRecPtr &&
 				regbuf->remap.prepared)
 			{
-				/* Capture-only remaps retain an image of their unsafe old P. */
-				needs_backup = remapNeedsImage;
+				/* Checkpoint writeback preserves the captured old-P baseline. */
+				needs_backup = false;
 				needs_remap = true;
 			}
 #endif
@@ -1430,7 +1426,7 @@ XLogBlockRemapEligible(registered_buffer *regbuf, RmgrId rmid, uint8 info,
 static bool
 XLogPrepareBlockRemaps(RmgrId rmid, uint8 info,
 						XLogRecPtr RedoRecPtr, bool doPageWrites,
-						XLogRecPtr *remapRecPtr, bool *remapNeedsImage)
+						XLogRecPtr *remapRecPtr)
 {
 	int			block_id;
 	XLogRecPtr	completedRedoRecPtr;
@@ -1438,9 +1434,7 @@ XLogPrepareBlockRemaps(RmgrId rmid, uint8 info,
 	bool		prepared = false;
 
 	Assert(remapRecPtr != NULL);
-	Assert(remapNeedsImage != NULL);
 	*remapRecPtr = InvalidXLogRecPtr;
-	*remapNeedsImage = false;
 	for (block_id = 0; block_id < max_registered_block_id; block_id++)
 	{
 		registered_buffer *regbuf = &registered_buffers[block_id];
@@ -1484,10 +1478,7 @@ XLogPrepareBlockRemaps(RmgrId rmid, uint8 info,
 	}
 
 	if (prepared)
-	{
 		*remapRecPtr = captureActive ? RedoRecPtr : completedRedoRecPtr;
-		*remapNeedsImage = captureActive;
-	}
 	return prepared;
 }
 #endif
