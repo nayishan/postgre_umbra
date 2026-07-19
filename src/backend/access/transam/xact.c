@@ -3022,13 +3022,23 @@ AbortTransaction(void)
 		AtEOXact_TypeCache();
 		AtEOXact_Inval(false);
 		AtEOXact_MultiXact();
+#ifdef USE_UMBRA
+		/*
+		 * Umbra storage lifecycle locks are session locks so that they survive
+		 * the normal transaction-lock release until pending files are unlinked.
+		 * An abort releases session locks too, so process pending deletes first.
+		 */
+		smgrDoPendingDeletes(false);
+#endif
 		ResourceOwnerRelease(TopTransactionResourceOwner,
 							 RESOURCE_RELEASE_LOCKS,
 							 false, true);
 		ResourceOwnerRelease(TopTransactionResourceOwner,
 							 RESOURCE_RELEASE_AFTER_LOCKS,
 							 false, true);
+#ifndef USE_UMBRA
 		smgrDoPendingDeletes(false);
+#endif
 
 		AtEOXact_GUC(false, 1);
 		AtEOXact_SPI(false);

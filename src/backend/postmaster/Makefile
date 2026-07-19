@@ -32,6 +32,7 @@ OBJS = \
 
 ifeq ($(with_umbra), yes)
 OBJS += \
+	mapcompactor.o \
 	mapwriter.o
 endif
 

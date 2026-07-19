@@ -72,6 +72,7 @@ tests += {
       't/063_umbra_checkpoint_source_p.pl',
       't/064_umbra_map_generation_reuse.pl',
       't/065_umbra_mapwriter.pl',
+      't/066_umbra_mapcompactor.pl',
     ],
   },
 }

@@ -247,7 +247,19 @@ disk root I/O transfers one zero-padded 512-byte sector.
 
 The map writer preallocates capacity only for permanent MAIN forks.  FSM and VM
 remain on foreground extension because they do not yet have an independent
-physical-allocation lifecycle.  This patch does not relocate live blocks,
-reclaim or reuse retired physical blocks, or unlink physical segments.  CRC
-detects an invalid root but does not provide a duplicate root or repair
-arbitrary storage corruption.
+physical-allocation lifecycle.
+
+The optional map compactor counts live P references by extent and relocates
+resident permanent MAIN buffers from sparse extents, while skipping the newest
+live extent.  It never copies old-P directly: an exclusive shared-buffer lock
+captures the latest page and a deliberate full-page relocation record carries
+both that image and the exact old-P/new-P transition.  This is distinct from
+the normal data-WAL path, where exact old-P remap replaces an otherwise needed
+FPW and redo applies the record's logical delta.  Compactor work is bounded per
+round by relation visits and relocation count, and runs in a short transaction
+so checkpoint-delay processing can see a valid VXID.  Collecting the resident
+root snapshot still scans all resident roots.
+
+Compaction does not reclaim or reuse retired physical blocks, unlink physical
+segments, or scan FSM and VM.  CRC detects an invalid root but does not provide
+a duplicate root or repair arbitrary storage corruption.

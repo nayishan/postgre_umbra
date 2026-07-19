@@ -542,6 +542,12 @@ heapam_relation_copy_data(Relation rel, const RelFileLocator *newrlocator)
 {
 	SMgrRelation dstrel;
 
+#ifdef USE_UMBRA
+	/* Keep the MAP fixed from the final buffer flush through direct copying. */
+	if (RelationIsPermanent(rel))
+		LockRelationStorage(rel->rd_locator, AccessExclusiveLock);
+#endif
+
 	/*
 	 * Since we copy the file directly without looking at the shared buffers,
 	 * we'd better first flush out any pages of the source relation that are
@@ -587,6 +593,11 @@ heapam_relation_copy_data(Relation rel, const RelFileLocator *newrlocator)
 
 	/* drop old relation, and close new one */
 	RelationDropStorage(rel);
+#ifdef USE_UMBRA
+	/* RelationDropStorage has replaced the copy lock with its session lock. */
+	if (RelationIsPermanent(rel))
+		UnlockRelationStorage(rel->rd_locator, AccessExclusiveLock);
+#endif
 	smgrclose(dstrel);
 }
 

@@ -21,9 +21,12 @@
 
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "access/xloginsert.h"
 #include "access/xlogutils.h"
+#include "catalog/pg_control.h"
 #include "catalog/storage.h"
 #include "miscadmin.h"
+#include "storage/bufmgr.h"
 #include "storage/map.h"
 #include "storage/map_internal.h"
 #include "storage/proc.h"
@@ -951,6 +954,60 @@ UmGetBlockPhysical(SMgrRelation reln, ForkNumber forknum,
 		return false;
 	*pblkno = ummap_lookup_block(um_get_filectx(reln),
 								reln->smgr_rlocator, forknum, lblkno);
+	return true;
+}
+
+BlockNumber
+UmGetBlockPhysicalRun(SMgrRelation reln, ForkNumber forknum,
+					  BlockNumber lblkno, BlockNumber maxblocks,
+					  BlockNumber *pblkno)
+{
+	Assert(reln != NULL);
+	Assert(pblkno != NULL);
+	if (!um_fork_uses_map(reln, forknum))
+		return 0;
+	return ummap_lookup_run(um_get_filectx(reln), reln->smgr_rlocator,
+							forknum, lblkno, maxblocks, pblkno);
+}
+
+bool
+UmRelocateBufferedBlock(SMgrRelation reln, Buffer buffer, ForkNumber forknum,
+						BlockNumber lblkno, BlockNumber expected_old_pblkno)
+{
+	RelFileLocator rlocator;
+	ForkNumber buffer_forknum;
+	BlockNumber buffer_lblkno;
+	XLogRecPtr	recptr;
+
+	Assert(reln != NULL);
+	Assert(BufferIsValid(buffer));
+	Assert(BufferIsLockedByMeInMode(buffer, BUFFER_LOCK_EXCLUSIVE));
+	BufferGetTag(buffer, &rlocator, &buffer_forknum, &buffer_lblkno);
+	if (!RelFileLocatorEquals(rlocator, reln->smgr_rlocator.locator) ||
+		buffer_forknum != forknum || buffer_lblkno != lblkno ||
+		!BufferIsPermanent(buffer))
+		return false;
+
+	/*
+	 * This is a deliberate relocation image, not an ordinary FPW fallback.
+	 * The compactor has no logical page delta, and the shared buffer may contain
+	 * permanent skip-WAL changes that old-P cannot reconstruct.  The exact
+	 * remap header tells redo where to restore this latest image.
+	 */
+	XLogBeginInsert();
+	/* Compaction can move non-standard AM pages, so retain every page byte. */
+	if (!XLogRegisterBufferForRemap(0, buffer, 0,
+								 expected_old_pblkno))
+	{
+		XLogResetInsertion();
+		return false;
+	}
+
+	START_CRIT_SECTION();
+	MarkBufferDirty(buffer);
+	recptr = XLogInsert(RM_XLOG_ID, XLOG_FPI);
+	PageSetLSN(BufferGetPage(buffer), recptr);
+	END_CRIT_SECTION();
 	return true;
 }
 

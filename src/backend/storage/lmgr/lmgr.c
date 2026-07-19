@@ -482,6 +482,58 @@ UnlockRelationForExtension(Relation relation, LOCKMODE lockmode)
 	LockRelease(&tag, lockmode, false);
 }
 
+#ifdef USE_UMBRA
+/*
+ * Umbra background maintenance has only a physical locator, not a relation
+ * OID.  This lock keeps maintenance WAL on the correct side of storage
+ * creation/deletion WAL and protects locator-owned cache entries while used.
+ */
+void
+LockRelationStorage(RelFileLocator rlocator, LOCKMODE lockmode)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_RELATION_STORAGE(tag, rlocator);
+	(void) LockAcquire(&tag, lockmode, false, false);
+}
+
+void
+UnlockRelationStorage(RelFileLocator rlocator, LOCKMODE lockmode)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_RELATION_STORAGE(tag, rlocator);
+	LockRelease(&tag, lockmode, false);
+}
+
+bool
+ConditionalLockRelationStorage(RelFileLocator rlocator, LOCKMODE lockmode)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_RELATION_STORAGE(tag, rlocator);
+	return LockAcquire(&tag, lockmode, false, true) != LOCKACQUIRE_NOT_AVAIL;
+}
+
+void
+LockRelationStorageForSession(RelFileLocator rlocator, LOCKMODE lockmode)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_RELATION_STORAGE(tag, rlocator);
+	(void) LockAcquire(&tag, lockmode, true, false);
+}
+
+void
+UnlockRelationStorageForSession(RelFileLocator rlocator, LOCKMODE lockmode)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_RELATION_STORAGE(tag, rlocator);
+	LockRelease(&tag, lockmode, true);
+}
+#endif
+
 /*
  *		LockDatabaseFrozenIds
  *
@@ -1262,6 +1314,15 @@ DescribeLockTag(StringInfo buf, const LOCKTAG *tag)
 							 tag->locktag_field2,
 							 tag->locktag_field1);
 			break;
+#ifdef USE_UMBRA
+		case LOCKTAG_RELATION_STORAGE:
+			appendStringInfo(buf,
+							 _("Umbra storage %u/%u/%u"),
+							 tag->locktag_field2,
+							 tag->locktag_field1,
+							 tag->locktag_field3);
+			break;
+#endif
 		case LOCKTAG_DATABASE_FROZEN_IDS:
 			appendStringInfo(buf,
 							 _("pg_database.datfrozenxid of database %u"),

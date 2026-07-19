@@ -62,6 +62,18 @@ extern bool ConditionalLockRelationForExtension(Relation relation,
 												LOCKMODE lockmode);
 extern int	RelationExtensionLockWaiterCount(Relation relation);
 
+#ifdef USE_UMBRA
+/* Interlock Umbra background maintenance with physical storage lifecycle. */
+extern void LockRelationStorage(RelFileLocator rlocator, LOCKMODE lockmode);
+extern void UnlockRelationStorage(RelFileLocator rlocator, LOCKMODE lockmode);
+extern bool ConditionalLockRelationStorage(RelFileLocator rlocator,
+											LOCKMODE lockmode);
+extern void LockRelationStorageForSession(RelFileLocator rlocator,
+										  LOCKMODE lockmode);
+extern void UnlockRelationStorageForSession(RelFileLocator rlocator,
+											LOCKMODE lockmode);
+#endif
+
 /* Lock to recompute pg_database.datfrozenxid in the current database */
 extern void LockDatabaseFrozenIds(LOCKMODE lockmode);
 

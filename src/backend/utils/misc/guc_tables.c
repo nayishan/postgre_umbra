@@ -68,6 +68,7 @@
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/bgwriter.h"
 #ifdef USE_UMBRA
+#include "postmaster/mapcompactor.h"
 #include "postmaster/mapwriter.h"
 #endif
 #include "postmaster/postmaster.h"
@@ -92,6 +93,7 @@
 #include "storage/procnumber.h"
 #include "storage/standby.h"
 #ifdef USE_UMBRA
+#include "storage/map.h"
 #include "storage/ummap.h"
 #endif
 #include "tcop/backend_startup.h"

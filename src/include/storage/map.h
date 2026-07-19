@@ -45,6 +45,12 @@ extern void MapStrategyNotifyWriter(int mapwriter_procno);
 extern void MapWakeWriter(void);
 extern int MapPreallocStep(int max_relations);
 
+extern PGDLLIMPORT bool map_compactor_enable;
+extern PGDLLIMPORT int map_compactor_extent_blocks;
+extern PGDLLIMPORT int map_compactor_low_live_percent;
+extern PGDLLIMPORT int map_compactor_max_moves;
+extern int MapCompactorStep(int max_relations);
+
 extern MapPageBuffer MapPageBufferRead(UmbraFileContext *ctx,
 									   RelFileLocatorBackend rlocator,
 									   BlockNumber map_blkno,

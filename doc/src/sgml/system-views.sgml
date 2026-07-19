@@ -1829,8 +1829,10 @@ AND c1.path[c2.level] = c2.path[c2.level];
        <literal>spectoken</literal>,
        <literal>object</literal>,
        <literal>userlock</literal>,
-       <literal>advisory</literal>, or
-       <literal>applytransaction</literal>.
+       <literal>advisory</literal>,
+       <literal>applytransaction</literal>, or
+       <literal>relationstorage</literal> (in builds with the Umbra storage
+       manager).
        (See also <xref linkend="wait-event-lock-table"/>.)
       </para></entry>
      </row>
@@ -1906,7 +1908,9 @@ AND c1.path[c2.level] = c2.path[c2.level];
       </para>
       <para>
        OID of the system catalog containing the lock target, or null if the
-       target is not a general database object
+       target is not a general database object.  For a
+       <literal>relationstorage</literal> lock, this column instead contains
+       the tablespace OID of the physical relation.
       </para></entry>
      </row>
 
@@ -1917,7 +1921,9 @@ AND c1.path[c2.level] = c2.path[c2.level];
       </para>
       <para>
        OID of the lock target within its system catalog, or null if the
-       target is not a general database object
+       target is not a general database object.  For a
+       <literal>relationstorage</literal> lock, this column instead contains
+       the physical relation file number.
       </para></entry>
      </row>
 

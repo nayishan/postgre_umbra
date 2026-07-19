@@ -97,6 +97,7 @@ typedef struct
 #ifdef USE_UMBRA
 	Buffer		buffer;
 	bool		from_shared_buffer;
+	bool		force_remap;
 	bool		remap_in_record;
 	UmbraMapRemap remap;
 #endif
@@ -280,6 +281,7 @@ XLogResetInsertion(void)
 #ifdef USE_UMBRA
 		registered_buffers[i].buffer = InvalidBuffer;
 		registered_buffers[i].from_shared_buffer = false;
+		registered_buffers[i].force_remap = false;
 		registered_buffers[i].remap_in_record = false;
 		MemSet(&registered_buffers[i].remap, 0,
 			   sizeof(registered_buffers[i].remap));
@@ -342,6 +344,7 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
 #ifdef USE_UMBRA
 	regbuf->buffer = buffer;
 	regbuf->from_shared_buffer = true;
+	regbuf->force_remap = false;
 	regbuf->remap_in_record = false;
 	MemSet(&regbuf->remap, 0, sizeof(regbuf->remap));
 #endif
@@ -370,6 +373,46 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
 
 	regbuf->in_use = true;
 }
+
+#ifdef USE_UMBRA
+/* Register one explicit relocation image with an exact old-P expectation. */
+bool
+XLogRegisterBufferForRemap(uint8 block_id, Buffer buffer, uint8 flags,
+						   BlockNumber expected_old_pblkno)
+{
+	registered_buffer *regbuf;
+	SMgrRelation reln;
+	BlockNumber current_pblkno;
+
+	Assert(BlockNumberIsValid(expected_old_pblkno));
+	Assert((flags & (REGBUF_FORCE_IMAGE | REGBUF_NO_IMAGE |
+					 REGBUF_NO_CHANGE | REGBUF_WILL_INIT)) == 0);
+
+	/* Preparation happens before the caller marks the unchanged page dirty. */
+	XLogRegisterBuffer(block_id, buffer,
+					   flags | REGBUF_FORCE_IMAGE | REGBUF_NO_CHANGE);
+	regbuf = &registered_buffers[block_id];
+	reln = smgrlookup(regbuf->rlocator, INVALID_PROC_NUMBER);
+	if (reln == NULL ||
+		!LocalTransactionIdIsValid(MyProc->vxid.lxid) ||
+		!UmWalOwnedRemapAvailable(reln, regbuf->forkno) ||
+		!UmGetBlockPhysical(reln, regbuf->forkno, regbuf->block,
+							&current_pblkno) ||
+		current_pblkno != expected_old_pblkno ||
+		!UmPrepareBlockRemap(reln, regbuf->forkno, regbuf->block,
+							&regbuf->remap))
+		return false;
+
+	if (regbuf->remap.old_pblkno != expected_old_pblkno)
+	{
+		UmAbortBlockRemap(&regbuf->remap);
+		return false;
+	}
+	regbuf->flags = flags | REGBUF_FORCE_IMAGE;
+	regbuf->force_remap = true;
+	return true;
+}
+#endif
 
 /*
  * Like XLogRegisterBuffer, but for registering a block that's not in the
@@ -401,6 +444,7 @@ XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator, ForkNumber forknum,
 #ifdef USE_UMBRA
 	regbuf->buffer = InvalidBuffer;
 	regbuf->from_shared_buffer = false;
+	regbuf->force_remap = false;
 	regbuf->remap_in_record = false;
 	MemSet(&regbuf->remap, 0, sizeof(regbuf->remap));
 #endif
@@ -820,6 +864,15 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 #endif
 
 		/* Determine if this block needs to be backed up */
+#ifdef USE_UMBRA
+		if (regbuf->force_remap)
+		{
+			Assert(regbuf->remap.prepared);
+			needs_backup = true;
+			needs_remap = true;
+		}
+		else
+#endif
 		if (regbuf->flags & REGBUF_FORCE_IMAGE)
 			needs_backup = true;
 		else if (regbuf->flags & REGBUF_NO_IMAGE)
@@ -1306,12 +1359,21 @@ XLogPrepareBlockRemaps(RmgrId rmid, uint8 info,
 	Assert(remapNeedsImage != NULL);
 	*remapRecPtr = InvalidXLogRecPtr;
 	*remapNeedsImage = false;
+	for (block_id = 0; block_id < max_registered_block_id; block_id++)
+	{
+		registered_buffer *regbuf = &registered_buffers[block_id];
+
+		if (!regbuf->in_use || !regbuf->force_remap)
+			continue;
+		Assert(regbuf->remap.prepared);
+		prepared = true;
+	}
 	if (!doPageWrites || IsBootstrapProcessingMode() || IsInitProcessingMode())
-		return false;
+		return prepared;
 	completedRedoRecPtr = GetLastCompletedCheckpointRedo();
 	captureActive = CheckpointBufferCaptureIsActive();
 	if (!XLogRecPtrIsValid(completedRedoRecPtr) && !captureActive)
-		return false;
+		return prepared;
 
 	/*
 	 * This prepass may run inside the caller's critical section.  Every storage

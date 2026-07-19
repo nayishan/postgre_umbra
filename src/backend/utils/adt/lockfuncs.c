@@ -37,7 +37,10 @@ const char *const LockTagTypeNames[] = {
 	"object",
 	"userlock",
 	"advisory",
-	"applytransaction"
+	"applytransaction",
+#ifdef USE_UMBRA
+	"relationstorage"
+#endif
 };
 
 StaticAssertDecl(lengthof(LockTagTypeNames) == (LOCKTAG_LAST_TYPE + 1),
@@ -257,6 +260,19 @@ pg_lock_status(PG_FUNCTION_ARGS)
 				nulls[8] = true;
 				nulls[9] = true;
 				break;
+#ifdef USE_UMBRA
+			case LOCKTAG_RELATION_STORAGE:
+				values[1] = ObjectIdGetDatum(instance->locktag.locktag_field1);
+				values[7] = ObjectIdGetDatum(instance->locktag.locktag_field2);
+				values[8] = ObjectIdGetDatum(instance->locktag.locktag_field3);
+				nulls[2] = true;
+				nulls[3] = true;
+				nulls[4] = true;
+				nulls[5] = true;
+				nulls[6] = true;
+				nulls[9] = true;
+				break;
+#endif
 			case LOCKTAG_DATABASE_FROZEN_IDS:
 				values[1] = ObjectIdGetDatum(instance->locktag.locktag_field1);
 				nulls[2] = true;

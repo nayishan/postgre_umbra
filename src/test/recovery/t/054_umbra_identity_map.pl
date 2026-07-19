@@ -132,6 +132,8 @@ $node->append_conf(
 	'postgresql.conf', qq{
 autovacuum = off
 fsync = on
+# This test derives logical identity bounds from the physical file size.
+map_prealloc_main_low = 100000
 });
 $node->start;
 

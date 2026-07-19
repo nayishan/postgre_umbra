@@ -19,6 +19,7 @@
 #include "postmaster/bgworker.h"
 #include "postmaster/bgwriter.h"
 #include "postmaster/interrupt.h"
+#include "postmaster/mapcompactor.h"
 #include "postmaster/mapwriter.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
@@ -60,6 +61,7 @@ MapBackgroundWorkersRegister(void)
 	worker.bgw_notify_pid = 0;
 	worker.bgw_main_arg = (Datum) 0;
 	RegisterBackgroundWorker(&worker);
+	MapCompactorRegister();
 }
 
 void

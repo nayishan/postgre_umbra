@@ -30,6 +30,9 @@
 #include "pgstat.h"
 #include "storage/bulk_write.h"
 #include "storage/freespace.h"
+#ifdef USE_UMBRA
+#include "storage/lmgr.h"
+#endif
 #include "storage/proc.h"
 #include "storage/smgr.h"
 #include "utils/hsearch.h"
@@ -68,6 +71,15 @@ typedef struct PendingRelDelete
 	struct PendingRelDelete *next;	/* linked-list link */
 } PendingRelDelete;
 
+#ifdef USE_UMBRA
+typedef struct PendingRelStorageLock
+{
+	RelFileLocator rlocator;
+	int			nestLevel;
+	struct PendingRelStorageLock *next;
+} PendingRelStorageLock;
+#endif
+
 typedef struct PendingRelSync
 {
 	RelFileLocator rlocator;
@@ -76,11 +88,18 @@ typedef struct PendingRelSync
 
 static PendingRelDelete *pendingDeletes = NULL; /* head of linked list */
 static HTAB *pendingSyncHash = NULL;
+#ifdef USE_UMBRA
+static PendingRelStorageLock *pendingStorageLocks = NULL;
+#endif
 
 static void smgr_pretruncate_or_panic(SMgrRelation reln, ForkNumber *forknum,
 									 int nforks, BlockNumber *old_nblocks,
 									 BlockNumber *nblocks,
 									 XLogRecPtr truncate_lsn);
+#ifdef USE_UMBRA
+static void RememberRelationStorageLock(RelFileLocator rlocator);
+static void ReleaseRelationStorageLocks(int nestLevel);
+#endif
 
 
 /*
@@ -109,6 +128,47 @@ AddPendingSync(const RelFileLocator *rlocator)
 	Assert(!found);
 	pending->is_truncated = false;
 }
+
+#ifdef USE_UMBRA
+static void
+RememberRelationStorageLock(RelFileLocator rlocator)
+{
+	PendingRelStorageLock *pending;
+
+	for (pending = pendingStorageLocks; pending != NULL; pending = pending->next)
+	{
+		if (RelFileLocatorEquals(pending->rlocator, rlocator))
+			return;
+	}
+	pending = MemoryContextAlloc(TopMemoryContext,
+								 sizeof(PendingRelStorageLock));
+	LockRelationStorageForSession(rlocator, AccessExclusiveLock);
+	pending->rlocator = rlocator;
+	pending->nestLevel = GetCurrentTransactionNestLevel();
+	pending->next = pendingStorageLocks;
+	pendingStorageLocks = pending;
+}
+
+static void
+ReleaseRelationStorageLocks(int nestLevel)
+{
+	PendingRelStorageLock **prev_next = &pendingStorageLocks;
+	PendingRelStorageLock *pending;
+
+	while ((pending = *prev_next) != NULL)
+	{
+		if (pending->nestLevel < nestLevel)
+		{
+			prev_next = &pending->next;
+			continue;
+		}
+		*prev_next = pending->next;
+		UnlockRelationStorageForSession(pending->rlocator,
+										AccessExclusiveLock);
+		pfree(pending);
+	}
+}
+#endif
 
 /*
  * RelationCreateStorage
@@ -151,6 +211,12 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 			elog(ERROR, "invalid relpersistence: %c", relpersistence);
 			return NULL;		/* placate compiler */
 	}
+
+#ifdef USE_UMBRA
+	/* Cover physical creation and its CREATE WAL with one lifecycle lock. */
+	if (needs_wal && !IsBootstrapProcessingMode())
+		RememberRelationStorageLock(rlocator);
+#endif
 
 	srel = smgropen(rlocator, procNumber);
 	smgrcreate(srel, MAIN_FORKNUM, false);
@@ -253,6 +319,11 @@ RelationDropStorage(Relation rel)
 	pending->rlocator = rel->rd_locator;
 	pending->procNumber = rel->rd_backend;
 	pending->atCommit = true;	/* delete if commit */
+#ifdef USE_UMBRA
+	if (rel->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT &&
+		!IsBootstrapProcessingMode())
+		RememberRelationStorageLock(rel->rd_locator);
+#endif
 	pending->nestLevel = GetCurrentTransactionNestLevel();
 	pending->next = pendingDeletes;
 	pendingDeletes = pending;
@@ -336,6 +407,13 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 	int			nforks = 0;
 	XLogRecPtr	truncate_lsn = InvalidXLogRecPtr;
 	SMgrRelation reln;
+
+#ifdef USE_UMBRA
+	/* Keep compactor relocation WAL outside the complete truncate protocol. */
+	if (rel->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT &&
+		!IsBootstrapProcessingMode())
+		RememberRelationStorageLock(rel->rd_locator);
+#endif
 
 	/*
 	 * Make sure smgr_targblock etc aren't pointing somewhere past new end.
@@ -774,6 +852,11 @@ smgrDoPendingDeletes(bool isCommit)
 
 		pfree(srels);
 	}
+
+#ifdef USE_UMBRA
+	/* DROP/abort WAL and all required physical unlinks now precede maintenance. */
+	ReleaseRelationStorageLocks(nestLevel);
+#endif
 }
 
 /*
@@ -978,6 +1061,10 @@ PostPrepare_smgr(void)
 	PendingRelDelete *pending;
 	PendingRelDelete *next;
 
+#ifdef USE_UMBRA
+	/* Any later final decision will reacquire locks before its lifecycle WAL. */
+	ReleaseRelationStorageLocks(1);
+#endif
 	for (pending = pendingDeletes; pending != NULL; pending = next)
 	{
 		next = pending->next;
@@ -1004,6 +1091,14 @@ AtSubCommit_smgr(void)
 		if (pending->nestLevel >= nestLevel)
 			pending->nestLevel = nestLevel - 1;
 	}
+#ifdef USE_UMBRA
+	for (PendingRelStorageLock *pending = pendingStorageLocks;
+		 pending != NULL; pending = pending->next)
+	{
+		if (pending->nestLevel >= nestLevel)
+			pending->nestLevel = nestLevel - 1;
+	}
+#endif
 }
 
 /*

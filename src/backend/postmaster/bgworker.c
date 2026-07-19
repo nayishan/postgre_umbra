@@ -21,6 +21,7 @@
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/datachecksum_state.h"
 #ifdef USE_UMBRA
+#include "postmaster/mapcompactor.h"
 #include "postmaster/mapwriter.h"
 #endif
 #include "postmaster/postmaster.h"
@@ -175,6 +176,10 @@ static const struct
 	{
 		.fn_name = "MapWriterMain",
 		.fn_addr = MapWriterMain
+	},
+	{
+		.fn_name = "MapCompactorMain",
+		.fn_addr = MapCompactorMain
 	}
 #endif
 };

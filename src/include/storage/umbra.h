@@ -15,6 +15,7 @@
 
 #include "storage/aio_types.h"
 #include "storage/block.h"
+#include "storage/buf.h"
 #include "storage/relfilelocator.h"
 #include "storage/smgr.h"
 #include "storage/ummap.h"
@@ -78,7 +79,14 @@ extern void UmAbortBlockRemap(UmbraMapRemap *remap);
 extern void UmReleaseBlockRemapOnExit(UmbraMapRemap *remap);
 extern void UmPublishBlockRemap(UmbraMapRemap *remap, XLogRecPtr lsn);
 extern bool UmGetBlockPhysical(SMgrRelation reln, ForkNumber forknum,
-							   BlockNumber lblkno, BlockNumber *pblkno);
+								   BlockNumber lblkno, BlockNumber *pblkno);
+extern BlockNumber UmGetBlockPhysicalRun(SMgrRelation reln,
+										 ForkNumber forknum, BlockNumber lblkno,
+										 BlockNumber maxblocks,
+										 BlockNumber *pblkno);
+extern bool UmRelocateBufferedBlock(SMgrRelation reln, Buffer buffer,
+									ForkNumber forknum, BlockNumber lblkno,
+									BlockNumber expected_old_pblkno);
 extern void UmCheckpointWritePblk(SMgrRelation reln, ForkNumber forknum,
 								  BlockNumber lblkno, BlockNumber pblkno,
 								  const void *buffer);

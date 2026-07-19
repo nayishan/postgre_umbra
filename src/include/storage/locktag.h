@@ -47,9 +47,16 @@ typedef enum LockTagType
 	LOCKTAG_ADVISORY,			/* advisory user locks */
 	LOCKTAG_APPLY_TRANSACTION,	/* transaction being applied on a logical
 								 * replication subscriber */
+#ifdef USE_UMBRA
+	LOCKTAG_RELATION_STORAGE,	/* an Umbra physical relation locator */
+#endif
 } LockTagType;
 
+#ifdef USE_UMBRA
+#define LOCKTAG_LAST_TYPE	LOCKTAG_RELATION_STORAGE
+#else
 #define LOCKTAG_LAST_TYPE	LOCKTAG_APPLY_TRANSACTION
+#endif
 
 extern PGDLLIMPORT const char *const LockTagTypeNames[];
 
@@ -94,6 +101,17 @@ typedef struct LOCKTAG
 	 (locktag).locktag_field4 = 0, \
 	 (locktag).locktag_type = LOCKTAG_RELATION_EXTEND, \
 	 (locktag).locktag_lockmethodid = DEFAULT_LOCKMETHOD)
+
+#ifdef USE_UMBRA
+/* ID info for Umbra storage is database + tablespace + relfilenumber. */
+#define SET_LOCKTAG_RELATION_STORAGE(locktag,rlocator) \
+	((locktag).locktag_field1 = (rlocator).dbOid, \
+	 (locktag).locktag_field2 = (rlocator).spcOid, \
+	 (locktag).locktag_field3 = (rlocator).relNumber, \
+	 (locktag).locktag_field4 = 0, \
+	 (locktag).locktag_type = LOCKTAG_RELATION_STORAGE, \
+	 (locktag).locktag_lockmethodid = DEFAULT_LOCKMETHOD)
+#endif
 
 /* ID info for frozen IDs is DB OID */
 #define SET_LOCKTAG_DATABASE_FROZEN_IDS(locktag,dboid) \

@@ -98,6 +98,9 @@
 #include "replication/syncrep.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
+#ifdef USE_UMBRA
+#include "storage/lmgr.h"
+#endif
 #include "storage/md.h"
 #include "storage/predicate.h"
 #include "storage/proc.h"
@@ -1562,6 +1565,22 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 
 	/* compute latestXid among all children */
 	latestXid = TransactionIdLatest(xid, hdr->nsubxacts, children);
+	if (isCommit)
+	{
+		delrels = commitrels;
+		ndelrels = hdr->ncommitrels;
+	}
+	else
+	{
+		delrels = abortrels;
+		ndelrels = hdr->nabortrels;
+	}
+
+#ifdef USE_UMBRA
+	/* Final lifecycle WAL must remain after every compactor relocation WAL. */
+	for (int i = 0; i < ndelrels; i++)
+		LockRelationStorage(delrels[i], AccessExclusiveLock);
+#endif
 
 	/* Prevent cancel/die interrupt while cleaning up */
 	HOLD_INTERRUPTS();
@@ -1609,17 +1628,6 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 	 *
 	 * NB: this code knows that we couldn't be dropping any temp rels ...
 	 */
-	if (isCommit)
-	{
-		delrels = commitrels;
-		ndelrels = hdr->ncommitrels;
-	}
-	else
-	{
-		delrels = abortrels;
-		ndelrels = hdr->nabortrels;
-	}
-
 	/* Make sure files supposed to be dropped are dropped */
 	DropRelationFiles(delrels, ndelrels, false);
 
