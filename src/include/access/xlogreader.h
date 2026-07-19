@@ -134,6 +134,7 @@ typedef struct
 
 #ifdef USE_UMBRA
 	bool		has_remap;
+	BlockNumber old_pblkno;
 	BlockNumber first_lblkno;
 	BlockNumber first_pblkno;
 	BlockNumber nblocks;

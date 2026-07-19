@@ -109,6 +109,9 @@ CHECKPOINT;
 my $relpath = $node->safe_psql(
 	'postgres',
 	q{SELECT pg_relation_filepath('umbra_remap_first');});
+my $filenode = $node->safe_psql(
+	'postgres',
+	q{SELECT pg_relation_filenode('umbra_remap_first');});
 my $data_path = $node->data_dir . "/$relpath";
 my $map_path = "${data_path}_map";
 # pg_relation_size() reports the retained physical fork size in Umbra.  This
@@ -215,14 +218,43 @@ is(
 isnt(read_main_map_entry($map_path, $block_size, 0), 0,
 	're-extension produces an L != P mapping');
 
-# After this checkpoint, the first update of the existing page carries a
-# PostgreSQL full-page image.  Replay must still translate L through the MAP.
-my $updated_block = $node->safe_psql(
-	'postgres', q{
-UPDATE umbra_remap_first SET payload = 'after-fpi' WHERE id = 99
+# After this checkpoint, the first update remaps the existing page instead of
+# carrying a full-page image.  Restart first so the updating backend must open
+# the data fork itself; remap reservation deliberately does not open files from
+# inside WAL assembly.  Redo rebuilds new P from the checkpointed old P.
+$node->restart;
+my $existing_wal_start = $node->safe_psql(
+	'postgres', 'SELECT pg_current_wal_insert_lsn();');
+my $update_session = $node->background_psql('postgres');
+$update_session->query_safe(
+	q{SELECT payload FROM umbra_remap_first WHERE id = 99;});
+my $updated_block = $update_session->query_safe(q{
+UPDATE umbra_remap_first SET payload = 'after-remap' WHERE id = 99
 RETURNING (ctid::text::point)[0]::integer;
 });
-is($updated_block, '0', 'FPI update stays on logical block 0');
+$update_session->quit;
+my $existing_wal_end = $node->safe_psql(
+	'postgres', 'SELECT pg_current_wal_insert_lsn();');
+my $physical_after_existing = file_blocks($data_path, $block_size);
+
+is($updated_block, '0', 'existing-page remap stays on logical block 0');
+is($physical_after_existing, $physical_after,
+	'existing-page WAL reservation does not extend the physical file');
+my ($existing_wal, $existing_wal_stderr) = run_command(
+	[
+		'pg_waldump', '-b', '--path' => $node->data_dir . '/pg_wal',
+		'--start' => $existing_wal_start,
+		'--end' => $existing_wal_end,
+	]);
+is($existing_wal_stderr, '', 'pg_waldump reads existing-page remap WAL');
+my @existing_records = grep {
+	/rel \d+\/\d+\/$filenode fork main blk 0/
+} split(/\n/, $existing_wal);
+ok(grep(/; remap: lblkno 0 old_pblkno $physical_before new_pblkno $physical_after/,
+		@existing_records),
+	'existing-page WAL names the exact old and new physical blocks');
+ok(!grep(/\bFPW\b/, @existing_records),
+	'existing-page remap replaces the full-page image');
 
 $node->stop('immediate');
 $node->start;
@@ -230,12 +262,14 @@ is(
 	$node->safe_psql(
 		'postgres',
 		q{SELECT id::text || '|' || payload FROM umbra_remap_first;}),
-	'99|after-fpi',
-	'FPI redo updates the existing non-identity page');
+	'99|after-remap',
+	'old-P delta redo updates the existing non-identity page');
 is(
 	read_main_map_entry($map_path, $block_size, 0),
-	$physical_before,
-	'FPI redo does not replace the first-born mapping');
+	$physical_after,
+	'old-P delta redo publishes the new physical mapping');
+cmp_ok(file_blocks($data_path, $block_size), '>', $physical_after,
+	'old-P delta redo materializes the reserved physical block');
 
 # New permanent relations can skip incremental WAL under wal_level=minimal.
 # Force both end-of-xact durability choices and verify them with a crash: the

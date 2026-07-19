@@ -370,6 +370,20 @@ smgropen(RelFileLocator rlocator, ProcNumber backend)
 	return reln;
 }
 
+/* Return an existing smgr handle without allocating one during WAL assembly. */
+SMgrRelation
+smgrlookup(RelFileLocator rlocator, ProcNumber backend)
+{
+	RelFileLocatorBackend brlocator;
+
+	if (SMgrRelationHash == NULL)
+		return NULL;
+	brlocator.locator = rlocator;
+	brlocator.backend = backend;
+	return (SMgrRelation) hash_search(SMgrRelationHash, &brlocator,
+									 HASH_FIND, NULL);
+}
+
 /*
  * smgrpin() -- Prevent an SMgrRelation object from being destroyed at end of
  *				transaction

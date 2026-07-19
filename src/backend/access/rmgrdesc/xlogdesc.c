@@ -386,7 +386,14 @@ XLogRecGetBlockRefInfo(XLogReaderState *record, bool pretty,
 			{
 				DecodedBkpBlock *blkref = XLogRecGetBlock(record, block_id);
 
-				appendStringInfo(buf,
+				if (BlockNumberIsValid(blkref->old_pblkno))
+					appendStringInfo(buf,
+								 "; remap: lblkno %u old_pblkno %u new_pblkno %u",
+								 blkref->first_lblkno,
+								 blkref->old_pblkno,
+								 blkref->first_pblkno);
+				else
+					appendStringInfo(buf,
 								 "; remap: first_lblkno %u first_pblkno %u nblocks %u",
 								 blkref->first_lblkno,
 								 blkref->first_pblkno,

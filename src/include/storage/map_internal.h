@@ -54,8 +54,10 @@ typedef struct MapPagePendingRange
 {
 	/* Exact target hidden behind a transaction or recovery barrier. */
 	UmbraMapRange range;
+	BlockNumber old_pblkno;
 	ForkNumber	forknum;
 	bool		physical_ready;
+	bool		use_old_pblkno;
 	bool		recovery_replay;
 	bool		recovery_exact;
 	bool		valid;
@@ -95,7 +97,11 @@ extern int	MapPageBufferCount;
 
 #define MapPageGetBlock(slot_id) (MapPageBlocks[(slot_id)].data)
 
+extern bool MapPagePoolIsInitialized(void);
 extern void MapPageEnsureInitialized(void);
+extern bool MapPageBufferTryReadCached(RelFileLocatorBackend rlocator,
+										BlockNumber map_blkno, LWLockMode mode,
+										MapPageBuffer *buffer);
 extern void MapPagePoolShmemRequest(void);
 extern void MapPagePoolShmemInit(void);
 extern void MapPagePoolShmemAttach(void);
@@ -113,6 +119,7 @@ extern void MapPageClockFreeBuffer(int slot_id);
 extern bool MapPageRegisterPendingPin(MapPageDesc *desc);
 extern void MapPageUnregisterPendingPin(MapPageDesc *desc);
 extern void MapPagePinBuffer(int slot_id, bool adjust_usage);
+extern bool MapPagePinBufferNoOwner(int slot_id, bool adjust_usage);
 extern void MapPageUnpinBuffer(int slot_id);
 extern void MapPageRememberPin(int slot_id);
 extern void MapPageTransferBufferPin(MapPageBuffer buffer,
@@ -123,7 +130,11 @@ extern void MapPageUnlockBufferKeepPin(MapPageBuffer buffer);
 extern void MapPageReleaseBufferOwned(MapPageBuffer buffer,
 									  ResourceOwner owner);
 extern void MapPageReleasePendingBufferOwned(MapPageBuffer buffer,
-										 ResourceOwner owner);
+											 ResourceOwner owner);
+extern void MapPageReleaseBufferNoOwner(MapPageBuffer buffer);
+extern void MapPageReleasePendingBufferNoOwner(MapPageBuffer buffer);
+extern void MapPageReleaseBufferOnExit(MapPageBuffer buffer,
+										 bool pending_registered);
 extern bool MapPageTryClaimBuffer(int slot_id);
 extern void MapPageReleaseClaimBuffer(int slot_id);
 extern void MapPageUpdateState(MapPageDesc *desc, uint64 set_bits,

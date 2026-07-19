@@ -80,6 +80,9 @@ static void um_ensure_physical_capacity(UmbraFileContext *ctx,
 										ForkNumber forknum,
 										BlockNumber first_pblkno,
 										BlockNumber nblocks, bool skipFsync);
+static void um_write_mapped_run(UmbraFileContext *ctx, ForkNumber forknum,
+								BlockNumber pblkno, const void **buffers,
+								BlockNumber nblocks, bool skipFsync);
 static bool um_redo_create_seen(RelFileLocator rlocator, ForkNumber forknum);
 static UmbraRedoCreateState *um_get_redo_create_state(
 	RelFileLocator rlocator, bool create);
@@ -898,6 +901,47 @@ UmPrepareFirstbornRangeLocator(RelFileLocator rlocator, ForkNumber forknum,
 }
 
 bool
+UmWalOwnedRemapAvailable(SMgrRelation reln, ForkNumber forknum)
+{
+	return reln != NULL && !InRecovery && forknum == MAIN_FORKNUM &&
+		um_fork_uses_map(reln, forknum);
+}
+
+bool
+UmPrepareBlockRemap(SMgrRelation reln, ForkNumber forknum,
+					BlockNumber lblkno, UmbraMapRemap *remap)
+{
+	UmbraSmgrRelationState *state;
+
+	Assert(reln != NULL);
+	Assert(remap != NULL);
+	if (!UmWalOwnedRemapAvailable(reln, forknum))
+		return false;
+	state = reln->smgr_private;
+	return ummap_prepare_remap(um_get_filectx(reln), reln->smgr_rlocator,
+							  state->root_desc,
+							  forknum, lblkno, remap);
+}
+
+void
+UmAbortBlockRemap(UmbraMapRemap *remap)
+{
+	ummap_abort_remap(remap);
+}
+
+void
+UmReleaseBlockRemapOnExit(UmbraMapRemap *remap)
+{
+	ummap_release_remap_on_exit(remap);
+}
+
+void
+UmPublishBlockRemap(UmbraMapRemap *remap, XLogRecPtr lsn)
+{
+	ummap_publish_remap(remap, lsn);
+}
+
+bool
 UmLogMappingRange(RelFileLocator rlocator, ForkNumber forknum,
 				  BlockNumber startblk, BlockNumber endblk,
 				  BlockNumber anchor_lblkno)
@@ -984,7 +1028,8 @@ UmMappingPublicationDone(void)
 
 void
 UmPrepareReplayMappingRange(SMgrRelation reln, ForkNumber forknum,
-								const UmbraMapRange *range, XLogRecPtr lsn)
+								const UmbraMapRange *range,
+								BlockNumber old_pblkno, XLogRecPtr lsn)
 {
 	UmbraFileContext *ctx;
 	BlockNumber logical_nblocks;
@@ -1000,14 +1045,29 @@ UmPrepareReplayMappingRange(SMgrRelation reln, ForkNumber forknum,
 		return;
 	ctx = um_get_filectx(reln);
 	logical_nblocks = um_get_logical_nblocks(reln, forknum);
-	physical_ready = logical_nblocks >= range->first_lblkno;
+	physical_ready = BlockNumberIsValid(old_pblkno) ||
+		logical_nblocks >= range->first_lblkno;
+	if (BlockNumberIsValid(old_pblkno))
+		um_ensure_physical_capacity(ctx, reln->smgr_rlocator, forknum,
+								 old_pblkno, 1, false);
 	if (physical_ready)
 		um_ensure_physical_capacity(ctx, reln->smgr_rlocator, forknum,
 								 range->first_pblkno,
 									range->nblocks, false);
-	ummap_prepare_replay_range(ctx, reln->smgr_rlocator, forknum, range, lsn,
-							  physical_ready);
+	ummap_prepare_replay_range(ctx, reln->smgr_rlocator, forknum, range,
+							  old_pblkno, lsn, physical_ready);
 	reln->smgr_cached_nblocks[forknum] = InvalidBlockNumber;
+}
+
+void
+UmSwitchReplayBlockRemap(SMgrRelation reln, ForkNumber forknum,
+						 BlockNumber lblkno, BlockNumber old_pblkno,
+						 BlockNumber new_pblkno)
+{
+	Assert(InRecovery);
+	Assert(reln != NULL);
+	ummap_switch_replay_remap(reln->smgr_rlocator, forknum, lblkno,
+							  old_pblkno, new_pblkno);
 }
 
 void
@@ -1172,12 +1232,51 @@ umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		run_blocks = ummap_lookup_write_run(um_get_filectx(reln),
 											reln->smgr_rlocator, forknum,
 											blocknum, nblocks, &pblkno);
-		umfile_writev(um_get_filectx(reln), forknum, pblkno, buffers,
-					  run_blocks, skipFsync);
+		um_write_mapped_run(um_get_filectx(reln), forknum, pblkno, buffers,
+							run_blocks, skipFsync);
 
 		blocknum += run_blocks;
 		buffers += run_blocks;
 		nblocks -= run_blocks;
+	}
+}
+
+/* A reserved remap target can remain beyond physical EOF until first write. */
+static void
+um_write_mapped_run(UmbraFileContext *ctx, ForkNumber forknum,
+					BlockNumber pblkno, const void **buffers,
+					BlockNumber nblocks, bool skipFsync)
+{
+	BlockNumber physical_nblocks;
+	BlockNumber done = 0;
+
+	Assert(ctx != NULL);
+	Assert(nblocks > 0);
+	Assert((uint64) pblkno + nblocks < (uint64) InvalidBlockNumber);
+	physical_nblocks = umfile_nblocks(ctx, forknum);
+
+	while (done < nblocks)
+	{
+		BlockNumber current = pblkno + done;
+
+		if (current < physical_nblocks)
+		{
+			BlockNumber existing = Min(nblocks - done,
+									   physical_nblocks - current);
+			BlockNumber segment_remaining =
+				RELSEG_SIZE - (current % ((BlockNumber) RELSEG_SIZE));
+
+			existing = Min(existing, segment_remaining);
+			umfile_writev(ctx, forknum, current, buffers + done, existing,
+						  skipFsync);
+			done += existing;
+		}
+		else
+		{
+			umfile_extend(ctx, forknum, current, buffers[done], skipFsync);
+			physical_nblocks = current + 1;
+			done++;
+		}
 	}
 }
 

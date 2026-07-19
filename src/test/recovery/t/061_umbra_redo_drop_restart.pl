@@ -49,7 +49,7 @@ $standby->init_from_backup(
 $standby->start;
 
 # Read before checkpoint so hint-bit WAL cannot consume the target page's
-# first post-checkpoint full-page image before the UPDATE below.
+# first post-checkpoint remap opportunity below.
 my $target_block = 0 + $primary->safe_psql(
 	'postgres', q{
 SELECT (ctid::text::point)[0]::integer
@@ -64,17 +64,23 @@ cmp_ok($target_block, '<', $last_block,
 	'target existing page leaves a recovery scratch gap before EOF');
 
 $primary->safe_psql('postgres', 'CHECKPOINT');
+$primary->restart;
 $primary->wait_for_replay_catchup($standby);
 $standby->safe_psql('postgres', 'CHECKPOINT');
 my $restart_redo = $standby->safe_psql(
 	'postgres', q{SELECT redo_lsn FROM pg_control_checkpoint();});
 
+# Clear shared buffers so the UPDATE backend opens the target physical fork
+# before WAL assembly attempts its allocation-free remap reservation.
 my $wal_start = $primary->safe_psql(
 	'postgres', q{SELECT pg_current_wal_insert_lsn();});
-$primary->safe_psql(
-	'postgres', q{
+my $update_session = $primary->background_psql('postgres');
+$update_session->query_safe(
+	"SELECT payload FROM umbra_redo_drop_old WHERE id = 2000");
+$update_session->query_safe(q{
 UPDATE umbra_redo_drop_old SET payload = repeat('y', 400) WHERE id = 2000;
 });
+$update_session->quit;
 my $wal_end = $primary->safe_psql(
 	'postgres', q{SELECT pg_current_wal_insert_lsn();});
 is(
@@ -96,10 +102,11 @@ is($wal_dump_stderr, '', 'pg_waldump reads existing-page update WAL');
 my @target_records = grep {
 	/rel \d+\/\d+\/$old_filenode fork main blk $target_block/
 } split(/\n/, $wal_dump);
-ok(grep(/\bFPW\b/, @target_records),
-	'existing-page update carries a full-page image');
-ok(!grep(/; remap:/, @target_records),
-	'existing-page full-page image has no first-born remap header');
+ok(!grep(/\bFPW\b/, @target_records),
+	'existing-page update does not carry a full-page image');
+ok(grep(/; remap: lblkno $target_block old_pblkno \d+ new_pblkno \d+/,
+		@target_records),
+	'existing-page update carries exact old/new physical mapping');
 
 $primary->safe_psql(
 	'postgres', q{
@@ -132,7 +139,7 @@ ok(!-e $standby->data_dir . "/${old_path}_map",
 $standby->stop('immediate');
 my $standby_restarted = $standby->start(fail_ok => 1);
 ok($standby_restarted,
-	'second recovery rebuilds a disposable mapping for the old full-page image');
+	'second recovery resolves old-P redo after the later relation DROP');
 BAIL_OUT('standby failed during the second replay')
   unless $standby_restarted;
 $primary->wait_for_replay_catchup($standby);

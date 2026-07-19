@@ -1891,6 +1891,7 @@ typedef struct UmbraReplayMappingRange
 {
 	RelFileLocator rlocator;
 	ForkNumber	forknum;
+	BlockNumber old_pblkno;
 	UmbraMapRange range;
 } UmbraReplayMappingRange;
 
@@ -1914,6 +1915,8 @@ UmbraReplayMappingRangeCmp(const void *a, const void *b)
 		return left->range.first_pblkno < right->range.first_pblkno ? -1 : 1;
 	if (left->range.nblocks != right->range.nblocks)
 		return left->range.nblocks < right->range.nblocks ? -1 : 1;
+	if (left->old_pblkno != right->old_pblkno)
+		return left->old_pblkno < right->old_pblkno ? -1 : 1;
 	return 0;
 }
 
@@ -1938,6 +1941,7 @@ ReplayUmbraMappingRanges(XLogReaderState *xlogreader)
 		Assert(nranges < lengthof(ranges));
 		ranges[nranges].rlocator = block->rlocator;
 		ranges[nranges].forknum = block->forknum;
+		ranges[nranges].old_pblkno = block->old_pblkno;
 		ranges[nranges].range.first_lblkno = block->first_lblkno;
 		ranges[nranges].range.first_pblkno = block->first_pblkno;
 		ranges[nranges].range.nblocks = block->nblocks;
@@ -1954,7 +1958,9 @@ ReplayUmbraMappingRanges(XLogReaderState *xlogreader)
 			UmbraReplayMappingRange *previous = &ranges[nmerged - 1];
 
 			if (RelFileLocatorEquals(previous->rlocator, current->rlocator) &&
-				previous->forknum == current->forknum)
+				previous->forknum == current->forknum &&
+				!BlockNumberIsValid(previous->old_pblkno) &&
+				!BlockNumberIsValid(current->old_pblkno))
 			{
 				uint64		previous_lend =
 					(uint64) previous->range.first_lblkno +
@@ -1976,6 +1982,17 @@ ReplayUmbraMappingRanges(XLogReaderState *xlogreader)
 				previous->range.nblocks += current->range.nblocks;
 				continue;
 			}
+			if (RelFileLocatorEquals(previous->rlocator, current->rlocator) &&
+				previous->forknum == current->forknum)
+			{
+				uint64		previous_end =
+					(uint64) previous->range.first_lblkno +
+					previous->range.nblocks;
+
+				if ((uint64) current->range.first_lblkno < previous_end)
+					elog(PANIC,
+						 "overlapping Umbra mapping ranges in one WAL record");
+			}
 		}
 		if (nmerged != range_no)
 			ranges[nmerged] = *current;
@@ -1989,6 +2006,7 @@ ReplayUmbraMappingRanges(XLogReaderState *xlogreader)
 		reln = smgropen(ranges[range_no].rlocator, INVALID_PROC_NUMBER);
 		UmPrepareReplayMappingRange(reln, ranges[range_no].forknum,
 									&ranges[range_no].range,
+									ranges[range_no].old_pblkno,
 									xlogreader->EndRecPtr);
 	}
 }

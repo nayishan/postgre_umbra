@@ -41,6 +41,7 @@
 #define UMMAP_ROOT_MAGIC		0x554D4252U	/* "UMBR" */
 #define UMMAP_ROOT_VERSION		1U
 #define UMMAP_ROOT_FLAG_FORMAT_V1 0x00000001U
+
 #define UMMAP_BLOCK_ROOT			0
 #define UMMAP_BLOCK_FIRST_GROUP	1
 
@@ -59,11 +60,11 @@
 	(UMMAP_GROUP_FSM_PAGES + UMMAP_GROUP_VM_PAGES + UMMAP_GROUP_MAIN_PAGES)
 
 StaticAssertDecl((BLCKSZ % sizeof(BlockNumber)) == 0,
-				 "BLCKSZ must be a multiple of BlockNumber");
+					 "BLCKSZ must be a multiple of BlockNumber");
 StaticAssertDecl(BLCKSZ >= UMMAP_ROOT_SECTOR_SIZE,
-				 "BLCKSZ must hold an Umbra MAP root sector");
+					 "BLCKSZ must hold an Umbra MAP root sector");
 StaticAssertDecl(UMMAP_ROOT_SECTOR_SIZE >= UMMAP_ROOT_IMAGE_SIZE,
-				 "Umbra MAP root sector must hold its payload");
+					 "Umbra MAP root sector must hold its payload");
 
 /* The CRC covers this fixed 64-byte payload; block padding remains zero. */
 typedef struct pg_attribute_packed() UmbraMapRootData
@@ -87,11 +88,11 @@ typedef struct pg_attribute_packed() UmbraMapRootData
 } UmbraMapRootData;
 
 StaticAssertDecl(sizeof(UmbraMapRootData) == UMMAP_ROOT_IMAGE_SIZE,
-				 "Umbra MAP root payload size is wrong");
+					 "Umbra MAP root payload size is wrong");
 StaticAssertDecl(offsetof(UmbraMapRootData, generation_lsn) == 40,
-				 "Umbra MAP root generation offset is wrong");
+					 "Umbra MAP root generation offset is wrong");
 StaticAssertDecl(offsetof(UmbraMapRootData, crc) == 60,
-				 "Umbra MAP root CRC offset is wrong");
+					 "Umbra MAP root CRC offset is wrong");
 
 typedef struct UmbraMapPendingPage
 {
@@ -129,11 +130,13 @@ typedef struct UmbraMapRecoveryPending
 	RelFileLocatorBackend rlocator;
 	ForkNumber	forknum;
 	UmbraMapRange range;
+	BlockNumber old_pblkno;
 	XLogRecPtr	lsn;
 	ResourceOwner owner;
 	int			slot_id;
 	bool		exact;
 	bool		physical_ready;
+	bool		use_old_pblkno;
 	bool		barrier_installed;
 	bool		resource_remembered;
 	struct UmbraMapRecoveryPending *next;
@@ -152,12 +155,15 @@ static void ummap_root_get_frontiers(const UmbraMapRootData *root,
 									 BlockNumber *logical_eof,
 									 BlockNumber *physical_frontier);
 static void ummap_root_set_frontiers(UmbraMapRootData *root,
-									 ForkNumber forknum,
-									 BlockNumber logical_eof,
-									 BlockNumber physical_frontier);
+										 ForkNumber forknum,
+										 BlockNumber logical_eof,
+										 BlockNumber physical_frontier);
 static bool ummap_root_reserve_buffer(MapSuperBuffer buffer,
 	ForkNumber forknum, BlockNumber physical_floor, BlockNumber nblocks,
 	bool skipFsync, BlockNumber *first_pblkno);
+static bool ummap_try_reserve_physical_block(
+	RelFileLocatorBackend rlocator, MapSuperDesc *root_desc, ForkNumber forknum,
+	BlockNumber *pblkno);
 static BlockNumber ummap_fork_page_index_to_map_blkno(ForkNumber forknum,
 											  BlockNumber fork_page_idx);
 static uint64 ummap_existing_fork_pages(ForkNumber forknum,
@@ -176,9 +182,7 @@ static void ummap_replay_mapping_range(UmbraFileContext *ctx,
 static bool ummap_range_contains(const UmbraMapRange *range,
 								BlockNumber lblkno);
 static void ummap_validate_range(const UmbraMapRange *range);
-static void ummap_validate_replay_canonical(UmbraFileContext *ctx,
-	RelFileLocatorBackend rlocator, ForkNumber forknum,
-	const UmbraMapRange *range);
+static bool ummap_pending_replay_uses_slot(int slot_id);
 static UmbraMapPendingRange *ummap_find_pending_range(
 	RelFileLocatorBackend rlocator, ForkNumber forknum, BlockNumber lblkno,
 	UmbraMapPendingRange ***prev_next);
@@ -217,8 +221,8 @@ static BlockNumber ummap_lookup_run_internal(UmbraFileContext *ctx,
 static ResourceOwner ummap_get_recovery_resowner(void);
 static UmbraMapRecoveryPending *ummap_prepare_recovery_pending(
 	UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
-	ForkNumber forknum, const UmbraMapRange *range, XLogRecPtr lsn,
-	bool exact, bool physical_ready);
+	ForkNumber forknum, const UmbraMapRange *range, BlockNumber old_pblkno,
+	XLogRecPtr lsn, bool exact, bool physical_ready);
 static void ummap_release_recovery_pending(
 	UmbraMapRecoveryPending *pending, bool owner_release);
 static void ummap_release_recovery_resource(Datum res);
@@ -359,9 +363,9 @@ ummap_root_read_frontiers(UmbraFileContext *ctx,
 /* Advance both frontiers monotonically in the resident root. */
 void
 ummap_root_advance(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
-				   ForkNumber forknum, BlockNumber logical_end,
-				   BlockNumber physical_end, XLogRecPtr wal_flush_lsn,
-				   bool skipFsync)
+					   ForkNumber forknum, BlockNumber logical_end,
+					   BlockNumber physical_end, XLogRecPtr wal_flush_lsn,
+					   bool skipFsync)
 {
 	MapSuperBuffer buffer;
 	MapSuperDesc *desc = NULL;
@@ -391,7 +395,7 @@ ummap_root_advance(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 		buffer = MapSuperBufferRead(ctx, rlocator, LW_EXCLUSIVE);
 	root = (UmbraMapRootData *) MapSuperBufferGetData(buffer);
 	ummap_root_get_frontiers(root, forknum, &old_logical,
-							 &old_physical);
+								 &old_physical);
 	if (!BlockNumberIsValid(old_logical) || logical_end > old_logical)
 	{
 		old_logical = logical_end;
@@ -413,8 +417,8 @@ ummap_root_advance(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 
 BlockNumber
 ummap_reserve_physical_run(UmbraFileContext *ctx,
-						   RelFileLocatorBackend rlocator, ForkNumber forknum,
-						   BlockNumber nblocks, bool skipFsync)
+							   RelFileLocatorBackend rlocator, ForkNumber forknum,
+							   BlockNumber nblocks, bool skipFsync)
 {
 	BlockNumber first_pblkno = InvalidBlockNumber;
 	BlockNumber physical_nblocks;
@@ -446,16 +450,49 @@ ummap_reserve_physical_run(UmbraFileContext *ctx,
 		while ((uint64) physical_nblocks < required_nblocks)
 		{
 			int			chunk = (int) Min(required_nblocks - physical_nblocks,
-									 (uint64) INT_MAX);
+										 (uint64) INT_MAX);
 
 			umfile_zeroextend(ctx, forknum, physical_nblocks, chunk,
-							  skipFsync);
+								  skipFsync);
 			physical_nblocks += chunk;
 		}
 	}
 	LWLockRelease(extension_lock);
 
 	return first_pblkno;
+}
+
+/* Reserve one P using only locks and an already-resident root. */
+static bool
+ummap_try_reserve_physical_block(RelFileLocatorBackend rlocator,
+								 MapSuperDesc *root_desc, ForkNumber forknum,
+								 BlockNumber *pblkno)
+{
+	MapSuperBuffer root_buffer;
+	LWLock	   *extension_lock;
+	bool		reserved = false;
+
+	Assert(ummap_tracks_fork(forknum));
+	Assert(pblkno != NULL);
+	if (root_desc == NULL || !MapPagePoolIsInitialized())
+		return false;
+
+	extension_lock = MapPageExtensionLock(rlocator);
+	if (!LWLockConditionalAcquire(extension_lock, LW_EXCLUSIVE))
+		return false;
+	if (LWLockConditionalAcquire(&root_desc->content_lock, LW_EXCLUSIVE))
+	{
+		if (root_desc->valid &&
+			RelFileLocatorBackendEquals(root_desc->tag.rlocator, rlocator))
+		{
+			root_buffer.desc = root_desc;
+			reserved = ummap_root_reserve_buffer(root_buffer, forknum,
+											InvalidBlockNumber, 1, false, pblkno);
+		}
+		LWLockRelease(&root_desc->content_lock);
+	}
+	LWLockRelease(extension_lock);
+	return reserved;
 }
 
 /* content_lock and the relation extension lock serialize this allocation. */
@@ -793,6 +830,227 @@ ummap_prepare_wal_range(UmbraFileContext *ctx,
 		elog(PANIC, "Umbra WAL-only mapping preparation requested a retry");
 }
 
+/* A replay range has one shared descriptor slot, even if its entries are local. */
+static bool
+ummap_pending_replay_uses_slot(int slot_id)
+{
+	UmbraMapPendingRange *pending;
+
+	for (pending = ummap_pending_ranges; pending != NULL;
+		 pending = pending->next)
+	{
+		if (pending->npinned > 0 && pending->pages[0].slot_id == slot_id)
+			return true;
+	}
+	return false;
+}
+
+bool
+ummap_prepare_remap(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
+					MapSuperDesc *root_desc, ForkNumber forknum, BlockNumber lblkno,
+					UmbraMapRemap *remap)
+{
+	MapPageBuffer buffer;
+	BlockNumber current;
+	BlockNumber map_blkno;
+	int			entry_idx;
+	int			word_idx;
+	uint64		entry_mask;
+
+	Assert(ctx != NULL);
+	Assert(remap != NULL);
+	Assert(!remap->prepared && !remap->map_pinned);
+	(void) ctx;
+	if (!ummap_tracks_fork(forknum))
+		return false;
+
+	/* A failed MAP claim leaves a monotonic physical hole, never a reused P. */
+	if (!ummap_try_reserve_physical_block(rlocator, root_desc, forknum,
+										  &remap->new_pblkno))
+		return false;
+
+	map_blkno = ummap_map_blkno(forknum, lblkno);
+	if (!MapPageBufferTryReadCached(rlocator, map_blkno, LW_EXCLUSIVE,
+								&buffer))
+		return false;
+	remap->rlocator = rlocator;
+	remap->forknum = forknum;
+	remap->lblkno = lblkno;
+	remap->map_slot_id = buffer.desc->slot_id;
+	remap->map_pinned = true;
+
+	entry_idx = ummap_entry_index(lblkno);
+	word_idx = entry_idx / 64;
+	entry_mask = UINT64CONST(1) << (entry_idx % 64);
+	current = ummap_page_get_entry(MapPageBufferGetData(buffer), entry_idx);
+	if (!BlockNumberIsValid(current) ||
+		(buffer.desc->pending_bits[word_idx] & entry_mask) != 0 ||
+		ummap_pending_replay_uses_slot(buffer.desc->slot_id) ||
+		buffer.desc->pending_range.valid ||
+		!MapPageRegisterPendingPin(buffer.desc))
+	{
+		MapPageReleaseBufferNoOwner(buffer);
+		remap->map_pinned = false;
+		return false;
+	}
+	buffer.desc->pending_bits[word_idx] |= entry_mask;
+	buffer.desc->pending_range.range.first_lblkno = lblkno;
+	buffer.desc->pending_range.range.first_pblkno = current;
+	buffer.desc->pending_range.range.nblocks = 1;
+	buffer.desc->pending_range.old_pblkno = InvalidBlockNumber;
+	buffer.desc->pending_range.forknum = forknum;
+	buffer.desc->pending_range.physical_ready = true;
+	buffer.desc->pending_range.recovery_replay = false;
+	buffer.desc->pending_range.recovery_exact = false;
+	buffer.desc->pending_range.valid = true;
+	remap->pending_registered = true;
+	remap->old_pblkno = current;
+	MapPageUnlockBufferKeepPin(buffer);
+	remap->prepared = true;
+	return true;
+}
+
+void
+ummap_abort_remap(UmbraMapRemap *remap)
+{
+	MapPageBuffer buffer;
+	int			entry_idx;
+	int			word_idx;
+	uint64		entry_mask;
+
+	if (remap == NULL || !remap->map_pinned)
+		return;
+
+	if (remap->map_pinned)
+	{
+		buffer.desc = &MapPageDescriptors[remap->map_slot_id];
+		entry_idx = ummap_entry_index(remap->lblkno);
+		word_idx = entry_idx / 64;
+		entry_mask = UINT64CONST(1) << (entry_idx % 64);
+		MapPageLockBuffer(buffer, LW_EXCLUSIVE);
+		if (buffer.desc->tag.map_blkno !=
+			ummap_map_blkno(remap->forknum, remap->lblkno) ||
+			!RelFileLocatorBackendEquals(buffer.desc->tag.rlocator,
+										 remap->rlocator))
+			elog(PANIC, "Umbra prepared remap MAP buffer changed before abort");
+		if (remap->pending_registered)
+		{
+			if ((buffer.desc->pending_bits[word_idx] & entry_mask) == 0)
+				elog(PANIC, "Umbra prepared remap lost its MAP ownership");
+			if (!buffer.desc->pending_range.valid ||
+				buffer.desc->pending_range.forknum != remap->forknum ||
+				buffer.desc->pending_range.range.first_lblkno != remap->lblkno ||
+				buffer.desc->pending_range.range.first_pblkno !=
+				remap->old_pblkno ||
+				buffer.desc->pending_range.range.nblocks != 1)
+				elog(PANIC, "Umbra prepared remap barrier changed before abort");
+			buffer.desc->pending_bits[word_idx] &= ~entry_mask;
+			MemSet(&buffer.desc->pending_range, 0,
+				   sizeof(buffer.desc->pending_range));
+			MapPageReleasePendingBufferNoOwner(buffer);
+			remap->pending_registered = false;
+		}
+		else
+			MapPageReleaseBufferNoOwner(buffer);
+		remap->map_pinned = false;
+	}
+	remap->prepared = false;
+}
+
+/* Release a raw WAL remap pin during backend exit without raising an error. */
+void
+ummap_release_remap_on_exit(UmbraMapRemap *remap)
+{
+	MapPageBuffer buffer;
+	int			entry_idx;
+	int			word_idx;
+	uint64		entry_mask;
+
+	if (remap == NULL || !remap->map_pinned)
+		return;
+	if (!MapPagePoolIsInitialized() || remap->map_slot_id < 0 ||
+		remap->map_slot_id >= MapPageBufferCount)
+	{
+		MemSet(remap, 0, sizeof(*remap));
+		return;
+	}
+
+	buffer.desc = &MapPageDescriptors[remap->map_slot_id];
+	if (LWLockHeldByMe(&buffer.desc->content_lock) &&
+		!LWLockHeldByMeInMode(&buffer.desc->content_lock, LW_EXCLUSIVE))
+		LWLockRelease(&buffer.desc->content_lock);
+	if (!LWLockHeldByMe(&buffer.desc->content_lock))
+		LWLockAcquire(&buffer.desc->content_lock, LW_EXCLUSIVE);
+
+	entry_idx = ummap_entry_index(remap->lblkno);
+	word_idx = entry_idx / 64;
+	entry_mask = UINT64CONST(1) << (entry_idx % 64);
+	if (remap->pending_registered &&
+		RelFileLocatorBackendEquals(buffer.desc->tag.rlocator,
+									remap->rlocator) &&
+		(buffer.desc->pending_bits[word_idx] & entry_mask) != 0 &&
+		buffer.desc->pending_range.valid &&
+		!buffer.desc->pending_range.recovery_replay &&
+		buffer.desc->pending_range.forknum == remap->forknum &&
+		buffer.desc->pending_range.range.first_lblkno == remap->lblkno &&
+		buffer.desc->pending_range.range.first_pblkno == remap->old_pblkno &&
+		buffer.desc->pending_range.range.nblocks == 1)
+	{
+		buffer.desc->pending_bits[word_idx] &= ~entry_mask;
+		MemSet(&buffer.desc->pending_range, 0,
+			   sizeof(buffer.desc->pending_range));
+	}
+	MapPageReleaseBufferOnExit(buffer, remap->pending_registered);
+	MemSet(remap, 0, sizeof(*remap));
+}
+
+void
+ummap_publish_remap(UmbraMapRemap *remap, XLogRecPtr lsn)
+{
+	MapPageBuffer buffer;
+	char	   *page;
+	int			entry_idx;
+	int			word_idx;
+	uint64		entry_mask;
+
+	Assert(remap != NULL);
+	Assert(remap->prepared && remap->map_pinned);
+	Assert(remap->pending_registered);
+	Assert(XLogRecPtrIsValid(lsn));
+	buffer.desc = &MapPageDescriptors[remap->map_slot_id];
+	entry_idx = ummap_entry_index(remap->lblkno);
+	word_idx = entry_idx / 64;
+	entry_mask = UINT64CONST(1) << (entry_idx % 64);
+
+	MapPageLockBuffer(buffer, LW_EXCLUSIVE);
+	if (buffer.desc->tag.map_blkno !=
+		ummap_map_blkno(remap->forknum, remap->lblkno) ||
+		!RelFileLocatorBackendEquals(buffer.desc->tag.rlocator,
+									 remap->rlocator) ||
+		(buffer.desc->pending_bits[word_idx] & entry_mask) == 0)
+		elog(PANIC, "Umbra prepared remap changed before publication");
+	if (!buffer.desc->pending_range.valid ||
+		buffer.desc->pending_range.forknum != remap->forknum ||
+		buffer.desc->pending_range.range.first_lblkno != remap->lblkno ||
+		buffer.desc->pending_range.range.first_pblkno != remap->old_pblkno ||
+		buffer.desc->pending_range.range.nblocks != 1)
+		elog(PANIC, "Umbra prepared remap barrier changed before publication");
+	page = MapPageBufferGetData(buffer);
+	if (ummap_page_get_entry(page, entry_idx) != remap->old_pblkno)
+		elog(PANIC,
+			 "Umbra remap changed fork %d block %u from an unexpected physical block",
+			 (int) remap->forknum, remap->lblkno);
+	ummap_page_set_entry(page, entry_idx, remap->new_pblkno);
+	MapPageMarkBufferDirty(buffer, false, lsn);
+	buffer.desc->pending_bits[word_idx] &= ~entry_mask;
+	MemSet(&buffer.desc->pending_range, 0,
+		   sizeof(buffer.desc->pending_range));
+	MapPageReleasePendingBufferNoOwner(buffer);
+	remap->map_pinned = false;
+	remap->pending_registered = false;
+	remap->prepared = false;
+}
+
 bool
 ummap_pending_range_for_block(RelFileLocator rlocator, ForkNumber forknum,
 								  BlockNumber lblkno, UmbraMapRange *range)
@@ -1071,7 +1329,7 @@ ummap_publish_ready_ranges_internal(bool include_local)
 				pending->range.nblocks;
 			if (include_local)
 				physical_end = Max(physical_end,
-								   umfile_nblocks(pending->ctx, pending->forknum));
+							   umfile_nblocks(pending->ctx, pending->forknum));
 			else
 				Assert(CritSectionCount > 0);
 			ummap_root_advance(pending->ctx, pending->rlocator,
@@ -1159,8 +1417,8 @@ ummap_next_physical_block(UmbraFileContext *ctx,
 
 static void
 ummap_replay_mapping_range(UmbraFileContext *ctx,
-						   RelFileLocatorBackend rlocator, ForkNumber forknum,
-						   const UmbraMapRange *range, XLogRecPtr lsn)
+							   RelFileLocatorBackend rlocator, ForkNumber forknum,
+							   const UmbraMapRange *range, XLogRecPtr lsn)
 {
 	BlockNumber done = 0;
 
@@ -1176,11 +1434,7 @@ ummap_replay_mapping_range(UmbraFileContext *ctx,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("invalid Umbra WAL mapping range")));
 
-	/*
-	 * Recovery follows WAL order, not the MAP image left by a later failed
-	 * recovery attempt.  Install the exact P from this record even when the
-	 * page currently contains a different, newer mapping.
-	 */
+	/* Recovery before consistency may overwrite a later failed replay's MAP. */
 	while (done < range->nblocks)
 	{
 		BlockNumber lblkno = range->first_lblkno + done;
@@ -1195,8 +1449,12 @@ ummap_replay_mapping_range(UmbraFileContext *ctx,
 								   LW_EXCLUSIVE);
 		page = MapPageBufferGetData(buffer);
 		for (BlockNumber i = 0; i < count; i++)
+		{
+			BlockNumber expected = range->first_pblkno + done + i;
+
 			ummap_page_set_entry(page, entry_idx + i,
-								 range->first_pblkno + done + i);
+								 expected);
+		}
 		MapPageMarkBufferDirty(buffer, false, lsn);
 		MapPageReleaseBuffer(buffer);
 		done += count;
@@ -1206,7 +1464,8 @@ ummap_replay_mapping_range(UmbraFileContext *ctx,
 void
 ummap_prepare_replay_range(UmbraFileContext *ctx,
 						   RelFileLocatorBackend rlocator, ForkNumber forknum,
-						   const UmbraMapRange *range, XLogRecPtr lsn,
+						   const UmbraMapRange *range,
+						   BlockNumber old_pblkno, XLogRecPtr lsn,
 						   bool physical_ready)
 {
 	UmbraMapRecoveryPending *pending;
@@ -1214,6 +1473,9 @@ ummap_prepare_replay_range(UmbraFileContext *ctx,
 	Assert(InRecovery);
 	Assert(XLogRecPtrIsValid(lsn));
 	ummap_validate_range(range);
+	if (BlockNumberIsValid(old_pblkno) &&
+		(range->nblocks != 1 || old_pblkno == range->first_pblkno))
+		elog(PANIC, "invalid Umbra existing-page replay mapping");
 	for (pending = ummap_replay_ranges; pending != NULL;
 		 pending = pending->next)
 	{
@@ -1228,7 +1490,8 @@ ummap_prepare_replay_range(UmbraFileContext *ctx,
 			continue;
 		if (pending->range.first_lblkno == range->first_lblkno &&
 			pending->range.first_pblkno == range->first_pblkno &&
-			pending->range.nblocks == range->nblocks)
+			pending->range.nblocks == range->nblocks &&
+			pending->old_pblkno == old_pblkno)
 		{
 			return;
 		}
@@ -1257,13 +1520,54 @@ ummap_prepare_replay_range(UmbraFileContext *ctx,
 			elog(PANIC,
 				 "Umbra exact replay mapping overlaps recovery scratch");
 	}
-	if (reachedConsistency)
-		ummap_validate_replay_canonical(ctx, rlocator, forknum, range);
-
 	pending = ummap_prepare_recovery_pending(ctx, rlocator, forknum, range,
-										 lsn, true, physical_ready);
+										 old_pblkno, lsn, true,
+										 physical_ready);
 	pending->next = ummap_replay_ranges;
 	ummap_replay_ranges = pending;
+}
+
+void
+ummap_switch_replay_remap(RelFileLocatorBackend rlocator, ForkNumber forknum,
+						  BlockNumber lblkno, BlockNumber old_pblkno,
+						  BlockNumber new_pblkno)
+{
+	UmbraMapRecoveryPending *pending;
+
+	Assert(InRecovery);
+	Assert(BlockNumberIsValid(old_pblkno));
+	for (pending = ummap_replay_ranges; pending != NULL;
+		 pending = pending->next)
+	{
+		MapPageBuffer buffer;
+
+		if (pending->forknum != forknum ||
+			!RelFileLocatorBackendEquals(pending->rlocator, rlocator) ||
+			pending->range.first_lblkno != lblkno ||
+			pending->range.first_pblkno != new_pblkno ||
+			pending->range.nblocks != 1 ||
+			pending->old_pblkno != old_pblkno)
+			continue;
+		if (!pending->use_old_pblkno)
+			return;
+
+		buffer.desc = &MapPageDescriptors[pending->slot_id];
+		MapPageLockBuffer(buffer, LW_EXCLUSIVE);
+		if (!buffer.desc->replay_range.valid ||
+			!buffer.desc->replay_range.recovery_replay ||
+			!buffer.desc->replay_range.recovery_exact ||
+			buffer.desc->replay_range.forknum != forknum ||
+			buffer.desc->replay_range.range.first_lblkno != lblkno ||
+			buffer.desc->replay_range.range.first_pblkno != new_pblkno ||
+			buffer.desc->replay_range.old_pblkno != old_pblkno ||
+			!buffer.desc->replay_range.use_old_pblkno)
+			elog(PANIC, "Umbra replay remap changed before target switch");
+		buffer.desc->replay_range.use_old_pblkno = false;
+		pending->use_old_pblkno = false;
+		MapPageUnlockBufferKeepPin(buffer);
+		return;
+	}
+	elog(PANIC, "Umbra replay remap disappeared before target switch");
 }
 
 bool
@@ -1351,6 +1655,10 @@ ummap_publish_replay_ranges(void)
 		BlockNumber physical_end = Max(pending->range.first_pblkno +
 			pending->range.nblocks,
 			umfile_nblocks(pending->ctx, pending->forknum));
+
+		if (BlockNumberIsValid(pending->old_pblkno) &&
+			pending->use_old_pblkno)
+			elog(PANIC, "Umbra replay remap reached publication on old P");
 
 		ummap_replay_mapping_range(pending->ctx, pending->rlocator,
 								   pending->forknum, &pending->range,
@@ -1442,6 +1750,7 @@ ummap_prepare_recovery_scratch_range(UmbraFileContext *ctx,
 	}
 
 	pending = ummap_prepare_recovery_pending(ctx, rlocator, forknum, range,
+										 InvalidBlockNumber,
 										 InvalidXLogRecPtr, false, true);
 	pending->next = ummap_recovery_scratch;
 	ummap_recovery_scratch = pending;
@@ -1549,9 +1858,10 @@ ummap_get_recovery_resowner(void)
 static UmbraMapRecoveryPending *
 ummap_prepare_recovery_pending(UmbraFileContext *ctx,
 							   RelFileLocatorBackend rlocator,
-							   ForkNumber forknum,
-							   const UmbraMapRange *range,
-							   XLogRecPtr lsn, bool exact,
+								   ForkNumber forknum,
+								   const UmbraMapRange *range,
+								   BlockNumber old_pblkno,
+								   XLogRecPtr lsn, bool exact,
 							   bool physical_ready)
 {
 	UmbraMapRecoveryPending *pending;
@@ -1577,11 +1887,13 @@ ummap_prepare_recovery_pending(UmbraFileContext *ctx,
 	pending->rlocator = rlocator;
 	pending->forknum = forknum;
 	pending->range = *range;
+	pending->old_pblkno = old_pblkno;
 	pending->lsn = lsn;
 	pending->owner = owner;
 	pending->slot_id = -1;
 	pending->exact = exact;
 	pending->physical_ready = physical_ready;
+	pending->use_old_pblkno = exact && BlockNumberIsValid(old_pblkno);
 	ResourceOwnerRemember(owner, PointerGetDatum(pending),
 						  &ummap_recovery_resowner_desc);
 	pending->resource_remembered = true;
@@ -1615,8 +1927,10 @@ ummap_prepare_recovery_pending(UmbraFileContext *ctx,
 	}
 	buffer.desc->pending_bits[word_idx] |= entry_mask;
 	shared_pending->range = *range;
+	shared_pending->old_pblkno = old_pblkno;
 	shared_pending->forknum = forknum;
 	shared_pending->physical_ready = physical_ready;
+	shared_pending->use_old_pblkno = pending->use_old_pblkno;
 	shared_pending->recovery_replay = true;
 	shared_pending->recovery_exact = exact;
 	shared_pending->valid = true;
@@ -1681,7 +1995,9 @@ ummap_release_recovery_pending(UmbraMapRecoveryPending *pending,
 			shared_pending->range.first_lblkno ==
 			pending->range.first_lblkno &&
 			shared_pending->range.first_pblkno ==
-			pending->range.first_pblkno)
+			pending->range.first_pblkno &&
+			shared_pending->old_pblkno == pending->old_pblkno &&
+			shared_pending->use_old_pblkno == pending->use_old_pblkno)
 		{
 			buffer.desc->pending_bits[word_idx] &= ~entry_mask;
 			MemSet(shared_pending, 0, sizeof(*shared_pending));
@@ -1708,7 +2024,9 @@ ummap_release_recovery_pending(UmbraMapRecoveryPending *pending,
 		pending->range.first_lblkno ||
 		shared_pending->range.first_pblkno !=
 		pending->range.first_pblkno ||
-		shared_pending->range.nblocks != pending->range.nblocks)
+		shared_pending->range.nblocks != pending->range.nblocks ||
+		shared_pending->old_pblkno != pending->old_pblkno ||
+		shared_pending->use_old_pblkno != pending->use_old_pblkno)
 		elog(PANIC, "Umbra recovery MAP barrier changed before release");
 	buffer.desc->pending_bits[word_idx] &= ~entry_mask;
 	MemSet(shared_pending, 0, sizeof(*shared_pending));
@@ -1782,51 +2100,6 @@ ummap_validate_range(const UmbraMapRange *range)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("invalid Umbra recovery mapping range")));
-}
-
-static void
-ummap_validate_replay_canonical(UmbraFileContext *ctx,
-							   RelFileLocatorBackend rlocator,
-							   ForkNumber forknum,
-							   const UmbraMapRange *range)
-{
-	BlockNumber done = 0;
-	BlockNumber map_nblocks;
-
-	Assert(reachedConsistency);
-	map_nblocks = umfile_nblocks(ctx, UMBRA_MAP_FORKNUM);
-	while (done < range->nblocks)
-	{
-		BlockNumber lblkno = range->first_lblkno + done;
-		BlockNumber count = ummap_page_run_limit(lblkno,
-											 range->nblocks - done);
-		BlockNumber map_blkno = ummap_map_blkno(forknum, lblkno);
-		MapPageBuffer buffer;
-		char	   *page;
-		int			entry_idx;
-
-		if (map_blkno >= map_nblocks)
-			return;
-		buffer = MapPageBufferRead(ctx, rlocator, map_blkno, false, false,
-								   LW_SHARED);
-		page = MapPageBufferGetData(buffer);
-		entry_idx = ummap_entry_index(lblkno);
-		for (BlockNumber i = 0; i < count; i++)
-		{
-			BlockNumber current = ummap_page_get_entry(page, entry_idx + i);
-			BlockNumber expected = range->first_pblkno + done + i;
-
-			if (BlockNumberIsValid(current) && current != expected)
-			{
-				MapPageReleaseBuffer(buffer);
-				elog(PANIC,
-					 "Umbra first-born WAL mapping conflicts with canonical MAP for fork %d block %u",
-					 (int) forknum, lblkno + i);
-			}
-		}
-		MapPageReleaseBuffer(buffer);
-		done += count;
-	}
 }
 
 static bool
@@ -1906,10 +2179,19 @@ ummap_lookup_recovery_pending(RelFileLocatorBackend rlocator,
 			elog(ERROR,
 				 "Umbra exact replay mapping for fork %d block %u is not physically ready",
 				 (int) forknum, lblkno);
-		*pblkno = pending->range.first_pblkno +
-			(lblkno - pending->range.first_lblkno);
-		*nblocks = Min(maxblocks, pending->range.nblocks -
-						  (lblkno - pending->range.first_lblkno));
+		if (pending->use_old_pblkno)
+		{
+			Assert(pending->range.nblocks == 1);
+			*pblkno = pending->old_pblkno;
+			*nblocks = 1;
+		}
+		else
+		{
+			*pblkno = pending->range.first_pblkno +
+				(lblkno - pending->range.first_lblkno);
+			*nblocks = Min(maxblocks, pending->range.nblocks -
+							  (lblkno - pending->range.first_lblkno));
+		}
 		return true;
 	}
 	for (pending = ummap_recovery_scratch; pending != NULL;
@@ -2028,9 +2310,18 @@ ummap_lookup_shared_pending(RelFileLocatorBackend rlocator,
 		{
 			BlockNumber offset = lblkno - shared_pending->range.first_lblkno;
 
-			*pblkno = shared_pending->range.first_pblkno + offset;
-			*nblocks = Min(maxblocks,
-						   shared_pending->range.nblocks - offset);
+			if (shared_pending->use_old_pblkno)
+			{
+				Assert(shared_pending->range.nblocks == 1 && offset == 0);
+				*pblkno = shared_pending->old_pblkno;
+				*nblocks = 1;
+			}
+			else
+			{
+				*pblkno = shared_pending->range.first_pblkno + offset;
+				*nblocks = Min(maxblocks,
+							   shared_pending->range.nblocks - offset);
+			}
 			*physical_ready = shared_pending->physical_ready;
 			found = true;
 		}
@@ -2628,7 +2919,7 @@ retry:
 		BlockNumber current_physical;
 
 		ummap_root_read_frontiers(ctx, rlocator, forknum, &current_eof,
-									   &current_physical);
+								   &current_physical);
 		if (current_eof != logical_eof ||
 			current_physical != physical_frontier)
 			goto retry;

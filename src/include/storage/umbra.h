@@ -71,13 +71,24 @@ extern void UmPrepareFirstbornLocator(RelFileLocator rlocator,
 extern void UmPrepareFirstbornRangeLocator(RelFileLocator rlocator,
 										 ForkNumber forknum, int nblocks,
 										 const BlockNumber *lblknos);
+extern bool UmWalOwnedRemapAvailable(SMgrRelation reln, ForkNumber forknum);
+extern bool UmPrepareBlockRemap(SMgrRelation reln, ForkNumber forknum,
+								BlockNumber lblkno, UmbraMapRemap *remap);
+extern void UmAbortBlockRemap(UmbraMapRemap *remap);
+extern void UmReleaseBlockRemapOnExit(UmbraMapRemap *remap);
+extern void UmPublishBlockRemap(UmbraMapRemap *remap, XLogRecPtr lsn);
 extern bool UmLogMappingRange(RelFileLocator rlocator, ForkNumber forknum,
 							  BlockNumber startblk, BlockNumber endblk,
 							  BlockNumber anchor_lblkno);
 extern void UmLogMappingRangeFinish(bool delay_started);
 extern void UmMappingPublicationDone(void);
 extern void UmPrepareReplayMappingRange(SMgrRelation reln, ForkNumber forknum,
-									const UmbraMapRange *range, XLogRecPtr lsn);
+									const UmbraMapRange *range,
+									BlockNumber old_pblkno, XLogRecPtr lsn);
+extern void UmSwitchReplayBlockRemap(SMgrRelation reln, ForkNumber forknum,
+									BlockNumber lblkno,
+									BlockNumber old_pblkno,
+									BlockNumber new_pblkno);
 extern void UmPublishReplayMappingRanges(void);
 extern bool UmRedoDiscardingPrecreateRecords(SMgrRelation reln);
 extern void UmCheckRecoveryDependencies(void);

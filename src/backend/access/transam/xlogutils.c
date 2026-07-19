@@ -367,6 +367,11 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 	Page		page;
 	bool		zeromode;
 	bool		willinit;
+#ifdef USE_UMBRA
+	DecodedBkpBlock *blkref;
+	bool		existing_remap;
+	SMgrRelation remap_reln = NULL;
+#endif
 
 	if (!XLogRecGetBlockTagExtended(record, block_id, &rlocator, &forknum, &blkno,
 									&prefetch_buffer))
@@ -386,6 +391,13 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 		elog(PANIC, "block with WILL_INIT flag in WAL record must be zeroed by redo routine");
 	if (!willinit && zeromode)
 		elog(PANIC, "block to be initialized in redo routine must be marked with WILL_INIT flag in the WAL record");
+#ifdef USE_UMBRA
+	blkref = XLogRecGetBlock(record, block_id);
+	existing_remap = blkref->has_remap &&
+		BlockNumberIsValid(blkref->old_pblkno);
+	if (existing_remap && (willinit || zeromode))
+		elog(PANIC, "invalid Umbra existing-page remap in WAL record");
+#endif
 
 	/* If it has a full-page image and it should be restored, do it. */
 	if (XLogRecBlockImageApply(record, block_id))
@@ -434,6 +446,31 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 				else
 					LockBuffer(*buf, BUFFER_LOCK_EXCLUSIVE);
 			}
+#ifdef USE_UMBRA
+			if (existing_remap)
+			{
+				/* Preserve the accumulated redo baseline before writes follow new P. */
+				MarkBufferDirty(*buf);
+				FlushOneBuffer(*buf);
+			}
+#endif
+		}
+#ifdef USE_UMBRA
+		if (existing_remap)
+		{
+			remap_reln = smgropen(rlocator, INVALID_PROC_NUMBER);
+			UmSwitchReplayBlockRemap(remap_reln, forknum, blkno,
+								 blkref->old_pblkno,
+								 blkref->first_pblkno);
+			if (BufferIsValid(*buf))
+			{
+				/* A restart may already have applied this record; copy it to new P. */
+				MarkBufferDirty(*buf);
+			}
+		}
+#endif
+		if (BufferIsValid(*buf))
+		{
 			if (lsn <= PageGetLSN(BufferGetPage(*buf)))
 				return BLK_DONE;
 			else

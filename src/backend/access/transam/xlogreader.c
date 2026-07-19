@@ -1797,6 +1797,7 @@ DecodeXLogRecord(XLogReaderState *state,
 			blk->apply_image = false;
 #ifdef USE_UMBRA
 			blk->has_remap = false;
+			blk->old_pblkno = InvalidBlockNumber;
 			blk->first_lblkno = InvalidBlockNumber;
 			blk->first_pblkno = InvalidBlockNumber;
 			blk->nblocks = InvalidBlockNumber;
@@ -1835,6 +1836,7 @@ DecodeXLogRecord(XLogReaderState *state,
 #ifdef USE_UMBRA
 			if (blk->has_remap)
 			{
+				COPY_HEADER_FIELD(&blk->old_pblkno, sizeof(BlockNumber));
 				COPY_HEADER_FIELD(&blk->first_lblkno, sizeof(BlockNumber));
 				COPY_HEADER_FIELD(&blk->first_pblkno, sizeof(BlockNumber));
 				COPY_HEADER_FIELD(&blk->nblocks, sizeof(BlockNumber));
@@ -1962,6 +1964,18 @@ DecodeXLogRecord(XLogReaderState *state,
 			{
 				report_invalid_record(state,
 								  "Umbra mapping range does not cover block %u at %X/%08X",
+								  blk->blkno,
+								  LSN_FORMAT_ARGS(state->ReadRecPtr));
+				goto err;
+			}
+			if (blk->has_remap && BlockNumberIsValid(blk->old_pblkno) &&
+				(blk->first_lblkno != blk->blkno || blk->nblocks != 1 ||
+				 blk->first_pblkno == blk->old_pblkno ||
+				 blk->has_image ||
+				 (blk->flags & BKPBLOCK_WILL_INIT) != 0))
+			{
+				report_invalid_record(state,
+								  "invalid Umbra existing-page remap for block %u at %X/%08X",
 								  blk->blkno,
 								  LSN_FORMAT_ARGS(state->ReadRecPtr));
 				goto err;

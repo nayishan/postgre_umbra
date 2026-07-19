@@ -243,9 +243,8 @@ relation cardinality.  Each entry stores only the opaque 64-byte root image;
 disk root I/O transfers one zero-padded 512-byte sector.
 
 This patch can reserve next-free ownership ahead of physical capacity, but it
-does not replace an existing visible mapping, suppress a full-page image,
-reclaim or reuse physical blocks, preallocate capacity in the background, run a
-background mapwriter.  CRC detects an invalid root but does not provide a
-duplicate root or repair arbitrary storage corruption.  The authoritative
-runtime EOF contract and append-only physical frontier must be revisited before
-physical blocks can be reclaimed or reused.
+does not reclaim or reuse physical blocks, preallocate capacity in the
+background, or run a background mapwriter.  CRC detects an invalid root but
+does not provide a duplicate root or repair arbitrary storage corruption.  The
+authoritative runtime EOF contract and append-only physical frontier must be
+revisited before physical blocks can be reclaimed or reused.

@@ -131,8 +131,8 @@ like($stopped_checkpointer_pid, qr/^[0-9]+$/,
 is(kill('STOP', $stopped_checkpointer_pid), 1,
 	'standby checkpointer is stopped before DROP replay');
 
-# These first post-checkpoint changes carry full-page images for the old
-# generation.  The second recovery must discard them after locator reuse.
+# These first post-checkpoint changes use old-P delta redo.  The second
+# recovery will no longer have either old-P baseline after locator reuse.
 $primary->safe_psql(
 	'postgres',
 	"UPDATE umbra_generation_old SET payload = 'old-overlap-redo' "

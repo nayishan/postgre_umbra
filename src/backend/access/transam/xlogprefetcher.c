@@ -690,6 +690,17 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 				return LRQ_NEXT_NO_IO;
 			}
 
+#ifdef USE_UMBRA
+			/* Redo must install this record's mapping before any physical read. */
+			if (block->has_remap)
+			{
+				XLogPrefetcherAddFilter(prefetcher, block->rlocator,
+										block->blkno, record->lsn);
+				XLogPrefetchIncrement(&SharedStats->skip_new);
+				return LRQ_NEXT_NO_IO;
+			}
+#endif
+
 			/*
 			 * If there is a full page image attached, we won't be reading the
 			 * page, so don't bother trying to prefetch.

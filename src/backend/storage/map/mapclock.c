@@ -139,10 +139,16 @@ MapPagePoolShmemAttach(void)
 void
 MapPageEnsureInitialized(void)
 {
-	if (MapPagePoolCtlData == NULL || MapPageDescriptors == NULL ||
-		MapPageBlocks == NULL || MapPageCacheHash == NULL ||
-		MapPageCacheLocks == NULL || MapPageExtensionLocks == NULL)
+	if (!MapPagePoolIsInitialized())
 		elog(ERROR, "Umbra MAP page buffer pool is not initialized");
+}
+
+bool
+MapPagePoolIsInitialized(void)
+{
+	return MapPagePoolCtlData != NULL && MapPageDescriptors != NULL &&
+		MapPageBlocks != NULL && MapPageCacheHash != NULL &&
+		MapPageCacheLocks != NULL && MapPageExtensionLocks != NULL;
 }
 
 uint32
@@ -310,7 +316,7 @@ MapPageRegisterPendingPin(MapPageDesc *desc)
 	Assert(desc != NULL);
 	Assert(LWLockHeldByMeInMode(&desc->content_lock, LW_EXCLUSIVE));
 	if (desc->pending_pin_refs == UINT32_MAX)
-		elog(ERROR, "Umbra MAP pending pin reference count overflow");
+		return false;
 	if (desc->pending_pin_refs == 0 && !MapPageTryReservePendingSlot())
 		return false;
 	desc->pending_pin_refs++;
@@ -334,7 +340,7 @@ MapPageTryReservePendingSlot(void)
 	uint32		limit;
 	uint32		old_reservations;
 
-	MapPageEnsureInitialized();
+	Assert(MapPagePoolIsInitialized());
 	limit = MapPagePoolCtlData->nslots - 1;
 	old_reservations = pg_atomic_read_u32(
 		&MapPagePoolCtlData->pending_reservations);
@@ -357,7 +363,7 @@ MapPageReleasePendingSlot(void)
 {
 	uint32		old_reservations;
 
-	MapPageEnsureInitialized();
+	Assert(MapPagePoolIsInitialized());
 	old_reservations = pg_atomic_fetch_sub_u32(
 		&MapPagePoolCtlData->pending_reservations, 1);
 	if (old_reservations == 0)

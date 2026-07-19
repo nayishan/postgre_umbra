@@ -224,6 +224,65 @@ MapPageBufferRead(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 	}
 }
 
+/*
+ * Pin an already-valid MAP page without allocating or starting I/O.
+ *
+ * The WAL insertion prepass can run inside a critical section.  Its remap path
+ * owns this raw pin explicitly and releases it on every retry or error.
+ */
+bool
+MapPageBufferTryReadCached(RelFileLocatorBackend rlocator,
+						   BlockNumber map_blkno, LWLockMode mode,
+						   MapPageBuffer *buffer)
+{
+	MapPageTag tag = {0};
+	MapPageDesc *desc;
+	LWLock	   *partition_lock;
+	uint32		hashcode;
+	uint64		state;
+	int			slot_id;
+
+	Assert(buffer != NULL);
+	Assert(mode == LW_SHARED || mode == LW_EXCLUSIVE);
+	buffer->desc = NULL;
+	if (!MapPagePoolIsInitialized())
+		return false;
+	tag.rlocator = rlocator;
+	tag.map_blkno = map_blkno;
+	hashcode = MapPageCacheHashCode(&tag);
+	partition_lock = MapPageCachePartitionLock(hashcode);
+
+	if (!LWLockConditionalAcquire(partition_lock, LW_SHARED))
+		return false;
+	slot_id = MapPageCacheLookup(&tag, hashcode);
+	if (slot_id >= 0 && !MapPagePinBufferNoOwner(slot_id, true))
+		slot_id = -1;
+	LWLockRelease(partition_lock);
+	if (slot_id < 0)
+		return false;
+
+	desc = &MapPageDescriptors[slot_id];
+	state = pg_atomic_read_u64(&desc->state);
+	if ((state & MAP_PAGE_IO_IN_PROGRESS) != 0 ||
+		!LWLockConditionalAcquire(&desc->content_lock, mode))
+	{
+		MapPageUnpinBufferNoOwner(slot_id);
+		return false;
+	}
+	state = pg_atomic_read_u64(&desc->state);
+	if ((state & (MAP_PAGE_TAG_VALID | MAP_PAGE_VALID)) !=
+		(MAP_PAGE_TAG_VALID | MAP_PAGE_VALID) ||
+		!MapPageTagEquals(&desc->tag, &tag))
+	{
+		LWLockRelease(&desc->content_lock);
+		MapPageUnpinBufferNoOwner(slot_id);
+		return false;
+	}
+
+	buffer->desc = desc;
+	return true;
+}
+
 char *
 MapPageBufferGetData(MapPageBuffer buffer)
 {
@@ -294,6 +353,70 @@ MapPageReleasePendingBufferOwned(MapPageBuffer buffer, ResourceOwner owner)
 }
 
 void
+MapPageReleaseBufferNoOwner(MapPageBuffer buffer)
+{
+	MapPageDesc *desc = buffer.desc;
+
+	Assert(desc != NULL);
+	Assert(LWLockHeldByMe(&desc->content_lock));
+	LWLockRelease(&desc->content_lock);
+	MapPageUnpinBufferNoOwner(desc->slot_id);
+}
+
+void
+MapPageReleasePendingBufferNoOwner(MapPageBuffer buffer)
+{
+	MapPageDesc *desc = buffer.desc;
+
+	Assert(desc != NULL);
+	Assert(LWLockHeldByMeInMode(&desc->content_lock, LW_EXCLUSIVE));
+	MapPageUnpinBufferNoOwner(desc->slot_id);
+	MapPageUnregisterPendingPin(desc);
+	LWLockRelease(&desc->content_lock);
+}
+
+/* Best-effort release for before_shmem_exit callbacks; this must not throw. */
+void
+MapPageReleaseBufferOnExit(MapPageBuffer buffer, bool pending_registered)
+{
+	MapPageDesc *desc = buffer.desc;
+	uint64		old_state;
+
+	if (desc == NULL)
+		return;
+
+	/* Match normal pending release ordering: drop the pin before the guard. */
+	old_state = pg_atomic_read_u64(&desc->state);
+	while (MAP_PAGE_GET_REFCOUNT(old_state) > 0 &&
+		   !pg_atomic_compare_exchange_u64(&desc->state, &old_state,
+									 old_state - 1))
+	{
+		/* old_state is refreshed by the failed compare-and-exchange. */
+	}
+
+	if (pending_registered && desc->pending_pin_refs > 0)
+	{
+		desc->pending_pin_refs--;
+		if (desc->pending_pin_refs == 0 && MapPagePoolCtlData != NULL)
+		{
+			uint32		old_reservations = pg_atomic_read_u32(
+				&MapPagePoolCtlData->pending_reservations);
+
+			while (old_reservations > 0 &&
+				   !pg_atomic_compare_exchange_u32(
+					   &MapPagePoolCtlData->pending_reservations,
+					   &old_reservations, old_reservations - 1))
+			{
+				/* The failed compare-and-exchange refreshes old_reservations. */
+			}
+		}
+	}
+
+	if (LWLockHeldByMe(&desc->content_lock))
+		LWLockRelease(&desc->content_lock);
+}
+
+void
 MapPageLockBuffer(MapPageBuffer buffer, LWLockMode mode)
 {
 	MapPageDesc *desc = buffer.desc;
@@ -316,6 +439,14 @@ MapPageUnlockBufferKeepPin(MapPageBuffer buffer)
 void
 MapPagePinBuffer(int slot_id, bool adjust_usage)
 {
+	if (!MapPagePinBufferNoOwner(slot_id, adjust_usage))
+		elog(ERROR, "Umbra MAP page buffer reference count overflow");
+	MapPageRememberPin(slot_id);
+}
+
+bool
+MapPagePinBufferNoOwner(int slot_id, bool adjust_usage)
+{
 	MapPageDesc *desc = &MapPageDescriptors[slot_id];
 	uint64		old_state;
 
@@ -325,16 +456,15 @@ MapPagePinBuffer(int slot_id, bool adjust_usage)
 		uint64		new_state;
 
 		if (MAP_PAGE_GET_REFCOUNT(old_state) == UINT32_MAX)
-			elog(ERROR, "Umbra MAP page buffer reference count overflow");
+			return false;
 		new_state = old_state + 1;
 		if (adjust_usage &&
 			MAP_PAGE_GET_USAGE(old_state) < MAP_PAGE_MAX_USAGE_COUNT)
 			new_state += MAP_PAGE_USAGE_ONE;
 		if (pg_atomic_compare_exchange_u64(&desc->state, &old_state,
 										   new_state))
-			break;
+			return true;
 	}
-	MapPageRememberPin(slot_id);
 }
 
 void

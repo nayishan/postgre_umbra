@@ -22,6 +22,7 @@
 #include "storage/smgr.h"
 
 typedef struct UmbraFileContext UmbraFileContext;
+typedef struct MapSuperDesc MapSuperDesc;
 
 typedef struct UmbraMapRange
 {
@@ -29,6 +30,20 @@ typedef struct UmbraMapRange
 	BlockNumber first_pblkno;
 	BlockNumber nblocks;
 } UmbraMapRange;
+
+/* Fixed-size ownership token for one WAL-owned existing-page remap. */
+typedef struct UmbraMapRemap
+{
+	RelFileLocatorBackend rlocator;
+	ForkNumber	forknum;
+	BlockNumber lblkno;
+	BlockNumber old_pblkno;
+	BlockNumber new_pblkno;
+	int			map_slot_id;
+	bool		map_pinned;
+	bool		pending_registered;
+	bool		prepared;
+} UmbraMapRemap;
 
 /*
  * Umbra-private relation-local map fork.
@@ -111,6 +126,14 @@ extern BlockNumber ummap_reserve_physical_run(UmbraFileContext *ctx,
 											ForkNumber forknum,
 											BlockNumber nblocks,
 											bool skipFsync);
+extern bool ummap_prepare_remap(UmbraFileContext *ctx,
+									RelFileLocatorBackend rlocator,
+									MapSuperDesc *root_desc, ForkNumber forknum,
+									BlockNumber lblkno,
+									UmbraMapRemap *remap);
+extern void ummap_abort_remap(UmbraMapRemap *remap);
+extern void ummap_release_remap_on_exit(UmbraMapRemap *remap);
+extern void ummap_publish_remap(UmbraMapRemap *remap, XLogRecPtr lsn);
 extern bool ummap_prepare_firstborn_range(UmbraFileContext *ctx,
 										  RelFileLocatorBackend rlocator,
 										  ForkNumber forknum,
@@ -152,8 +175,13 @@ extern void ummap_prepare_replay_range(UmbraFileContext *ctx,
 									   RelFileLocatorBackend rlocator,
 									   ForkNumber forknum,
 									   const UmbraMapRange *range,
+									   BlockNumber old_pblkno,
 									   XLogRecPtr lsn,
 									   bool physical_ready);
+extern void ummap_switch_replay_remap(RelFileLocatorBackend rlocator,
+									 ForkNumber forknum, BlockNumber lblkno,
+									 BlockNumber old_pblkno,
+									 BlockNumber new_pblkno);
 extern bool ummap_replay_range_for_extension(
 	RelFileLocatorBackend rlocator, ForkNumber forknum,
 	BlockNumber first_lblkno, BlockNumber nblocks,

@@ -478,6 +478,10 @@ typedef struct XLogCtlData
 	pg_atomic_uint64 logInsertResult;	/* last byte + 1 inserted to buffers */
 	pg_atomic_uint64 logWriteResult;	/* last byte + 1 written out */
 	pg_atomic_uint64 logFlushResult;	/* last byte + 1 flushed */
+#ifdef USE_UMBRA
+	/* Old-P redo may use only a baseline covered by a completed checkpoint. */
+	pg_atomic_uint64 completedCheckpointRedo;
+#endif
 
 	/*
 	 * Latest initialized page in the cache (last byte position + 1).
@@ -5435,6 +5439,10 @@ XLOGShmemInit(void *arg)
 	pg_atomic_init_u64(&XLogCtl->logInsertResult, InvalidXLogRecPtr);
 	pg_atomic_init_u64(&XLogCtl->logWriteResult, InvalidXLogRecPtr);
 	pg_atomic_init_u64(&XLogCtl->logFlushResult, InvalidXLogRecPtr);
+#ifdef USE_UMBRA
+	pg_atomic_init_u64(&XLogCtl->completedCheckpointRedo,
+					   ControlFile->checkPointCopy.redo);
+#endif
 	pg_atomic_init_u64(&XLogCtl->unloggedLSN, InvalidXLogRecPtr);
 }
 
@@ -6967,6 +6975,14 @@ GetFullPageWriteInfo(XLogRecPtr *RedoRecPtr_p, bool *doPageWrites_p)
 	*doPageWrites_p = doPageWrites;
 }
 
+#ifdef USE_UMBRA
+XLogRecPtr
+GetLastCompletedCheckpointRedo(void)
+{
+	return pg_atomic_read_u64(&XLogCtl->completedCheckpointRedo);
+}
+#endif
+
 /*
  * GetInsertRecPtr -- Returns the current insert position.
  *
@@ -7804,6 +7820,9 @@ CreateCheckPoint(int flags)
 
 	UpdateControlFile();
 	LWLockRelease(ControlFileLock);
+#ifdef USE_UMBRA
+	pg_atomic_write_u64(&XLogCtl->completedCheckpointRedo, checkPoint.redo);
+#endif
 
 	/*
 	 * We are now done with critical updates; no need for system panic if we
@@ -8140,6 +8159,9 @@ CreateRestartPoint(int flags)
 	XLogRecPtr	endptr;
 	XLogSegNo	_logSegNo;
 	TimestampTz xtime;
+#ifdef USE_UMBRA
+	XLogRecPtr	completedRedoRecPtr;
+#endif
 
 	/* Concurrent checkpoint/restartpoint cannot happen */
 	Assert(!IsUnderPostmaster || MyBackendType == B_CHECKPOINTER);
@@ -8292,7 +8314,15 @@ CreateRestartPoint(int flags)
 
 		UpdateControlFile();
 	}
+#ifdef USE_UMBRA
+	completedRedoRecPtr = ControlFile->checkPointCopy.redo;
+#endif
 	LWLockRelease(ControlFileLock);
+
+#ifdef USE_UMBRA
+	pg_atomic_write_u64(&XLogCtl->completedCheckpointRedo,
+						completedRedoRecPtr);
+#endif
 
 	/*
 	 * Update the average distance between checkpoints/restartpoints if the

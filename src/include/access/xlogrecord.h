@@ -118,11 +118,15 @@ typedef struct XLogRecordBlockHeader
 /*
  * Umbra mapping metadata attached to an ordinary WAL block reference.
  *
- * The range describes first-born logical blocks whose exact physical blocks
- * must be installed before redo resolves the referenced logical block.
+ * An invalid old_pblkno describes a first-born range whose exact physical
+ * blocks must be installed before redo resolves the referenced logical block.
+ * A valid old_pblkno describes one existing logical block moving from that
+ * physical block to first_pblkno.  Redo applies the record delta to the
+ * checkpointed old physical block before publishing the new mapping.
  */
 typedef struct XLogRecordBlockRemapHeader
 {
+	BlockNumber old_pblkno;
 	BlockNumber first_lblkno;
 	BlockNumber first_pblkno;
 	BlockNumber nblocks;
