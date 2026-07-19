@@ -11,6 +11,9 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
+plan skip_all => 'pg_upgrade is not supported with Umbra storage'
+  if check_pg_config('^#define USE_UMBRA 1$');
+
 # Make sure the extension file .so path is provided
 my $ext_lib_so = $ENV{TEST_EXT_LIB}
   or die "couldn't get the extension so path";

@@ -44,6 +44,9 @@ use PostgreSQL::Test::RecursiveCopy;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
+plan skip_all => 'pg_rewind is not supported with Umbra storage'
+  if PostgreSQL::Test::Utils::check_pg_config('^#define USE_UMBRA 1$');
+
 our @EXPORT = qw(
   $node_primary
   $node_standby
