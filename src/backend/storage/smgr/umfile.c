@@ -145,8 +145,8 @@ typedef struct UmFilePathStr
 
 
 /* local routines */
-static void umfile_unlinkfork(RelFileLocatorBackend rlocator, ForkNumber forknum,
-							  bool isRedo);
+static bool umfile_unlinkfork(RelFileLocatorBackend rlocator, ForkNumber forknum,
+								  bool isRedo);
 static UmfdVec *umfile_openfork(UmbraFileContext *ctx, ForkNumber forknum, int behavior);
 static void umfile_register_dirty_segment(UmbraFileContext *ctx, ForkNumber forknum,
 										  UmfdVec *seg);
@@ -450,17 +450,24 @@ umfile_write_bytes(UmbraFileContext *ctx, ForkNumber forknum,
  * Note: any failure should be reported as WARNING not ERROR, because
  * we are usually not in a transaction anymore when this is called.
  */
-void
+bool
 umfile_unlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 {
+	bool		success = true;
+
 	/* Now do the per-fork work */
 	if (forknum == InvalidForkNumber)
 	{
 		for (int forkidx = 0; forkidx < UMBRA_NUM_FORKS; forkidx++)
-			umfile_unlinkfork(rlocator, (ForkNumber) forkidx, isRedo);
+		{
+			if (!umfile_unlinkfork(rlocator, (ForkNumber) forkidx, isRedo))
+				success = false;
+		}
 	}
 	else
-		umfile_unlinkfork(rlocator, forknum, isRedo);
+		success = umfile_unlinkfork(rlocator, forknum, isRedo);
+
+	return success;
 }
 
 /*
@@ -487,12 +494,13 @@ do_truncate(const char *path)
 	return ret;
 }
 
-static void
+static bool
 umfile_unlinkfork(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 {
 	RelPathStr	path;
 	int			ret;
 	int			save_errno;
+	bool		success = true;
 
 	Assert(umfile_forknum_is_valid(forknum));
 
@@ -517,15 +525,18 @@ umfile_unlinkfork(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRed
 			if (access(segpath.str, F_OK) < 0)
 			{
 				if (errno != ENOENT)
+				{
+					success = false;
 					ereport(WARNING,
 							(errcode_for_file_access(),
 							 errmsg("could not access file \"%s\": %m",
 									segpath.str)));
+				}
 				break;
 			}
 			umfile_register_unlink_segment(rlocator, forknum, segno);
 		}
-		return;
+		return success;
 	}
 
 	/*
@@ -539,6 +550,8 @@ umfile_unlinkfork(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRed
 		{
 			/* Prevent other backends' fds from holding on to the disk space */
 			ret = do_truncate(path.str);
+			if (ret < 0 && errno != ENOENT)
+				success = false;
 
 			/* Forget any pending sync requests for the first segment */
 			save_errno = errno;
@@ -554,6 +567,7 @@ umfile_unlinkfork(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRed
 			ret = unlink(path.str);
 			if (ret < 0 && errno != ENOENT)
 			{
+				success = false;
 				save_errno = errno;
 				ereport(WARNING,
 						(errcode_for_file_access(),
@@ -566,6 +580,8 @@ umfile_unlinkfork(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRed
 	{
 		/* Prevent other backends' fds from holding on to the disk space */
 		ret = do_truncate(path.str);
+		if (ret < 0 && errno != ENOENT)
+			success = false;
 
 		/* Register request to unlink first segment later */
 		save_errno = errno;
@@ -596,12 +612,19 @@ umfile_unlinkfork(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRed
 
 			if (!RelFileLocatorBackendIsTemp(rlocator))
 			{
+				int			truncate_ret;
+
 				/*
 				 * Prevent other backends' fds from holding on to the disk
 				 * space.  We're done if we see ENOENT, though.
 				 */
-				if (do_truncate(segpath.str) < 0 && errno == ENOENT)
-					break;
+				truncate_ret = do_truncate(segpath.str);
+				if (truncate_ret < 0)
+				{
+					if (errno == ENOENT)
+						break;
+					success = false;
+				}
 
 				/*
 				 * Forget any pending sync requests for this segment before we
@@ -614,13 +637,18 @@ umfile_unlinkfork(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRed
 			{
 				/* ENOENT is expected after the last segment... */
 				if (errno != ENOENT)
+				{
+					success = false;
 					ereport(WARNING,
 							(errcode_for_file_access(),
 							 errmsg("could not remove file \"%s\": %m", segpath.str)));
+				}
 				break;
 			}
 		}
 	}
+
+	return success;
 }
 
 /*

@@ -741,6 +741,15 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 			 */
 			reln = smgropen(block->rlocator, INVALID_PROC_NUMBER);
 
+#ifdef USE_UMBRA
+			/* Never prefetch an old record through a later generation's MAP. */
+			if (smgrredogenerationahead(reln, record->next_lsn))
+			{
+				XLogPrefetchIncrement(&SharedStats->skip_new);
+				return LRQ_NEXT_NO_IO;
+			}
+#endif
+
 			/*
 			 * If the relation file doesn't exist on disk, for example because
 			 * we're replaying after a crash and the file will be created and

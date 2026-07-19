@@ -80,12 +80,16 @@ typedef struct pg_attribute_packed() UmbraMapRootData
 	BlockNumber physical_frontier_fsm;
 	BlockNumber physical_frontier_vm;
 
-	uint8		reserved[20];
+	/* Immutable identity of the MAIN CREATE record that owns this storage. */
+	XLogRecPtr	generation_lsn;
+	uint8		reserved[12];
 	pg_crc32c	crc;
 } UmbraMapRootData;
 
 StaticAssertDecl(sizeof(UmbraMapRootData) == UMMAP_ROOT_IMAGE_SIZE,
 				 "Umbra MAP root payload size is wrong");
+StaticAssertDecl(offsetof(UmbraMapRootData, generation_lsn) == 40,
+				 "Umbra MAP root generation offset is wrong");
 StaticAssertDecl(offsetof(UmbraMapRootData, crc) == 60,
 				 "Umbra MAP root CRC offset is wrong");
 
@@ -267,6 +271,71 @@ ummap_create(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 		ummap_root_write_image(ctx, image, false);
 	}
 	LWLockRelease(root_lock);
+}
+
+bool
+ummap_is_empty(UmbraFileContext *ctx, RelFileLocatorBackend rlocator)
+{
+	char		empty_image[UMMAP_ROOT_IMAGE_SIZE];
+	MapSuperBuffer buffer;
+	bool		empty;
+
+	if (umfile_nblocks(ctx, UMBRA_MAP_FORKNUM) != 1)
+		return false;
+
+	ummap_root_init(empty_image);
+	buffer = MapSuperBufferRead(ctx, rlocator, LW_SHARED);
+	empty = memcmp(MapSuperBufferGetData(buffer), empty_image,
+				   UMMAP_ROOT_IMAGE_SIZE) == 0;
+	MapSuperReleaseBuffer(buffer);
+	return empty;
+}
+
+XLogRecPtr
+ummap_get_generation_lsn(UmbraFileContext *ctx,
+						 RelFileLocatorBackend rlocator)
+{
+	MapSuperBuffer buffer;
+	UmbraMapRootData *root;
+	XLogRecPtr	generation_lsn;
+
+	buffer = MapSuperBufferRead(ctx, rlocator, LW_SHARED);
+	root = (UmbraMapRootData *) MapSuperBufferGetData(buffer);
+	generation_lsn = root->generation_lsn;
+	MapSuperReleaseBuffer(buffer);
+	return generation_lsn;
+}
+
+void
+ummap_set_generation_lsn(UmbraFileContext *ctx,
+						 RelFileLocatorBackend rlocator,
+						 XLogRecPtr generation_lsn)
+{
+	MapSuperBuffer buffer;
+	UmbraMapRootData *root;
+	bool		immediate_sync = InRecovery;
+
+	Assert(XLogRecPtrIsValid(generation_lsn));
+	buffer = MapSuperBufferRead(ctx, rlocator, LW_EXCLUSIVE);
+	root = (UmbraMapRootData *) MapSuperBufferGetData(buffer);
+	if (XLogRecPtrIsValid(root->generation_lsn) &&
+		root->generation_lsn != generation_lsn)
+	{
+		MapSuperReleaseBuffer(buffer);
+		elog(PANIC, "Umbra MAP belongs to a different storage generation");
+	}
+	if (root->generation_lsn != generation_lsn)
+	{
+		root->generation_lsn = generation_lsn;
+		ummap_root_refresh_crc(root);
+		MapSuperMarkBufferDirty(buffer, false, generation_lsn);
+		/* A replayed CREATE marker must survive another physical crash. */
+		if (InRecovery)
+			MapSuperFlushLocked(buffer.desc, ctx);
+	}
+	MapSuperReleaseBuffer(buffer);
+	if (immediate_sync)
+		ummap_immedsync_if_exists(ctx);
 }
 
 void
@@ -1516,6 +1585,8 @@ ummap_prepare_recovery_pending(UmbraFileContext *ctx,
 	ResourceOwnerRemember(owner, PointerGetDatum(pending),
 						  &ummap_recovery_resowner_desc);
 	pending->resource_remembered = true;
+	if (!exact)
+		return pending;
 
 	map_blkno = ummap_map_blkno(forknum, range->first_lblkno);
 	entry_idx = ummap_entry_index(range->first_lblkno);
@@ -1678,12 +1749,12 @@ ummap_unlink_recovery_pending(UmbraMapRecoveryPending *pending)
 static void
 ummap_update_recovery_barrier(UmbraMapRecoveryPending *pending)
 {
-	MapPageBuffer buffer =
-	{
-		.desc = &MapPageDescriptors[pending->slot_id],
-	};
+	MapPageBuffer buffer;
 
 	Assert(!pending->exact);
+	if (!pending->barrier_installed)
+		return;
+	buffer.desc = &MapPageDescriptors[pending->slot_id];
 	MapPageLockBuffer(buffer, LW_EXCLUSIVE);
 	if (!buffer.desc->pending_range.valid ||
 		!buffer.desc->pending_range.recovery_replay ||

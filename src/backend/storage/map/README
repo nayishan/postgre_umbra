@@ -190,6 +190,24 @@ paths.  It also does not wait for MAP fsync; checkpoint writeback and the WAL
 flush frontier above own persistence after the MAP state is visible.
 
 
+Relation Generations
+--------------------
+
+The root records the EndRecPtr of the MAIN CREATE record as the storage
+generation identity.  Normal CREATE publishes that marker inside its checkpoint
+delay.  Redo writes and syncs a replayed marker immediately so another crash can
+distinguish the restored generation.
+
+A second recovery can begin before an old generation's DROP while newer files
+already occupy the same locator.  Before resolving a page or exact mapping,
+redo compares its record position with the resident generation marker.  A
+future marker causes the newer canonical files to be replaced by an empty
+recovery scratch generation.  Missing pre-CREATE pages then use PostgreSQL's
+invalid-page accounting until the old DROP or TRUNCATE record proves that the
+dependency is disposable.  Redo CREATE installs the new generation marker and
+subsequent exact mappings rebuild its storage.
+
+
 Lifecycle
 ---------
 
@@ -227,7 +245,7 @@ disk root I/O transfers one zero-padded 512-byte sector.
 This patch can reserve next-free ownership ahead of physical capacity, but it
 does not replace an existing visible mapping, suppress a full-page image,
 reclaim or reuse physical blocks, preallocate capacity in the background, run a
-background mapwriter, or handle relation generations.  CRC detects an invalid
-root but does not provide a duplicate root or repair arbitrary storage
-corruption.  The authoritative runtime EOF contract and append-only physical
-frontier must be revisited before physical blocks can be reclaimed or reused.
+background mapwriter.  CRC detects an invalid root but does not provide a
+duplicate root or repair arbitrary storage corruption.  The authoritative
+runtime EOF contract and append-only physical frontier must be revisited before
+physical blocks can be reclaimed or reused.

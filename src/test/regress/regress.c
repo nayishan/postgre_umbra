@@ -21,6 +21,7 @@
 
 #include "access/detoast.h"
 #include "access/htup_details.h"
+#include "access/transam.h"
 #include "catalog/catalog.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_operator.h"
@@ -40,6 +41,7 @@
 #include "port/atomics.h"
 #include "portability/instr_time.h"
 #include "postmaster/postmaster.h"	/* for MAX_BACKENDS */
+#include "storage/lwlock.h"
 #include "storage/spin.h"
 #include "tcop/tcopprot.h"
 #include "utils/array.h"
@@ -91,6 +93,24 @@ PG_MODULE_MAGIC_EXT(
 					.name = "regress",
 					.version = PG_VERSION
 );
+
+/* Test-only support for deterministic relfilenumber reuse. */
+PG_FUNCTION_INFO_V1(regress_set_next_oid);
+
+Datum
+regress_set_next_oid(PG_FUNCTION_ARGS)
+{
+	Oid			new_next_oid = PG_GETARG_OID(0);
+	Oid			old_next_oid;
+
+	LWLockAcquire(OidGenLock, LW_EXCLUSIVE);
+	old_next_oid = TransamVariables->nextOid;
+	TransamVariables->nextOid = new_next_oid;
+	TransamVariables->oidCount = 0;
+	LWLockRelease(OidGenLock);
+
+	PG_RETURN_OID(old_next_oid);
+}
 
 
 /* return the point where two paths intersect, or NULL if no intersection. */

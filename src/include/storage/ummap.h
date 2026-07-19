@@ -45,6 +45,13 @@ extern bool ummap_tracks_fork(ForkNumber forknum);
 extern bool ummap_exists(UmbraFileContext *ctx);
 extern void ummap_create(UmbraFileContext *ctx,
 						 RelFileLocatorBackend rlocator, bool isRedo);
+extern bool ummap_is_empty(UmbraFileContext *ctx,
+						  RelFileLocatorBackend rlocator);
+extern XLogRecPtr ummap_get_generation_lsn(UmbraFileContext *ctx,
+										 RelFileLocatorBackend rlocator);
+extern void ummap_set_generation_lsn(UmbraFileContext *ctx,
+									 RelFileLocatorBackend rlocator,
+									 XLogRecPtr generation_lsn);
 extern void ummap_close(UmbraFileContext *ctx);
 extern void ummap_immedsync_if_exists(UmbraFileContext *ctx);
 extern void ummap_registersync_if_exists(UmbraFileContext *ctx);

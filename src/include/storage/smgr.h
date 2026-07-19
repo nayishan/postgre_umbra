@@ -98,7 +98,13 @@ extern void smgrreleaseall(void);
 extern void smgrreleaserellocator(RelFileLocatorBackend rlocator);
 extern void smgrcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
 extern void smgrinitnewrelation(SMgrRelation reln, bool needs_wal);
-extern void smgrredocreate(SMgrRelation reln, ForkNumber forknum);
+extern void smgrsetgeneration(SMgrRelation reln, ForkNumber forknum,
+							  XLogRecPtr generation_lsn);
+extern void smgrredocreate(SMgrRelation reln, ForkNumber forknum,
+							   XLogRecPtr generation_lsn);
+extern void smgrprepareredo(SMgrRelation reln, XLogRecPtr replay_lsn);
+extern bool smgrredogenerationahead(SMgrRelation reln,
+									XLogRecPtr replay_lsn);
 extern void smgrcheckpoint(void);
 extern void smgrflushdatabasetablespace(Oid dbid, Oid spcOid);
 extern void smgrinvalidatedatabase(Oid dbid);

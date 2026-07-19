@@ -69,6 +69,7 @@ tests += {
       't/060_umbra_remap_first.pl',
       't/061_umbra_redo_drop_restart.pl',
       't/062_umbra_checkpoint_publication.pl',
+      't/064_umbra_map_generation_reuse.pl',
     ],
   },
 }

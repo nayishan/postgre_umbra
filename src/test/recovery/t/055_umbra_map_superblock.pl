@@ -22,7 +22,8 @@ use constant MAP_LOGICAL_VM_OFFSET => 24;
 use constant MAP_PHYSICAL_MAIN_OFFSET => 28;
 use constant MAP_PHYSICAL_FSM_OFFSET => 32;
 use constant MAP_PHYSICAL_VM_OFFSET => 36;
-use constant MAP_RESERVED_OFFSET => 40;
+use constant MAP_GENERATION_LSN_OFFSET => 40;
+use constant MAP_RESERVED_OFFSET => 48;
 use constant MAP_CRC_OFFSET => 60;
 use constant MAP_PAYLOAD_SIZE => 64;
 use constant MAP_SECTOR_SIZE => 512;
@@ -38,6 +39,12 @@ sub u32_at
 {
 	my ($buffer, $offset) = @_;
 	return unpack('L', substr($buffer, $offset, 4));
+}
+
+sub u64_at
+{
+	my ($buffer, $offset) = @_;
+	return unpack('Q', substr($buffer, $offset, 8));
 }
 
 sub read_map_super
@@ -193,8 +200,10 @@ is(u32_at($identity_super, MAP_LOGICAL_FSM_OFFSET),
 is(u32_at($identity_super, MAP_LOGICAL_VM_OFFSET),
 	u32_at($identity_super, MAP_PHYSICAL_VM_OFFSET),
 	'VM root fields use the same absent or identity state');
-is(substr($identity_super, MAP_RESERVED_OFFSET, 20), "\0" x 20,
-	'future root fields remain reserved in this patch');
+isnt(u64_at($identity_super, MAP_GENERATION_LSN_OFFSET), 0,
+	'root identifies the MAIN CREATE WAL generation');
+is(substr($identity_super, MAP_RESERVED_OFFSET, 12), "\0" x 12,
+	'remaining root fields stay reserved');
 is(substr($identity_super, MAP_PAYLOAD_SIZE,
 		MAP_SECTOR_SIZE - MAP_PAYLOAD_SIZE),
 	"\0" x (MAP_SECTOR_SIZE - MAP_PAYLOAD_SIZE),

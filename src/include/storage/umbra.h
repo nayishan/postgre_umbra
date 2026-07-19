@@ -26,7 +26,12 @@ extern void umclose(SMgrRelation reln, ForkNumber forknum);
 extern void umdestroy(SMgrRelation reln);
 extern void umcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
 extern void uminitnewrelation(SMgrRelation reln, bool needs_wal);
-extern void umredocreate(SMgrRelation reln, ForkNumber forknum);
+extern void umsetgeneration(SMgrRelation reln, ForkNumber forknum,
+								XLogRecPtr generation_lsn);
+extern void umredocreate(SMgrRelation reln, ForkNumber forknum,
+							 XLogRecPtr generation_lsn);
+extern void umprepareredo(SMgrRelation reln, XLogRecPtr replay_lsn);
+extern bool umredogenerationahead(SMgrRelation reln, XLogRecPtr replay_lsn);
 extern void umcheckpoint(void);
 extern void umflushdatabasetablespace(Oid dbid, Oid spcOid);
 extern void uminvalidatedatabase(Oid dbid);
@@ -74,6 +79,7 @@ extern void UmMappingPublicationDone(void);
 extern void UmPrepareReplayMappingRange(SMgrRelation reln, ForkNumber forknum,
 									const UmbraMapRange *range, XLogRecPtr lsn);
 extern void UmPublishReplayMappingRanges(void);
+extern bool UmRedoDiscardingPrecreateRecords(SMgrRelation reln);
 extern void UmCheckRecoveryDependencies(void);
 extern void UmRecoveryEnd(void);
 

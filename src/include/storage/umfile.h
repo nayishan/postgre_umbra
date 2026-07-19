@@ -32,8 +32,8 @@ extern void umfile_destroy(UmbraFileContext *ctx);
 extern void umfile_create(UmbraFileContext *ctx, ForkNumber forknum,
 						  bool isRedo);
 extern bool umfile_exists(UmbraFileContext *ctx, ForkNumber forknum);
-extern void umfile_unlink(RelFileLocatorBackend rlocator, ForkNumber forknum,
-						  bool isRedo);
+extern bool umfile_unlink(RelFileLocatorBackend rlocator, ForkNumber forknum,
+							  bool isRedo);
 extern void umfile_extend(UmbraFileContext *ctx, ForkNumber forknum,
 						  BlockNumber blocknum, const void *buffer,
 						  bool skipFsync);

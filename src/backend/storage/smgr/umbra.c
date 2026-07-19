@@ -46,18 +46,21 @@ typedef struct UmbraSmgrRelationState
 	/* Root entries are not replaced while their relation remains live. */
 	MapSuperDesc *root_desc;
 	bool		uses_map;
+	XLogRecPtr	generation_lsn;
 } UmbraSmgrRelationState;
 
 typedef struct UmbraRedoCreateState
 {
 	RelFileLocator rlocator;		/* hash key, must be first */
 	uint32		created_forks;
+	bool		discard_precreate_redo;
 } UmbraRedoCreateState;
 
 static UmbraFileContext *um_get_filectx(SMgrRelation reln);
 static void um_cache_root_desc(UmbraSmgrRelationState *state,
 								RelFileLocatorBackend rlocator);
 static bool um_fork_uses_map(SMgrRelation reln, ForkNumber forknum);
+static void um_reset_recovery_storage(SMgrRelation reln);
 static BlockNumber um_get_logical_nblocks(SMgrRelation reln,
 										  ForkNumber forknum);
 static bool um_begin_checkpoint_delay(void);
@@ -78,6 +81,8 @@ static void um_ensure_physical_capacity(UmbraFileContext *ctx,
 										BlockNumber first_pblkno,
 										BlockNumber nblocks, bool skipFsync);
 static bool um_redo_create_seen(RelFileLocator rlocator, ForkNumber forknum);
+static UmbraRedoCreateState *um_get_redo_create_state(
+	RelFileLocator rlocator, bool create);
 static void um_forget_redo_create(RelFileLocator rlocator);
 static void um_forget_redo_create_database(Oid dbid, Oid spcOid);
 
@@ -111,14 +116,19 @@ umopen(SMgrRelation reln)
 	state->filectx = umfile_open(reln);
 	/* Existing MAP storage is the durable policy marker on reopen. */
 	state->uses_map = !SmgrIsTemp(reln) && ummap_exists(state->filectx);
-	if (state->uses_map)
+	state->generation_lsn = InvalidXLogRecPtr;
+	if (state->uses_map &&
+		(!InRecovery ||
+		 umfile_nblocks(state->filectx, UMBRA_MAP_FORKNUM) > 0))
 	{
 		um_cache_root_desc(state, reln->smgr_rlocator);
-		if (!InRecovery)
-			ummap_root_read_frontiers(state->filectx, reln->smgr_rlocator,
-									   MAIN_FORKNUM, &logical_eof,
-									   &physical_frontier);
+		state->generation_lsn = ummap_get_generation_lsn(state->filectx,
+												  reln->smgr_rlocator);
 	}
+	if (state->uses_map && !InRecovery)
+		ummap_root_read_frontiers(state->filectx, reln->smgr_rlocator,
+								   MAIN_FORKNUM, &logical_eof,
+								   &physical_frontier);
 	reln->smgr_private = state;
 }
 
@@ -162,9 +172,11 @@ umcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 	if (isRedo && ummap_tracks_fork(forknum))
 	{
 		state->uses_map = true;
-		if (!ummap_exists(ctx))
-			ummap_create(ctx, reln->smgr_rlocator, true);
+		/* Also rebuild a root left empty by an interrupted redo unlink. */
+		ummap_create(ctx, reln->smgr_rlocator, true);
 		um_cache_root_desc(state, reln->smgr_rlocator);
+		state->generation_lsn = ummap_get_generation_lsn(ctx,
+												  reln->smgr_rlocator);
 	}
 
 	if (state->uses_map && forknum != MAIN_FORKNUM &&
@@ -190,6 +202,7 @@ uminitnewrelation(SMgrRelation reln, bool needs_wal)
 	Assert(state != NULL);
 	state->uses_map = needs_wal;
 	state->root_desc = NULL;
+	state->generation_lsn = InvalidXLogRecPtr;
 	if (needs_wal)
 	{
 		ummap_create(state->filectx, reln->smgr_rlocator, false);
@@ -198,36 +211,118 @@ uminitnewrelation(SMgrRelation reln, bool needs_wal)
 }
 
 void
-umredocreate(SMgrRelation reln, ForkNumber forknum)
+umsetgeneration(SMgrRelation reln, ForkNumber forknum,
+				XLogRecPtr generation_lsn)
 {
+	UmbraSmgrRelationState *state = reln->smgr_private;
+
+	Assert(state != NULL);
+	if (forknum == MAIN_FORKNUM && state->uses_map)
+	{
+		ummap_set_generation_lsn(state->filectx, reln->smgr_rlocator,
+								 generation_lsn);
+		state->generation_lsn = generation_lsn;
+	}
+}
+
+void
+umredocreate(SMgrRelation reln, ForkNumber forknum,
+			 XLogRecPtr generation_lsn)
+{
+	UmbraSmgrRelationState *state = reln->smgr_private;
 	UmbraRedoCreateState *entry;
-	bool		found;
+	bool		empty_storage = true;
 
 	Assert(InRecovery);
+	Assert(state != NULL);
 	Assert(forknum >= 0 && forknum <= MAX_FORKNUM);
+	if (forknum == MAIN_FORKNUM)
+	{
+		if (!XLogRecPtrIsValid(state->generation_lsn))
+		{
+			empty_storage = ummap_is_empty(state->filectx,
+										 reln->smgr_rlocator);
+			for (int forkidx = 0; empty_storage && forkidx <= MAX_FORKNUM;
+				 forkidx++)
+			{
+				ForkNumber fork = (ForkNumber) forkidx;
+
+				if (umfile_exists(state->filectx, fork) &&
+					umfile_nblocks(state->filectx, fork) != 0)
+					empty_storage = false;
+			}
+		}
+
+		/* An authoritative CREATE never inherits another generation's files. */
+		if ((XLogRecPtrIsValid(state->generation_lsn) &&
+			 state->generation_lsn != generation_lsn) ||
+			(!XLogRecPtrIsValid(state->generation_lsn) && !empty_storage))
+			um_reset_recovery_storage(reln);
+	}
 	if (ummap_has_recovery_scratch_relation(reln->smgr_rlocator))
 		elog(PANIC,
 			 "Umbra redo CREATE encountered unresolved recovery mapping for relation %u/%u/%u",
 			 reln->smgr_rlocator.locator.spcOid,
 			 reln->smgr_rlocator.locator.dbOid,
 			 reln->smgr_rlocator.locator.relNumber);
-	if (um_redo_create_hash == NULL)
+	if (forknum == MAIN_FORKNUM)
 	{
-		HASHCTL		ctl;
-
-		MemSet(&ctl, 0, sizeof(ctl));
-		ctl.keysize = sizeof(RelFileLocator);
-		ctl.entrysize = sizeof(UmbraRedoCreateState);
-		ctl.hcxt = TopMemoryContext;
-		um_redo_create_hash = hash_create("Umbra redo CREATE state", 128,
-										   &ctl,
-										   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		ummap_set_generation_lsn(state->filectx, reln->smgr_rlocator,
+								 generation_lsn);
+		state->generation_lsn = generation_lsn;
 	}
-	entry = hash_search(um_redo_create_hash,
-						&reln->smgr_rlocator.locator, HASH_ENTER, &found);
-	if (!found)
-		entry->created_forks = 0;
+	entry = um_get_redo_create_state(reln->smgr_rlocator.locator, true);
+	if (forknum == MAIN_FORKNUM)
+		entry->discard_precreate_redo = false;
 	entry->created_forks |= (uint32) 1 << forknum;
+}
+
+void
+umprepareredo(SMgrRelation reln, XLogRecPtr replay_lsn)
+{
+	UmbraRedoCreateState *entry;
+
+	Assert(InRecovery);
+	Assert(XLogRecPtrIsValid(replay_lsn));
+	entry = um_get_redo_create_state(reln->smgr_rlocator.locator, false);
+	if (entry != NULL && entry->discard_precreate_redo)
+		return;
+	if (umredogenerationahead(reln, replay_lsn))
+	{
+		um_reset_recovery_storage(reln);
+		/* Missing old-generation pages now depend on its later DROP/TRUNCATE. */
+		entry = um_get_redo_create_state(reln->smgr_rlocator.locator, true);
+		entry->discard_precreate_redo = true;
+	}
+}
+
+bool
+umredogenerationahead(SMgrRelation reln, XLogRecPtr replay_lsn)
+{
+	UmbraSmgrRelationState *state = reln->smgr_private;
+	UmbraRedoCreateState *entry;
+
+	if (!InRecovery || state == NULL || !state->uses_map ||
+		!XLogRecPtrIsValid(replay_lsn))
+		return false;
+	/* Keep prefetch out of the disposable old-generation scratch. */
+	entry = um_get_redo_create_state(reln->smgr_rlocator.locator, false);
+	if (entry != NULL && entry->discard_precreate_redo)
+		return true;
+	if (!XLogRecPtrIsValid(state->generation_lsn))
+		return false;
+	return replay_lsn < state->generation_lsn;
+}
+
+bool
+UmRedoDiscardingPrecreateRecords(SMgrRelation reln)
+{
+	UmbraRedoCreateState *entry;
+
+	if (!InRecovery || reln == NULL)
+		return false;
+	entry = um_get_redo_create_state(reln->smgr_rlocator.locator, false);
+	return entry != NULL && entry->discard_precreate_redo;
 }
 
 void
@@ -531,7 +626,8 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 			recovery_nblocks = scratch_end - logical_nblocks;
 			XLogRecordInvalidPage(reln->smgr_rlocator.locator, forknum,
-							  logical_nblocks, false);
+							  logical_nblocks, false,
+							  UmRedoDiscardingPrecreateRecords(reln));
 			first_pblkno = ummap_next_physical_block(ctx,
 											 reln->smgr_rlocator, forknum);
 			um_ensure_physical_capacity(ctx, reln->smgr_rlocator, forknum,
@@ -676,11 +772,41 @@ um_redo_create_seen(RelFileLocator rlocator, ForkNumber forknum)
 {
 	UmbraRedoCreateState *entry;
 
-	if (um_redo_create_hash == NULL)
-		return false;
-	entry = hash_search(um_redo_create_hash, &rlocator, HASH_FIND, NULL);
+	entry = um_get_redo_create_state(rlocator, false);
 	return entry != NULL &&
 		(entry->created_forks & ((uint32) 1 << forknum)) != 0;
+}
+
+static UmbraRedoCreateState *
+um_get_redo_create_state(RelFileLocator rlocator, bool create)
+{
+	UmbraRedoCreateState *entry;
+	bool		found;
+
+	if (um_redo_create_hash == NULL)
+	{
+		HASHCTL		ctl;
+
+		if (!create)
+			return NULL;
+		MemSet(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(RelFileLocator);
+		ctl.entrysize = sizeof(UmbraRedoCreateState);
+		ctl.hcxt = TopMemoryContext;
+		um_redo_create_hash = hash_create("Umbra redo CREATE state", 128,
+										   &ctl,
+										   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+
+	entry = hash_search(um_redo_create_hash, &rlocator,
+						create ? HASH_ENTER : HASH_FIND,
+						create ? &found : NULL);
+	if (create && !found)
+	{
+		entry->created_forks = 0;
+		entry->discard_precreate_redo = false;
+	}
+	return entry;
 }
 
 static void
@@ -868,6 +994,7 @@ UmPrepareReplayMappingRange(SMgrRelation reln, ForkNumber forknum,
 	Assert(range != NULL);
 	if (forknum != MAIN_FORKNUM)
 		return;
+	smgrprepareredo(reln, lsn);
 	smgrcreate(reln, forknum, true);
 	if (!um_fork_uses_map(reln, forknum))
 		return;
@@ -1156,6 +1283,42 @@ um_fork_uses_map(SMgrRelation reln, ForkNumber forknum)
 
 	Assert(state != NULL);
 	return state->uses_map && ummap_tracks_fork(forknum);
+}
+
+/*
+ * A second recovery can start before an old generation's DROP while a newer
+ * generation already occupies the same locator.  Replace that newer canonical
+ * storage with an empty scratch generation before replay resolves any L -> P.
+ */
+static void
+um_reset_recovery_storage(SMgrRelation reln)
+{
+	UmbraSmgrRelationState *state = reln->smgr_private;
+	UmbraFileContext *ctx;
+	SMgrRelation rels[1] = {reln};
+
+	Assert(InRecovery);
+	Assert(state != NULL);
+	ctx = state->filectx;
+	state->root_desc = NULL;
+
+	/* Drop shared buffers and stale file/cache state before locator reuse. */
+	smgrdounlinkall(rels, lengthof(rels), true);
+	if (!umfile_unlink(reln->smgr_rlocator, InvalidForkNumber, true))
+		elog(PANIC,
+			 "could not remove old Umbra storage generation for relation %u/%u/%u",
+			 reln->smgr_rlocator.locator.spcOid,
+			 reln->smgr_rlocator.locator.dbOid,
+			 reln->smgr_rlocator.locator.relNumber);
+	umfile_create(ctx, MAIN_FORKNUM, true);
+	ummap_create(ctx, reln->smgr_rlocator, true);
+
+	state->uses_map = true;
+	um_cache_root_desc(state, reln->smgr_rlocator);
+	state->generation_lsn = InvalidXLogRecPtr;
+	for (int forkidx = 0; forkidx <= MAX_FORKNUM; forkidx++)
+		reln->smgr_cached_nblocks[forkidx] = InvalidBlockNumber;
+	reln->smgr_targblock = InvalidBlockNumber;
 }
 
 static BlockNumber
