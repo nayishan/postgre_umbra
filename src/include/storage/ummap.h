@@ -77,6 +77,11 @@ extern void ummap_root_read_frontiers(UmbraFileContext *ctx,
 									  ForkNumber forknum,
 									  BlockNumber *logical_eof,
 									  BlockNumber *physical_frontier);
+extern void ummap_root_read_capacity(UmbraFileContext *ctx,
+									RelFileLocatorBackend rlocator,
+									ForkNumber forknum,
+									BlockNumber *physical_frontier,
+									BlockNumber *physical_capacity);
 extern void ummap_root_advance(UmbraFileContext *ctx,
 								RelFileLocatorBackend rlocator,
 								ForkNumber forknum, BlockNumber logical_end,
@@ -89,6 +94,11 @@ extern void ummap_root_set_logical(UmbraFileContext *ctx,
 									BlockNumber physical_floor,
 									XLogRecPtr wal_flush_lsn,
 									bool skipFsync);
+extern void ummap_root_advance_capacity(UmbraFileContext *ctx,
+									   RelFileLocatorBackend rlocator,
+									   ForkNumber forknum,
+									   BlockNumber physical_capacity,
+									   bool skipFsync);
 
 extern BlockNumber ummap_nblocks(UmbraFileContext *ctx,
 								  RelFileLocatorBackend rlocator,

@@ -66,17 +66,20 @@ alternative representation of an unmapped page.
 Disk Root Authority
 -------------------
 
-The root stores the authoritative normal-runtime logical EOF and a physical
-frontier for each tracked fork.  The physical frontier is a monotonic next-free
-high-water mark; it can advance before the corresponding physical capacity is
-materialized.  Reserving from it does not authorize an L -> P translation: the
+The root stores the authoritative normal-runtime logical EOF, a physical
+allocation frontier, and an independently monotonic physical capacity for each
+tracked fork.  The frontier names the next unclaimed P and can advance before
+capacity is materialized.  Capacity says only how far the data fork is
+addressable; it neither reserves P nor authorizes an L -> P translation.  The
 ordinary MAP entry remains the sole authority for each exact mapping.
 
 Normal relation open makes the root resident.  A miss reads and validates one
-512-byte sector, reconciles the physical frontier with data-fork EOF, and
-publishes only the opaque 64-byte payload to the cache.  An update refreshes the
-payload CRC while holding the entry content lock and marks the entry dirty; it
-does not immediately rewrite the sector.
+512-byte sector.  File growth beyond persisted capacity is conservatively
+treated as already allocated, while file growth covered by persisted capacity
+does not move the allocation frontier.  The cache publishes only the opaque
+64-byte payload.  An update refreshes the payload CRC while holding the entry
+content lock and marks the entry dirty; it does not immediately rewrite the
+sector.
 
 During normal execution, smgrnblocks reads the resident logical EOF directly.
 The same backend can extend that value with its own contiguous unpublished

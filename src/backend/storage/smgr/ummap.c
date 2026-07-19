@@ -39,8 +39,8 @@
 #include "utils/memutils.h"
 
 #define UMMAP_ROOT_MAGIC		0x554D4252U	/* "UMBR" */
-#define UMMAP_ROOT_VERSION		1U
-#define UMMAP_ROOT_FLAG_FORMAT_V1 0x00000001U
+#define UMMAP_ROOT_VERSION		2U
+#define UMMAP_ROOT_FLAG_FORMAT_V2 0x00000002U
 
 #define UMMAP_BLOCK_ROOT			0
 #define UMMAP_BLOCK_FIRST_GROUP	1
@@ -83,7 +83,11 @@ typedef struct pg_attribute_packed() UmbraMapRootData
 
 	/* Immutable identity of the MAIN CREATE record that owns this storage. */
 	XLogRecPtr	generation_lsn;
-	uint8		reserved[12];
+
+	/* Addressable file ranges; allocation frontiers above remain independent. */
+	BlockNumber physical_capacity_main;
+	BlockNumber physical_capacity_fsm;
+	BlockNumber physical_capacity_vm;
 	pg_crc32c	crc;
 } UmbraMapRootData;
 
@@ -91,6 +95,8 @@ StaticAssertDecl(sizeof(UmbraMapRootData) == UMMAP_ROOT_IMAGE_SIZE,
 					 "Umbra MAP root payload size is wrong");
 StaticAssertDecl(offsetof(UmbraMapRootData, generation_lsn) == 40,
 					 "Umbra MAP root generation offset is wrong");
+StaticAssertDecl(offsetof(UmbraMapRootData, physical_capacity_main) == 48,
+					 "Umbra MAP root capacity offset is wrong");
 StaticAssertDecl(offsetof(UmbraMapRootData, crc) == 60,
 					 "Umbra MAP root CRC offset is wrong");
 
@@ -158,6 +164,11 @@ static void ummap_root_set_frontiers(UmbraMapRootData *root,
 										 ForkNumber forknum,
 										 BlockNumber logical_eof,
 										 BlockNumber physical_frontier);
+static BlockNumber ummap_root_get_capacity(const UmbraMapRootData *root,
+											ForkNumber forknum);
+static void ummap_root_set_capacity(UmbraMapRootData *root,
+									  ForkNumber forknum,
+									  BlockNumber physical_capacity);
 static bool ummap_root_reserve_buffer(MapSuperBuffer buffer,
 	ForkNumber forknum, BlockNumber physical_floor, BlockNumber nblocks,
 	bool skipFsync, BlockNumber *first_pblkno);
@@ -360,6 +371,24 @@ ummap_root_read_frontiers(UmbraFileContext *ctx,
 	MapSuperReleaseBuffer(buffer);
 }
 
+void
+ummap_root_read_capacity(UmbraFileContext *ctx,
+						 RelFileLocatorBackend rlocator, ForkNumber forknum,
+						 BlockNumber *physical_frontier,
+						 BlockNumber *physical_capacity)
+{
+	MapSuperBuffer buffer;
+	UmbraMapRootData *root;
+
+	Assert(physical_frontier != NULL);
+	Assert(physical_capacity != NULL);
+	buffer = MapSuperBufferRead(ctx, rlocator, LW_SHARED);
+	root = (UmbraMapRootData *) MapSuperBufferGetData(buffer);
+	ummap_root_get_frontiers(root, forknum, NULL, physical_frontier);
+	*physical_capacity = ummap_root_get_capacity(root, forknum);
+	MapSuperReleaseBuffer(buffer);
+}
+
 /* Advance both frontiers monotonically in the resident root. */
 void
 ummap_root_advance(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
@@ -373,6 +402,7 @@ ummap_root_advance(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 	UmbraMapRootData *root;
 	BlockNumber old_logical;
 	BlockNumber old_physical;
+	BlockNumber old_capacity;
 	bool		dirty = false;
 
 	Assert(BlockNumberIsValid(logical_end));
@@ -396,6 +426,7 @@ ummap_root_advance(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 	root = (UmbraMapRootData *) MapSuperBufferGetData(buffer);
 	ummap_root_get_frontiers(root, forknum, &old_logical,
 								 &old_physical);
+	old_capacity = ummap_root_get_capacity(root, forknum);
 	if (!BlockNumberIsValid(old_logical) || logical_end > old_logical)
 	{
 		old_logical = logical_end;
@@ -406,11 +437,39 @@ ummap_root_advance(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 		old_physical = physical_end;
 		dirty = true;
 	}
+	if (!BlockNumberIsValid(old_capacity) || physical_end > old_capacity)
+	{
+		old_capacity = physical_end;
+		dirty = true;
+	}
 	if (dirty)
 	{
 		ummap_root_set_frontiers(root, forknum, old_logical, old_physical);
+		ummap_root_set_capacity(root, forknum, old_capacity);
 		ummap_root_refresh_crc(root);
 		MapSuperMarkBufferDirty(buffer, skipFsync, wal_flush_lsn);
+	}
+	MapSuperReleaseBuffer(buffer);
+}
+
+void
+ummap_root_advance_capacity(UmbraFileContext *ctx,
+							RelFileLocatorBackend rlocator, ForkNumber forknum,
+							BlockNumber physical_capacity, bool skipFsync)
+{
+	MapSuperBuffer buffer;
+	UmbraMapRootData *root;
+	BlockNumber old_capacity;
+
+	Assert(BlockNumberIsValid(physical_capacity));
+	buffer = MapSuperBufferRead(ctx, rlocator, LW_EXCLUSIVE);
+	root = (UmbraMapRootData *) MapSuperBufferGetData(buffer);
+	old_capacity = ummap_root_get_capacity(root, forknum);
+	if (!BlockNumberIsValid(old_capacity) || physical_capacity > old_capacity)
+	{
+		ummap_root_set_capacity(root, forknum, physical_capacity);
+		ummap_root_refresh_crc(root);
+		MapSuperMarkBufferDirty(buffer, skipFsync, InvalidXLogRecPtr);
 	}
 	MapSuperReleaseBuffer(buffer);
 }
@@ -456,6 +515,8 @@ ummap_reserve_physical_run(UmbraFileContext *ctx,
 								  skipFsync);
 			physical_nblocks += chunk;
 		}
+		ummap_root_advance_capacity(ctx, rlocator, forknum,
+								physical_nblocks, skipFsync);
 	}
 	LWLockRelease(extension_lock);
 
@@ -504,7 +565,9 @@ ummap_root_reserve_buffer(MapSuperBuffer buffer, ForkNumber forknum,
 	UmbraMapRootData *root;
 	BlockNumber logical_eof;
 	BlockNumber physical_frontier;
+	BlockNumber physical_capacity;
 	uint64		physical_end;
+	bool		dirty = false;
 
 	Assert(buffer.desc != NULL);
 	Assert(nblocks > 0);
@@ -512,12 +575,18 @@ ummap_root_reserve_buffer(MapSuperBuffer buffer, ForkNumber forknum,
 	root = (UmbraMapRootData *) MapSuperBufferGetData(buffer);
 	ummap_root_get_frontiers(root, forknum, &logical_eof,
 								 &physical_frontier);
+	physical_capacity = ummap_root_get_capacity(root, forknum);
 	if (!BlockNumberIsValid(logical_eof) ||
 		!BlockNumberIsValid(physical_frontier))
 		return false;
 	if (BlockNumberIsValid(physical_floor) &&
-		physical_floor > physical_frontier)
-		physical_frontier = physical_floor;
+		physical_floor > physical_capacity)
+	{
+		/* File growth beyond recorded capacity has unknown ownership. */
+		physical_frontier = Max(physical_frontier, physical_floor);
+		physical_capacity = physical_floor;
+		dirty = true;
+	}
 	physical_end = (uint64) physical_frontier + nblocks;
 	if (physical_end >= (uint64) InvalidBlockNumber)
 		return false;
@@ -525,6 +594,8 @@ ummap_root_reserve_buffer(MapSuperBuffer buffer, ForkNumber forknum,
 	*first_pblkno = physical_frontier;
 	ummap_root_set_frontiers(root, forknum, logical_eof,
 							  (BlockNumber) physical_end);
+	if (dirty)
+		ummap_root_set_capacity(root, forknum, physical_capacity);
 	ummap_root_refresh_crc(root);
 	MapSuperMarkBufferDirty(buffer, skipFsync, InvalidXLogRecPtr);
 	return true;
@@ -542,6 +613,7 @@ ummap_root_set_logical(UmbraFileContext *ctx,
 	UmbraMapRootData *root;
 	BlockNumber old_logical;
 	BlockNumber old_physical;
+	BlockNumber old_capacity;
 	bool		dirty;
 
 	Assert(BlockNumberIsValid(logical_eof));
@@ -550,6 +622,7 @@ ummap_root_set_logical(UmbraFileContext *ctx,
 	root = (UmbraMapRootData *) MapSuperBufferGetData(buffer);
 	ummap_root_get_frontiers(root, forknum, &old_logical,
 							 &old_physical);
+	old_capacity = ummap_root_get_capacity(root, forknum);
 	dirty = logical_eof != old_logical;
 	if (!BlockNumberIsValid(old_physical) ||
 		physical_floor > old_physical)
@@ -557,9 +630,16 @@ ummap_root_set_logical(UmbraFileContext *ctx,
 		old_physical = physical_floor;
 		dirty = true;
 	}
+	if (!BlockNumberIsValid(old_capacity) ||
+		physical_floor > old_capacity)
+	{
+		old_capacity = physical_floor;
+		dirty = true;
+	}
 	if (dirty)
 	{
 		ummap_root_set_frontiers(root, forknum, logical_eof, old_physical);
+		ummap_root_set_capacity(root, forknum, old_capacity);
 		ummap_root_refresh_crc(root);
 		MapSuperMarkBufferDirty(buffer, skipFsync, wal_flush_lsn);
 	}
@@ -577,13 +657,16 @@ ummap_root_init(char *image)
 	root->magic = UMMAP_ROOT_MAGIC;
 	root->version = UMMAP_ROOT_VERSION;
 	root->blcksz = BLCKSZ;
-	root->flags = UMMAP_ROOT_FLAG_FORMAT_V1;
+	root->flags = UMMAP_ROOT_FLAG_FORMAT_V2;
 	root->logical_eof_main = 0;
 	root->logical_eof_fsm = InvalidBlockNumber;
 	root->logical_eof_vm = InvalidBlockNumber;
 	root->physical_frontier_main = 0;
 	root->physical_frontier_fsm = InvalidBlockNumber;
 	root->physical_frontier_vm = InvalidBlockNumber;
+	root->physical_capacity_main = 0;
+	root->physical_capacity_fsm = InvalidBlockNumber;
+	root->physical_capacity_vm = InvalidBlockNumber;
 	ummap_root_refresh_crc(root);
 }
 
@@ -608,14 +691,18 @@ ummap_root_is_valid(const UmbraMapRootData *root)
 	if (root->magic != UMMAP_ROOT_MAGIC ||
 		root->version != UMMAP_ROOT_VERSION ||
 		root->blcksz != BLCKSZ ||
-		root->flags != UMMAP_ROOT_FLAG_FORMAT_V1 ||
-		!pg_memory_is_all_zeros(root->reserved, sizeof(root->reserved)) ||
+		root->flags != UMMAP_ROOT_FLAG_FORMAT_V2 ||
 		!BlockNumberIsValid(root->logical_eof_main) ||
 		!BlockNumberIsValid(root->physical_frontier_main) ||
+		!BlockNumberIsValid(root->physical_capacity_main) ||
 		BlockNumberIsValid(root->logical_eof_fsm) !=
 		BlockNumberIsValid(root->physical_frontier_fsm) ||
+		BlockNumberIsValid(root->physical_frontier_fsm) !=
+		BlockNumberIsValid(root->physical_capacity_fsm) ||
 		BlockNumberIsValid(root->logical_eof_vm) !=
-		BlockNumberIsValid(root->physical_frontier_vm))
+		BlockNumberIsValid(root->physical_frontier_vm) ||
+		BlockNumberIsValid(root->physical_frontier_vm) !=
+		BlockNumberIsValid(root->physical_capacity_vm))
 		return false;
 
 	INIT_CRC32C(crc);
@@ -653,18 +740,28 @@ ummap_root_load_image(UmbraFileContext *ctx, char *image)
 	 * allocation frontier before it can hand out a new physical block.
 	 */
 	root = (UmbraMapRootData *) image;
-	if (umfile_exists(ctx, MAIN_FORKNUM))
+	for (ForkNumber forknum = MAIN_FORKNUM; forknum <= VISIBILITYMAP_FORKNUM;
+		 forknum++)
 	{
-		BlockNumber physical_nblocks = umfile_nblocks(ctx, MAIN_FORKNUM);
+		BlockNumber physical_nblocks;
 		BlockNumber logical_eof;
 		BlockNumber physical_frontier;
+		BlockNumber physical_capacity;
 
-		ummap_root_get_frontiers(root, MAIN_FORKNUM, &logical_eof,
-									 &physical_frontier);
-		if (physical_nblocks > physical_frontier)
+		ummap_root_get_frontiers(root, forknum, &logical_eof,
+								 &physical_frontier);
+		if (!BlockNumberIsValid(logical_eof) || !umfile_exists(ctx, forknum))
+			continue;
+		physical_nblocks = umfile_nblocks(ctx, forknum);
+		physical_capacity = ummap_root_get_capacity(root, forknum);
+
+		if (physical_nblocks > physical_capacity)
 		{
-			ummap_root_set_frontiers(root, MAIN_FORKNUM, logical_eof,
-									  physical_nblocks);
+			/* Unknown file growth cannot be handed out again after restart. */
+			physical_frontier = Max(physical_frontier, physical_nblocks);
+			ummap_root_set_frontiers(root, forknum, logical_eof,
+									  physical_frontier);
+			ummap_root_set_capacity(root, forknum, physical_nblocks);
 			ummap_root_refresh_crc(root);
 		}
 	}
@@ -745,6 +842,47 @@ ummap_root_set_frontiers(UmbraMapRootData *root, ForkNumber forknum,
 			break;
 		default:
 			elog(ERROR, "unsupported fork number for Umbra MAP root: %d",
+				 (int) forknum);
+	}
+}
+
+static BlockNumber
+ummap_root_get_capacity(const UmbraMapRootData *root, ForkNumber forknum)
+{
+	Assert(root != NULL);
+	switch (forknum)
+	{
+		case MAIN_FORKNUM:
+			return root->physical_capacity_main;
+		case FSM_FORKNUM:
+			return root->physical_capacity_fsm;
+		case VISIBILITYMAP_FORKNUM:
+			return root->physical_capacity_vm;
+		default:
+			elog(ERROR, "unsupported fork number for Umbra MAP capacity: %d",
+				 (int) forknum);
+	}
+	pg_unreachable();
+}
+
+static void
+ummap_root_set_capacity(UmbraMapRootData *root, ForkNumber forknum,
+						BlockNumber physical_capacity)
+{
+	Assert(root != NULL);
+	switch (forknum)
+	{
+		case MAIN_FORKNUM:
+			root->physical_capacity_main = physical_capacity;
+			break;
+		case FSM_FORKNUM:
+			root->physical_capacity_fsm = physical_capacity;
+			break;
+		case VISIBILITYMAP_FORKNUM:
+			root->physical_capacity_vm = physical_capacity;
+			break;
+		default:
+			elog(ERROR, "unsupported fork number for Umbra MAP capacity: %d",
 				 (int) forknum);
 	}
 }

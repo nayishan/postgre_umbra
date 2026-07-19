@@ -21,6 +21,9 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/file.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
 
 #include "access/xlogutils.h"
 #include "commands/tablespace.h"
@@ -169,6 +172,8 @@ static UmfdVec *umfile_openseg(UmbraFileContext *ctx, ForkNumber forknum,
 static UmfdVec *umfile_getseg(UmbraFileContext *ctx, ForkNumber forknum,
 							  BlockNumber blkno, bool skipFsync, int behavior);
 static BlockNumber umfile_nblocks_in_seg(UmfdVec *seg);
+static bool umfile_preallocate_fd(File fd, pgoff_t target_bytes);
+static bool umfile_preallocate_errno_is_unsupported(int err);
 static inline int umfile_open_flags(ForkNumber forknum);
 
 static PgAioResult umfile_readv_complete(PgAioHandle *ioh, PgAioResult prior_result, uint8 cb_data);
@@ -842,6 +847,209 @@ umfile_zeroextend(UmbraFileContext *ctx, ForkNumber forknum,
 		remblocks -= numblocks;
 		curblocknum += numblocks;
 	}
+}
+
+/*
+ * Make every block below target_nblocks addressable without publishing any
+ * logical mapping or reserving a physical block number.  Return false when
+ * the platform or filesystem has no native preallocation primitive.
+ */
+bool
+umfile_preallocate(UmbraFileContext *ctx, ForkNumber forknum,
+				   BlockNumber target_nblocks, bool skipFsync)
+{
+	BlockNumber current_nblocks;
+	bool		is_temp;
+
+	Assert(ctx != NULL);
+	Assert(forknum >= 0 && forknum <= MAX_FORKNUM);
+
+	if (!umfile_exists(ctx, forknum))
+		return false;
+
+	current_nblocks = umfile_nblocks(ctx, forknum);
+	if (target_nblocks <= current_nblocks)
+		return true;
+	is_temp = RelFileLocatorBackendIsTemp(ctx->rlocator);
+
+	while (current_nblocks < target_nblocks)
+	{
+		BlockNumber target_block;
+		BlockNumber target_seg;
+		BlockNumber target_seg_nblocks;
+		uint64		seg_start;
+		uint64		seg_end;
+		pgoff_t		target_bytes;
+		UmfdVec    *v;
+
+		target_seg = current_nblocks / ((BlockNumber) RELSEG_SIZE);
+		seg_start = (uint64) target_seg * (uint64) RELSEG_SIZE;
+		seg_end = Min(seg_start + (uint64) RELSEG_SIZE,
+					  (uint64) target_nblocks);
+		target_seg_nblocks = (BlockNumber) (seg_end - seg_start);
+		target_block = (BlockNumber) (seg_end - 1);
+		target_bytes = (pgoff_t) target_seg_nblocks * BLCKSZ;
+
+		v = umfile_getseg(ctx, forknum, target_block, skipFsync,
+						  EXTENSION_CREATE);
+		if (!umfile_preallocate_fd(v->umfd_vfd, target_bytes))
+			return false;
+		if (!skipFsync && !is_temp)
+			umfile_register_dirty_segment(ctx, forknum, v);
+
+		current_nblocks = (BlockNumber) seg_end;
+	}
+
+	return true;
+}
+
+/* Reserve real filesystem space, without a userspace zero-fill fallback. */
+static bool
+umfile_preallocate_fd(File fd, pgoff_t target_bytes)
+{
+	pgoff_t		current_bytes;
+	pgoff_t		delta_bytes;
+	int			rawfd;
+
+	current_bytes = FileSize(fd);
+	if (current_bytes < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not determine file size for \"%s\": %m",
+						FilePathName(fd))));
+	if (current_bytes >= target_bytes)
+		return true;
+
+	delta_bytes = target_bytes - current_bytes;
+	rawfd = FileGetRawDesc(fd);
+
+#if defined(__linux__)
+#ifdef SYS_fallocate
+	for (;;)
+	{
+		long		rc;
+
+		errno = 0;
+		pgstat_report_wait_start(WAIT_EVENT_DATA_FILE_EXTEND);
+		rc = syscall(SYS_fallocate, rawfd, 0, current_bytes, delta_bytes);
+		pgstat_report_wait_end();
+		if (rc == 0)
+			break;
+		if (errno == EINTR)
+			continue;
+		if (umfile_preallocate_errno_is_unsupported(errno))
+			return false;
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not preallocate file \"%s\" to %llu bytes: %m",
+						FilePathName(fd),
+						(unsigned long long) target_bytes)));
+	}
+#else
+	return false;
+#endif
+#elif defined(__APPLE__) && defined(F_PREALLOCATE)
+	{
+		fstore_t	store;
+		int			rc;
+
+		MemSet(&store, 0, sizeof(store));
+		store.fst_flags = F_ALLOCATECONTIG | F_ALLOCATEALL;
+		store.fst_posmode = F_PEOFPOSMODE;
+		store.fst_length = delta_bytes;
+
+		for (;;)
+		{
+			errno = 0;
+			pgstat_report_wait_start(WAIT_EVENT_DATA_FILE_EXTEND);
+			rc = fcntl(rawfd, F_PREALLOCATE, &store);
+			pgstat_report_wait_end();
+			if (rc == 0 || errno != EINTR)
+				break;
+		}
+		if (rc < 0)
+		{
+			store.fst_flags = F_ALLOCATEALL;
+			store.fst_bytesalloc = 0;
+			for (;;)
+			{
+				errno = 0;
+				pgstat_report_wait_start(WAIT_EVENT_DATA_FILE_EXTEND);
+				rc = fcntl(rawfd, F_PREALLOCATE, &store);
+				pgstat_report_wait_end();
+				if (rc == 0 || errno != EINTR)
+					break;
+			}
+		}
+		if (rc < 0)
+		{
+			if (umfile_preallocate_errno_is_unsupported(errno))
+				return false;
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not preallocate file \"%s\" to %llu bytes: %m",
+							FilePathName(fd),
+							(unsigned long long) target_bytes)));
+		}
+		if (store.fst_bytesalloc < delta_bytes)
+			return false;
+	}
+#elif defined(HAVE_POSIX_FALLOCATE)
+	for (;;)
+	{
+		int			rc;
+
+		pgstat_report_wait_start(WAIT_EVENT_DATA_FILE_EXTEND);
+		rc = posix_fallocate(rawfd, current_bytes, delta_bytes);
+		pgstat_report_wait_end();
+		if (rc == 0)
+			break;
+		if (rc == EINTR)
+			continue;
+		errno = rc;
+		if (umfile_preallocate_errno_is_unsupported(errno))
+			return false;
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not preallocate file \"%s\" to %llu bytes: %m",
+						FilePathName(fd),
+						(unsigned long long) target_bytes)));
+	}
+#else
+	return false;
+#endif
+
+	current_bytes = FileSize(fd);
+	if (current_bytes < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not determine file size for \"%s\": %m",
+						FilePathName(fd))));
+	if (current_bytes < target_bytes &&
+		FileTruncate(fd, target_bytes, WAIT_EVENT_DATA_FILE_EXTEND) < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not extend preallocated file \"%s\" to %llu bytes: %m",
+						FilePathName(fd),
+						(unsigned long long) target_bytes)));
+
+	return true;
+}
+
+static bool
+umfile_preallocate_errno_is_unsupported(int err)
+{
+	if (err == EINVAL || err == EOPNOTSUPP)
+		return true;
+#ifdef ENOSYS
+	if (err == ENOSYS)
+		return true;
+#endif
+#ifdef ENOTSUP
+	if (err == ENOTSUP)
+		return true;
+#endif
+	return false;
 }
 
 /*

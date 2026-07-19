@@ -14,8 +14,8 @@ plan skip_all => 'requires an Umbra storage manager build'
   unless check_pg_config('^#define USE_UMBRA 1$');
 
 use constant MAP_MAGIC => 0x554D4252;
-use constant MAP_VERSION => 1;
-use constant MAP_FORMAT_V1 => 0x00000001;
+use constant MAP_VERSION => 2;
+use constant MAP_FORMAT_V2 => 0x00000002;
 use constant MAP_LOGICAL_MAIN_OFFSET => 16;
 use constant MAP_LOGICAL_FSM_OFFSET => 20;
 use constant MAP_LOGICAL_VM_OFFSET => 24;
@@ -23,7 +23,9 @@ use constant MAP_PHYSICAL_MAIN_OFFSET => 28;
 use constant MAP_PHYSICAL_FSM_OFFSET => 32;
 use constant MAP_PHYSICAL_VM_OFFSET => 36;
 use constant MAP_GENERATION_LSN_OFFSET => 40;
-use constant MAP_RESERVED_OFFSET => 48;
+use constant MAP_CAPACITY_MAIN_OFFSET => 48;
+use constant MAP_CAPACITY_FSM_OFFSET => 52;
+use constant MAP_CAPACITY_VM_OFFSET => 56;
 use constant MAP_CRC_OFFSET => 60;
 use constant MAP_PAYLOAD_SIZE => 64;
 use constant MAP_SECTOR_SIZE => 512;
@@ -188,7 +190,7 @@ is(u32_at($identity_super, 4), MAP_VERSION,
 	'superblock version is supported');
 is(u32_at($identity_super, 8), $block_size,
 	'superblock block size matches the build');
-is(u32_at($identity_super, 12), MAP_FORMAT_V1,
+is(u32_at($identity_super, 12), MAP_FORMAT_V2,
 	'identity root has only the format flag');
 is(u32_at($identity_super, MAP_LOGICAL_MAIN_OFFSET), $identity_blocks,
 	'identity logical EOF matches physical EOF');
@@ -202,8 +204,14 @@ is(u32_at($identity_super, MAP_LOGICAL_VM_OFFSET),
 	'VM root fields use the same absent or identity state');
 isnt(u64_at($identity_super, MAP_GENERATION_LSN_OFFSET), 0,
 	'root identifies the MAIN CREATE WAL generation');
-is(substr($identity_super, MAP_RESERVED_OFFSET, 12), "\0" x 12,
-	'remaining root fields stay reserved');
+is(u32_at($identity_super, MAP_CAPACITY_MAIN_OFFSET), $identity_blocks,
+	'identity MAIN capacity matches physical EOF');
+is(u32_at($identity_super, MAP_CAPACITY_FSM_OFFSET),
+	u32_at($identity_super, MAP_PHYSICAL_FSM_OFFSET),
+	'FSM capacity uses the same absent or identity state');
+is(u32_at($identity_super, MAP_CAPACITY_VM_OFFSET),
+	u32_at($identity_super, MAP_PHYSICAL_VM_OFFSET),
+	'VM capacity uses the same absent or identity state');
 is(substr($identity_super, MAP_PAYLOAD_SIZE,
 		MAP_SECTOR_SIZE - MAP_PAYLOAD_SIZE),
 	"\0" x (MAP_SECTOR_SIZE - MAP_PAYLOAD_SIZE),
@@ -225,6 +233,8 @@ is(u32_at($truncated_super, MAP_LOGICAL_MAIN_OFFSET), 0,
 	'truncate lowers the root logical EOF to zero');
 is(u32_at($truncated_super, MAP_PHYSICAL_MAIN_OFFSET), $identity_blocks,
 	'truncate does not rewind the physical frontier');
+is(u32_at($truncated_super, MAP_CAPACITY_MAIN_OFFSET), $identity_blocks,
+	'truncate does not rewind physical capacity');
 check_root_crc($node, $truncated_super, 'truncated phase');
 
 $node->safe_psql(
@@ -243,7 +253,9 @@ cmp_ok($logical_after, '<', $physical_after,
 	'remapped logical EOF is independent of the physical frontier');
 is($physical_after, $remapped_blocks,
 	'physical frontier follows append-only physical allocation');
-is(u32_at($remapped_super, 12), MAP_FORMAT_V1,
+is(u32_at($remapped_super, MAP_CAPACITY_MAIN_OFFSET), $remapped_blocks,
+	'physical capacity follows materialized allocation');
+is(u32_at($remapped_super, 12), MAP_FORMAT_V2,
 	'root flags remain limited to the format marker');
 is($node->safe_psql('postgres', 'SELECT id FROM umbra_super_t;'),
 	'2000', 'remapped relation remains readable');
@@ -265,16 +277,16 @@ $node->stop('fast');
 
 open(my $map_fh, '+<:raw', $map_file)
   or BAIL_OUT("could not open \"$map_file\": $!");
-my $position = sysseek($map_fh, MAP_RESERVED_OFFSET, SEEK_SET);
+my $position = sysseek($map_fh, MAP_CAPACITY_MAIN_OFFSET, SEEK_SET);
 BAIL_OUT('could not seek to the CRC-covered root payload')
-  unless defined($position) && $position == MAP_RESERVED_OFFSET;
+  unless defined($position) && $position == MAP_CAPACITY_MAIN_OFFSET;
 my $payload_byte;
 my $nread = sysread($map_fh, $payload_byte, 1);
 BAIL_OUT('could not read the CRC-covered root payload')
   unless defined($nread) && $nread == 1;
-$position = sysseek($map_fh, MAP_RESERVED_OFFSET, SEEK_SET);
+$position = sysseek($map_fh, MAP_CAPACITY_MAIN_OFFSET, SEEK_SET);
 BAIL_OUT('could not seek back to the CRC-covered root payload')
-  unless defined($position) && $position == MAP_RESERVED_OFFSET;
+  unless defined($position) && $position == MAP_CAPACITY_MAIN_OFFSET;
 my $nwritten = syswrite($map_fh, chr(ord($payload_byte) ^ 1));
 BAIL_OUT('could not corrupt the CRC-covered root payload')
   unless defined($nwritten) && $nwritten == 1;

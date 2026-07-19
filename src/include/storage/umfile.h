@@ -40,6 +40,9 @@ extern void umfile_extend(UmbraFileContext *ctx, ForkNumber forknum,
 extern void umfile_zeroextend(UmbraFileContext *ctx, ForkNumber forknum,
 							  BlockNumber blocknum, int nblocks,
 							  bool skipFsync);
+extern bool umfile_preallocate(UmbraFileContext *ctx, ForkNumber forknum,
+							   BlockNumber target_nblocks,
+							   bool skipFsync);
 extern void umfile_read_bytes(UmbraFileContext *ctx, ForkNumber forknum,
 							  BlockNumber blocknum, void *buffer, int nbytes);
 extern void umfile_write_bytes(UmbraFileContext *ctx, ForkNumber forknum,
