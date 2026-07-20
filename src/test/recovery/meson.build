@@ -85,6 +85,7 @@ tests += {
       't/080_umbra_preallocate_guc.pl',
       't/081_umbra_torn_page_remap.pl',
       't/083_umbra_checkpoint_publication.pl',
+      't/084_umbra_checkpoint_source_p.pl',
     ],
   },
 }

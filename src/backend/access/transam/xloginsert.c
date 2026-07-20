@@ -258,6 +258,7 @@ XLogCommitBlockRemapsUmbra(XLogRecPtr record_endptr)
 
 		ctx = umfile_ctx_acquire(regbuf->remap_reln->smgr_rlocator);
 
+		BufferSaveCheckpointPblk(regbuf->buffer, regbuf->old_pblkno);
 		UmMapSetMapping(regbuf->remap_reln, regbuf->forkno, regbuf->block,
 						regbuf->new_pblkno, record_endptr);
 		if (regbuf->old_pblkno == InvalidBlockNumber)
@@ -411,6 +412,7 @@ XLogResetInsertion(void)
 	{
 		registered_buffers[i].in_use = false;
 #ifdef USE_UMBRA
+		registered_buffers[i].buffer = InvalidBuffer;
 		registered_buffers[i].has_remap = false;
 		registered_buffers[i].buffer = InvalidBuffer;
 		registered_buffers[i].from_shared_buffer = false;

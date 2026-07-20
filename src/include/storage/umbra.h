@@ -170,6 +170,11 @@ extern bool UmWalOwnedFirstbornAvailable(SMgrRelation reln, ForkNumber forknum,
 										 BlockNumber lblkno);
 extern bool UmMapTryLookupPblkno(SMgrRelation reln, ForkNumber forknum,
 								 BlockNumber lblkno, BlockNumber *pblkno);
+extern void UmCheckpointWritePblk(SMgrRelation reln, ForkNumber forknum,
+								  BlockNumber lblkno, BlockNumber pblkno,
+								  const void *buffer);
+extern void UmCheckpointWritebackPblk(SMgrRelation reln, ForkNumber forknum,
+									  BlockNumber pblkno);
 extern bool UmMapIsLogicalUnmaterialized(SMgrRelation reln, ForkNumber forknum,
 										 BlockNumber lblkno);
 extern void UmMapSetMapping(SMgrRelation reln, ForkNumber forknum,

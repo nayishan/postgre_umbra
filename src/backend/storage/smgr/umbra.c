@@ -1687,6 +1687,31 @@ UmMapTryLookupPblkno(SMgrRelation reln, ForkNumber forknum,
 						forknum, lblkno, pblkno);
 }
 
+void
+UmCheckpointWritePblk(SMgrRelation reln, ForkNumber forknum,
+						BlockNumber lblkno, BlockNumber pblkno,
+						const void *buffer)
+{
+	const void *buffers[1] = {buffer};
+
+	Assert(reln != NULL);
+	Assert(buffer != NULL);
+	Assert(BlockNumberIsValid(lblkno));
+	Assert(BlockNumberIsValid(pblkno));
+	Assert(UmMapAccessAvailable(reln, forknum));
+	umfile_writev(um_ctx_acquire(reln), forknum, pblkno, buffers, 1, false);
+}
+
+void
+UmCheckpointWritebackPblk(SMgrRelation reln, ForkNumber forknum,
+							 BlockNumber pblkno)
+{
+	Assert(reln != NULL);
+	Assert(BlockNumberIsValid(pblkno));
+	Assert(UmMapAccessAvailable(reln, forknum));
+	umfile_writeback(um_ctx_acquire(reln), forknum, pblkno, 1);
+}
+
 bool
 UmMapIsLogicalUnmaterialized(SMgrRelation reln, ForkNumber forknum,
 							 BlockNumber lblkno)

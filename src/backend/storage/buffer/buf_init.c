@@ -27,6 +27,8 @@ ConditionVariableMinimallyPadded *BufferIOCVArray;
 WritebackContext BackendWritebackContext;
 CkptSortItem *CkptBufferIds;
 #ifdef USE_UMBRA
+BlockNumber *CkptBufferPblks;
+uint64	   *CkptBufferPblkEpochs;
 pg_atomic_uint64 *CkptBufferCaptureEpoch;
 #endif
 
@@ -113,6 +115,14 @@ BufferManagerShmemRequest(void *arg)
 		);
 
 #ifdef USE_UMBRA
+	ShmemRequestStruct(.name = "Checkpoint Buffer Physical Blocks",
+					   .size = NBuffers * sizeof(BlockNumber),
+					   .ptr = (void **) &CkptBufferPblks,
+		);
+	ShmemRequestStruct(.name = "Checkpoint Buffer Physical Block Epochs",
+					   .size = NBuffers * sizeof(uint64),
+					   .ptr = (void **) &CkptBufferPblkEpochs,
+		);
 	ShmemRequestStruct(.name = "Checkpoint Buffer Capture Epoch",
 					   .size = sizeof(pg_atomic_uint64),
 					   .ptr = (void **) &CkptBufferCaptureEpoch,
@@ -151,6 +161,10 @@ BufferManagerShmemInit(void *arg)
 
 		proclist_init(&buf->lock_waiters);
 		ConditionVariableInit(BufferDescriptorGetIOCV(buf));
+#ifdef USE_UMBRA
+		CkptBufferPblks[i] = InvalidBlockNumber;
+		CkptBufferPblkEpochs[i] = 0;
+#endif
 	}
 
 	/* Initialize per-backend file flush context */

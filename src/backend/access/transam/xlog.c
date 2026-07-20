@@ -8118,7 +8118,9 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 
 		/* Select data buffers before MAP checkpoint publishes its snapshot. */
 		CheckPointBuffersPrepare(flags);
+		INJECTION_POINT("umbra-checkpoint-before-map", NULL);
 		MapCheckpoint();
+		INJECTION_POINT("umbra-checkpoint-after-map", NULL);
 		CheckPointBuffers(flags);
 	}
 	PG_CATCH();
