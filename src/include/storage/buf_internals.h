@@ -413,6 +413,9 @@ typedef struct WritebackContext
 extern PGDLLIMPORT BufferDescPadded *BufferDescriptors;
 extern PGDLLIMPORT ConditionVariableMinimallyPadded *BufferIOCVArray;
 extern PGDLLIMPORT WritebackContext BackendWritebackContext;
+#ifdef USE_UMBRA
+extern PGDLLIMPORT pg_atomic_uint64 *CkptBufferCaptureEpoch;
+#endif
 
 /* in localbuf.c */
 extern PGDLLIMPORT BufferDesc *LocalBufferDescriptors;

@@ -480,6 +480,10 @@ typedef struct XLogCtlData
 	pg_atomic_uint64 logInsertResult;	/* last byte + 1 inserted to buffers */
 	pg_atomic_uint64 logWriteResult;	/* last byte + 1 written out */
 	pg_atomic_uint64 logFlushResult;	/* last byte + 1 flushed */
+#ifdef USE_UMBRA
+	/* Old-P redo may use only a baseline covered by a completed checkpoint. */
+	pg_atomic_uint64 completedCheckpointRedo;
+#endif
 
 	/*
 	 * Latest initialized page in the cache (last byte position + 1).
@@ -5437,6 +5441,10 @@ XLOGShmemInit(void *arg)
 	pg_atomic_init_u64(&XLogCtl->logInsertResult, InvalidXLogRecPtr);
 	pg_atomic_init_u64(&XLogCtl->logWriteResult, InvalidXLogRecPtr);
 	pg_atomic_init_u64(&XLogCtl->logFlushResult, InvalidXLogRecPtr);
+#ifdef USE_UMBRA
+	pg_atomic_init_u64(&XLogCtl->completedCheckpointRedo,
+					   ControlFile->checkPointCopy.redo);
+#endif
 	pg_atomic_init_u64(&XLogCtl->unloggedLSN, InvalidXLogRecPtr);
 }
 
@@ -6973,6 +6981,14 @@ GetFullPageWriteInfo(XLogRecPtr *RedoRecPtr_p, bool *doPageWrites_p)
 	*doPageWrites_p = doPageWrites;
 }
 
+#ifdef USE_UMBRA
+XLogRecPtr
+GetLastCompletedCheckpointRedo(void)
+{
+	return pg_atomic_read_u64(&XLogCtl->completedCheckpointRedo);
+}
+#endif
+
 /*
  * GetInsertRecPtr -- Returns the current insert position.
  *
@@ -7447,6 +7463,11 @@ CreateCheckPoint(int flags)
 	/* Run these points outside the critical section. */
 	INJECTION_POINT("create-checkpoint-initial", NULL);
 	INJECTION_POINT_LOAD("create-checkpoint-run");
+#ifdef USE_UMBRA
+	INJECTION_POINT_LOAD("umbra-checkpoint-after-capture-before-redo");
+	CheckPointBuffersCaptureBegin();
+	INJECTION_POINT_CACHED("umbra-checkpoint-after-capture-before-redo", NULL);
+#endif
 
 	/*
 	 * Use a critical section to force system panic if we have trouble.
@@ -7492,6 +7513,9 @@ CreateCheckPoint(int flags)
 		if (last_important_lsn == ControlFile->checkPoint)
 		{
 			END_CRIT_SECTION();
+#ifdef USE_UMBRA
+			CheckPointBuffersAbort();
+#endif
 			ereport(DEBUG1,
 					(errmsg_internal("checkpoint skipped because system is idle")));
 			return false;
@@ -7805,6 +7829,9 @@ CreateCheckPoint(int flags)
 
 	UpdateControlFile();
 	LWLockRelease(ControlFileLock);
+#ifdef USE_UMBRA
+	pg_atomic_write_u64(&XLogCtl->completedCheckpointRedo, checkPoint.redo);
+#endif
 
 	/*
 	 * We are now done with critical updates; no need for system panic if we
@@ -8050,6 +8077,11 @@ CreateOverwriteContrecordRecord(XLogRecPtr aborted_lsn, XLogRecPtr pagePtr,
 static void
 CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 {
+#ifdef USE_UMBRA
+	VirtualTransactionId *umbra_vxids = NULL;
+	int			umbra_nvxids;
+#endif
+
 	CheckPointRelationMap();
 	CheckPointReplicationSlots(flags & CHECKPOINT_IS_SHUTDOWN);
 	CheckPointSnapBuild();
@@ -8065,9 +8097,41 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 	CheckPointMultiXact();
 	CheckPointPredicate();
 #ifdef USE_UMBRA
-	MapCheckpoint();
-#endif
+	PG_TRY();
+	{
+		/* Capture is visible; take a fresh publication-delay snapshot. */
+		INJECTION_POINT_LOAD("umbra-checkpoint-after-capture");
+		INJECTION_POINT_CACHED("umbra-checkpoint-after-capture", NULL);
+		umbra_vxids = GetVirtualXIDsDelayingChkpt(&umbra_nvxids,
+											 DELAY_CHKPT_START);
+		while (umbra_nvxids > 0 &&
+			   HaveVirtualXIDsDelayingChkpt(umbra_vxids, umbra_nvxids,
+											 DELAY_CHKPT_START))
+		{
+			AbsorbSyncRequests();
+			pgstat_report_wait_start(WAIT_EVENT_CHECKPOINT_DELAY_START);
+			pg_usleep(10000L);
+			pgstat_report_wait_end();
+		}
+		pfree(umbra_vxids);
+		umbra_vxids = NULL;
+
+		/* Select data buffers before MAP checkpoint publishes its snapshot. */
+		CheckPointBuffersPrepare(flags);
+		MapCheckpoint();
+		CheckPointBuffers(flags);
+	}
+	PG_CATCH();
+	{
+		if (umbra_vxids != NULL)
+			pfree(umbra_vxids);
+		CheckPointBuffersAbort();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+#else
 	CheckPointBuffers(flags);
+#endif
 
 	/* Perform all queued up fsyncs */
 	TRACE_POSTGRESQL_BUFFER_CHECKPOINT_SYNC_START();
@@ -8143,6 +8207,9 @@ CreateRestartPoint(int flags)
 	XLogRecPtr	endptr;
 	XLogSegNo	_logSegNo;
 	TimestampTz xtime;
+#ifdef USE_UMBRA
+	XLogRecPtr	completedRedoRecPtr;
+#endif
 
 	/* Concurrent checkpoint/restartpoint cannot happen */
 	Assert(!IsUnderPostmaster || MyBackendType == B_CHECKPOINTER);
@@ -8206,6 +8273,9 @@ CreateRestartPoint(int flags)
 	 * during recovery this is just pro forma, because no WAL insertions are
 	 * happening.
 	 */
+#ifdef USE_UMBRA
+	CheckPointBuffersCaptureBegin();
+#endif
 	WALInsertLockAcquireExclusive();
 	RedoRecPtr = XLogCtl->Insert.RedoRecPtr = lastCheckPoint.redo;
 	WALInsertLockRelease();
@@ -8295,7 +8365,15 @@ CreateRestartPoint(int flags)
 
 		UpdateControlFile();
 	}
+#ifdef USE_UMBRA
+	completedRedoRecPtr = ControlFile->checkPointCopy.redo;
+#endif
 	LWLockRelease(ControlFileLock);
+
+#ifdef USE_UMBRA
+	pg_atomic_write_u64(&XLogCtl->completedCheckpointRedo,
+						completedRedoRecPtr);
+#endif
 
 	/*
 	 * Update the average distance between checkpoints/restartpoints if the

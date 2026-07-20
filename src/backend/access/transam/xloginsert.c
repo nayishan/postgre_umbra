@@ -44,6 +44,7 @@
 #include "storage/map.h"
 #include "storage/umbra.h"
 #include "storage/umfile.h"
+#include "utils/injection_point.h"
 #endif
 #include "utils/memutils.h"
 #include "utils/pgstat_internal.h"
@@ -92,7 +93,10 @@ typedef struct
 								 * backup block data in XLogRecordAssemble() */
 
 #ifdef USE_UMBRA
+	Buffer		buffer;			/* source shared buffer, if any */
+	bool		from_shared_buffer;
 	bool		has_remap;		/* true if remap metadata is prepared */
+	bool		remap_needs_image; /* prepared old P needs an APPLY image */
 	bool		remap_in_record; /* true if current assembled record includes remap */
 	bool		remap_committed; /* true if mapping switch was committed after insert */
 	bool		wal_owns_firstborn; /* this WAL block owns first-born mapping */
@@ -152,6 +156,9 @@ static int	max_rdatas;			/* allocated size */
 
 static bool begininsert_called = false;
 static bool curinsert_has_block_remap = false;
+#ifdef USE_UMBRA
+static bool curinsert_remap_delay_started = false;
+#endif
 
 /* Memory context to hold the registered buffer and data references. */
 static MemoryContext xloginsert_cxt;
@@ -393,6 +400,11 @@ XLogResetInsertion(void)
 
 #ifdef USE_UMBRA
 	XLogAbortBlockRemapsUmbra();
+	if (curinsert_remap_delay_started)
+	{
+		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+		curinsert_remap_delay_started = false;
+	}
 #endif
 
 	for (i = 0; i < max_registered_block_id; i++)
@@ -400,6 +412,9 @@ XLogResetInsertion(void)
 		registered_buffers[i].in_use = false;
 #ifdef USE_UMBRA
 		registered_buffers[i].has_remap = false;
+		registered_buffers[i].buffer = InvalidBuffer;
+		registered_buffers[i].from_shared_buffer = false;
+		registered_buffers[i].remap_needs_image = false;
 		registered_buffers[i].remap_in_record = false;
 		registered_buffers[i].remap_committed = false;
 		registered_buffers[i].wal_owns_firstborn = false;
@@ -466,7 +481,10 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
 	regbuf->rdata_tail = (XLogRecData *) &regbuf->rdata_head;
 	regbuf->rdata_len = 0;
 #ifdef USE_UMBRA
+	regbuf->buffer = buffer;
+	regbuf->from_shared_buffer = true;
 	regbuf->has_remap = false;
+	regbuf->remap_needs_image = false;
 	regbuf->remap_in_record = false;
 	regbuf->remap_committed = false;
 	regbuf->wal_owns_firstborn = false;
@@ -530,7 +548,10 @@ XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator, ForkNumber forknum,
 	regbuf->rdata_tail = (XLogRecData *) &regbuf->rdata_head;
 	regbuf->rdata_len = 0;
 #ifdef USE_UMBRA
+	regbuf->buffer = InvalidBuffer;
+	regbuf->from_shared_buffer = false;
 	regbuf->has_remap = false;
+	regbuf->remap_needs_image = false;
 	regbuf->remap_in_record = false;
 	regbuf->remap_committed = false;
 	regbuf->wal_owns_firstborn = false;
@@ -715,8 +736,6 @@ XLogInsert(RmgrId rmid, uint8 info)
 
 	PG_TRY();
 	{
-		bool		delay_chkp_start_set = false;
-
 		do
 		{
 			XLogRecPtr	RedoRecPtr;
@@ -727,7 +746,6 @@ XLogInsert(RmgrId rmid, uint8 info)
 			int			num_fpi = 0;
 			uint64		fpi_bytes = 0;
 
-			delay_chkp_start_set = false;
 			GetFullPageWriteInfo(&RedoRecPtr, &doPageWrites);
 
 			rdt = xlog_storage_mgr_f.xlog_record_assemble(rmid, info, RedoRecPtr,
@@ -741,7 +759,9 @@ XLogInsert(RmgrId rmid, uint8 info)
 				if ((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0)
 				{
 					MyProc->delayChkptFlags |= DELAY_CHKPT_START;
-					delay_chkp_start_set = true;
+#ifdef USE_UMBRA
+					curinsert_remap_delay_started = true;
+#endif
 				}
 			}
 
@@ -749,21 +769,18 @@ XLogInsert(RmgrId rmid, uint8 info)
 									  fpi_bytes, topxid_included);
 
 			if (!XLogRecPtrIsValid(EndPos) && curinsert_has_block_remap)
-			{
-				if (delay_chkp_start_set)
-					MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 				END_CRIT_SECTION();
-			}
 		} while (!XLogRecPtrIsValid(EndPos));
+
+#ifdef USE_UMBRA
+		if (curinsert_has_block_remap)
+			INJECTION_POINT_CACHED("umbra-remap-after-wal", NULL);
+#endif
 
 		xlog_storage_mgr_f.xlog_insert_finish(EndPos);
 
 		if (curinsert_has_block_remap)
-		{
-			if (delay_chkp_start_set)
-				MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 			END_CRIT_SECTION();
-		}
 	}
 	PG_CATCH();
 	{
@@ -1270,6 +1287,8 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 	XLogRecData *rdt_datas_last;
 	XLogRecord *rechdr;
 	char	   *scratch = hdr_scratch;
+	XLogRecPtr	completedRedoRecPtr = GetLastCompletedCheckpointRedo();
+	bool		captureActive = CheckpointBufferCaptureIsActive();
 
 	rechdr = (XLogRecord *) scratch;
 	scratch += SizeOfXLogRecord;
@@ -1319,7 +1338,10 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 		{
 			XLogRecPtr	page_lsn = PageGetLSN(regbuf->page);
 
-			if (rmid != RM_XLOG_ID || info != XLOG_FPI_FOR_HINT)
+			if (regbuf->from_shared_buffer &&
+				LocalTransactionIdIsValid(MyProc->vxid.lxid) &&
+				(XLogRecPtrIsValid(completedRedoRecPtr) || captureActive) &&
+				(rmid != RM_XLOG_ID || info != XLOG_FPI_FOR_HINT))
 			{
 				reln = smgropen(regbuf->rlocator, INVALID_PROC_NUMBER);
 				regbuf->remap_reln = reln;
@@ -1333,10 +1355,18 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 				needs_backup = (page_lsn <= RedoRecPtr);
 				needs_remap = false;
 			}
+			else if (XLogRecPtrIsValid(page_lsn) &&
+					 page_lsn <= RedoRecPtr &&
+					 (captureActive || page_lsn <= completedRedoRecPtr))
+			{
+				/* Capture-only remaps retain an image of their unsafe old P. */
+				needs_backup = captureActive;
+				needs_remap = true;
+			}
 			else
 			{
-				needs_backup = false;
-				needs_remap = (page_lsn <= RedoRecPtr);
+				needs_backup = (page_lsn <= RedoRecPtr);
+				needs_remap = false;
 			}
 			if (!needs_backup && !needs_remap)
 			{
@@ -1345,7 +1375,16 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 			}
 		}
 
-		Assert(!(needs_backup && needs_remap));
+		if (regbuf->has_remap && needs_backup && needs_remap)
+			regbuf->remap_needs_image = true;
+		if (regbuf->has_remap && regbuf->remap_needs_image)
+		{
+			needs_backup = true;
+			needs_remap = true;
+		}
+
+		Assert(!(needs_backup && needs_remap) ||
+			   captureActive || regbuf->remap_needs_image);
 
 		if (!regbuf->has_remap &&
 			(regbuf->flags & REGBUF_LOGICAL_BIRTH) != 0)
@@ -1403,6 +1442,7 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 							 &regbuf->old_pblkno);
 
 			regbuf->has_remap = true;
+			regbuf->remap_needs_image = needs_backup;
 			regbuf->remap_committed = false;
 			include_remap = true;
 
@@ -1424,7 +1464,8 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 			XLogFillBlockRemapFrontierUmbra(regbuf, &rbmh);
 
 			if ((regbuf->flags & REGBUF_FORCE_IMAGE) == 0 &&
-				(info & XLR_CHECK_CONSISTENCY) == 0)
+				(info & XLR_CHECK_CONSISTENCY) == 0 &&
+				!(needs_backup && needs_remap))
 				include_image = false;
 		}
 
