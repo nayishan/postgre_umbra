@@ -17,7 +17,7 @@ paths still keep image ownership:
 
 - `REGBUF_FORCE_IMAGE`
 - `XLR_CHECK_CONSISTENCY`
-- `XLOG_FPI_FOR_HINT`
+- auxiliary-fork and unconverted `XLOG_FPI_FOR_HINT` callers
 
 So the more accurate goal is:
 
@@ -56,7 +56,8 @@ Current scope:
 Current non-goals and conservative boundaries:
 
 - do not claim to remove every full-page image; `REGBUF_FORCE_IMAGE`,
-  `XLR_CHECK_CONSISTENCY`, and `XLOG_FPI_FOR_HINT` still keep image ownership
+  `XLR_CHECK_CONSISTENCY`, auxiliary-fork hints, and unconverted hint callers
+  still keep image ownership
 - do not claim that compactor, AIO, primary/standby physical-page alignment,
   `CREATE DATABASE` copy strategy, or explicit range-born protocol are fully
   engineered and closed

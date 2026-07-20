@@ -66,6 +66,14 @@ where only a share lock is already held, use BufferBeginSetHintBits() &
 BufferFinishSetHintBits() (if multiple hint bits are to be set) or
 BufferSetHintBits16() (if a single hint bit is set).
 
+Umbra MAIN-fork core paths that will mark a multi-field hint update dirty use
+BufferBeginHintDelta() and BufferFinishHintDelta() instead.  This preserves
+the pre-update bytes needed to WAL-log the hint without a full-page image.
+When protective WAL is required, BufferBeginHintDelta() obtains the remap
+claim before the caller changes the page.  Remap allocation retains Umbra's
+existing error behavior when no MAP buffer can be claimed; it does not select
+a different WAL representation.
+
 E.g. for heapam, a share-exclusive lock allows to update tuple commit status
 bits (ie, OR the values HEAP_XMIN_COMMITTED, HEAP_XMIN_INVALID,
 HEAP_XMAX_COMMITTED, or HEAP_XMAX_INVALID into t_infomask) while holding only

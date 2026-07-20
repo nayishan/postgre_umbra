@@ -1845,6 +1845,11 @@ PerformWalRecovery(void)
 
 		RmgrCleanup();
 
+#ifdef USE_UMBRA
+		/* Require a later lifecycle record to resolve every missing old P. */
+		XLogCheckInvalidPages();
+#endif
+
 		ereport(LOG,
 				errmsg("redo done at %X/%08X system usage: %s",
 					   LSN_FORMAT_ARGS(xlogreader->ReadRecPtr),

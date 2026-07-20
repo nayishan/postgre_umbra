@@ -9346,6 +9346,95 @@ xlog2_redo(XLogReaderState *record)
 		 */
 		EmitAndWaitDataChecksumsBarrier(state.new_checksum_state);
 	}
+#ifdef USE_UMBRA
+	else if (info == XLOG2_HINT_DELTA)
+	{
+		DecodedBkpBlock *block;
+		XLogRedoAction action;
+		Buffer		buffer;
+		char	   *data;
+		char	   *ptr;
+		Size		data_len;
+		Size		remaining;
+		uint32		previous_end = 0;
+		int			fragment_count = 0;
+
+		if (XLogRecGetDataLen(record) != 0 ||
+			XLogRecMaxBlockId(record) != 0 ||
+			!XLogRecHasBlockRef(record, 0))
+			elog(PANIC, "invalid Umbra hint delta WAL record");
+
+		block = XLogRecGetBlock(record, 0);
+		if (block->forknum != MAIN_FORKNUM || !block->has_remap ||
+			!BlockNumberIsValid(block->old_pblkno) ||
+			block->has_image || !block->has_data)
+			elog(PANIC, "invalid Umbra hint delta block reference");
+
+		data = XLogRecGetBlockData(record, 0, &data_len);
+		if (data == NULL || data_len == 0)
+			elog(PANIC, "empty Umbra hint delta WAL record");
+
+		ptr = data;
+		remaining = data_len;
+		while (remaining > 0)
+		{
+			xl_hint_delta_fragment fragment;
+			uint32		fragment_end;
+
+			if (remaining < SizeOfXLogHintDeltaFragment)
+				elog(PANIC, "truncated Umbra hint delta fragment");
+			memcpy(&fragment, ptr, SizeOfXLogHintDeltaFragment);
+			ptr += SizeOfXLogHintDeltaFragment;
+			remaining -= SizeOfXLogHintDeltaFragment;
+			fragment_end = (uint32) fragment.offset + fragment.length;
+			if (fragment.length == 0 ||
+				fragment.offset < offsetof(PageHeaderData, pd_flags) ||
+				fragment.offset < previous_end ||
+				fragment_end > BLCKSZ || remaining < fragment.length)
+				elog(PANIC, "invalid Umbra hint delta fragment");
+
+			ptr += fragment.length;
+			remaining -= fragment.length;
+			previous_end = fragment_end;
+			fragment_count++;
+		}
+
+		if (fragment_count == 0)
+			elog(PANIC, "empty Umbra hint delta WAL record");
+
+		action = XLogReadBufferForRedoExtended(record, 0, RBM_NORMAL,
+										   false, &buffer);
+		/* A later DROP or TRUNCATE must clear the recorded invalid page. */
+		if (action == BLK_NOTFOUND)
+			return;
+		if (action == BLK_NEEDS_REDO)
+		{
+			Page		page = BufferGetPage(buffer);
+
+			Assert(!PageIsNew(page));
+			ptr = data;
+			remaining = data_len;
+			while (remaining > 0)
+			{
+				xl_hint_delta_fragment fragment;
+
+				memcpy(&fragment, ptr, SizeOfXLogHintDeltaFragment);
+				ptr += SizeOfXLogHintDeltaFragment;
+				remaining -= SizeOfXLogHintDeltaFragment;
+				memcpy(page + fragment.offset, ptr, fragment.length);
+				ptr += fragment.length;
+				remaining -= fragment.length;
+			}
+			PageSetLSN(page, record->EndRecPtr);
+			MarkBufferDirty(buffer);
+		}
+		else if (action == BLK_RESTORED)
+			elog(PANIC, "unexpected image in Umbra hint delta WAL record");
+
+		if (BufferIsValid(buffer))
+			UnlockReleaseBuffer(buffer);
+	}
+#endif
 }
 
 /*

@@ -88,7 +88,7 @@
  * set. This enum serves as the necessary state space passed to
  * SetHintBitsExt().
  */
-typedef enum SetHintBitsState
+typedef enum SetHintBitsStatus
 {
 	/* not yet checked if hint bits may be set */
 	SHB_INITIAL,
@@ -96,6 +96,12 @@ typedef enum SetHintBitsState
 	SHB_DISABLED,
 	/* allowed to set hint bits */
 	SHB_ENABLED,
+} SetHintBitsStatus;
+
+typedef struct SetHintBitsState
+{
+	SetHintBitsStatus status;
+	BufferHintDeltaContext delta;
 } SetHintBitsState;
 
 /*
@@ -146,7 +152,7 @@ SetHintBitsExt(HeapTupleHeader tuple, Buffer buffer,
 	 * In batched mode, if we previously did not get permission to set hint
 	 * bits, don't try again - in all likelihood IO is still going on.
 	 */
-	if (state && *state == SHB_DISABLED)
+	if (state && state->status == SHB_DISABLED)
 		return;
 
 	if (TransactionIdIsValid(xid))
@@ -178,15 +184,15 @@ SetHintBitsExt(HeapTupleHeader tuple, Buffer buffer,
 		return;
 	}
 
-	if (*state == SHB_INITIAL)
+	if (state->status == SHB_INITIAL)
 	{
-		if (!BufferBeginSetHintBits(buffer))
+		if (!BufferBeginHintDelta(buffer, &state->delta))
 		{
-			*state = SHB_DISABLED;
+			state->status = SHB_DISABLED;
 			return;
 		}
 
-		*state = SHB_ENABLED;
+		state->status = SHB_ENABLED;
 	}
 	tuple->t_infomask |= infomask;
 }
@@ -1693,7 +1699,7 @@ HeapTupleSatisfiesMVCCBatch(Snapshot snapshot, Buffer buffer,
 							OffsetNumber *vistuples_dense)
 {
 	int			nvis = 0;
-	SetHintBitsState state = SHB_INITIAL;
+	SetHintBitsState state = {.status = SHB_INITIAL};
 
 	Assert(IsMVCCSnapshot(snapshot));
 
@@ -1712,8 +1718,8 @@ HeapTupleSatisfiesMVCCBatch(Snapshot snapshot, Buffer buffer,
 		}
 	}
 
-	if (state == SHB_ENABLED)
-		BufferFinishSetHintBits(buffer, true, true);
+	if (state.status == SHB_ENABLED)
+		BufferFinishHintDelta(&state.delta, true, true);
 
 	return nvis;
 }

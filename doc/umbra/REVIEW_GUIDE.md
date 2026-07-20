@@ -131,12 +131,13 @@ Known conservative cases:
 
 - `REGBUF_FORCE_IMAGE` keeps image semantics.
 - `XLR_CHECK_CONSISTENCY` keeps verification images.
-- `XLOG_FPI_FOR_HINT` keeps the PostgreSQL hint-image rule and does not use
-  Umbra remap today.
+- auxiliary-fork and unconverted hint callers keep PostgreSQL's
+  `XLOG_FPI_FOR_HINT` rule.
 
-That last point is deliberate.  Hint-bit FPI optimization would require a
-separate checksum/torn-page protection design; it is not a header encoding
-optimization.
+Converted core MAIN-fork hint callers use `XLOG2_HINT_DELTA`.  They claim an
+exact old-P/new-P remap before changing the page and WAL-log sorted final-byte
+ranges without a page image.  This is a separate hint-write protocol, not an
+automatic change to every `MarkBufferDirtyHint()` caller.
 
 ## 7. Skip-WAL Dense Map
 

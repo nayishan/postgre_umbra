@@ -39,6 +39,7 @@ static void
 gistkillitems(IndexScanDesc scan)
 {
 	GISTScanOpaque so = (GISTScanOpaque) scan->opaque;
+	BufferHintDeltaContext hint_delta;
 	Buffer		buffer;
 	Page		page;
 	OffsetNumber offnum;
@@ -81,7 +82,7 @@ gistkillitems(IndexScanDesc scan)
 			 * page while just holding a share lock. If we are not allowed,
 			 * there's no point continuing.
 			 */
-			if (!BufferBeginSetHintBits(buffer))
+			if (!BufferBeginHintDelta(buffer, &hint_delta))
 				goto unlock;
 		}
 
@@ -94,7 +95,7 @@ gistkillitems(IndexScanDesc scan)
 	if (killedsomething)
 	{
 		GistMarkPageHasGarbage(page);
-		BufferFinishSetHintBits(buffer, true, true);
+		BufferFinishHintDelta(&hint_delta, true, true);
 	}
 
 unlock:

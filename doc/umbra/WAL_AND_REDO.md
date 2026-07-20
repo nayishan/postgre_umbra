@@ -95,9 +95,11 @@ For ordinary data-bearing records:
 - `!doPageWrites` means:
   - backup image no
   - automatic remap no
-- `RM_XLOG_ID / XLOG_FPI_FOR_HINT` keeps MD's hint-image rule:
-  - backup image if `page_lsn <= RedoRecPtr`
-  - no remap
+- converted Umbra MAIN-fork hints use `XLOG2_HINT_DELTA`:
+  - claim exact old-P/new-P before changing page bytes
+  - record sorted final-byte ranges without an image
+- auxiliary-fork and unconverted hint callers keep MD's
+  `RM_XLOG_ID / XLOG_FPI_FOR_HINT` rule
 - ordinary checkpoint-boundary case means:
   - no backup image
   - remap if `page_lsn <= RedoRecPtr`
@@ -394,7 +396,8 @@ The branch still chooses conservative rules in a few places:
 - explicit image owners keep their image semantics
 - first-born and initialization cases carry dedicated frontier payload when it
   cannot be derived from a stronger WAL anchor
-- checksum-driven hint FPIs still use PostgreSQL's `XLOG_FPI_FOR_HINT` path
+- converted core MAIN-fork hints use image-free `XLOG2_HINT_DELTA`; auxiliary
+  and unconverted hint paths still use PostgreSQL's `XLOG_FPI_FOR_HINT`
 - redo keeps a very explicit old-view/new-view split for remap-without-image
 - remap format is record-level, so mixed birth/ordinary remap records can fall
   back to the full header rather than using per-block variant tags

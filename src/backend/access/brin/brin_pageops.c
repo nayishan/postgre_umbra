@@ -521,6 +521,7 @@ brin_metapage_init(Page page, BlockNumber pagesPerRange, uint16 version)
 bool
 brin_start_evacuating_page(Relation idxRel, Buffer buf)
 {
+	BufferHintDeltaContext hint_delta;
 	OffsetNumber off;
 	OffsetNumber maxoff;
 	Page		page;
@@ -541,11 +542,14 @@ brin_start_evacuating_page(Relation idxRel, Buffer buf)
 			/*
 			 * Prevent other backends from adding more stuff to this page:
 			 * BRIN_EVACUATE_PAGE informs br_page_get_freespace that this page
-			 * can no longer be used to add new tuples.  Note that this flag
-			 * is not WAL-logged, except accidentally.
+			 * can no longer be used to add new tuples.  The change needs no
+			 * semantic WAL, although hint-write protection may emit WAL.
 			 */
-			BrinPageFlags(page) |= BRIN_EVACUATE_PAGE;
-			MarkBufferDirtyHint(buf, true);
+			if (BufferBeginHintDelta(buf, &hint_delta))
+			{
+				BrinPageFlags(page) |= BRIN_EVACUATE_PAGE;
+				BufferFinishHintDelta(&hint_delta, true, true);
+			}
 
 			return true;
 		}

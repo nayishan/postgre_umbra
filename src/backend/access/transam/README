@@ -636,10 +636,15 @@ of optimising for performance. When a hint is written we use
 MarkBufferDirtyHint() to mark the block dirty.
 
 If the buffer is clean and checksums are in use then MarkBufferDirtyHint()
-inserts an XLOG_FPI_FOR_HINT record to ensure that we take a full page image
-that includes the hint. We do this to avoid a partial page write, when we
-write the dirtied page. WAL is not written during recovery, so we simply skip
-dirtying blocks because of hints when in recovery.
+inserts protective WAL before the hinted page can be written.  The standard
+path uses XLOG_FPI_FOR_HINT.  Umbra MAIN-fork core callers capture the
+pre-update page for multi-field changes, or directly describe a single-field
+change, and record final-byte ranges together with an old-P/new-P remap.
+Auxiliary forks retain the full-page path.  A MAIN-fork remap claim is prepared
+before changing the page and uses Umbra's existing MAP allocation behavior; it
+does not fall back to XLOG_FPI_FOR_HINT.
+WAL is not written during recovery, so we simply skip dirtying blocks because
+of hints then.
 
 If you do decide to optimise away a WAL record, then any calls to
 MarkBufferDirty() must be replaced by MarkBufferDirtyHint(),

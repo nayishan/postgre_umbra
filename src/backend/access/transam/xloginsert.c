@@ -95,6 +95,7 @@ typedef struct
 #ifdef USE_UMBRA
 	Buffer		buffer;			/* source shared buffer, if any */
 	bool		from_shared_buffer;
+	bool		hint_delta_remap; /* hint WAL repairs old P during redo */
 	bool		has_remap;		/* true if remap metadata is prepared */
 	bool		remap_needs_image; /* prepared old P needs an APPLY image */
 	bool		remap_in_record; /* true if current assembled record includes remap */
@@ -258,7 +259,8 @@ XLogCommitBlockRemapsUmbra(XLogRecPtr record_endptr)
 
 		ctx = umfile_ctx_acquire(regbuf->remap_reln->smgr_rlocator);
 
-		BufferSaveCheckpointPblk(regbuf->buffer, regbuf->old_pblkno);
+		if (!regbuf->hint_delta_remap)
+			BufferSaveCheckpointPblk(regbuf->buffer, regbuf->old_pblkno);
 		UmMapSetMapping(regbuf->remap_reln, regbuf->forkno, regbuf->block,
 						regbuf->new_pblkno, record_endptr);
 		if (regbuf->old_pblkno == InvalidBlockNumber)
@@ -412,10 +414,10 @@ XLogResetInsertion(void)
 	{
 		registered_buffers[i].in_use = false;
 #ifdef USE_UMBRA
-		registered_buffers[i].buffer = InvalidBuffer;
 		registered_buffers[i].has_remap = false;
 		registered_buffers[i].buffer = InvalidBuffer;
 		registered_buffers[i].from_shared_buffer = false;
+		registered_buffers[i].hint_delta_remap = false;
 		registered_buffers[i].remap_needs_image = false;
 		registered_buffers[i].remap_in_record = false;
 		registered_buffers[i].remap_committed = false;
@@ -485,6 +487,7 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
 #ifdef USE_UMBRA
 	regbuf->buffer = buffer;
 	regbuf->from_shared_buffer = true;
+	regbuf->hint_delta_remap = false;
 	regbuf->has_remap = false;
 	regbuf->remap_needs_image = false;
 	regbuf->remap_in_record = false;
@@ -522,6 +525,84 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
 	regbuf->in_use = true;
 }
 
+#ifdef USE_UMBRA
+/* Interlock checkpoint start and claim a remap if this hint needs WAL. */
+bool
+XLogPrepareBufferHintDelta(Buffer buffer)
+{
+	registered_buffer *regbuf;
+	SMgrRelation reln;
+
+	Assert(CritSectionCount == 0);
+	XLogBeginInsert();
+	XLogRegisterBuffer(0, buffer, REGBUF_NO_IMAGE | REGBUF_NO_CHANGE);
+	regbuf = &registered_buffers[0];
+	if (regbuf->forkno != MAIN_FORKNUM)
+	{
+		XLogResetInsertion();
+		elog(ERROR, "cannot prepare Umbra hint delta for fork %d",
+			 (int) regbuf->forkno);
+	}
+	if (!LocalTransactionIdIsValid(MyProc->vxid.lxid))
+	{
+		XLogResetInsertion();
+		elog(ERROR, "cannot prepare Umbra hint delta outside a transaction");
+	}
+	if ((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0)
+	{
+		MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+		curinsert_remap_delay_started = true;
+	}
+
+	/*
+	 * The checkpoint interlock stays set until the caller marks the page
+	 * dirty.  Therefore a page newer than the current redo point needs no
+	 * hint WAL even if a checkpoint starts before the caller finishes.
+	 */
+	if (PageGetLSN(regbuf->page) > GetRedoRecPtr())
+		return false;
+
+	PG_TRY();
+	{
+		reln = smgropen(regbuf->rlocator, INVALID_PROC_NUMBER);
+		if (!UmWalOwnedRemapAvailable(reln, regbuf->forkno))
+			elog(ERROR, "Umbra remap is unavailable for fork %d",
+				 (int) regbuf->forkno);
+		UmMapGetNewPbkno(reln, regbuf->forkno, regbuf->block,
+						 &regbuf->new_pblkno, &regbuf->old_pblkno);
+		regbuf->remap_reln = reln;
+		regbuf->has_remap = true;
+		regbuf->hint_delta_remap = true;
+		regbuf->remap_committed = false;
+		if (!BlockNumberIsValid(regbuf->old_pblkno) ||
+			regbuf->new_pblkno == regbuf->old_pblkno)
+			elog(ERROR,
+				 "invalid Umbra hint remap for relation %u/%u/%u fork %d block %u",
+				 regbuf->rlocator.spcOid, regbuf->rlocator.dbOid,
+				 regbuf->rlocator.relNumber, (int) regbuf->forkno,
+				 regbuf->block);
+	}
+	PG_CATCH();
+	{
+		XLogResetInsertion();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	regbuf->flags = REGBUF_NO_IMAGE;
+	return true;
+}
+
+XLogRecPtr
+XLogInsertPreparedHintDelta(const void *data, uint32 len)
+{
+	Assert(data != NULL);
+	Assert(len > 0);
+	XLogRegisterBufData(0, data, len);
+	return XLogInsert(RM_XLOG2_ID, XLOG2_HINT_DELTA);
+}
+#endif
+
 /*
  * Like XLogRegisterBuffer, but for registering a block that's not in the
  * shared buffer pool (i.e. when you don't have a Buffer for it).
@@ -552,6 +633,7 @@ XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator, ForkNumber forknum,
 #ifdef USE_UMBRA
 	regbuf->buffer = InvalidBuffer;
 	regbuf->from_shared_buffer = false;
+	regbuf->hint_delta_remap = false;
 	regbuf->has_remap = false;
 	regbuf->remap_needs_image = false;
 	regbuf->remap_in_record = false;
@@ -1289,6 +1371,8 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 	XLogRecData *rdt_datas_last;
 	XLogRecord *rechdr;
 	char	   *scratch = hdr_scratch;
+	bool		hint_delta = rmid == RM_XLOG2_ID &&
+		(info & XLR_RMGR_INFO_MASK) == XLOG2_HINT_DELTA;
 	XLogRecPtr	completedRedoRecPtr = GetLastCompletedCheckpointRedo();
 	bool		captureActive = CheckpointBufferCaptureIsActive();
 
@@ -1300,7 +1384,8 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 	hdr_rdt.data = hdr_scratch;
 	curinsert_has_block_remap = false;
 
-	if (wal_consistency_checking[rmid])
+	/* HINT_DELTA must remain image-free; its byte payload is self-checking. */
+	if (wal_consistency_checking[rmid] && !hint_delta)
 		info |= XLR_CHECK_CONSISTENCY;
 
 	*fpw_lsn = InvalidXLogRecPtr;

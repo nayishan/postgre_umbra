@@ -87,6 +87,52 @@ xlog2_desc(StringInfo buf, XLogReaderState *record)
 		memcpy(&xlrec, rec, sizeof(xl_checksum_state));
 		appendStringInfoString(buf, get_checksum_state_string(xlrec.new_checksum_state));
 	}
+	else if (info == XLOG2_HINT_DELTA)
+	{
+		char	   *data;
+		char	   *ptr;
+		Size		data_len;
+		Size		remaining;
+		uint32		final_bytes = 0;
+		int			fragments = 0;
+		bool		valid = true;
+
+		if (!XLogRecHasBlockRef(record, 0))
+		{
+			appendStringInfoString(buf, "invalid hint delta");
+			return;
+		}
+		data = XLogRecGetBlockData(record, 0, &data_len);
+		ptr = data;
+		remaining = data_len;
+		while (remaining > 0)
+		{
+			xl_hint_delta_fragment fragment;
+
+			if (remaining < SizeOfXLogHintDeltaFragment)
+			{
+				valid = false;
+				break;
+			}
+			memcpy(&fragment, ptr, SizeOfXLogHintDeltaFragment);
+			ptr += SizeOfXLogHintDeltaFragment;
+			remaining -= SizeOfXLogHintDeltaFragment;
+			if (fragment.length == 0 || remaining < fragment.length)
+			{
+				valid = false;
+				break;
+			}
+			ptr += fragment.length;
+			remaining -= fragment.length;
+			final_bytes += fragment.length;
+			fragments++;
+		}
+		if (!valid || fragments == 0)
+			appendStringInfoString(buf, "invalid hint delta");
+		else
+			appendStringInfo(buf, "fragments %d, final bytes %u",
+							 fragments, final_bytes);
+	}
 }
 
 void
@@ -289,6 +335,9 @@ xlog2_identify(uint8 info)
 	{
 		case XLOG2_CHECKSUMS:
 			id = "CHECKSUMS";
+			break;
+		case XLOG2_HINT_DELTA:
+			id = "HINT_DELTA";
 			break;
 	}
 
