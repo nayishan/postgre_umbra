@@ -321,9 +321,22 @@ extern void BufferGetTag(Buffer buffer, RelFileLocator *rlocator,
 
 extern void MarkBufferDirtyHint(Buffer buffer, bool buffer_std);
 
+typedef struct BufferHintDeltaContext
+{
+	Buffer		buffer;
+	char	   *before;
+	char	   *delta;
+	bool		xlog_active;
+	bool		remap_prepared;
+} BufferHintDeltaContext;
+
 extern bool BufferSetHintBits16(uint16 *ptr, uint16 val, Buffer buffer);
 extern bool BufferBeginSetHintBits(Buffer buffer);
 extern void BufferFinishSetHintBits(Buffer buffer, bool mark_dirty, bool buffer_std);
+extern bool BufferBeginHintDelta(Buffer buffer,
+							 BufferHintDeltaContext *context);
+extern void BufferFinishHintDelta(BufferHintDeltaContext *context,
+							  bool mark_dirty, bool buffer_std);
 
 extern void UnlockBuffers(void);
 extern void UnlockBuffer(Buffer buffer);

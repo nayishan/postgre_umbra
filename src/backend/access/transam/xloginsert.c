@@ -96,6 +96,7 @@ typedef struct
 
 #ifdef USE_UMBRA
 	Buffer		buffer;			/* shared buffer, if registered from one */
+	bool		hint_delta_shift; /* hint WAL reconstructs target slot during redo */
 	bool		has_shift;		/* true if shift metadata is prepared */
 	bool		shift_in_record;	/* current record includes shift */
 	bool		shift_committed;	/* shift slot was committed after insert */
@@ -154,6 +155,9 @@ static int	max_rdatas;			/* allocated size */
 
 static bool begininsert_called = false;
 static bool curinsert_has_block_shift = false;
+#ifdef USE_UMBRA
+static bool curinsert_hint_delay_started = false;
+#endif
 
 /* Memory context to hold the registered buffer and data references. */
 static MemoryContext xloginsert_cxt;
@@ -303,7 +307,8 @@ XLogCommitBlockShiftsUmbra(XLogRecPtr record_endptr)
 
 		ctx = umfile_ctx_acquire(regbuf->shift_reln->smgr_rlocator);
 
-		BufferSaveCheckpointSlot(regbuf->buffer, regbuf->shift_source_slot);
+		if (!regbuf->hint_delta_shift)
+			BufferSaveCheckpointSlot(regbuf->buffer, regbuf->shift_source_slot);
 		UmShiftSetActiveSlot(regbuf->shift_reln, regbuf->forkno, regbuf->block,
 							  regbuf->shift_target_slot, record_endptr);
 		if (UmbraChunkPairedPhysicalCapacity(regbuf->shift_logical_nblocks,
@@ -431,6 +436,11 @@ XLogResetInsertion(void)
 
 #ifdef USE_UMBRA
 	XLogAbortBlockShiftsUmbra();
+	if (curinsert_hint_delay_started)
+	{
+		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+		curinsert_hint_delay_started = false;
+	}
 #endif
 
 	for (i = 0; i < max_registered_block_id; i++)
@@ -438,6 +448,7 @@ XLogResetInsertion(void)
 		registered_buffers[i].in_use = false;
 #ifdef USE_UMBRA
 		registered_buffers[i].buffer = InvalidBuffer;
+		registered_buffers[i].hint_delta_shift = false;
 		registered_buffers[i].has_shift = false;
 		registered_buffers[i].shift_in_record = false;
 		registered_buffers[i].shift_committed = false;
@@ -504,6 +515,7 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
 	regbuf->rdata_len = 0;
 #ifdef USE_UMBRA
 	regbuf->buffer = buffer;
+	regbuf->hint_delta_shift = false;
 	regbuf->has_shift = false;
 	regbuf->shift_in_record = false;
 	regbuf->shift_committed = false;
@@ -538,6 +550,79 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
 	regbuf->in_use = true;
 }
 
+#ifdef USE_UMBRA
+/* Interlock checkpoint start and prepare a chunk shift for hint WAL. */
+bool
+XLogPrepareBufferHintDelta(Buffer buffer)
+{
+	registered_buffer *regbuf;
+	SMgrRelation reln;
+
+	Assert(CritSectionCount == 0);
+	XLogBeginInsert();
+	XLogRegisterBuffer(0, buffer, REGBUF_NO_IMAGE | REGBUF_NO_CHANGE);
+	regbuf = &registered_buffers[0];
+	if (regbuf->forkno != MAIN_FORKNUM)
+	{
+		XLogResetInsertion();
+		elog(ERROR, "cannot prepare Umbra hint delta for fork %d",
+			 (int) regbuf->forkno);
+	}
+	if (!LocalTransactionIdIsValid(MyProc->vxid.lxid))
+	{
+		XLogResetInsertion();
+		elog(ERROR, "cannot prepare Umbra hint delta outside a transaction");
+	}
+	if ((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0)
+	{
+		MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+		curinsert_hint_delay_started = true;
+	}
+
+	/* The interlock makes a page newer than redo safe without hint WAL. */
+	if (PageGetLSN(regbuf->page) > GetRedoRecPtr())
+		return false;
+
+	PG_TRY();
+	{
+		reln = smgropen(regbuf->rlocator, INVALID_PROC_NUMBER);
+		regbuf->shift_reln = reln;
+		regbuf->shift_target_slot =
+			UmShiftChooseTargetSlot(reln, regbuf->forkno, regbuf->block,
+								&regbuf->shift_source_slot);
+		if (!UmbraChunkActiveSlotIsValid(regbuf->shift_source_slot) ||
+			!UmbraChunkActiveSlotIsValid(regbuf->shift_target_slot) ||
+			regbuf->shift_source_slot == regbuf->shift_target_slot)
+			elog(ERROR,
+				 "invalid Umbra hint shift for relation %u/%u/%u fork %d block %u",
+				 regbuf->rlocator.spcOid, regbuf->rlocator.dbOid,
+				 regbuf->rlocator.relNumber, (int) regbuf->forkno,
+				 regbuf->block);
+		regbuf->has_shift = true;
+		regbuf->hint_delta_shift = true;
+		regbuf->shift_committed = false;
+	}
+	PG_CATCH();
+	{
+		XLogResetInsertion();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	regbuf->flags = REGBUF_NO_IMAGE;
+	return true;
+}
+
+XLogRecPtr
+XLogInsertPreparedHintDelta(const void *data, uint32 len)
+{
+	Assert(data != NULL);
+	Assert(len > 0);
+	XLogRegisterBufData(0, data, len);
+	return XLogInsert(RM_XLOG2_ID, XLOG2_HINT_DELTA);
+}
+#endif
+
 /*
  * Like XLogRegisterBuffer, but for registering a block that's not in the
  * shared buffer pool (i.e. when you don't have a Buffer for it).
@@ -567,6 +652,7 @@ XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator, ForkNumber forknum,
 	regbuf->rdata_len = 0;
 #ifdef USE_UMBRA
 	regbuf->buffer = InvalidBuffer;
+	regbuf->hint_delta_shift = false;
 	regbuf->has_shift = false;
 	regbuf->shift_in_record = false;
 	regbuf->shift_committed = false;
@@ -1306,6 +1392,8 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 	XLogRecData *rdt_datas_last;
 	XLogRecord *rechdr;
 	char	   *scratch = hdr_scratch;
+	bool		hint_delta = rmid == RM_XLOG2_ID &&
+		(info & XLR_RMGR_INFO_MASK) == XLOG2_HINT_DELTA;
 
 	rechdr = (XLogRecord *) scratch;
 	scratch += SizeOfXLogRecord;
@@ -1315,7 +1403,8 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 	hdr_rdt.data = hdr_scratch;
 	curinsert_has_block_shift = false;
 
-	if (wal_consistency_checking[rmid])
+	/* Hint deltas must remain image-free; their block data is self-checking. */
+	if (wal_consistency_checking[rmid] && !hint_delta)
 		info |= XLR_CHECK_CONSISTENCY;
 
 	*fpw_lsn = InvalidXLogRecPtr;

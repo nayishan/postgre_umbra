@@ -412,6 +412,7 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 				 IndexUniqueCheck checkUnique, bool *is_unique,
 				 uint32 *speculativeToken)
 {
+	BufferHintDeltaContext hint_delta;
 	IndexTuple	itup = insertstate->itup;
 	IndexTuple	curitup = NULL;
 	ItemId		curitemid = NULL;
@@ -701,11 +702,11 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 					 * Can't use BufferSetHintBits16() here as we update two
 					 * different locations.
 					 */
-					if (BufferBeginSetHintBits(buf))
+					if (BufferBeginHintDelta(buf, &hint_delta))
 					{
 						ItemIdMarkDead(curitemid);
 						opaque->btpo_flags |= BTP_HAS_GARBAGE;
-						BufferFinishSetHintBits(buf, true, true);
+						BufferFinishHintDelta(&hint_delta, true, true);
 					}
 				}
 

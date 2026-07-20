@@ -1414,6 +1414,7 @@ btvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 static BlockNumber
 btvacuumpage(BTVacState *vstate, Buffer buf)
 {
+	BufferHintDeltaContext hint_delta;
 	IndexVacuumInfo *info = vstate->info;
 	IndexBulkDeleteResult *stats = vstate->stats;
 	IndexBulkDeleteCallback callback = vstate->callback;
@@ -1665,8 +1666,11 @@ backtrack:
 			if (vstate->cycleid != 0 &&
 				opaque->btpo_cycleid == vstate->cycleid)
 			{
-				opaque->btpo_cycleid = 0;
-				MarkBufferDirtyHint(buf, true);
+				if (BufferBeginHintDelta(buf, &hint_delta))
+				{
+					opaque->btpo_cycleid = 0;
+					BufferFinishHintDelta(&hint_delta, true, true);
+				}
 			}
 		}
 

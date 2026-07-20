@@ -80,6 +80,7 @@ tests += {
       't/081_umbra_torn_page_remap.pl',
       't/082_umbra_chunk_paired_smoke.pl',
       't/083_umbra_chunk_checkpoint_publication.pl',
+      't/084_umbra_chunk_hint_delta.pl',
     ],
   },
 }
