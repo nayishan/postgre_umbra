@@ -3626,7 +3626,8 @@ BufferSyncPrepare(int flags)
 					CHECKPOINT_FLUSH_UNLOGGED))))
 		mask |= BM_PERMANENT;
 
-	CheckPointBuffersCaptureBegin();
+	if (CkptBufferSlotActiveEpoch() == 0)
+		CheckPointBuffersCaptureBegin();
 
 	/*
 	 * Loop over all buffers, and mark the ones that need to be written with
