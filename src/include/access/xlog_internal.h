@@ -294,6 +294,7 @@ typedef struct xl_checksum_state
 	ChecksumStateType new_checksum_state;
 } xl_checksum_state;
 
+#ifdef USE_UMBRA
 /* One final-byte range in an XLOG2_HINT_DELTA block-data stream. */
 typedef struct xl_hint_delta_fragment
 {
@@ -302,6 +303,7 @@ typedef struct xl_hint_delta_fragment
 } xl_hint_delta_fragment;
 
 #define SizeOfXLogHintDeltaFragment (sizeof(xl_hint_delta_fragment))
+#endif
 
 /* Overwrite of prior contrecord */
 typedef struct xl_overwrite_contrecord

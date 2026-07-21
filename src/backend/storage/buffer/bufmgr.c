@@ -38,7 +38,9 @@
 #include <unistd.h>
 
 #include "access/tableam.h"
+#ifdef USE_UMBRA
 #include "access/xlog_internal.h"
+#endif
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
 #ifdef USE_ASSERT_CHECKING
@@ -637,7 +639,9 @@ static bool PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy,
 static void PinBuffer_Locked(BufferDesc *buf);
 static void UnpinBuffer(BufferDesc *buf);
 static void UnpinBufferNoOwner(BufferDesc *buf);
+#ifdef USE_UMBRA
 static int	BufferSyncPrepare(int flags);
+#endif
 static void BufferSync(int flags);
 static int	SyncOneBuffer(int buf_id, bool skip_recently_used,
 						  WritebackContext *wb_context);
@@ -655,17 +659,17 @@ static bool AsyncReadBuffers(ReadBuffersOperation *operation, int *nblocks_progr
 static void CheckReadBuffersOperation(ReadBuffersOperation *operation, bool is_complete);
 
 static pg_attribute_always_inline void TrackBufferHit(IOObject io_object,
-													  IOContext io_context,
-													  Relation rel, char persistence, SMgrRelation smgr,
-													  ForkNumber forknum, BlockNumber blocknum);
+														  IOContext io_context,
+														  Relation rel, char persistence, SMgrRelation smgr,
+														  ForkNumber forknum, BlockNumber blocknum);
 static Buffer GetVictimBuffer(BufferAccessStrategy strategy, IOContext io_context);
+#ifdef USE_UMBRA
 static bool FlushUnlockedBuffer(BufferDesc *buf, SMgrRelation reln,
-								IOObject io_object, IOContext io_context,
-								uint8 *checkpoint_slot);
+									IOObject io_object, IOContext io_context,
+									uint8 *checkpoint_slot);
 static bool FlushBuffer(BufferDesc *buf, SMgrRelation reln,
 						IOObject io_object, IOContext io_context,
 						uint8 *checkpoint_slot);
-#ifdef USE_UMBRA
 static bool CkptBufferIdsPrepared = false;
 static int	CkptBufferIdsPreparedCount = 0;
 #define CKPT_BUFFER_SLOT_EPOCH_ACTIVE	((uint32) 0x80000000)
@@ -674,14 +678,19 @@ static uint32 CkptBufferSlotActiveEpoch(void);
 static void ClearCheckpointBufferSlot(BufferDesc *buf);
 static void TerminateCheckpointBufferIO(BufferDesc *buf, bool forget_owner,
 										bool release_aio);
-#endif
 static void ScheduleBufferTagForWritebackWithSlot(WritebackContext *wb_context,
-												  IOContext io_context,
-												  BufferTag *tag,
-												  bool checkpoint_slot_valid,
-												  uint8 checkpoint_slot);
+													  IOContext io_context,
+													  BufferTag *tag,
+													  bool checkpoint_slot_valid,
+													  uint8 checkpoint_slot);
 static inline int pending_writeback_comparator(const PendingWriteback *a,
-											   const PendingWriteback *b);
+													   const PendingWriteback *b);
+#else
+static void FlushUnlockedBuffer(BufferDesc *buf, SMgrRelation reln,
+									IOObject io_object, IOContext io_context);
+static void FlushBuffer(BufferDesc *buf, SMgrRelation reln,
+						IOObject io_object, IOContext io_context);
+#endif
 static void FindAndDropRelationBuffers(RelFileLocator rlocator,
 									   ForkNumber forkNum,
 									   BlockNumber nForkBlock,
@@ -2663,7 +2672,8 @@ again:
 			goto again;
 		}
 
-		/* OK, do the I/O */
+		/* OK, do the I/O. */
+#ifdef USE_UMBRA
 		{
 			uint8		checkpoint_slot = CKPT_BUFFER_SLOT_INVALID;
 
@@ -2674,9 +2684,16 @@ again:
 												  &buf_hdr->tag,
 												  checkpoint_slot !=
 												  CKPT_BUFFER_SLOT_INVALID,
-												  checkpoint_slot);
+													  checkpoint_slot);
 		}
 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+#else
+		FlushBuffer(buf_hdr, NULL, IOOBJECT_RELATION, io_context);
+		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+
+		ScheduleBufferTagForWriteback(&BackendWritebackContext, io_context,
+										  &buf_hdr->tag);
+#endif
 	}
 
 
@@ -3591,16 +3608,7 @@ TrackNewBufferPin(Buffer buf)
 #define ST_DEFINE
 #include "lib/sort_template.h"
 
-/*
- * BufferSync -- Write out all dirty buffers in the pool.
- *
- * This is called at checkpoint time to write out all dirty shared buffers.
- * The checkpoint request flags should be passed in.  If CHECKPOINT_FAST is
- * set, we disable delays between writes; if CHECKPOINT_IS_SHUTDOWN,
- * CHECKPOINT_END_OF_RECOVERY or CHECKPOINT_FLUSH_UNLOGGED is set, we write
- * even unlogged buffers, which are otherwise skipped.  The remaining flags
- * currently have no effect here.
- */
+#ifdef USE_UMBRA
 static int
 BufferSyncPrepare(int flags)
 {
@@ -3618,9 +3626,7 @@ BufferSyncPrepare(int flags)
 					CHECKPOINT_FLUSH_UNLOGGED))))
 		mask |= BM_PERMANENT;
 
-#ifdef USE_UMBRA
 	CheckPointBuffersCaptureBegin();
-#endif
 
 	/*
 	 * Loop over all buffers, and mark the ones that need to be written with
@@ -3681,14 +3687,12 @@ BufferSyncPrepare(int flags)
 			}
 			else
 			{
-#ifdef USE_UMBRA
 				if (bufHdr->tag.spcOid == item.tsId &&
 					bufHdr->tag.dbOid == item.dbOid &&
 					BufTagGetRelNumber(&bufHdr->tag) == item.relNumber &&
 					BufTagGetForkNum(&bufHdr->tag) == item.forkNum &&
 					bufHdr->tag.blockNum == item.blockNum)
 					ClearCheckpointBufferSlot(bufHdr);
-#endif
 				UnlockBufHdr(bufHdr);
 			}
 		}
@@ -3700,6 +3704,7 @@ BufferSyncPrepare(int flags)
 
 	return num_to_scan;
 }
+#endif
 
 /*
  * BufferSync -- Write out all dirty buffers in the pool.
@@ -3733,8 +3738,43 @@ BufferSync(int flags)
 		CkptBufferIdsPreparedCount = 0;
 	}
 	else
-#endif
 		num_to_scan = BufferSyncPrepare(flags);
+#else
+	{
+		uint64		buf_state;
+		uint64		mask = BM_DIRTY;
+
+		if (!((flags & (CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_END_OF_RECOVERY |
+							CHECKPOINT_FLUSH_UNLOGGED))))
+			mask |= BM_PERMANENT;
+
+		num_to_scan = 0;
+		for (buf_id = 0; buf_id < NBuffers; buf_id++)
+		{
+			BufferDesc *bufHdr = GetBufferDescriptor(buf_id);
+			uint64		set_bits = 0;
+
+			buf_state = LockBufHdr(bufHdr);
+			if ((buf_state & mask) == mask)
+			{
+				CkptSortItem *item;
+
+				set_bits = BM_CHECKPOINT_NEEDED;
+				item = &CkptBufferIds[num_to_scan++];
+				item->buf_id = buf_id;
+				item->tsId = bufHdr->tag.spcOid;
+				item->relNumber = BufTagGetRelNumber(&bufHdr->tag);
+				item->forkNum = BufTagGetForkNum(&bufHdr->tag);
+				item->blockNum = bufHdr->tag.blockNum;
+			}
+
+			UnlockBufHdrExt(bufHdr, buf_state, set_bits, 0, 0);
+
+			if (ProcSignalBarrierPending)
+				ProcessProcSignalBarrier();
+		}
+	}
+#endif
 
 	if (num_to_scan == 0)
 	{
@@ -4315,8 +4355,10 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
 	int			result = 0;
 	uint64		buf_state;
 	BufferTag	tag;
+#ifdef USE_UMBRA
 	uint8		checkpoint_slot = CKPT_BUFFER_SLOT_INVALID;
 	bool		flushed;
+#endif
 
 	/* Make sure we can handle the pin */
 	ReservePrivateRefCountEntry();
@@ -4358,24 +4400,32 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
 	 */
 	PinBuffer_Locked(bufHdr);
 
+#ifdef USE_UMBRA
 	flushed = FlushUnlockedBuffer(bufHdr, NULL, IOOBJECT_RELATION,
-								  IOCONTEXT_NORMAL, &checkpoint_slot);
+									  IOCONTEXT_NORMAL, &checkpoint_slot);
+#else
+	FlushUnlockedBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+#endif
 
 	tag = bufHdr->tag;
 
 	UnpinBuffer(bufHdr);
 
-	if (!flushed)
-		return result;
-
 	/*
 	 * SyncOneBuffer() is only called by checkpointer and bgwriter, so
 	 * IOContext will always be IOCONTEXT_NORMAL.
 	 */
+#ifdef USE_UMBRA
+	if (!flushed)
+		return result;
+
 	ScheduleBufferTagForWritebackWithSlot(wb_context, IOCONTEXT_NORMAL, &tag,
-										  checkpoint_slot !=
-										  CKPT_BUFFER_SLOT_INVALID,
-										  checkpoint_slot);
+											  checkpoint_slot !=
+											  CKPT_BUFFER_SLOT_INVALID,
+											  checkpoint_slot);
+#else
+	ScheduleBufferTagForWriteback(wb_context, IOCONTEXT_NORMAL, &tag);
+#endif
 
 	return result | BUF_WRITTEN;
 }
@@ -4691,9 +4741,15 @@ BufferGetTag(Buffer buffer, RelFileLocator *rlocator, ForkNumber *forknum,
  * If the caller has an smgr reference for the buffer's relation, pass it
  * as the second parameter.  If not, pass NULL.
  */
+#ifdef USE_UMBRA
 static bool
 FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 			IOContext io_context, uint8 *checkpoint_slot)
+#else
+static void
+FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
+			IOContext io_context)
+#endif
 {
 	XLogRecPtr	recptr;
 	ErrorContextCallback errcallback;
@@ -4710,8 +4766,10 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	Assert(BufferLockHeldByMeInMode(buf, BUFFER_LOCK_EXCLUSIVE) ||
 		   BufferLockHeldByMeInMode(buf, BUFFER_LOCK_SHARE_EXCLUSIVE));
 
+#ifdef USE_UMBRA
 	if (checkpoint_slot != NULL)
 		*checkpoint_slot = CKPT_BUFFER_SLOT_INVALID;
+#endif
 
 	/*
 	 * Try to start an I/O operation.  If StartBufferIO returns false, then
@@ -4719,7 +4777,13 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	 * anything.
 	 */
 	if (StartSharedBufferIO(buf, false, true, NULL) == BUFFER_IO_ALREADY_DONE)
+	{
+#ifdef USE_UMBRA
 		return false;
+#else
+		return;
+#endif
+	}
 
 #ifdef USE_UMBRA
 	buf_state = LockBufHdr(buf);
@@ -4872,25 +4936,41 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 
 	/* Pop the error context stack */
 	error_context_stack = errcallback.previous;
+#ifdef USE_UMBRA
 	return true;
+#endif
 }
 
 /*
  * Convenience wrapper around FlushBuffer() that locks/unlocks the buffer
  * before/after calling FlushBuffer().
  */
+#ifdef USE_UMBRA
 static bool
 FlushUnlockedBuffer(BufferDesc *buf, SMgrRelation reln,
 					IOObject io_object, IOContext io_context,
 					uint8 *checkpoint_slot)
+#else
+static void
+FlushUnlockedBuffer(BufferDesc *buf, SMgrRelation reln,
+					IOObject io_object, IOContext io_context)
+#endif
 {
 	Buffer		buffer = BufferDescriptorGetBuffer(buf);
+#ifdef USE_UMBRA
 	bool		flushed;
+#endif
 
 	BufferLockAcquire(buffer, buf, BUFFER_LOCK_SHARE_EXCLUSIVE);
+#ifdef USE_UMBRA
 	flushed = FlushBuffer(buf, reln, io_object, io_context, checkpoint_slot);
+#else
+	FlushBuffer(buf, reln, io_object, io_context);
+#endif
 	BufferLockUnlock(buffer, buf);
+#ifdef USE_UMBRA
 	return flushed;
+#endif
 }
 
 #ifdef USE_UMBRA
@@ -5511,8 +5591,12 @@ FlushRelationBuffers(Relation rel)
 			(buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
 		{
 			PinBuffer_Locked(bufHdr);
+	#ifdef USE_UMBRA
 			(void) FlushUnlockedBuffer(bufHdr, srel, IOOBJECT_RELATION,
 									   IOCONTEXT_NORMAL, NULL);
+	#else
+			FlushUnlockedBuffer(bufHdr, srel, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+	#endif
 			UnpinBuffer(bufHdr);
 		}
 		else
@@ -5607,9 +5691,14 @@ FlushRelationsAllBuffers(SMgrRelation *smgrs, int nrels)
 			(buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
 		{
 			PinBuffer_Locked(bufHdr);
+	#ifdef USE_UMBRA
 			(void) FlushUnlockedBuffer(bufHdr, srelent->srel,
 									   IOOBJECT_RELATION, IOCONTEXT_NORMAL,
 									   NULL);
+	#else
+			FlushUnlockedBuffer(bufHdr, srelent->srel, IOOBJECT_RELATION,
+									IOCONTEXT_NORMAL);
+	#endif
 			UnpinBuffer(bufHdr);
 		}
 		else
@@ -5841,8 +5930,12 @@ FlushDatabaseBuffers(Oid dbid)
 			(buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
 		{
 			PinBuffer_Locked(bufHdr);
+	#ifdef USE_UMBRA
 			(void) FlushUnlockedBuffer(bufHdr, NULL, IOOBJECT_RELATION,
 									   IOCONTEXT_NORMAL, NULL);
+	#else
+			FlushUnlockedBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+	#endif
 			UnpinBuffer(bufHdr);
 		}
 		else
@@ -5868,8 +5961,12 @@ FlushOneBuffer(Buffer buffer)
 
 	Assert(BufferIsLockedByMe(buffer));
 
+#ifdef USE_UMBRA
 	(void) FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL,
 					   NULL);
+#else
+	FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+#endif
 }
 
 /*
@@ -6074,11 +6171,17 @@ CaptureBufferHintPreimage(Buffer buffer, BufferDesc *bufHdr, uint64 lockstate,
 }
 #endif
 
+#ifdef USE_UMBRA
 static inline void
 MarkSharedBufferDirtyHint(Buffer buffer, BufferDesc *bufHdr, uint64 lockstate,
-						  bool buffer_std, const char *before,
-						  char *delta_data, uint32 delta_len,
-						  bool delta_xlog_active, bool delta_prepared)
+							  bool buffer_std, const char *before,
+							  char *delta_data, uint32 delta_len,
+							  bool delta_xlog_active, bool delta_prepared)
+#else
+static inline void
+MarkSharedBufferDirtyHint(Buffer buffer, BufferDesc *bufHdr, uint64 lockstate,
+							  bool buffer_std)
+#endif
 {
 	Page		page = BufferGetPage(buffer);
 
@@ -6108,15 +6211,9 @@ MarkSharedBufferDirtyHint(Buffer buffer, BufferDesc *bufHdr, uint64 lockstate,
 		XLogRecPtr	lsn = InvalidXLogRecPtr;
 		bool		wal_log = false;
 		uint64		buf_state;
-#ifdef USE_UMBRA
-		Assert(!delta_prepared || delta_xlog_active);
-#else
-		(void) before;
-		(void) delta_data;
-		(void) delta_len;
-		(void) delta_xlog_active;
-		(void) delta_prepared;
-#endif
+	#ifdef USE_UMBRA
+	Assert(!delta_prepared || delta_xlog_active);
+	#endif
 
 		/*
 		 * If we need to protect hint bit updates from torn writes, WAL-log the
@@ -6270,9 +6367,14 @@ MarkBufferDirtyHint(Buffer buffer, bool buffer_std)
 		return;
 	}
 
+#ifdef USE_UMBRA
 	MarkSharedBufferDirtyHint(buffer, bufHdr,
-							  pg_atomic_read_u64(&bufHdr->state),
-							  buffer_std, NULL, NULL, 0, false, false);
+								  pg_atomic_read_u64(&bufHdr->state),
+								  buffer_std, NULL, NULL, 0, false, false);
+#else
+	MarkSharedBufferDirtyHint(buffer, bufHdr,
+								  pg_atomic_read_u64(&bufHdr->state), buffer_std);
+#endif
 }
 
 /*
@@ -7495,6 +7597,7 @@ BufferBeginSetHintBits(Buffer buffer)
 	return SharedBufferBeginSetHintBits(buffer, buf_hdr, &lockstate);
 }
 
+#ifdef USE_UMBRA
 /* Begin a hint update whose pre-update bytes can be WAL-logged by Umbra. */
 bool
 BufferBeginHintDelta(Buffer buffer, BufferHintDeltaContext *context)
@@ -7516,11 +7619,10 @@ BufferBeginHintDelta(Buffer buffer, BufferHintDeltaContext *context)
 	if (!SharedBufferBeginSetHintBits(buffer, buf_hdr, &lockstate))
 		return false;
 
-#ifdef USE_UMBRA
 	CaptureBufferHintPreimage(buffer, buf_hdr, lockstate, context);
-#endif
 	return true;
 }
+#endif
 
 /*
  * End a phase of setting hint bits on this buffer, started with
@@ -7541,6 +7643,7 @@ BufferFinishSetHintBits(Buffer buffer, bool mark_dirty, bool buffer_std)
 		MarkBufferDirtyHint(buffer, buffer_std);
 }
 
+#ifdef USE_UMBRA
 void
 BufferFinishHintDelta(BufferHintDeltaContext *context, bool mark_dirty,
 					  bool buffer_std)
@@ -7581,6 +7684,7 @@ BufferFinishHintDelta(BufferHintDeltaContext *context, bool mark_dirty,
 	context->xlog_active = false;
 	context->remap_prepared = false;
 }
+#endif
 
 /*
  * Try to set hint bits on a single 16bit value in a buffer.
@@ -7599,10 +7703,12 @@ BufferSetHintBits16(uint16 *ptr, uint16 val, Buffer buffer)
 {
 	BufferDesc *buf_hdr;
 	uint64		lockstate;
+#ifdef USE_UMBRA
 	char		delta[SizeOfXLogHintDeltaFragment + sizeof(uint16)];
 	uint32		delta_len = 0;
 	bool		delta_xlog_active = false;
 	bool		delta_prepared = false;
+#endif
 #ifdef USE_ASSERT_CHECKING
 	char	   *page;
 
@@ -7611,8 +7717,10 @@ BufferSetHintBits16(uint16 *ptr, uint16 val, Buffer buffer)
 	Assert((char *) ptr >= page && (char *) ptr < (page + BLCKSZ));
 #endif
 
+#ifdef USE_UMBRA
 	if (*ptr == val)
 		return true;
+#endif
 
 	if (BufferIsLocal(buffer))
 	{
@@ -7648,9 +7756,13 @@ BufferSetHintBits16(uint16 *ptr, uint16 val, Buffer buffer)
 #endif
 		*ptr = val;
 
+#ifdef USE_UMBRA
 		MarkSharedBufferDirtyHint(buffer, buf_hdr, lockstate, true, NULL,
-							  delta_len > 0 ? delta : NULL, delta_len,
-							  delta_xlog_active, delta_prepared);
+								  delta_len > 0 ? delta : NULL, delta_len,
+								  delta_xlog_active, delta_prepared);
+#else
+		MarkSharedBufferDirtyHint(buffer, buf_hdr, lockstate, true);
+#endif
 
 		return true;
 	}
@@ -8212,11 +8324,13 @@ ckpt_buforder_comparator(const CkptSortItem *a, const CkptSortItem *b)
 		return -1;
 	else if (a->tsId > b->tsId)
 		return 1;
+#ifdef USE_UMBRA
 	/* compare database */
 	if (a->dbOid < b->dbOid)
 		return -1;
 	else if (a->dbOid > b->dbOid)
 		return 1;
+#endif
 	/* compare relation */
 	if (a->relNumber < b->relNumber)
 		return -1;
@@ -8277,12 +8391,30 @@ WritebackContextInit(WritebackContext *context, int *max_pending)
  */
 void
 ScheduleBufferTagForWriteback(WritebackContext *wb_context, IOContext io_context,
-							  BufferTag *tag)
+								  BufferTag *tag)
 {
+#ifdef USE_UMBRA
 	ScheduleBufferTagForWritebackWithSlot(wb_context, io_context, tag,
-										  false, CKPT_BUFFER_SLOT_INVALID);
+											  false, CKPT_BUFFER_SLOT_INVALID);
+#else
+	PendingWriteback *pending;
+
+	if (io_direct_flags & IO_DIRECT_DATA || !enableFsync)
+		return;
+
+	if (*wb_context->max_pending > 0)
+	{
+		Assert(*wb_context->max_pending <= WRITEBACK_MAX_PENDING_FLUSHES);
+		pending = &wb_context->pending_writebacks[wb_context->nr_pending++];
+		pending->tag = *tag;
+	}
+
+	if (wb_context->nr_pending >= *wb_context->max_pending)
+		IssuePendingWritebacks(wb_context, io_context);
+#endif
 }
 
+#ifdef USE_UMBRA
 static void
 ScheduleBufferTagForWritebackWithSlot(WritebackContext *wb_context,
 									  IOContext io_context,
@@ -8347,10 +8479,15 @@ pending_writeback_comparator(const PendingWriteback *a, const PendingWriteback *
 
 	return 0;
 }
+#endif
 
 #define ST_SORT sort_pending_writebacks
 #define ST_ELEMENT_TYPE PendingWriteback
+#ifdef USE_UMBRA
 #define ST_COMPARE(a, b) pending_writeback_comparator(a, b)
+#else
+#define ST_COMPARE(a, b) buffertag_comparator(&a->tag, &b->tag)
+#endif
 #define ST_SCOPE static
 #define ST_DEFINE
 #include "lib/sort_template.h"
@@ -8557,8 +8694,12 @@ EvictUnpinnedBufferInternal(BufferDesc *desc, bool *buffer_flushed)
 	/* If it was dirty, try to clean it once. */
 	if (buf_state & BM_DIRTY)
 	{
+	#ifdef USE_UMBRA
 		(void) FlushUnlockedBuffer(desc, NULL, IOOBJECT_RELATION,
 								   IOCONTEXT_NORMAL, NULL);
+	#else
+		FlushUnlockedBuffer(desc, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+	#endif
 		*buffer_flushed = true;
 	}
 

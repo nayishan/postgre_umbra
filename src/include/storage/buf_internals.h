@@ -394,8 +394,10 @@ typedef struct PendingWriteback
 {
 	/* could store different types of pending flushes here */
 	BufferTag	tag;
+#ifdef USE_UMBRA
 	bool		checkpoint_slot_valid;
 	uint8		checkpoint_slot;
+#endif
 } PendingWriteback;
 
 /* struct forward declared in bufmgr.h */
@@ -415,8 +417,8 @@ typedef struct WritebackContext
 extern PGDLLIMPORT BufferDescPadded *BufferDescriptors;
 extern PGDLLIMPORT ConditionVariableMinimallyPadded *BufferIOCVArray;
 extern PGDLLIMPORT WritebackContext BackendWritebackContext;
-#define CKPT_BUFFER_SLOT_INVALID	((uint8) 0xFF)
 #ifdef USE_UMBRA
+#define CKPT_BUFFER_SLOT_INVALID	((uint8) 0xFF)
 extern PGDLLIMPORT uint8 *CkptBufferSlots;
 extern PGDLLIMPORT uint32 *CkptBufferSlotEpochs;
 extern PGDLLIMPORT pg_atomic_uint32 *CkptBufferSlotCaptureEpoch;
@@ -517,7 +519,9 @@ extern uint64 WaitBufHdrUnlocked(BufferDesc *buf);
 typedef struct CkptSortItem
 {
 	Oid			tsId;
+#ifdef USE_UMBRA
 	Oid			dbOid;
+#endif
 	RelFileNumber relNumber;
 	ForkNumber	forkNum;
 	BlockNumber blockNum;

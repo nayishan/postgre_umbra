@@ -920,14 +920,21 @@ heap_page_fix_vm_corruption(PruneState *prstate, OffsetNumber offnum,
 	/* Avoid marking the buffer dirty if PD_ALL_VISIBLE is already clear */
 	if (do_clear_heap)
 	{
+	#ifdef USE_UMBRA
 		BufferHintDeltaContext hint_delta;
+	#endif
 
 		Assert(PageIsAllVisible(prstate->page));
+	#ifdef USE_UMBRA
 		if (BufferBeginHintDelta(prstate->buffer, &hint_delta))
 		{
 			PageClearAllVisible(prstate->page);
 			BufferFinishHintDelta(&hint_delta, true, true);
 		}
+	#else
+		PageClearAllVisible(prstate->page);
+		MarkBufferDirtyHint(prstate->buffer, true);
+	#endif
 	}
 
 	if (do_clear_vm)
@@ -1024,6 +1031,7 @@ prune_freeze_fast_path(PruneState *prstate, PruneFreezeResult *presult)
 	/* Clear any stale prune hint */
 	if (TransactionIdIsValid(PageGetPruneXid(page)))
 	{
+	#ifdef USE_UMBRA
 		BufferHintDeltaContext hint_delta;
 
 		if (BufferBeginHintDelta(prstate->buffer, &hint_delta))
@@ -1031,6 +1039,10 @@ prune_freeze_fast_path(PruneState *prstate, PruneFreezeResult *presult)
 			PageClearPrunable(page);
 			BufferFinishHintDelta(&hint_delta, true, true);
 		}
+	#else
+		PageClearPrunable(page);
+		MarkBufferDirtyHint(prstate->buffer, true);
+	#endif
 	}
 
 	if (PageIsEmpty(page))
@@ -1109,10 +1121,14 @@ heap_page_prune_and_freeze(PruneFreezeParams *params,
 	bool		do_hint_prune;
 	bool		do_set_vm;
 	bool		did_tuple_hint_fpi;
+#ifdef USE_UMBRA
 	bool		hint_delta_started = false;
+#endif
 	int64		fpi_before = pgWalUsage.wal_fpi;
 	TransactionId conflict_xid;
+#ifdef USE_UMBRA
 	BufferHintDeltaContext hint_delta;
+#endif
 
 	/* Initialize prstate */
 	prune_freeze_setup(params,
@@ -1238,9 +1254,11 @@ heap_page_prune_and_freeze(PruneFreezeParams *params,
 	if (do_set_vm)
 		LockBuffer(prstate.vmbuffer, BUFFER_LOCK_EXCLUSIVE);
 
+	#ifdef USE_UMBRA
 	/* Capture before the critical section can apply the hint-only change. */
 	if (do_hint_prune && !do_freeze && !do_prune && !do_set_vm)
 		hint_delta_started = BufferBeginHintDelta(prstate.buffer, &hint_delta);
+	#endif
 
 	/* Any error while applying the changes is critical */
 	START_CRIT_SECTION();
@@ -1268,8 +1286,13 @@ heap_page_prune_and_freeze(PruneFreezeParams *params,
 		 * Setting PD_ALL_VISIBLE is fully WAL-logged because it is forbidden
 		 * for the VM to be set and PD_ALL_VISIBLE to be clear.
 		 */
+	#ifdef USE_UMBRA
 		if (!do_freeze && !do_prune && !do_set_vm && hint_delta_started)
 			BufferFinishHintDelta(&hint_delta, true, true);
+	#else
+		if (!do_freeze && !do_prune && !do_set_vm)
+			MarkBufferDirtyHint(prstate.buffer, true);
+	#endif
 	}
 
 	if (do_prune || do_freeze || do_set_vm)

@@ -32,7 +32,9 @@
 #include "catalog/pg_control.h"
 #include "common/pg_lzcompress.h"
 #include "replication/origin.h"
+#ifdef USE_UMBRA
 #include "storage/bufpage.h"
+#endif
 
 #ifndef FRONTEND
 #include "pgstat.h"

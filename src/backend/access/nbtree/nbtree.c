@@ -1414,7 +1414,9 @@ btvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 static BlockNumber
 btvacuumpage(BTVacState *vstate, Buffer buf)
 {
+#ifdef USE_UMBRA
 	BufferHintDeltaContext hint_delta;
+#endif
 	IndexVacuumInfo *info = vstate->info;
 	IndexBulkDeleteResult *stats = vstate->stats;
 	IndexBulkDeleteCallback callback = vstate->callback;
@@ -1666,11 +1668,16 @@ backtrack:
 			if (vstate->cycleid != 0 &&
 				opaque->btpo_cycleid == vstate->cycleid)
 			{
+	#ifdef USE_UMBRA
 				if (BufferBeginHintDelta(buf, &hint_delta))
 				{
 					opaque->btpo_cycleid = 0;
 					BufferFinishHintDelta(&hint_delta, true, true);
 				}
+	#else
+				opaque->btpo_cycleid = 0;
+				MarkBufferDirtyHint(buf, true);
+	#endif
 			}
 		}
 

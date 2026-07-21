@@ -521,7 +521,9 @@ brin_metapage_init(Page page, BlockNumber pagesPerRange, uint16 version)
 bool
 brin_start_evacuating_page(Relation idxRel, Buffer buf)
 {
+#ifdef USE_UMBRA
 	BufferHintDeltaContext hint_delta;
+#endif
 	OffsetNumber off;
 	OffsetNumber maxoff;
 	Page		page;
@@ -545,11 +547,16 @@ brin_start_evacuating_page(Relation idxRel, Buffer buf)
 			 * can no longer be used to add new tuples.  Note that this flag
 			 * is not WAL-logged, except accidentally.
 			 */
+	#ifdef USE_UMBRA
 			if (BufferBeginHintDelta(buf, &hint_delta))
 			{
 				BrinPageFlags(page) |= BRIN_EVACUATE_PAGE;
 				BufferFinishHintDelta(&hint_delta, true, true);
 			}
+	#else
+			BrinPageFlags(page) |= BRIN_EVACUATE_PAGE;
+			MarkBufferDirtyHint(buf, true);
+	#endif
 
 			return true;
 		}

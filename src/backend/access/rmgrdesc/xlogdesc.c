@@ -87,6 +87,7 @@ xlog2_desc(StringInfo buf, XLogReaderState *record)
 		memcpy(&xlrec, rec, sizeof(xl_checksum_state));
 		appendStringInfoString(buf, get_checksum_state_string(xlrec.new_checksum_state));
 	}
+#ifdef USE_UMBRA
 	else if (info == XLOG2_HINT_DELTA)
 	{
 		char	   *data;
@@ -133,6 +134,7 @@ xlog2_desc(StringInfo buf, XLogReaderState *record)
 			appendStringInfo(buf, "fragments %d, final bytes %u",
 							 fragments, final_bytes);
 	}
+#endif
 }
 
 void
@@ -336,9 +338,11 @@ xlog2_identify(uint8 info)
 		case XLOG2_CHECKSUMS:
 			id = "CHECKSUMS";
 			break;
+#ifdef USE_UMBRA
 		case XLOG2_HINT_DELTA:
 			id = "HINT_DELTA";
 			break;
+#endif
 	}
 
 	return id;
