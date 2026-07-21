@@ -91,6 +91,7 @@ MapShmemRequest(void *arg)
 		);
 
 	MapCacheTableShmemRequest();
+	MapCheckpointEpochShmemRequest();
 	MapSuperTableShmemRequest();
 }
 
@@ -118,7 +119,6 @@ MapShmemInit(void *arg)
 		buf->freeNext = (i == map_buffers - 1) ? FREENEXT_END_OF_LIST : i + 1;
 		pg_atomic_init_u32(&buf->state, 0);
 		buf->wait_backend_pid = 0;
-
 		memset(&buf->rnode, 0, sizeof(RelFileLocator));
 		buf->forknum = InvalidForkNumber;
 		buf->page_number = -1;
@@ -131,6 +131,7 @@ MapShmemInit(void *arg)
 	memset(MapPageData, 0, map_buffers * BLCKSZ);
 
 	MapCacheTableShmemInit();
+	MapCheckpointEpochShmemInit();
 	MapSuperTableShmemInit();
 }
 

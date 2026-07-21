@@ -505,8 +505,8 @@ UmbraShiftGetRun(UmbraFileContext *map_ctx, RelFileLocator rnode,
 
 void
 UmbraShiftSet(UmbraFileContext *map_ctx, RelFileLocator rnode,
-			  ForkNumber forknum, BlockNumber lblkno,
-			  uint8 active_slot, XLogRecPtr map_lsn)
+				  ForkNumber forknum, BlockNumber lblkno,
+				  uint8 active_slot, XLogRecPtr map_lsn)
 {
 	BlockNumber	shift_blkno;
 	int			bit_idx;

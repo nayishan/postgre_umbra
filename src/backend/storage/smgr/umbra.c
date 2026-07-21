@@ -553,6 +553,24 @@ uminit(void)
 }
 
 void
+umcheckpointbegin(void)
+{
+	MapCheckpointBegin();
+}
+
+void
+umcheckpointend(void)
+{
+	MapCheckpointEnd();
+}
+
+void
+umcheckpointabort(void)
+{
+	MapCheckpointAbort();
+}
+
+void
 umbeforeshmemexitcleanup(void)
 {
 	MapBackendExitCleanup();
@@ -1512,76 +1530,10 @@ UmTranslationSlotPhysicalBlockExists(SMgrRelation reln, ForkNumber forknum,
 	return umfile_ctx_block_exists(ctx, forknum, pblk);
 }
 
-bool
-UmCheckpointCaptureSlot(SMgrRelation reln, ForkNumber forknum,
-						BlockNumber lblkno, uint8 *checkpoint_slot)
+uint32
+UmCheckpointCurrentEpoch(void)
 {
-	UmbraAccessState access;
-	UmbraFileContext *ctx = um_ctx_acquire(reln);
-	uint8		active_slot = 0;
-
-	Assert(checkpoint_slot != NULL);
-
-	access = um_classify_access(reln, forknum);
-	if (!um_state_uses_chunk_base(access.policy))
-		return false;
-
-	if (lblkno >= umnblocks_for_access(reln, forknum, &access))
-		return false;
-
-	(void) UmbraShiftGet(ctx, reln->smgr_rlocator.locator,
-						 forknum, lblkno, &active_slot);
-	*checkpoint_slot = active_slot;
-	return true;
-}
-
-void
-UmCheckpointWriteSlot(SMgrRelation reln, ForkNumber forknum,
-					  BlockNumber lblkno, const void *buffer,
-					  uint8 checkpoint_slot)
-{
-	UmbraAccessState access;
-	UmbraFileContext *ctx = um_ctx_acquire(reln);
-	BlockNumber		pblk;
-
-	if (!UmbraChunkActiveSlotIsValid(checkpoint_slot))
-		elog(ERROR, "invalid Umbra checkpoint slot %u", checkpoint_slot);
-
-	access = um_classify_access(reln, forknum);
-	if (!um_state_uses_chunk_base(access.policy))
-		elog(ERROR,
-			 "checkpoint slot write requested for non-chunk Umbra relation %u/%u/%u fork %d block %u",
-			 reln->smgr_rlocator.locator.spcOid,
-			 reln->smgr_rlocator.locator.dbOid,
-			 reln->smgr_rlocator.locator.relNumber,
-			 forknum, lblkno);
-
-	um_ensure_chunk_physical_capacity(reln, forknum, ctx, lblkno + 1,
-									  false);
-	pblk = um_chunk_slot_pblk_checked(reln, forknum, lblkno,
-									  checkpoint_slot);
-	umfile_ctx_ensure_block_exists(ctx, forknum, pblk);
-	umfile_writev(ctx, forknum, pblk, &buffer, 1, false);
-}
-
-void
-UmCheckpointWritebackSlot(SMgrRelation reln, ForkNumber forknum,
-						  BlockNumber lblkno, uint8 checkpoint_slot)
-{
-	UmbraAccessState access;
-	UmbraFileContext *ctx = um_ctx_acquire(reln);
-	BlockNumber		pblk;
-
-	if (!UmbraChunkActiveSlotIsValid(checkpoint_slot))
-		return;
-
-	access = um_classify_access(reln, forknum);
-	if (!um_state_uses_chunk_base(access.policy))
-		return;
-
-	pblk = um_chunk_slot_pblk_checked(reln, forknum, lblkno,
-									  checkpoint_slot);
-	umfile_writeback(ctx, forknum, pblk, 1);
+	return MapCheckpointCurrentEpoch();
 }
 
 uint8
@@ -1627,7 +1579,7 @@ UmShiftSetActiveSlot(SMgrRelation reln, ForkNumber forknum, BlockNumber lblkno,
 	if (um_state_uses_chunk_base(access.policy))
 	{
 		UmbraShiftSet(ctx, reln->smgr_rlocator.locator,
-					  forknum, lblkno, active_slot, map_lsn);
+						  forknum, lblkno, active_slot, map_lsn);
 		return;
 	}
 
@@ -2511,6 +2463,57 @@ umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		logical_nblocks = umnblocks_for_access(reln, forknum, &access);
 		Assert(logical_nblocks >= blocknum + nblocks);
 	}
+}
+
+SmgrCheckpointWriteResult
+umwritevcheckpoint(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+					 const void **buffers, BlockNumber nblocks,
+					 uint32 checkpoint_epoch, bool skipFsync)
+{
+	UmbraAccessState access;
+	UmbraFileContext *ctx;
+	uint8		active_slot;
+	uint8		source_slot;
+	BlockNumber	pblk;
+
+	if (nblocks != 1)
+	{
+		umwritev(reln, forknum, blocknum, buffers, nblocks, skipFsync);
+		return SMGR_CHECKPOINT_WRITE_ACTIVE;
+	}
+
+	access = um_classify_access(reln, forknum);
+	if (!um_state_uses_chunk_base(access.policy))
+	{
+		umwritev(reln, forknum, blocknum, buffers, nblocks, skipFsync);
+		return SMGR_CHECKPOINT_WRITE_ACTIVE;
+	}
+
+	/* A matching epoch means this page shifted during this checkpoint. */
+	if (checkpoint_epoch == 0 ||
+		checkpoint_epoch != MapCheckpointCurrentEpoch())
+	{
+		umwritev(reln, forknum, blocknum, buffers, nblocks, skipFsync);
+		return SMGR_CHECKPOINT_WRITE_ACTIVE;
+	}
+
+	ctx = um_ctx_acquire(reln);
+	(void) UmbraShiftGet(ctx, reln->smgr_rlocator.locator,
+						 forknum, blocknum, &active_slot);
+
+	/*
+	 * A page shifts only on its first full-page-write-eligible change in a
+	 * checkpoint interval, so the predecessor of the active slot is the
+	 * source image that this checkpoint needs.
+	 */
+	source_slot = UmbraChunkPreviousActiveSlot(active_slot);
+	um_ensure_chunk_physical_capacity(reln, forknum, ctx, blocknum + 1,
+									  skipFsync);
+	pblk = um_chunk_slot_pblk_checked(reln, forknum, blocknum, source_slot);
+	umfile_ctx_ensure_block_exists(ctx, forknum, pblk);
+	umfile_writev(ctx, forknum, pblk, buffers, 1, skipFsync);
+
+	return SMGR_CHECKPOINT_WRITE_IMAGE_ONLY;
 }
 
 void

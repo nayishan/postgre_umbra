@@ -135,8 +135,8 @@ extern BlockNumber UmbraShiftGetRun(UmbraFileContext *map_ctx,
 									BlockNumber maxblocks,
 									uint8 *active_slot);
 extern void UmbraShiftSet(UmbraFileContext *map_ctx, RelFileLocator rnode,
-						  ForkNumber forknum, BlockNumber lblkno,
-						  uint8 active_slot, XLogRecPtr map_lsn);
+							  ForkNumber forknum, BlockNumber lblkno,
+							  uint8 active_slot, XLogRecPtr map_lsn);
 extern void UmbraShiftTruncate(UmbraFileContext *map_ctx,
 							   RelFileLocator rnode,
 							   ForkNumber forknum,

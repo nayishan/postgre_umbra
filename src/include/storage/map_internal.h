@@ -22,4 +22,11 @@ extern void MapTerminateBufferIO(MapBufferDesc *buf, bool clear_dirty,
 								 uint32 set_flag_bits);
 extern void MapFlushBuffer(int slot_id);
 
+extern void MapCheckpointEpochShmemRequest(void);
+extern void MapCheckpointEpochShmemInit(void);
+extern void MapCheckpointBegin(void);
+extern void MapCheckpointEnd(void);
+extern void MapCheckpointAbort(void);
+extern uint32 MapCheckpointCurrentEpoch(void);
+
 #endif							/* MAP_INTERNAL_H */

@@ -117,9 +117,16 @@ typedef struct f_smgr
 									BlockNumber blocknum,
 									void **buffers, BlockNumber nblocks);
 	void		(*smgr_writev) (SMgrRelation reln, ForkNumber forknum,
-								BlockNumber blocknum,
-								const void **buffers, BlockNumber nblocks,
-								bool skipFsync);
+									BlockNumber blocknum,
+									const void **buffers, BlockNumber nblocks,
+									bool skipFsync);
+	SmgrCheckpointWriteResult (*smgr_writev_checkpoint) (SMgrRelation reln,
+													 ForkNumber forknum,
+													 BlockNumber blocknum,
+													 const void **buffers,
+													 BlockNumber nblocks,
+													 uint32 checkpoint_epoch,
+													 bool skipFsync);
 	void		(*smgr_writeback) (SMgrRelation reln, ForkNumber forknum,
 								   BlockNumber blocknum, BlockNumber nblocks);
 	BlockNumber (*smgr_nblocks) (SMgrRelation reln, ForkNumber forknum);
@@ -154,6 +161,9 @@ typedef struct f_smgr
 	void		(*smgr_clear_skip_wal_pending) (SMgrRelation reln);
 	bool		(*smgr_prepare_pendingsync) (SMgrRelation reln);
 	bool		(*smgr_needs_recovery_fsm_vacuum) (SMgrRelation reln);
+	void		(*smgr_checkpoint_begin) (void);
+	void		(*smgr_checkpoint_end) (void);
+	void		(*smgr_checkpoint_abort) (void);
 } f_smgr;
 
 static const f_smgr smgrsw[] = {
@@ -176,6 +186,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_readv = umreadv,
 		.smgr_startreadv = umstartreadv,
 		.smgr_writev = umwritev,
+		.smgr_writev_checkpoint = umwritevcheckpoint,
 		.smgr_writeback = umwriteback,
 		.smgr_nblocks = umnblocks,
 		.smgr_pretruncate = umpretruncate,
@@ -198,6 +209,9 @@ static const f_smgr smgrsw[] = {
 		.smgr_clear_skip_wal_pending = umclearskipwalpending,
 		.smgr_prepare_pendingsync = umpreparependingsync,
 		.smgr_needs_recovery_fsm_vacuum = umneedsrecoveryfsmvacuum,
+		.smgr_checkpoint_begin = umcheckpointbegin,
+		.smgr_checkpoint_end = umcheckpointend,
+		.smgr_checkpoint_abort = umcheckpointabort,
 	},
 #else
 	/* magnetic disk */
@@ -218,6 +232,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_readv = mdreadv,
 		.smgr_startreadv = mdstartreadv,
 		.smgr_writev = mdwritev,
+		.smgr_writev_checkpoint = NULL,
 		.smgr_writeback = mdwriteback,
 		.smgr_nblocks = mdnblocks,
 		.smgr_pretruncate = NULL,
@@ -235,6 +250,9 @@ static const f_smgr smgrsw[] = {
 		.smgr_clear_skip_wal_pending = NULL,
 		.smgr_prepare_pendingsync = NULL,
 		.smgr_needs_recovery_fsm_vacuum = NULL,
+		.smgr_checkpoint_begin = NULL,
+		.smgr_checkpoint_end = NULL,
+		.smgr_checkpoint_abort = NULL,
 	}
 #endif
 };
@@ -1059,6 +1077,66 @@ smgrwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	smgrsw[reln->smgr_which].smgr_writev(reln, forknum, blocknum,
 										 buffers, nblocks, skipFsync);
 	RESUME_INTERRUPTS();
+}
+
+SmgrCheckpointWriteResult
+smgrwritevcheckpoint(SMgrRelation reln, ForkNumber forknum,
+						BlockNumber blocknum, const void **buffers,
+						BlockNumber nblocks, uint32 checkpoint_epoch,
+						bool skipFsync)
+{
+	SmgrCheckpointWriteResult result;
+
+	HOLD_INTERRUPTS();
+	if (smgrsw[reln->smgr_which].smgr_writev_checkpoint != NULL)
+		result = smgrsw[reln->smgr_which].smgr_writev_checkpoint(reln, forknum,
+													  blocknum, buffers, nblocks,
+													  checkpoint_epoch, skipFsync);
+	else
+	{
+		smgrsw[reln->smgr_which].smgr_writev(reln, forknum, blocknum,
+												 buffers, nblocks, skipFsync);
+		result = SMGR_CHECKPOINT_WRITE_ACTIVE;
+	}
+	RESUME_INTERRUPTS();
+
+	return result;
+}
+
+void
+smgrcheckpointbegin(void)
+{
+	int			i;
+
+	for (i = 0; i < NSmgr; i++)
+	{
+		if (smgrsw[i].smgr_checkpoint_begin != NULL)
+			smgrsw[i].smgr_checkpoint_begin();
+	}
+}
+
+void
+smgrcheckpointend(void)
+{
+	int			i;
+
+	for (i = 0; i < NSmgr; i++)
+	{
+		if (smgrsw[i].smgr_checkpoint_end != NULL)
+			smgrsw[i].smgr_checkpoint_end();
+	}
+}
+
+void
+smgrcheckpointabort(void)
+{
+	int			i;
+
+	for (i = 0; i < NSmgr; i++)
+	{
+		if (smgrsw[i].smgr_checkpoint_abort != NULL)
+			smgrsw[i].smgr_checkpoint_abort();
+	}
 }
 
 /*

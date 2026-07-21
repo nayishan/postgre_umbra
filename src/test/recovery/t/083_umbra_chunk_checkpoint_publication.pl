@@ -48,6 +48,7 @@ autovacuum = off
 full_page_writes = on
 wal_log_hints = off
 shared_buffers = '256MB'
+bgwriter_lru_maxpages = 0
 max_wal_size = '4GB'
 min_wal_size = '1GB'
 checkpoint_timeout = '1h'
@@ -141,6 +142,68 @@ is($node->safe_psql(
 		   WHERE left(payload, 8) = left(md5(id::text), 8);]),
 	'5',
 	'updated rows are visible after checkpoint-crossing crash recovery');
+
+SKIP:
+{
+	skip 'extension injection_points not installed', 5
+		unless $node->check_extension('injection_points');
+
+	$node->safe_psql('postgres', 'CREATE EXTENSION injection_points');
+	$node->safe_psql('postgres', q[
+CREATE TABLE umb_c3_source_t(id int, payload text) WITH (fillfactor = 70);
+ALTER TABLE umb_c3_source_t ALTER COLUMN payload SET STORAGE PLAIN;
+INSERT INTO umb_c3_source_t VALUES (1, repeat('x', 7000));
+CHECKPOINT;
+UPDATE umb_c3_source_t
+SET payload = 'before' || repeat('b', 6994)
+WHERE id = 1;
+]);
+
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_attach('create-checkpoint-initial', 'wait')]);
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_attach('create-checkpoint-run', 'wait')]);
+
+	my $source_checkpoint = $node->background_psql('postgres');
+	$source_checkpoint->{stdin} .= "CHECKPOINT;\n\\echo source_checkpoint_done\n";
+	$source_checkpoint->{run}->pump_nb();
+
+	$node->wait_for_event('checkpointer', 'create-checkpoint-initial');
+	pass('checkpoint reaches the setup pause before its critical section');
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_wakeup('create-checkpoint-initial')]);
+	$node->wait_for_event('checkpointer', 'create-checkpoint-run');
+	pass('checkpoint epoch is active before the second page shift');
+
+	is($node->safe_psql('postgres', q[
+UPDATE umb_c3_source_t
+SET payload = 'during' || repeat('d', 6994)
+WHERE id = 1
+RETURNING left(payload, 6);
+]), 'during', 'second update shifts the checkpoint-dirty page');
+
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_wakeup('create-checkpoint-run')]);
+	ok(pump_until(
+		$source_checkpoint->{run},
+		$psql_timeout,
+		\$source_checkpoint->{stdout},
+		qr/source_checkpoint_done/),
+		'checkpoint completes after the epoch-backed source write');
+	$source_checkpoint->quit;
+
+	$node->safe_psql('postgres', q[
+SELECT injection_points_detach('create-checkpoint-initial');
+SELECT injection_points_detach('create-checkpoint-run');
+]);
+
+	$node->stop('immediate');
+	$node->start();
+	is($node->safe_psql('postgres',
+		q[SELECT left(payload, 6) FROM umb_c3_source_t WHERE id = 1]),
+		'during',
+		'crash recovery reads the checkpoint source image before replaying the shift');
+}
 
 $node->stop();
 

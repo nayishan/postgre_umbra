@@ -90,6 +90,14 @@ UmbraChunkNextActiveSlot(uint8 active_slot)
 	return (uint8) ((active_slot + 1) % UMBRA_CHUNK_ACTIVE_SLOTS);
 }
 
+static inline uint8
+UmbraChunkPreviousActiveSlot(uint8 active_slot)
+{
+	Assert(UmbraChunkActiveSlotIsValid(active_slot));
+	return (uint8) ((active_slot + UMBRA_CHUNK_ACTIVE_SLOTS - 1) %
+					UMBRA_CHUNK_ACTIVE_SLOTS);
+}
+
 static inline bool
 UmbraChunkPairedSlotPblk(BlockNumber lblkno, uint8 active_slot,
 						BlockNumber *pblkno)
@@ -226,6 +234,13 @@ extern void umstartreadv(PgAioHandle *ioh,
 						 void **buffers, BlockNumber nblocks);
 extern void umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 					 const void **buffers, BlockNumber nblocks, bool skipFsync);
+extern SmgrCheckpointWriteResult umwritevcheckpoint(SMgrRelation reln,
+													ForkNumber forknum,
+													BlockNumber blocknum,
+													const void **buffers,
+													BlockNumber nblocks,
+													uint32 checkpoint_epoch,
+													bool skipFsync);
 extern void umwriteback(SMgrRelation reln, ForkNumber forknum,
 						BlockNumber blocknum, BlockNumber nblocks);
 extern void umpretruncate(SMgrRelation reln, ForkNumber forknum,
@@ -241,6 +256,9 @@ extern int umfd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uin
 extern int umsyncfiletag(const FileTag *ftag, char *path);
 extern int umunlinkfiletag(const FileTag *ftag, char *path);
 extern bool umfiletagmatches(const FileTag *ftag, const FileTag *candidate);
+extern void umcheckpointbegin(void);
+extern void umcheckpointend(void);
+extern void umcheckpointabort(void);
 
 /*
  * Runtime semantic helpers.
@@ -269,19 +287,12 @@ extern bool UmTranslationSlotPhysicalBlockExists(SMgrRelation reln,
 												 ForkNumber forknum,
 												 BlockNumber lblkno,
 												 uint8 slot);
-extern bool UmCheckpointCaptureSlot(SMgrRelation reln, ForkNumber forknum,
-									BlockNumber lblkno, uint8 *checkpoint_slot);
-extern void UmCheckpointWriteSlot(SMgrRelation reln, ForkNumber forknum,
-								  BlockNumber lblkno, const void *buffer,
-								  uint8 checkpoint_slot);
-extern void UmCheckpointWritebackSlot(SMgrRelation reln, ForkNumber forknum,
-									  BlockNumber lblkno,
-									  uint8 checkpoint_slot);
+extern uint32 UmCheckpointCurrentEpoch(void);
 extern uint8 UmShiftChooseTargetSlot(SMgrRelation reln, ForkNumber forknum,
 									 BlockNumber lblkno, uint8 *source_slot);
 extern void UmShiftSetActiveSlot(SMgrRelation reln, ForkNumber forknum,
-								 BlockNumber lblkno, uint8 active_slot,
-								 XLogRecPtr map_lsn);
+									 BlockNumber lblkno, uint8 active_slot,
+									 XLogRecPtr map_lsn);
 extern void UmRedoBeginShiftSourceSide(SMgrRelation reln, ForkNumber forknum,
 									   BlockNumber lblkno,
 									   uint8 source_slot);

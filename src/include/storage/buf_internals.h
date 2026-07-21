@@ -394,10 +394,6 @@ typedef struct PendingWriteback
 {
 	/* could store different types of pending flushes here */
 	BufferTag	tag;
-#ifdef USE_UMBRA
-	bool		checkpoint_slot_valid;
-	uint8		checkpoint_slot;
-#endif
 } PendingWriteback;
 
 /* struct forward declared in bufmgr.h */
@@ -418,10 +414,7 @@ extern PGDLLIMPORT BufferDescPadded *BufferDescriptors;
 extern PGDLLIMPORT ConditionVariableMinimallyPadded *BufferIOCVArray;
 extern PGDLLIMPORT WritebackContext BackendWritebackContext;
 #ifdef USE_UMBRA
-#define CKPT_BUFFER_SLOT_INVALID	((uint8) 0xFF)
-extern PGDLLIMPORT uint8 *CkptBufferSlots;
-extern PGDLLIMPORT uint32 *CkptBufferSlotEpochs;
-extern PGDLLIMPORT pg_atomic_uint32 *CkptBufferSlotCaptureEpoch;
+extern PGDLLIMPORT uint32 *CkptBufferShiftEpochs;
 #endif
 
 /* in localbuf.c */

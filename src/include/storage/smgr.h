@@ -76,6 +76,17 @@ typedef SMgrRelationData *SMgrRelation;
 #define SmgrIsTemp(smgr) \
 	RelFileLocatorBackendIsTemp((smgr)->smgr_rlocator)
 
+/*
+ * Outcome of a checkpoint-intent data write.  IMAGE_ONLY leaves the buffer
+ * dirty because the storage manager wrote a checkpoint image rather than the
+ * active physical target.
+ */
+typedef enum SmgrCheckpointWriteResult
+{
+	SMGR_CHECKPOINT_WRITE_ACTIVE,
+	SMGR_CHECKPOINT_WRITE_IMAGE_ONLY
+} SmgrCheckpointWriteResult;
+
 extern PGDLLIMPORT const PgAioTargetInfo aio_smgr_target_info;
 
 extern void smgrinit(void);
@@ -110,8 +121,18 @@ extern void smgrwritev(SMgrRelation reln, ForkNumber forknum,
 					   BlockNumber blocknum,
 					   const void **buffers, BlockNumber nblocks,
 					   bool skipFsync);
+extern SmgrCheckpointWriteResult smgrwritevcheckpoint(SMgrRelation reln,
+											ForkNumber forknum,
+											BlockNumber blocknum,
+											const void **buffers,
+											BlockNumber nblocks,
+											uint32 checkpoint_epoch,
+											bool skipFsync);
 extern void smgrwriteback(SMgrRelation reln, ForkNumber forknum,
-						  BlockNumber blocknum, BlockNumber nblocks);
+							  BlockNumber blocknum, BlockNumber nblocks);
+extern void smgrcheckpointbegin(void);
+extern void smgrcheckpointend(void);
+extern void smgrcheckpointabort(void);
 extern BlockNumber smgrnblocks(SMgrRelation reln, ForkNumber forknum);
 extern BlockNumber smgrnblocks_cached(SMgrRelation reln, ForkNumber forknum);
 extern void smgrbumpcachednblocks(SMgrRelation reln, ForkNumber forknum,
@@ -162,6 +183,15 @@ smgrwrite(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		  const void *buffer, bool skipFsync)
 {
 	smgrwritev(reln, forknum, blocknum, &buffer, 1, skipFsync);
+}
+
+static inline SmgrCheckpointWriteResult
+smgrwritecheckpoint(SMgrRelation reln, ForkNumber forknum,
+					BlockNumber blocknum, const void *buffer,
+					uint32 checkpoint_epoch, bool skipFsync)
+{
+	return smgrwritevcheckpoint(reln, forknum, blocknum, &buffer, 1,
+							  checkpoint_epoch, skipFsync);
 }
 
 extern void pgaio_io_set_target_smgr(PgAioHandle *ioh,

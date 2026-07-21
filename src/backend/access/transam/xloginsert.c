@@ -307,10 +307,11 @@ XLogCommitBlockShiftsUmbra(XLogRecPtr record_endptr)
 
 		ctx = umfile_ctx_acquire(regbuf->shift_reln->smgr_rlocator);
 
-		if (!regbuf->hint_delta_shift)
-			BufferSaveCheckpointSlot(regbuf->buffer, regbuf->shift_source_slot);
 		UmShiftSetActiveSlot(regbuf->shift_reln, regbuf->forkno, regbuf->block,
 							  regbuf->shift_target_slot, record_endptr);
+		if (!regbuf->hint_delta_shift)
+			BufferSaveCheckpointShiftEpoch(regbuf->buffer,
+										   UmCheckpointCurrentEpoch());
 		if (UmbraChunkPairedPhysicalCapacity(regbuf->shift_logical_nblocks,
 											 &physical_nblocks) &&
 			physical_nblocks > 0)
@@ -336,12 +337,11 @@ XLogAbortBlockShiftsUmbra(void)
 	{
 		registered_buffer *regbuf = &registered_buffers[block_id];
 
-		if (!regbuf->in_use || !regbuf->has_shift)
-			continue;
-		if (regbuf->shift_committed)
+		if (!regbuf->in_use)
 			continue;
 
-		regbuf->shift_in_record = false;
+		if (!regbuf->shift_committed)
+			regbuf->shift_in_record = false;
 	}
 }
 #else
@@ -1461,7 +1461,7 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 
 		include_image = needs_backup || (info & XLR_CHECK_CONSISTENCY) != 0;
 		if (regbuf->has_shift)
-			include_shift = regbuf->has_shift;
+			include_shift = true;
 		else if (needs_shift)
 		{
 			reln = smgropen(regbuf->rlocator, INVALID_PROC_NUMBER);
@@ -1469,9 +1469,6 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 			regbuf->shift_target_slot =
 				UmShiftChooseTargetSlot(reln, regbuf->forkno, regbuf->block,
 										&regbuf->shift_source_slot);
-			BufferSaveCheckpointSlot(regbuf->buffer,
-									  regbuf->shift_source_slot);
-
 			regbuf->has_shift = true;
 			regbuf->shift_committed = false;
 			include_shift = true;

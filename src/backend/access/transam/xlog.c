@@ -96,6 +96,7 @@
 #include "storage/procsignal.h"
 #include "storage/reinit.h"
 #include "storage/spin.h"
+#include "storage/smgr.h"
 #include "storage/subsystems.h"
 #include "storage/sync.h"
 #ifdef USE_UMBRA
@@ -942,6 +943,7 @@ XLogInsertRecord(XLogRecData *rdata,
 		ReserveXLogInsertLocation(rechdr->xl_tot_len, &StartPos, &EndPos,
 								  &rechdr->xl_prev);
 		RedoRecPtr = Insert->RedoRecPtr = StartPos;
+		smgrcheckpointbegin();
 		inserted = true;
 	}
 
@@ -7562,6 +7564,7 @@ CreateCheckPoint(int flags)
 		 * the checkpoint.
 		 */
 		RedoRecPtr = XLogCtl->Insert.RedoRecPtr = checkPoint.redo;
+		smgrcheckpointbegin();
 	}
 
 	/*
@@ -7608,10 +7611,6 @@ CreateCheckPoint(int flags)
 	SpinLockAcquire(&XLogCtl->info_lck);
 	XLogCtl->RedoRecPtr = checkPoint.redo;
 	SpinLockRelease(&XLogCtl->info_lck);
-
-#ifdef USE_UMBRA
-	CheckPointBuffersCaptureBegin();
-#endif
 
 	/*
 	 * If enabled, log checkpoint start.  We postpone this until now so as not
@@ -8069,11 +8068,12 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 	CheckPointSUBTRANS();
 	CheckPointMultiXact();
 	CheckPointPredicate();
+
 #ifdef USE_UMBRA
-	CheckPointBuffersPrepare(flags);
 	MapCheckpoint();
 #endif
 	CheckPointBuffers(flags);
+	smgrcheckpointend();
 
 	/* Perform all queued up fsyncs */
 	TRACE_POSTGRESQL_BUFFER_CHECKPOINT_SYNC_START();
@@ -8214,16 +8214,13 @@ CreateRestartPoint(int flags)
 	 */
 	WALInsertLockAcquireExclusive();
 	RedoRecPtr = XLogCtl->Insert.RedoRecPtr = lastCheckPoint.redo;
+	smgrcheckpointbegin();
 	WALInsertLockRelease();
 
 	/* Also update the info_lck-protected copy */
 	SpinLockAcquire(&XLogCtl->info_lck);
 	XLogCtl->RedoRecPtr = lastCheckPoint.redo;
 	SpinLockRelease(&XLogCtl->info_lck);
-
-#ifdef USE_UMBRA
-	CheckPointBuffersCaptureBegin();
-#endif
 
 	/*
 	 * Prepare to accumulate statistics.
