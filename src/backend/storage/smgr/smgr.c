@@ -99,6 +99,12 @@ typedef struct f_smgr
 	void		(*smgr_create) (SMgrRelation reln, ForkNumber forknum,
 								bool isRedo);
 	void		(*smgr_init_new_relation) (SMgrRelation reln, bool needs_wal);
+	void		(*smgr_checkpoint) (void); /* may be NULL */
+	void		(*smgr_flush_database_tablespace) (Oid dbid,
+												   Oid spcOid); /* may be NULL */
+	void		(*smgr_invalidate_database) (Oid dbid); /* may be NULL */
+	void		(*smgr_invalidate_database_tablespace) (Oid dbid,
+													Oid spcOid); /* may be NULL */
 	bool		(*smgr_exists) (SMgrRelation reln, ForkNumber forknum);
 	void		(*smgr_unlink) (RelFileLocatorBackend rlocator, ForkNumber forknum,
 								bool isRedo);
@@ -149,6 +155,10 @@ static const f_smgr smgrsw[] = {
 		.smgr_destroy = NULL,
 		.smgr_create = mdcreate,
 		.smgr_init_new_relation = NULL,
+		.smgr_checkpoint = NULL,
+		.smgr_flush_database_tablespace = NULL,
+		.smgr_invalidate_database = NULL,
+		.smgr_invalidate_database_tablespace = NULL,
 		.smgr_exists = mdexists,
 		.smgr_unlink = mdunlink,
 		.smgr_extend = mdextend,
@@ -175,6 +185,10 @@ static const f_smgr smgrsw[] = {
 		.smgr_destroy = umdestroy,
 		.smgr_create = umcreate,
 		.smgr_init_new_relation = uminitnewrelation,
+		.smgr_checkpoint = umcheckpoint,
+		.smgr_flush_database_tablespace = umflushdatabasetablespace,
+		.smgr_invalidate_database = uminvalidatedatabase,
+		.smgr_invalidate_database_tablespace = uminvalidatedatabasetablespace,
 		.smgr_exists = umexists,
 		.smgr_unlink = umunlink,
 		.smgr_extend = umextend,
@@ -542,6 +556,35 @@ smgrinitnewrelation(SMgrRelation reln, bool needs_wal)
 {
 	if (smgrsw[reln->smgr_which].smgr_init_new_relation != NULL)
 		smgrsw[reln->smgr_which].smgr_init_new_relation(reln, needs_wal);
+}
+
+/* Dispatch global lifecycle events to the build-selected storage manager. */
+void
+smgrcheckpoint(void)
+{
+	if (smgrsw[SMGR_DEFAULT].smgr_checkpoint != NULL)
+		smgrsw[SMGR_DEFAULT].smgr_checkpoint();
+}
+
+void
+smgrflushdatabasetablespace(Oid dbid, Oid spcOid)
+{
+	if (smgrsw[SMGR_DEFAULT].smgr_flush_database_tablespace != NULL)
+		smgrsw[SMGR_DEFAULT].smgr_flush_database_tablespace(dbid, spcOid);
+}
+
+void
+smgrinvalidatedatabase(Oid dbid)
+{
+	if (smgrsw[SMGR_DEFAULT].smgr_invalidate_database != NULL)
+		smgrsw[SMGR_DEFAULT].smgr_invalidate_database(dbid);
+}
+
+void
+smgrinvalidatedatabasetablespace(Oid dbid, Oid spcOid)
+{
+	if (smgrsw[SMGR_DEFAULT].smgr_invalidate_database_tablespace != NULL)
+		smgrsw[SMGR_DEFAULT].smgr_invalidate_database_tablespace(dbid, spcOid);
 }
 
 /*

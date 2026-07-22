@@ -56,6 +56,9 @@
 #include "storage/sinvaladt.h"
 #include "storage/smgr.h"
 #include "storage/sync.h"
+#ifdef USE_UMBRA
+#include "storage/ummap.h"
+#endif
 #include "tcop/backend_startup.h"
 #include "tcop/tcopprot.h"
 #include "utils/acl.h"
@@ -635,6 +638,11 @@ BaseInit(void)
 	 * can).
 	 */
 	pgstat_initialize();
+
+#ifdef USE_UMBRA
+	/* Let AIO drain before this backend releases its lazy DSA attachment. */
+	ummap_root_cache_backend_init();
+#endif
 
 	/*
 	 * Initialize AIO before infrastructure that might need to actually

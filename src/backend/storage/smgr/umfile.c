@@ -62,6 +62,7 @@ typedef struct UmfdVec
 struct UmbraFileContext
 {
 	RelFileLocatorBackend rlocator;
+	bool		registered;
 	int			num_open_segs[UMBRA_NUM_FORKS];
 	UmfdVec    *seg_fds[UMBRA_NUM_FORKS];
 };
@@ -588,6 +589,7 @@ umfile_write_bytes(UmbraFileContext *ctx, ForkNumber forknum,
 	int			written;
 
 	Assert(ctx != NULL);
+	Assert(UmbraForkNumberIsValid(forknum));
 	Assert(forknum == UMBRA_METADATA_FORKNUM);
 	Assert(buffer != NULL);
 	Assert(nbytes > 0 && nbytes <= BLCKSZ);
@@ -667,9 +669,24 @@ umfile_open(RelFileLocatorBackend rlocator)
 		elog(ERROR, "duplicate Umbra file context");
 
 	ctx->rlocator = rlocator;
+	ctx->registered = true;
 	memset(ctx->num_open_segs, 0, sizeof(ctx->num_open_segs));
 	memset(ctx->seg_fds, 0, sizeof(ctx->seg_fds));
 
+	return ctx;
+}
+
+/* Create an unregistered context for cache writeback. */
+UmbraFileContext *
+umfile_open_temporary(RelFileLocatorBackend rlocator)
+{
+	UmbraFileContext *ctx;
+
+	if (UmFileContextHash == NULL)
+		umfile_init();
+
+	ctx = MemoryContextAllocZero(UmFileCxt, sizeof(UmbraFileContext));
+	ctx->rlocator = rlocator;
 	return ctx;
 }
 
@@ -702,7 +719,6 @@ void
 umfile_destroy(UmbraFileContext *ctx)
 {
 	ForkNumber	forknum;
-	RelFileLocatorBackend rlocator;
 
 	if (ctx == NULL)
 		return;
@@ -710,9 +726,15 @@ umfile_destroy(UmbraFileContext *ctx)
 	for (forknum = 0; forknum <= UMBRA_METADATA_FORKNUM; forknum++)
 		umfile_close(ctx, forknum);
 
-	rlocator = ctx->rlocator;
-	if (hash_search(UmFileContextHash, &rlocator, HASH_REMOVE, NULL) == NULL)
-		elog(ERROR, "Umbra file context registry corrupted");
+	if (ctx->registered)
+	{
+		RelFileLocatorBackend rlocator = ctx->rlocator;
+
+		if (hash_search(UmFileContextHash, &rlocator, HASH_REMOVE, NULL) == NULL)
+			elog(ERROR, "Umbra file context registry corrupted");
+	}
+	else
+		pfree(ctx);
 }
 
 /* Initiate asynchronous read of relation blocks. */

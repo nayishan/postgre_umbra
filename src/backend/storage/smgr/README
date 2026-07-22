@@ -27,7 +27,9 @@ The files in this directory, and their contents, are
     smgr.c	The storage manager switch dispatch code.  The routines in
 		this file call the appropriate storage manager to do storage
 		accesses requested by higher-level code.  smgr.c also manages
-		the file handle cache (SMgrRelation table).
+		the file handle cache (SMgrRelation table) and dispatches
+		generic checkpoint and database-lifecycle events without
+		interpreting implementation-private relation state.
 
     md.c	The "magnetic disk" storage manager, which is really just
 		an interface to the kernel's filesystem operations.
@@ -42,7 +44,9 @@ The files in this directory, and their contents, are
 
     ummap.c	Umbra's private relation metadata root.  The _map file records
 		format identity and future mapping frontiers without yet changing
-		ordinary relation I/O.
+		ordinary relation I/O.  A private shared cache owns root residency,
+		content locking, deferred output, and invalidation; only ummap.c
+		interprets the root bytes.
 
 Note that md.c in turn relies on src/backend/storage/file/fd.c.
 
