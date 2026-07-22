@@ -35,6 +35,14 @@ extern void umclose(SMgrRelation reln, ForkNumber forknum);
 extern void umdestroy(SMgrRelation reln);
 extern void umcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
 extern void uminitnewrelation(SMgrRelation reln, bool needs_wal);
+extern void umsetgeneration(SMgrRelation reln, ForkNumber forknum,
+							XLogRecPtr generation_lsn);
+extern void umredocreate(SMgrRelation reln, ForkNumber forknum,
+							 XLogRecPtr generation_lsn);
+extern void umprepareredo(SMgrRelation reln, XLogRecPtr replay_lsn);
+extern bool umredogenerationahead(SMgrRelation reln,
+								  XLogRecPtr replay_lsn);
+extern bool UmRedoDiscardingPrecreateRecords(SMgrRelation reln);
 extern void umcheckpoint(void);
 extern void umflushdatabasetablespace(Oid dbid, Oid spcOid);
 extern void uminvalidatedatabase(Oid dbid);

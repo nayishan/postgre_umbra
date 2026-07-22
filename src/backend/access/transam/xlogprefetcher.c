@@ -723,6 +723,13 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 			 */
 			reln = smgropen(block->rlocator, INVALID_PROC_NUMBER);
 
+			/* Do not prefetch old WAL through a later storage generation. */
+			if (smgrredogenerationahead(reln, record->next_lsn))
+			{
+				XLogPrefetchIncrement(&SharedStats->skip_new);
+				return LRQ_NEXT_NO_IO;
+			}
+
 			/*
 			 * If the relation file doesn't exist on disk, for example because
 			 * we're replaying after a crash and the file will be created and

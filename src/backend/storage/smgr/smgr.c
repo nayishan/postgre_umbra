@@ -99,6 +99,16 @@ typedef struct f_smgr
 	void		(*smgr_create) (SMgrRelation reln, ForkNumber forknum,
 								bool isRedo);
 	void		(*smgr_init_new_relation) (SMgrRelation reln, bool needs_wal);
+	void		(*smgr_set_generation) (SMgrRelation reln,
+								 ForkNumber forknum,
+								 XLogRecPtr generation_lsn); /* may be NULL */
+	void		(*smgr_redo_create) (SMgrRelation reln,
+								 ForkNumber forknum,
+								 XLogRecPtr generation_lsn); /* may be NULL */
+	void		(*smgr_prepare_redo) (SMgrRelation reln,
+								 XLogRecPtr replay_lsn); /* may be NULL */
+	bool		(*smgr_redo_generation_ahead) (SMgrRelation reln,
+											 XLogRecPtr replay_lsn); /* may be NULL */
 	void		(*smgr_checkpoint) (void); /* may be NULL */
 	void		(*smgr_flush_database_tablespace) (Oid dbid,
 												   Oid spcOid); /* may be NULL */
@@ -155,6 +165,10 @@ static const f_smgr smgrsw[] = {
 		.smgr_destroy = NULL,
 		.smgr_create = mdcreate,
 		.smgr_init_new_relation = NULL,
+		.smgr_set_generation = NULL,
+		.smgr_redo_create = NULL,
+		.smgr_prepare_redo = NULL,
+		.smgr_redo_generation_ahead = NULL,
 		.smgr_checkpoint = NULL,
 		.smgr_flush_database_tablespace = NULL,
 		.smgr_invalidate_database = NULL,
@@ -185,6 +199,10 @@ static const f_smgr smgrsw[] = {
 		.smgr_destroy = umdestroy,
 		.smgr_create = umcreate,
 		.smgr_init_new_relation = uminitnewrelation,
+		.smgr_set_generation = umsetgeneration,
+		.smgr_redo_create = umredocreate,
+		.smgr_prepare_redo = umprepareredo,
+		.smgr_redo_generation_ahead = umredogenerationahead,
 		.smgr_checkpoint = umcheckpoint,
 		.smgr_flush_database_tablespace = umflushdatabasetablespace,
 		.smgr_invalidate_database = uminvalidatedatabase,
@@ -556,6 +574,44 @@ smgrinitnewrelation(SMgrRelation reln, bool needs_wal)
 {
 	if (smgrsw[reln->smgr_which].smgr_init_new_relation != NULL)
 		smgrsw[reln->smgr_which].smgr_init_new_relation(reln, needs_wal);
+}
+
+/* Associate a CREATE WAL record with the storage generation it created. */
+void
+smgrsetgeneration(SMgrRelation reln, ForkNumber forknum,
+				  XLogRecPtr generation_lsn)
+{
+	if (smgrsw[reln->smgr_which].smgr_set_generation != NULL)
+		smgrsw[reln->smgr_which].smgr_set_generation(reln, forknum,
+											 generation_lsn);
+}
+
+/* Replay an authoritative CREATE, as distinct from defensive smgrcreate(). */
+void
+smgrredocreate(SMgrRelation reln, ForkNumber forknum,
+				   XLogRecPtr generation_lsn)
+{
+	if (smgrsw[reln->smgr_which].smgr_redo_create != NULL)
+		smgrsw[reln->smgr_which].smgr_redo_create(reln, forknum,
+											generation_lsn);
+}
+
+/* Prepare owner-defined storage before the current redo record reads it. */
+void
+smgrprepareredo(SMgrRelation reln, XLogRecPtr replay_lsn)
+{
+	if (smgrsw[reln->smgr_which].smgr_prepare_redo != NULL)
+		smgrsw[reln->smgr_which].smgr_prepare_redo(reln, replay_lsn);
+}
+
+/* Side-effect-free generation probe for recovery prefetch. */
+bool
+smgrredogenerationahead(SMgrRelation reln, XLogRecPtr replay_lsn)
+{
+	if (smgrsw[reln->smgr_which].smgr_redo_generation_ahead == NULL)
+		return false;
+	return smgrsw[reln->smgr_which].smgr_redo_generation_ahead(reln,
+															 replay_lsn);
 }
 
 /* Dispatch global lifecycle events to the build-selected storage manager. */

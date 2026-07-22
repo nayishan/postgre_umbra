@@ -110,7 +110,7 @@ typedef struct UmFilePathStr
 
 
 /* local routines */
-static void umfile_unlinkfork(RelFileLocatorBackend rlocator, ForkNumber forknum,
+static bool umfile_unlinkfork(RelFileLocatorBackend rlocator, ForkNumber forknum,
 							  bool isRedo);
 static UmfdVec *umfile_openfork(UmbraFileContext *ctx, ForkNumber forknum, int behavior);
 static void umfile_register_dirty_segment(UmbraFileContext *ctx, ForkNumber forknum,
@@ -246,16 +246,23 @@ umfile_create(UmbraFileContext *ctx, ForkNumber forknum, bool isRedo)
  * release space held by other backends' descriptors, then unlinked.
  * Failures are warnings because unlink commonly runs after transaction end.
  */
-void
+bool
 umfile_unlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 {
+	bool		success = true;
+
 	if (forknum == InvalidForkNumber)
 	{
-		for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
-			umfile_unlinkfork(rlocator, forknum, isRedo);
+		for (int forkidx = 0; forkidx < UMBRA_NUM_FORKS; forkidx++)
+		{
+			if (!umfile_unlinkfork(rlocator, (ForkNumber) forkidx, isRedo))
+				success = false;
+		}
 	}
 	else
-		umfile_unlinkfork(rlocator, forknum, isRedo);
+		success = umfile_unlinkfork(rlocator, forknum, isRedo);
+
+	return success;
 }
 
 /* Truncate a file to release disk space. */
@@ -280,12 +287,13 @@ do_truncate(const char *path)
 	return ret;
 }
 
-static void
+static bool
 umfile_unlinkfork(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 {
 	RelPathStr	path;
 	int			ret;
 	int			save_errno;
+	bool		success = true;
 
 	Assert(UmbraForkNumberIsValid(forknum));
 
@@ -299,6 +307,8 @@ umfile_unlinkfork(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRed
 		{
 			/* Prevent other backends' fds from holding on to the disk space */
 			ret = do_truncate(path.str);
+			if (ret < 0 && errno != ENOENT)
+				success = false;
 
 			/* Forget any pending sync requests for the first segment */
 			save_errno = errno;
@@ -314,6 +324,7 @@ umfile_unlinkfork(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRed
 			ret = unlink(path.str);
 			if (ret < 0 && errno != ENOENT)
 			{
+				success = false;
 				save_errno = errno;
 				ereport(WARNING,
 						(errcode_for_file_access(),
@@ -326,6 +337,8 @@ umfile_unlinkfork(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRed
 	{
 		/* Prevent other backends' fds from holding on to the disk space */
 		ret = do_truncate(path.str);
+		if (ret < 0 && errno != ENOENT)
+			success = false;
 
 		/* Register request to unlink first segment later */
 		save_errno = errno;
@@ -345,9 +358,16 @@ umfile_unlinkfork(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRed
 
 			if (!RelFileLocatorBackendIsTemp(rlocator))
 			{
+				int			truncate_ret;
+
 				/* Release space still referenced by another backend. */
-				if (do_truncate(segpath.str) < 0 && errno == ENOENT)
-					break;
+				truncate_ret = do_truncate(segpath.str);
+				if (truncate_ret < 0)
+				{
+					if (errno == ENOENT)
+						break;
+					success = false;
+				}
 
 				/* Forget pending sync before unlink. */
 				umfile_register_forget_request(rlocator, forknum, segno);
@@ -357,13 +377,18 @@ umfile_unlinkfork(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRed
 			{
 				/* ENOENT is expected after the last segment... */
 				if (errno != ENOENT)
+				{
+					success = false;
 					ereport(WARNING,
 							(errcode_for_file_access(),
 							 errmsg("could not remove file \"%s\": %m", segpath.str)));
+				}
 				break;
 			}
 		}
 	}
+
+	return success;
 }
 
 /* Extend a fork by writing one block at or beyond EOF. */

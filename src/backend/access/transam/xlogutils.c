@@ -26,6 +26,9 @@
 #include "miscadmin.h"
 #include "storage/fd.h"
 #include "storage/smgr.h"
+#ifdef USE_UMBRA
+#include "storage/umbra.h"
+#endif
 #include "utils/hsearch.h"
 #include "utils/rel.h"
 
@@ -96,10 +99,10 @@ report_invalid_page(int elevel, RelFileLocator locator, ForkNumber forkno,
 			 blkno, path.str);
 }
 
-/* Log a reference to an invalid page */
+/* Log a reference to an invalid page. */
 static void
 log_invalid_page(RelFileLocator locator, ForkNumber forkno, BlockNumber blkno,
-				 bool present)
+				 bool present, bool defer_until_lifecycle)
 {
 	xl_invalid_page_key key;
 	xl_invalid_page *hentry;
@@ -113,7 +116,7 @@ log_invalid_page(RelFileLocator locator, ForkNumber forkno, BlockNumber blkno,
 	 * in the hash table until the end of recovery and PANIC there, which
 	 * might come only much later if this is a standby server.
 	 */
-	if (reachedConsistency)
+	if (reachedConsistency && !defer_until_lifecycle)
 	{
 		report_invalid_page(WARNING, locator, forkno, blkno, present);
 		elog(ignore_invalid_pages ? WARNING : PANIC,
@@ -464,8 +467,15 @@ XLogReadBufferExtended(RelFileLocator rlocator, ForkNumber forknum,
 	BlockNumber lastblock;
 	Buffer		buffer;
 	SMgrRelation smgr;
+	bool		defer_until_lifecycle = false;
 
 	Assert(blkno != P_NEW);
+	/* Do not consult a recent buffer through a later storage generation. */
+	smgr = smgropen(rlocator, INVALID_PROC_NUMBER);
+	smgrprepareredo(smgr, GetCurrentReplayRecPtr(NULL));
+#ifdef USE_UMBRA
+	defer_until_lifecycle = UmRedoDiscardingPrecreateRecords(smgr);
+#endif
 
 	/* Do we have a clue where the buffer might be already? */
 	if (BufferIsValid(recent_buffer) &&
@@ -475,9 +485,6 @@ XLogReadBufferExtended(RelFileLocator rlocator, ForkNumber forknum,
 		buffer = recent_buffer;
 		goto recent_buffer_fast_path;
 	}
-
-	/* Open the relation at smgr level */
-	smgr = smgropen(rlocator, INVALID_PROC_NUMBER);
 
 	/*
 	 * Create the target file if it doesn't already exist.  This lets us cope
@@ -502,7 +509,8 @@ XLogReadBufferExtended(RelFileLocator rlocator, ForkNumber forknum,
 		/* hm, page doesn't exist in file */
 		if (mode == RBM_NORMAL)
 		{
-			log_invalid_page(rlocator, forknum, blkno, false);
+			log_invalid_page(rlocator, forknum, blkno, false,
+							 defer_until_lifecycle);
 			return InvalidBuffer;
 		}
 		if (mode == RBM_NORMAL_NO_LOG)
@@ -533,7 +541,8 @@ recent_buffer_fast_path:
 		if (PageIsNew(page))
 		{
 			ReleaseBuffer(buffer);
-			log_invalid_page(rlocator, forknum, blkno, true);
+			log_invalid_page(rlocator, forknum, blkno, true,
+							 defer_until_lifecycle);
 			return InvalidBuffer;
 		}
 	}

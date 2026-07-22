@@ -189,7 +189,11 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 void
 log_smgrcreate(const RelFileLocator *rlocator, ForkNumber forkNum)
 {
+	XLogRecPtr	lsn;
 	xl_smgr_create xlrec;
+#ifdef USE_UMBRA
+	bool		delay_started = false;
+#endif
 
 	/*
 	 * Make an XLOG entry reporting the file creation.
@@ -197,9 +201,37 @@ log_smgrcreate(const RelFileLocator *rlocator, ForkNumber forkNum)
 	xlrec.rlocator = *rlocator;
 	xlrec.forkNum = forkNum;
 
+#ifdef USE_UMBRA
+	/* Keep MAIN CREATE generation publication on the checkpoint's WAL side. */
+	if (forkNum == MAIN_FORKNUM && !IsBootstrapProcessingMode() &&
+		(MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0)
+	{
+		MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+		delay_started = true;
+	}
+	PG_TRY();
+	{
+#endif
 	XLogBeginInsert();
 	XLogRegisterData(&xlrec, sizeof(xlrec));
-	XLogInsert(RM_SMGR_ID, XLOG_SMGR_CREATE | XLR_SPECIAL_REL_UPDATE);
+	lsn = XLogInsert(RM_SMGR_ID, XLOG_SMGR_CREATE | XLR_SPECIAL_REL_UPDATE);
+
+	/* The MAIN CREATE record is the immutable storage generation identity. */
+	if (!IsBootstrapProcessingMode())
+		smgrsetgeneration(smgropen(*rlocator, INVALID_PROC_NUMBER), forkNum,
+						  lsn);
+#ifdef USE_UMBRA
+	}
+	PG_CATCH();
+	{
+		if (delay_started)
+			MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (delay_started)
+		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+#endif
 }
 
 /*
@@ -996,6 +1028,7 @@ smgr_redo(XLogReaderState *record)
 
 		reln = smgropen(xlrec->rlocator, INVALID_PROC_NUMBER);
 		smgrcreate(reln, xlrec->forkNum, true);
+		smgrredocreate(reln, xlrec->forkNum, lsn);
 	}
 	else if (info == XLOG_SMGR_TRUNCATE)
 	{
@@ -1009,6 +1042,7 @@ smgr_redo(XLogReaderState *record)
 		bool		need_fsm_vacuum = false;
 
 		reln = smgropen(xlrec->rlocator, INVALID_PROC_NUMBER);
+		smgrprepareredo(reln, lsn);
 
 		/*
 		 * Forcibly create relation if it doesn't exist (which suggests that
