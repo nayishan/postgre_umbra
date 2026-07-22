@@ -35,6 +35,10 @@ extern void umclose(SMgrRelation reln, ForkNumber forknum);
 extern void umdestroy(SMgrRelation reln);
 extern void umcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
 extern void uminitnewrelation(SMgrRelation reln, bool needs_wal);
+extern void umcheckpoint(void);
+extern void umflushdatabasetablespace(Oid dbid, Oid spcOid);
+extern void uminvalidatedatabase(Oid dbid);
+extern void uminvalidatedatabasetablespace(Oid dbid, Oid spcOid);
 extern bool umexists(SMgrRelation reln, ForkNumber forknum);
 extern void umunlink(RelFileLocatorBackend rlocator, ForkNumber forknum,
 					 bool isRedo);

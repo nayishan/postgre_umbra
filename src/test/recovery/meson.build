@@ -65,6 +65,7 @@ tests += {
       't/054_umbra_mainfork_unlink.pl',
       't/055_umbra_map_root.pl',
       't/056_umbra_map_root_redo.pl',
+      't/057_umbra_root_cache.pl',
     ],
   },
 }

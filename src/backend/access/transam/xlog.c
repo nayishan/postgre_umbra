@@ -95,6 +95,7 @@
 #include "storage/procarray.h"
 #include "storage/procsignal.h"
 #include "storage/reinit.h"
+#include "storage/smgr.h"
 #include "storage/spin.h"
 #include "storage/subsystems.h"
 #include "storage/sync.h"
@@ -8061,6 +8062,7 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 	CheckPointSUBTRANS();
 	CheckPointMultiXact();
 	CheckPointPredicate();
+	smgrcheckpoint();
 	CheckPointBuffers(flags);
 
 	/* Perform all queued up fsyncs */

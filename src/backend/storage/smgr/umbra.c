@@ -65,8 +65,10 @@ umopen(SMgrRelation reln)
 		state->filectx = umfile_open(reln->smgr_rlocator);
 
 	/* CREATE redo repairs a deterministic root before normal validation. */
-	if (!InRecovery && !RelFileLocatorBackendIsTemp(reln->smgr_rlocator))
-		ummap_validate_if_exists(state->filectx);
+	if (!InRecovery && !RelFileLocatorBackendIsTemp(reln->smgr_rlocator) &&
+		IsUnderPostmaster && !IsBootstrapProcessingMode() &&
+		!IsInitProcessingMode())
+		ummap_validate_if_exists(state->filectx, reln->smgr_rlocator);
 }
 
 void
@@ -104,7 +106,7 @@ umcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 	umfile_create(ctx, forknum, isRedo);
 	if (isRedo && forknum == MAIN_FORKNUM &&
 		!RelFileLocatorBackendIsTemp(reln->smgr_rlocator))
-		ummap_create(ctx, isRedo);
+		ummap_create(ctx, reln->smgr_rlocator, isRedo);
 }
 
 void
@@ -112,8 +114,33 @@ uminitnewrelation(SMgrRelation reln, bool needs_wal)
 {
 	Assert(reln->smgr_private != NULL);
 
-	if (needs_wal)
-		ummap_create(um_get_filectx(reln), false);
+	if (needs_wal && IsUnderPostmaster && !IsBootstrapProcessingMode() &&
+		!IsInitProcessingMode())
+		ummap_create(um_get_filectx(reln), reln->smgr_rlocator, false);
+}
+
+void
+umcheckpoint(void)
+{
+	ummap_checkpoint();
+}
+
+void
+umflushdatabasetablespace(Oid dbid, Oid spcOid)
+{
+	ummap_flush_database_tablespace(dbid, spcOid);
+}
+
+void
+uminvalidatedatabase(Oid dbid)
+{
+	ummap_invalidate_database(dbid);
+}
+
+void
+uminvalidatedatabasetablespace(Oid dbid, Oid spcOid)
+{
+	ummap_invalidate_database_tablespace(dbid, spcOid);
 }
 
 bool
@@ -211,7 +238,7 @@ umimmedsync(SMgrRelation reln, ForkNumber forknum)
 
 	umfile_immedsync(ctx, forknum);
 	if (forknum == MAIN_FORKNUM)
-		ummap_immedsync_if_exists(ctx);
+		ummap_immedsync_if_exists(ctx, reln->smgr_rlocator);
 }
 
 void
@@ -221,7 +248,7 @@ umregistersync(SMgrRelation reln, ForkNumber forknum)
 
 	umfile_registersync(ctx, forknum);
 	if (forknum == MAIN_FORKNUM)
-		ummap_registersync_if_exists(ctx);
+		ummap_registersync_if_exists(ctx, reln->smgr_rlocator);
 }
 
 int
