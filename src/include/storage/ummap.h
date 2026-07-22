@@ -28,8 +28,30 @@ extern bool ummap_try_get_generation_lsn(UmbraFileContext *ctx,
 											RelFileLocatorBackend rlocator,
 											XLogRecPtr *generation_lsn);
 extern void ummap_set_generation_lsn(UmbraFileContext *ctx,
+									  RelFileLocatorBackend rlocator,
+									  XLogRecPtr generation_lsn);
+extern bool ummap_main_slot0_active(UmbraFileContext *ctx,
+								RelFileLocatorBackend rlocator);
+extern bool ummap_try_main_slot0_active(UmbraFileContext *ctx,
+									RelFileLocatorBackend rlocator,
+									bool *active);
+extern void ummap_activate_main_slot0(UmbraFileContext *ctx,
+								  RelFileLocatorBackend rlocator,
+								  XLogRecPtr generation_lsn);
+extern void ummap_get_main_frontiers(UmbraFileContext *ctx,
+								 RelFileLocatorBackend rlocator,
+								 BlockNumber *logical_eof,
+								 BlockNumber *physical_capacity);
+extern void ummap_set_main_frontiers(UmbraFileContext *ctx,
+								 RelFileLocatorBackend rlocator,
+								 BlockNumber logical_eof,
+								 BlockNumber physical_capacity);
+extern void ummap_prepare_main_frontiers(UmbraFileContext *ctx,
+								 RelFileLocatorBackend rlocator);
+extern void ummap_publish_prepared_main_frontiers(UmbraFileContext *ctx,
 										  RelFileLocatorBackend rlocator,
-										  XLogRecPtr generation_lsn);
+										  BlockNumber logical_eof,
+										  BlockNumber physical_capacity);
 extern void ummap_validate_if_exists(UmbraFileContext *ctx,
 								 RelFileLocatorBackend rlocator);
 extern void ummap_immedsync_if_exists(UmbraFileContext *ctx,

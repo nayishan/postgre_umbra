@@ -22,6 +22,7 @@
 #include "commands/tablespace.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
+#include "storage/smgr.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -360,6 +361,18 @@ calculate_relation_size(RelFileLocator *rfn, ProcNumber backend, ForkNumber fork
 	return totalsize;
 }
 
+/* Return a SQL-visible fork size, using Umbra's logical MAIN EOF when active. */
+static int64
+calculate_relation_fork_size(Relation rel, ForkNumber forknum)
+{
+#ifdef USE_UMBRA
+	if (forknum == MAIN_FORKNUM && RELKIND_HAS_STORAGE(rel->rd_rel->relkind))
+		return (int64) smgrnblocks(RelationGetSmgr(rel), forknum) * BLCKSZ;
+#endif
+
+	return calculate_relation_size(&(rel->rd_locator), rel->rd_backend, forknum);
+}
+
 Datum
 pg_relation_size(PG_FUNCTION_ARGS)
 {
@@ -380,8 +393,8 @@ pg_relation_size(PG_FUNCTION_ARGS)
 	if (rel == NULL)
 		PG_RETURN_NULL();
 
-	size = calculate_relation_size(&(rel->rd_locator), rel->rd_backend,
-								   forkname_to_number(text_to_cstring(forkName)));
+	size = calculate_relation_fork_size(
+		rel, forkname_to_number(text_to_cstring(forkName)));
 
 	relation_close(rel, AccessShareLock);
 
@@ -405,8 +418,7 @@ calculate_toast_table_size(Oid toastrelid)
 
 	/* toast heap size, including FSM and VM size */
 	for (forkNum = 0; forkNum <= MAX_FORKNUM; forkNum++)
-		size += calculate_relation_size(&(toastRel->rd_locator),
-										toastRel->rd_backend, forkNum);
+		size += calculate_relation_fork_size(toastRel, forkNum);
 
 	/* toast index size, including FSM and VM size */
 	indexlist = RelationGetIndexList(toastRel);
@@ -419,8 +431,7 @@ calculate_toast_table_size(Oid toastrelid)
 		toastIdxRel = relation_open(lfirst_oid(lc),
 									AccessShareLock);
 		for (forkNum = 0; forkNum <= MAX_FORKNUM; forkNum++)
-			size += calculate_relation_size(&(toastIdxRel->rd_locator),
-											toastIdxRel->rd_backend, forkNum);
+			size += calculate_relation_fork_size(toastIdxRel, forkNum);
 
 		relation_close(toastIdxRel, AccessShareLock);
 	}
@@ -448,8 +459,7 @@ calculate_table_size(Relation rel)
 	 * heap size, including FSM and VM
 	 */
 	for (forkNum = 0; forkNum <= MAX_FORKNUM; forkNum++)
-		size += calculate_relation_size(&(rel->rd_locator), rel->rd_backend,
-										forkNum);
+		size += calculate_relation_fork_size(rel, forkNum);
 
 	/*
 	 * Size of toast relation
@@ -487,9 +497,7 @@ calculate_indexes_size(Relation rel)
 			idxRel = relation_open(idxOid, AccessShareLock);
 
 			for (forkNum = 0; forkNum <= MAX_FORKNUM; forkNum++)
-				size += calculate_relation_size(&(idxRel->rd_locator),
-												idxRel->rd_backend,
-												forkNum);
+				size += calculate_relation_fork_size(idxRel, forkNum);
 
 			relation_close(idxRel, AccessShareLock);
 		}

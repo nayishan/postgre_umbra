@@ -105,6 +105,7 @@ extern void smgrredocreate(SMgrRelation reln, ForkNumber forknum,
 extern void smgrprepareredo(SMgrRelation reln, XLogRecPtr replay_lsn);
 extern bool smgrredogenerationahead(SMgrRelation reln,
 									XLogRecPtr replay_lsn);
+extern bool smgrpreparependingsync(SMgrRelation reln);
 extern void smgrcheckpoint(void);
 extern void smgrflushdatabasetablespace(Oid dbid, Oid spcOid);
 extern void smgrinvalidatedatabase(Oid dbid);
@@ -134,6 +135,9 @@ extern void smgrwriteback(SMgrRelation reln, ForkNumber forknum,
 						  BlockNumber blocknum, BlockNumber nblocks);
 extern BlockNumber smgrnblocks(SMgrRelation reln, ForkNumber forknum);
 extern BlockNumber smgrnblocks_cached(SMgrRelation reln, ForkNumber forknum);
+extern void smgrpreparetruncate(SMgrRelation reln, ForkNumber *forknum,
+								 int nforks, BlockNumber *old_nblocks,
+								 BlockNumber *nblocks);
 extern void smgrtruncate(SMgrRelation reln, ForkNumber *forknum, int nforks,
 						 BlockNumber *old_nblocks,
 						 BlockNumber *nblocks);

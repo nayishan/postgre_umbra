@@ -374,6 +374,9 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 		}
 	}
 
+	/* Umbra preloads root state before the truncation critical section. */
+	smgrpreparetruncate(reln, forks, nforks, old_blocks, blocks);
+
 	RelationPreTruncate(rel);
 
 	/*
@@ -816,8 +819,10 @@ smgrDoPendingSyncs(bool isCommit, bool isParallelWorker)
 		BlockNumber nblocks[MAX_FORKNUM + 1];
 		uint64		total_blocks = 0;
 		SMgrRelation srel;
+		bool		force_sync;
 
 		srel = smgropen(pendingsync->rlocator, INVALID_PROC_NUMBER);
+		force_sync = smgrpreparependingsync(srel);
 
 		/*
 		 * We emit newpage WAL records for smaller relations.
@@ -857,7 +862,12 @@ smgrDoPendingSyncs(bool isCommit, bool isParallelWorker)
 		 * the current main fork is longer than ever, but there's a case where
 		 * main fork is longer than ever but FSM fork gets shorter.
 		 */
-		if (pendingsync->is_truncated ||
+		/*
+		 * A selected smgr can require a real sync when its logical blocks do
+		 * not occupy matching physical offsets.  log_newpage_range() has no
+		 * way to describe that layout or its separately persisted frontier.
+		 */
+		if (pendingsync->is_truncated || force_sync ||
 			total_blocks >= wal_skip_threshold * (uint64) 1024 / BLCKSZ)
 		{
 			/* allocate the initial array, or extend it, if needed */
@@ -1111,6 +1121,7 @@ smgr_redo(XLogReaderState *record)
 		/* Do the real work to truncate relation forks */
 		if (nforks > 0)
 		{
+			smgrpreparetruncate(reln, forks, nforks, old_blocks, blocks);
 			START_CRIT_SECTION();
 			smgrtruncate(reln, forks, nforks, old_blocks, blocks);
 			END_CRIT_SECTION();

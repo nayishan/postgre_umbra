@@ -29,6 +29,9 @@
 #define UMMAP_ROOT_MAGIC		0x554D4252U	/* "UMBR" */
 #define UMMAP_ROOT_VERSION		1U
 #define UMMAP_ROOT_FLAGS_V1	0x00000001U
+#define UMMAP_ROOT_FLAG_MAIN_SLOT0	0x00000002U
+#define UMMAP_ROOT_FLAGS_CURRENT \
+	(UMMAP_ROOT_FLAGS_V1 | UMMAP_ROOT_FLAG_MAIN_SLOT0)
 #define UMMAP_ROOT_IMAGE_SIZE	64
 #define UMMAP_ROOT_SECTOR_SIZE	512
 
@@ -268,6 +271,194 @@ ummap_set_generation_lsn(UmbraFileContext *ctx,
 		ummap_immedsync_if_exists(ctx, rlocator);
 }
 
+bool
+ummap_main_slot0_active(UmbraFileContext *ctx,
+						RelFileLocatorBackend rlocator)
+{
+	UmbraMapRootEntry *entry;
+	UmbraMapRootData *root;
+	bool		active;
+
+	Assert(ctx != NULL);
+	entry = ummap_root_cache_get(ctx, rlocator, LW_SHARED);
+	root = (UmbraMapRootData *) entry->image;
+	active = (root->flags & UMMAP_ROOT_FLAG_MAIN_SLOT0) != 0;
+	LWLockRelease(&entry->content_lock);
+	return active;
+}
+
+bool
+ummap_try_main_slot0_active(UmbraFileContext *ctx,
+							RelFileLocatorBackend rlocator, bool *active)
+{
+	char		image[UMMAP_ROOT_IMAGE_SIZE];
+	UmbraMapRootData *root;
+
+	Assert(ctx != NULL);
+	Assert(active != NULL);
+	(void) rlocator;
+	if (!ummap_root_read_valid_image(ctx, image))
+		return false;
+	root = (UmbraMapRootData *) image;
+	*active = (root->flags & UMMAP_ROOT_FLAG_MAIN_SLOT0) != 0;
+	return true;
+}
+
+void
+ummap_activate_main_slot0(UmbraFileContext *ctx,
+						  RelFileLocatorBackend rlocator,
+						  XLogRecPtr generation_lsn)
+{
+	UmbraMapRootEntry *entry;
+	UmbraMapRootData *root;
+
+	Assert(ctx != NULL);
+	Assert(XLogRecPtrIsValid(generation_lsn));
+	entry = ummap_root_cache_get(ctx, rlocator, LW_EXCLUSIVE);
+	root = (UmbraMapRootData *) entry->image;
+	if (root->generation_lsn != generation_lsn)
+	{
+		LWLockRelease(&entry->content_lock);
+		elog(PANIC, "Umbra MAIN slot-0 activation has the wrong generation");
+	}
+	if ((root->flags & UMMAP_ROOT_FLAG_MAIN_SLOT0) == 0)
+	{
+		root->flags |= UMMAP_ROOT_FLAG_MAIN_SLOT0;
+		root->logical_eof_main = 0;
+		root->physical_capacity_main = 0;
+		ummap_root_refresh_crc(root);
+		entry->dirty = true;
+		entry->needs_fsync = true;
+		entry->wal_flush_lsn = InRecovery ? InvalidXLogRecPtr : generation_lsn;
+	}
+	LWLockRelease(&entry->content_lock);
+
+	/* A replayed activation must survive a second crash before page redo. */
+	if (InRecovery)
+		ummap_immedsync_if_exists(ctx, rlocator);
+}
+
+void
+ummap_get_main_frontiers(UmbraFileContext *ctx,
+						 RelFileLocatorBackend rlocator,
+						 BlockNumber *logical_eof,
+						 BlockNumber *physical_capacity)
+{
+	UmbraMapRootEntry *entry;
+	UmbraMapRootData *root;
+
+	Assert(ctx != NULL);
+	Assert(logical_eof != NULL);
+	Assert(physical_capacity != NULL);
+	entry = ummap_root_cache_get(ctx, rlocator, LW_SHARED);
+	root = (UmbraMapRootData *) entry->image;
+	Assert((root->flags & UMMAP_ROOT_FLAG_MAIN_SLOT0) != 0);
+	*logical_eof = root->logical_eof_main;
+	*physical_capacity = root->physical_capacity_main;
+	LWLockRelease(&entry->content_lock);
+}
+
+void
+ummap_set_main_frontiers(UmbraFileContext *ctx,
+						 RelFileLocatorBackend rlocator,
+						 BlockNumber logical_eof,
+						 BlockNumber physical_capacity)
+{
+	UmbraMapRootEntry *entry;
+	UmbraMapRootData *root;
+	BlockNumber	expected_capacity;
+
+	Assert(ctx != NULL);
+	if (!UmbraMainSlot0PhysicalCapacity(logical_eof, &expected_capacity) ||
+		physical_capacity != expected_capacity)
+		elog(PANIC, "invalid Umbra MAIN slot-0 frontiers");
+
+	entry = ummap_root_cache_get(ctx, rlocator, LW_EXCLUSIVE);
+	root = (UmbraMapRootData *) entry->image;
+	if ((root->flags & UMMAP_ROOT_FLAG_MAIN_SLOT0) == 0)
+	{
+		LWLockRelease(&entry->content_lock);
+		elog(PANIC, "Umbra MAIN frontiers require slot-0 activation");
+	}
+	if (root->logical_eof_main != logical_eof ||
+		root->physical_capacity_main != physical_capacity)
+	{
+		root->logical_eof_main = logical_eof;
+		root->physical_capacity_main = physical_capacity;
+		ummap_root_refresh_crc(root);
+		entry->dirty = true;
+		entry->needs_fsync = true;
+		entry->wal_flush_lsn = InRecovery ? InvalidXLogRecPtr :
+			Max(entry->wal_flush_lsn, GetXLogWriteRecPtr());
+	}
+	LWLockRelease(&entry->content_lock);
+}
+
+void
+ummap_prepare_main_frontiers(UmbraFileContext *ctx,
+						 RelFileLocatorBackend rlocator)
+{
+	UmbraMapRootEntry *entry;
+	UmbraMapRootData *root;
+
+	Assert(ctx != NULL);
+	entry = ummap_root_cache_get(ctx, rlocator, LW_SHARED);
+	root = (UmbraMapRootData *) entry->image;
+	if ((root->flags & UMMAP_ROOT_FLAG_MAIN_SLOT0) == 0)
+	{
+		LWLockRelease(&entry->content_lock);
+		elog(PANIC, "Umbra MAIN frontiers require slot-0 activation");
+	}
+	LWLockRelease(&entry->content_lock);
+
+	/* Open the metadata descriptor before the caller enters a critical section. */
+	(void) umfile_nblocks(ctx, UMBRA_METADATA_FORKNUM);
+}
+
+void
+ummap_publish_prepared_main_frontiers(UmbraFileContext *ctx,
+									  RelFileLocatorBackend rlocator,
+									  BlockNumber logical_eof,
+									  BlockNumber physical_capacity)
+{
+	UmbraMapRootTag tag = {0};
+	UmbraMapRootEntry *entry;
+	UmbraMapRootData *root;
+	BlockNumber	expected_capacity;
+
+	Assert(ctx != NULL);
+	if (!UmbraMainSlot0PhysicalCapacity(logical_eof, &expected_capacity) ||
+		physical_capacity != expected_capacity)
+		elog(PANIC, "invalid Umbra MAIN slot-0 frontiers");
+
+	tag.rlocator = rlocator;
+	if (!ummap_root_cache_find_locked(&tag, LW_EXCLUSIVE, &entry) ||
+		!entry->valid)
+		elog(PANIC, "Umbra MAIN slot-0 frontiers were not prepared");
+	root = (UmbraMapRootData *) entry->image;
+	if ((root->flags & UMMAP_ROOT_FLAG_MAIN_SLOT0) == 0)
+	{
+		LWLockRelease(&entry->content_lock);
+		elog(PANIC, "Umbra MAIN frontiers require slot-0 activation");
+	}
+	if (root->logical_eof_main != logical_eof ||
+		root->physical_capacity_main != physical_capacity)
+	{
+		root->logical_eof_main = logical_eof;
+		root->physical_capacity_main = physical_capacity;
+		ummap_root_refresh_crc(root);
+		entry->dirty = true;
+		entry->needs_fsync = true;
+		entry->wal_flush_lsn = InRecovery ? InvalidXLogRecPtr :
+			Max(entry->wal_flush_lsn, GetXLogWriteRecPtr());
+	}
+	ummap_root_cache_flush_locked(entry, ctx);
+	LWLockRelease(&entry->content_lock);
+
+	/* The prepared metadata fork is one short segment and needs no allocation. */
+	umfile_immedsync(ctx, UMBRA_METADATA_FORKNUM);
+}
+
 void
 ummap_validate_if_exists(UmbraFileContext *ctx, RelFileLocatorBackend rlocator)
 {
@@ -400,12 +591,14 @@ static bool
 ummap_root_is_valid(const UmbraMapRootData *root)
 {
 	pg_crc32c	crc;
+	BlockNumber	expected_capacity;
 
 	if (root->magic != UMMAP_ROOT_MAGIC ||
 		root->version != UMMAP_ROOT_VERSION ||
 		root->blcksz != BLCKSZ ||
 		root->chunk_pages != UMBRA_CHUNK_PAIRED_PAGES ||
-		root->flags != UMMAP_ROOT_FLAGS_V1 ||
+		(root->flags != UMMAP_ROOT_FLAGS_V1 &&
+		 root->flags != UMMAP_ROOT_FLAGS_CURRENT) ||
 		!BlockNumberIsValid(root->logical_eof_main) ||
 		!BlockNumberIsValid(root->physical_capacity_main) ||
 		BlockNumberIsValid(root->logical_eof_fsm) ||
@@ -413,6 +606,11 @@ ummap_root_is_valid(const UmbraMapRootData *root)
 		BlockNumberIsValid(root->physical_capacity_fsm) ||
 		BlockNumberIsValid(root->physical_capacity_vm) ||
 		!pg_memory_is_all_zeros(root->reserved, sizeof(root->reserved)))
+		return false;
+	if ((root->flags & UMMAP_ROOT_FLAG_MAIN_SLOT0) != 0 &&
+		(!UmbraMainSlot0PhysicalCapacity(root->logical_eof_main,
+										   &expected_capacity) ||
+		 root->physical_capacity_main != expected_capacity))
 		return false;
 
 	INIT_CRC32C(crc);
@@ -732,6 +930,14 @@ ummap_root_cache_flush_locked(UmbraMapRootEntry *entry,
 
 		if (XLogRecPtrIsValid(entry->wal_flush_lsn))
 			XLogFlush(entry->wal_flush_lsn);
+		/*
+		 * A slot-0 root makes its physical capacity authoritative.  Do not
+		 * allow the root to become durable before the MAIN file it describes:
+		 * checkpoint fsync requests have no ordering guarantee between forks.
+		 */
+		if ((((UmbraMapRootData *) entry->image)->flags &
+			 UMMAP_ROOT_FLAG_MAIN_SLOT0) != 0)
+			umfile_immedsync(write_ctx, MAIN_FORKNUM);
 		ummap_root_write_image(write_ctx, entry->image, !entry->needs_fsync);
 		if (temporary_ctx != NULL)
 		{

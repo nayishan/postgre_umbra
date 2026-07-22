@@ -67,6 +67,7 @@ tests += {
       't/056_umbra_map_root_redo.pl',
       't/057_umbra_root_cache.pl',
       't/058_umbra_generation_reuse.pl',
+      't/059_umbra_slot0_mapping.pl',
     ],
   },
 }
