@@ -17,4 +17,12 @@ OBJS = \
 	md.o \
 	smgr.o
 
+ifeq ($(with_umbra), yes)
+OBJS += \
+	umbra.o
+endif
+
+# Reconfiguration can change both OBJS and the default smgr implementation.
+objfiles.txt smgr.o: $(top_builddir)/src/Makefile.global
+
 include $(top_srcdir)/src/backend/common.mk

@@ -4,8 +4,9 @@
  *	  public interface routines to storage manager switch.
  *
  * All file system operations on relations dispatch through these routines.
- * An SMgrRelation represents physical on-disk relation files that are open
- * for reading and writing.
+ * An SMgrRelation represents storage-manager state for a relation.  The
+ * selected storage manager implementation owns any implementation-specific
+ * state needed to service those operations.
  *
  * When a relation is first accessed through the relation cache, the
  * corresponding SMgrRelation entry is opened by calling smgropen(), and the
@@ -71,6 +72,9 @@
 #include "storage/ipc.h"
 #include "storage/md.h"
 #include "storage/smgr.h"
+#ifdef USE_UMBRA
+#include "storage/umbra.h"
+#endif
 #include "utils/hsearch.h"
 #include "utils/inval.h"
 
@@ -91,6 +95,7 @@ typedef struct f_smgr
 	void		(*smgr_shutdown) (void);	/* may be NULL */
 	void		(*smgr_open) (SMgrRelation reln);
 	void		(*smgr_close) (SMgrRelation reln, ForkNumber forknum);
+	void		(*smgr_destroy) (SMgrRelation reln);	/* may be NULL */
 	void		(*smgr_create) (SMgrRelation reln, ForkNumber forknum,
 								bool isRedo);
 	bool		(*smgr_exists) (SMgrRelation reln, ForkNumber forknum);
@@ -122,8 +127,20 @@ typedef struct f_smgr
 								  BlockNumber old_blocks, BlockNumber nblocks);
 	void		(*smgr_immedsync) (SMgrRelation reln, ForkNumber forknum);
 	void		(*smgr_registersync) (SMgrRelation reln, ForkNumber forknum);
+	void		(*smgr_flush_database_tablespace_cache) (Oid dbid, Oid spcOid); /* may be NULL */
+	void		(*smgr_invalidate_database_cache) (Oid dbid); /* may be NULL */
+	void		(*smgr_invalidate_database_tablespace_cache) (Oid dbid,
+													Oid spcOid); /* may be NULL */
 	int			(*smgr_fd) (SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint32 *off);
 } f_smgr;
+
+#define SMGR_MD		0
+#ifdef USE_UMBRA
+#define SMGR_UMBRA	1
+#define SMGR_DEFAULT	SMGR_UMBRA
+#else
+#define SMGR_DEFAULT	SMGR_MD
+#endif
 
 static const f_smgr smgrsw[] = {
 	/* magnetic disk */
@@ -132,6 +149,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_shutdown = NULL,
 		.smgr_open = mdopen,
 		.smgr_close = mdclose,
+		.smgr_destroy = NULL,
 		.smgr_create = mdcreate,
 		.smgr_exists = mdexists,
 		.smgr_unlink = mdunlink,
@@ -147,8 +165,40 @@ static const f_smgr smgrsw[] = {
 		.smgr_truncate = mdtruncate,
 		.smgr_immedsync = mdimmedsync,
 		.smgr_registersync = mdregistersync,
+		.smgr_flush_database_tablespace_cache = NULL,
+		.smgr_invalidate_database_cache = NULL,
+		.smgr_invalidate_database_tablespace_cache = NULL,
 		.smgr_fd = mdfd,
-	}
+	},
+#ifdef USE_UMBRA
+	/* Umbra storage manager */
+	{
+		.smgr_init = uminit,
+		.smgr_shutdown = NULL,
+		.smgr_open = umopen,
+		.smgr_close = umclose,
+		.smgr_destroy = umdestroy,
+		.smgr_create = umcreate,
+		.smgr_exists = umexists,
+		.smgr_unlink = umunlink,
+		.smgr_extend = umextend,
+		.smgr_zeroextend = umzeroextend,
+		.smgr_prefetch = umprefetch,
+		.smgr_maxcombine = ummaxcombine,
+		.smgr_readv = umreadv,
+		.smgr_startreadv = umstartreadv,
+		.smgr_writev = umwritev,
+		.smgr_writeback = umwriteback,
+		.smgr_nblocks = umnblocks,
+		.smgr_truncate = umtruncate,
+		.smgr_immedsync = umimmedsync,
+		.smgr_registersync = umregistersync,
+		.smgr_flush_database_tablespace_cache = NULL,
+		.smgr_invalidate_database_cache = NULL,
+		.smgr_invalidate_database_tablespace_cache = NULL,
+		.smgr_fd = umfd,
+	},
+#endif
 };
 
 static const int NSmgr = lengthof(smgrsw);
@@ -273,7 +323,8 @@ smgropen(RelFileLocator rlocator, ProcNumber backend)
 		reln->smgr_targblock = InvalidBlockNumber;
 		for (int i = 0; i <= MAX_FORKNUM; ++i)
 			reln->smgr_cached_nblocks[i] = InvalidBlockNumber;
-		reln->smgr_which = 0;	/* we only have md.c at present */
+		reln->smgr_which = SMGR_DEFAULT;
+		reln->smgr_private = NULL;
 
 		/* it is not pinned yet */
 		reln->pincount = 0;
@@ -330,6 +381,9 @@ smgrdestroy(SMgrRelation reln)
 
 	for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
 		smgrsw[reln->smgr_which].smgr_close(reln, forknum);
+
+	if (smgrsw[reln->smgr_which].smgr_destroy != NULL)
+		smgrsw[reln->smgr_which].smgr_destroy(reln);
 
 	dlist_delete(&reln->node);
 
@@ -942,6 +996,28 @@ smgrregistersync(SMgrRelation reln, ForkNumber forknum)
 	HOLD_INTERRUPTS();
 	smgrsw[reln->smgr_which].smgr_registersync(reln, forknum);
 	RESUME_INTERRUPTS();
+}
+
+void
+smgrflushdatabasetablespacecache(Oid dbid, Oid spcOid)
+{
+	if (smgrsw[SMGR_DEFAULT].smgr_flush_database_tablespace_cache != NULL)
+		smgrsw[SMGR_DEFAULT].smgr_flush_database_tablespace_cache(dbid, spcOid);
+}
+
+void
+smgrinvalidatedatabasecache(Oid dbid)
+{
+	if (smgrsw[SMGR_DEFAULT].smgr_invalidate_database_cache != NULL)
+		smgrsw[SMGR_DEFAULT].smgr_invalidate_database_cache(dbid);
+}
+
+void
+smgrinvalidatedatabasetablespacecache(Oid dbid, Oid spcOid)
+{
+	if (smgrsw[SMGR_DEFAULT].smgr_invalidate_database_tablespace_cache != NULL)
+		smgrsw[SMGR_DEFAULT].smgr_invalidate_database_tablespace_cache(dbid,
+																	spcOid);
 }
 
 /*
