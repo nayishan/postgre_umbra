@@ -150,9 +150,6 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 	srel = smgropen(rlocator, procNumber);
 	smgrcreate(srel, MAIN_FORKNUM, false);
 
-	if (needs_wal)
-		log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);
-
 	/*
 	 * Add the relation to the list of stuff to delete at abort, if we are
 	 * asked to do so.
@@ -170,6 +167,12 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 		pending->next = pendingDeletes;
 		pendingDeletes = pending;
 	}
+
+	/* The implementation bootstrap may perform fallible metadata I/O. */
+	smgrinitnewrelation(srel, needs_wal);
+
+	if (needs_wal)
+		log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);
 
 	if (relpersistence == RELPERSISTENCE_PERMANENT && !XLogIsNeeded())
 	{

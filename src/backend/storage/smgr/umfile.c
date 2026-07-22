@@ -62,8 +62,8 @@ typedef struct UmfdVec
 struct UmbraFileContext
 {
 	RelFileLocatorBackend rlocator;
-	int			num_open_segs[MAX_FORKNUM + 1];
-	UmfdVec    *seg_fds[MAX_FORKNUM + 1];
+	int			num_open_segs[UMBRA_NUM_FORKS];
+	UmfdVec    *seg_fds[UMBRA_NUM_FORKS];
 };
 
 static MemoryContext UmFileCxt; /* context for all UmfdVec objects */
@@ -130,14 +130,18 @@ static UmfdVec *umfile_openseg(UmbraFileContext *ctx, ForkNumber forknum,
 static UmfdVec *umfile_getseg(UmbraFileContext *ctx, ForkNumber forknum,
 							  BlockNumber blkno, bool skipFsync, int behavior);
 static BlockNumber umfile_nblocks_in_seg(UmfdVec *seg);
-static inline int umfile_open_flags(void);
+static RelPathStr umfile_relpath(RelFileLocatorBackend rlocator,
+						 ForkNumber forknum);
+static inline int umfile_open_flags(ForkNumber forknum);
 
 static inline int
-umfile_open_flags(void)
+umfile_open_flags(ForkNumber forknum)
 {
 	int			flags = O_RDWR | PG_BINARY;
 
-	if (io_direct_flags & IO_DIRECT_DATA)
+	/* The metadata root uses sector I/O and deliberately remains buffered. */
+	if ((io_direct_flags & IO_DIRECT_DATA) &&
+		forknum != UMBRA_METADATA_FORKNUM)
 		flags |= PG_O_DIRECT;
 
 	return flags;
@@ -171,7 +175,7 @@ bool
 umfile_exists(UmbraFileContext *ctx, ForkNumber forknum)
 {
 	Assert(ctx != NULL);
-	Assert(forknum >= 0 && forknum <= MAX_FORKNUM);
+	Assert(UmbraForkNumberIsValid(forknum));
 
 	/*
 	 * Reopen outside recovery so an unlinked cached descriptor is not
@@ -192,7 +196,7 @@ umfile_create(UmbraFileContext *ctx, ForkNumber forknum, bool isRedo)
 	File		fd;
 
 	Assert(ctx != NULL);
-	Assert(forknum >= 0 && forknum <= MAX_FORKNUM);
+	Assert(UmbraForkNumberIsValid(forknum));
 
 	if (isRedo && ctx->num_open_segs[forknum] > 0)
 		return;					/* created and opened already... */
@@ -204,16 +208,16 @@ umfile_create(UmbraFileContext *ctx, ForkNumber forknum, bool isRedo)
 							ctx->rlocator.locator.dbOid,
 							isRedo);
 
-	path = relpath(ctx->rlocator, forknum);
+	path = umfile_relpath(ctx->rlocator, forknum);
 
-	fd = PathNameOpenFile(path.str, umfile_open_flags() | O_CREAT | O_EXCL);
+	fd = PathNameOpenFile(path.str, umfile_open_flags(forknum) | O_CREAT | O_EXCL);
 
 	if (fd < 0)
 	{
 		int			save_errno = errno;
 
 		if (isRedo)
-			fd = PathNameOpenFile(path.str, umfile_open_flags());
+			fd = PathNameOpenFile(path.str, umfile_open_flags(forknum));
 		if (fd < 0)
 		{
 			/* be sure to report the error reported by create, not open */
@@ -282,9 +286,9 @@ umfile_unlinkfork(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRed
 	int			ret;
 	int			save_errno;
 
-	Assert(forknum >= 0 && forknum <= MAX_FORKNUM);
+	Assert(UmbraForkNumberIsValid(forknum));
 
-	path = relpath(rlocator, forknum);
+	path = umfile_relpath(rlocator, forknum);
 
 	/* MAIN segment zero may be delayed as described by umfile_unlink(). */
 	if (isRedo || IsBinaryUpgrade || forknum != MAIN_FORKNUM ||
@@ -371,7 +375,7 @@ umfile_extend(UmbraFileContext *ctx, ForkNumber forknum,
 	UmfdVec    *v;
 
 	Assert(ctx != NULL);
-	Assert(forknum >= 0 && forknum <= MAX_FORKNUM);
+	Assert(UmbraForkNumberIsValid(forknum));
 
 	/* If this build supports direct I/O, the buffer must be I/O aligned. */
 	if (PG_O_DIRECT != 0 && PG_IO_ALIGN_SIZE <= BLCKSZ)
@@ -392,7 +396,7 @@ umfile_extend(UmbraFileContext *ctx, ForkNumber forknum,
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("cannot extend file \"%s\" beyond %u blocks",
-						relpath(ctx->rlocator, forknum).str,
+						umfile_relpath(ctx->rlocator, forknum).str,
 						InvalidBlockNumber)));
 
 	v = umfile_getseg(ctx, forknum, blocknum, skipFsync, EXTENSION_CREATE);
@@ -440,7 +444,7 @@ umfile_zeroextend(UmbraFileContext *ctx, ForkNumber forknum,
 	int			remblocks = nblocks;
 
 	Assert(ctx != NULL);
-	Assert(forknum >= 0 && forknum <= MAX_FORKNUM);
+	Assert(UmbraForkNumberIsValid(forknum));
 	Assert(nblocks > 0);
 
 	/* This assert is too expensive to have on normally ... */
@@ -457,7 +461,7 @@ umfile_zeroextend(UmbraFileContext *ctx, ForkNumber forknum,
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("cannot extend file \"%s\" beyond %u blocks",
-						relpath(ctx->rlocator, forknum).str,
+						umfile_relpath(ctx->rlocator, forknum).str,
 						InvalidBlockNumber)));
 
 	while (remblocks > 0)
@@ -540,6 +544,75 @@ umfile_zeroextend(UmbraFileContext *ctx, ForkNumber forknum,
 	}
 }
 
+/* Read a bounded byte range within one physical relation block. */
+void
+umfile_read_bytes(UmbraFileContext *ctx, ForkNumber forknum,
+				  BlockNumber blocknum, void *buffer, int nbytes)
+{
+	UmfdVec    *v;
+	pgoff_t		seekpos;
+	int			readbytes;
+
+	Assert(ctx != NULL);
+	Assert(UmbraForkNumberIsValid(forknum));
+	Assert(forknum == UMBRA_METADATA_FORKNUM);
+	Assert(buffer != NULL);
+	Assert(nbytes > 0 && nbytes <= BLCKSZ);
+
+	v = umfile_getseg(ctx, forknum, blocknum, false, EXTENSION_FAIL);
+	seekpos = (pgoff_t) BLCKSZ * (blocknum % ((BlockNumber) RELSEG_SIZE));
+	readbytes = FileRead(v->umfd_vfd, buffer, nbytes, seekpos,
+						 WAIT_EVENT_DATA_FILE_READ);
+	if (readbytes != nbytes)
+	{
+		if (readbytes < 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not read Umbra metadata file \"%s\": %m",
+							FilePathName(v->umfd_vfd))));
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("could not read complete Umbra metadata root from file \"%s\"",
+						FilePathName(v->umfd_vfd))));
+	}
+}
+
+/* Write a bounded byte range within one buffered metadata relation block. */
+void
+umfile_write_bytes(UmbraFileContext *ctx, ForkNumber forknum,
+				   BlockNumber blocknum, const void *buffer, int nbytes,
+				   bool skipFsync)
+{
+	UmfdVec    *v;
+	pgoff_t		seekpos;
+	int			written;
+
+	Assert(ctx != NULL);
+	Assert(forknum == UMBRA_METADATA_FORKNUM);
+	Assert(buffer != NULL);
+	Assert(nbytes > 0 && nbytes <= BLCKSZ);
+
+	v = umfile_getseg(ctx, forknum, blocknum, skipFsync, EXTENSION_FAIL);
+	seekpos = (pgoff_t) BLCKSZ * (blocknum % ((BlockNumber) RELSEG_SIZE));
+	written = FileWrite(v->umfd_vfd, buffer, nbytes, seekpos,
+						WAIT_EVENT_DATA_FILE_WRITE);
+	if (written != nbytes)
+	{
+		if (written < 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not write Umbra metadata file \"%s\": %m",
+							FilePathName(v->umfd_vfd))));
+		ereport(ERROR,
+				(errcode(ERRCODE_DISK_FULL),
+				 errmsg("could not write complete Umbra metadata root to file \"%s\"",
+						FilePathName(v->umfd_vfd))));
+	}
+
+	if (!skipFsync && !RelFileLocatorBackendIsTemp(ctx->rlocator))
+		umfile_register_dirty_segment(ctx, forknum, v);
+}
+
 /* Open segment zero, returning NULL only when behavior permits it. */
 static UmfdVec *
 umfile_openfork(UmbraFileContext *ctx, ForkNumber forknum, int behavior)
@@ -549,15 +622,15 @@ umfile_openfork(UmbraFileContext *ctx, ForkNumber forknum, int behavior)
 	File		fd;
 
 	Assert(ctx != NULL);
-	Assert(forknum >= 0 && forknum <= MAX_FORKNUM);
+	Assert(UmbraForkNumberIsValid(forknum));
 
 	/* No work if already open */
 	if (ctx->num_open_segs[forknum] > 0)
 		return &ctx->seg_fds[forknum][0];
 
-	path = relpath(ctx->rlocator, forknum);
+	path = umfile_relpath(ctx->rlocator, forknum);
 
-	fd = PathNameOpenFile(path.str, umfile_open_flags());
+	fd = PathNameOpenFile(path.str, umfile_open_flags(forknum));
 
 	if (fd < 0)
 	{
@@ -607,7 +680,7 @@ umfile_close(UmbraFileContext *ctx, ForkNumber forknum)
 	int			nopensegs;
 
 	Assert(ctx != NULL);
-	Assert(forknum >= 0 && forknum <= MAX_FORKNUM);
+	Assert(UmbraForkNumberIsValid(forknum));
 
 	nopensegs = ctx->num_open_segs[forknum];
 
@@ -634,7 +707,7 @@ umfile_destroy(UmbraFileContext *ctx)
 	if (ctx == NULL)
 		return;
 
-	for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
+	for (forknum = 0; forknum <= UMBRA_METADATA_FORKNUM; forknum++)
 		umfile_close(ctx, forknum);
 
 	rlocator = ctx->rlocator;
@@ -1053,7 +1126,7 @@ umfile_nblocks(UmbraFileContext *ctx, ForkNumber forknum)
 	BlockNumber segno;
 
 	Assert(ctx != NULL);
-	Assert(forknum >= 0 && forknum <= MAX_FORKNUM);
+	Assert(UmbraForkNumberIsValid(forknum));
 
 	umfile_openfork(ctx, forknum, EXTENSION_FAIL);
 
@@ -1096,7 +1169,7 @@ umfile_truncate(UmbraFileContext *ctx, ForkNumber forknum,
 	int			curopensegs;
 
 	Assert(ctx != NULL);
-	Assert(forknum >= 0 && forknum <= MAX_FORKNUM);
+	Assert(UmbraForkNumberIsValid(forknum));
 
 	if (nblocks > curnblk)
 	{
@@ -1105,7 +1178,7 @@ umfile_truncate(UmbraFileContext *ctx, ForkNumber forknum,
 			return;
 		ereport(ERROR,
 				(errmsg("could not truncate file \"%s\" to %u blocks: it's only %u blocks now",
-						relpath(ctx->rlocator, forknum).str,
+						umfile_relpath(ctx->rlocator, forknum).str,
 						nblocks, curnblk)));
 	}
 	if (nblocks == curnblk)
@@ -1357,6 +1430,16 @@ umfile_fdvec_resize(UmbraFileContext *ctx,
 	ctx->num_open_segs[forknum] = nseg;
 }
 
+static RelPathStr
+umfile_relpath(RelFileLocatorBackend rlocator, ForkNumber forknum)
+{
+	Assert(UmbraForkNumberIsValid(forknum));
+
+	if (forknum == UMBRA_METADATA_FORKNUM)
+		return UmMetadataRelPathBackend(rlocator);
+	return relpath(rlocator, forknum);
+}
+
 /* Return the fixed-size path for a relation segment. */
 static UmFilePathStr
 umfile_segpath(RelFileLocatorBackend rlocator, ForkNumber forknum, BlockNumber segno)
@@ -1364,7 +1447,7 @@ umfile_segpath(RelFileLocatorBackend rlocator, ForkNumber forknum, BlockNumber s
 	RelPathStr	path;
 	UmFilePathStr fullpath;
 
-	path = relpath(rlocator, forknum);
+	path = umfile_relpath(rlocator, forknum);
 
 	if (segno > 0)
 		sprintf(fullpath.str, "%s.%u", path.str, segno);
@@ -1398,7 +1481,7 @@ umfile_openseg(UmbraFileContext *ctx, ForkNumber forknum, BlockNumber segno,
 	fullpath = umfile_segpath(ctx->rlocator, forknum, segno);
 
 	/* open the file */
-	fd = PathNameOpenFile(fullpath.str, umfile_open_flags() | oflags);
+	fd = PathNameOpenFile(fullpath.str, umfile_open_flags(forknum) | oflags);
 
 	if (fd < 0)
 		return NULL;
@@ -1592,7 +1675,7 @@ umfilesyncfiletag(const FileTag *ftag, char *path)
 	p = umfile_segpath_perm(ftag->rlocator, ftag->forknum, ftag->segno);
 	strlcpy(path, p.str, MAXPGPATH);
 
-	file = PathNameOpenFile(path, umfile_open_flags());
+	file = PathNameOpenFile(path, umfile_open_flags(ftag->forknum));
 	if (file < 0)
 		return -1;
 

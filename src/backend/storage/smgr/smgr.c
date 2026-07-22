@@ -98,6 +98,7 @@ typedef struct f_smgr
 	void		(*smgr_destroy) (SMgrRelation reln);	/* may be NULL */
 	void		(*smgr_create) (SMgrRelation reln, ForkNumber forknum,
 								bool isRedo);
+	void		(*smgr_init_new_relation) (SMgrRelation reln, bool needs_wal);
 	bool		(*smgr_exists) (SMgrRelation reln, ForkNumber forknum);
 	void		(*smgr_unlink) (RelFileLocatorBackend rlocator, ForkNumber forknum,
 								bool isRedo);
@@ -147,6 +148,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_close = mdclose,
 		.smgr_destroy = NULL,
 		.smgr_create = mdcreate,
+		.smgr_init_new_relation = NULL,
 		.smgr_exists = mdexists,
 		.smgr_unlink = mdunlink,
 		.smgr_extend = mdextend,
@@ -172,6 +174,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_close = umclose,
 		.smgr_destroy = umdestroy,
 		.smgr_create = umcreate,
+		.smgr_init_new_relation = uminitnewrelation,
 		.smgr_exists = umexists,
 		.smgr_unlink = umunlink,
 		.smgr_extend = umextend,
@@ -527,6 +530,18 @@ smgrcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 	HOLD_INTERRUPTS();
 	smgrsw[reln->smgr_which].smgr_create(reln, forknum, isRedo);
 	RESUME_INTERRUPTS();
+}
+
+/*
+ * Establish implementation policy once the caller knows a new relation's
+ * persistence.  A shared relation locator alone cannot distinguish unlogged
+ * storage from WAL-owned permanent storage.
+ */
+void
+smgrinitnewrelation(SMgrRelation reln, bool needs_wal)
+{
+	if (smgrsw[reln->smgr_which].smgr_init_new_relation != NULL)
+		smgrsw[reln->smgr_which].smgr_init_new_relation(reln, needs_wal);
 }
 
 /*
