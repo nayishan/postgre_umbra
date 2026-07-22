@@ -35,6 +35,9 @@ typedef enum SyncRequestType
 typedef enum SyncRequestHandler
 {
 	SYNC_HANDLER_MD = 0,
+#ifdef USE_UMBRA
+	SYNC_HANDLER_UMFILE,
+#endif
 	SYNC_HANDLER_CLOG,
 	SYNC_HANDLER_COMMIT_TS,
 	SYNC_HANDLER_MULTIXACT_OFFSET,
@@ -59,6 +62,7 @@ extern void InitSync(void);
 extern void SyncPreCheckpoint(void);
 extern void SyncPostCheckpoint(void);
 extern void ProcessSyncRequests(void);
+extern void ForgetDatabaseSyncRequests(Oid dbid);
 extern void RememberSyncRequest(const FileTag *ftag, SyncRequestType type);
 extern bool RegisterSyncRequest(const FileTag *ftag, SyncRequestType type,
 								bool retryOnError);

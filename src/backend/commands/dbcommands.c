@@ -58,10 +58,10 @@
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/lmgr.h"
-#include "storage/md.h"
 #include "storage/procarray.h"
 #include "storage/procsignal.h"
 #include "storage/smgr.h"
+#include "storage/sync.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -3432,7 +3432,7 @@ dbase_redo(XLogReaderState *record)
 		/* Drop pages for this database that are in the shared buffer cache */
 		DropDatabaseBuffers(xlrec->db_id);
 
-		/* Also, clean out any fsync requests that might be pending in md.c */
+		/* Also, clean out any pending relation-file sync requests. */
 		ForgetDatabaseSyncRequests(xlrec->db_id);
 
 		/* Clean out the xlog relcache too */

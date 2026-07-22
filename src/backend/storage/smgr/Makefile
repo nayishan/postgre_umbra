@@ -19,7 +19,8 @@ OBJS = \
 
 ifeq ($(with_umbra), yes)
 OBJS += \
-	umbra.o
+	umbra.o \
+	umfile.o
 endif
 
 # Reconfiguration can change both OBJS and the default smgr implementation.
