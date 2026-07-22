@@ -46,6 +46,7 @@ $node->init;
 $node->append_conf(
 	'postgresql.conf', q[
 autovacuum = off
+mapwriter_lru_maxpages = 0
 checkpoint_timeout = '1h'
 full_page_writes = on
 max_wal_size = '4GB'

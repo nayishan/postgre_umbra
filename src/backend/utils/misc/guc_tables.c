@@ -67,6 +67,9 @@
 #include "postmaster/autovacuum.h"
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/bgwriter.h"
+#ifdef USE_UMBRA
+#include "postmaster/mapwriter.h"
+#endif
 #include "postmaster/postmaster.h"
 #include "postmaster/startup.h"
 #include "postmaster/syslogger.h"

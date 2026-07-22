@@ -39,6 +39,7 @@ extern void MapFlushRelation(UmbraFileContext *ctx,
 						 RelFileLocatorBackend rlocator);
 extern void MapFlushDatabaseTablespace(Oid dbid, Oid spcOid);
 extern void MapCheckpoint(void);
+extern int MapPageBgWriterFlush(int max_pages);
 
 extern uint8 MapGetActiveSlot(UmbraFileContext *ctx,
 						  RelFileLocatorBackend rlocator,
