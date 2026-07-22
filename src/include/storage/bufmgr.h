@@ -293,7 +293,9 @@ extern void CheckPointBuffersCaptureBegin(void);
 extern void CheckPointBuffersPrepare(int flags);
 extern void CheckPointBuffersAbort(void);
 extern bool CheckpointBufferCaptureIsActive(void);
-extern void BufferSaveCheckpointSourceSlot(Buffer buffer, uint8 source_slot);
+extern bool BufferCheckpointSourceSlotCaptureIsPossible(Buffer buffer,
+											 uint8 source_slot);
+extern bool BufferSaveCheckpointSourceSlot(Buffer buffer, uint8 source_slot);
 #endif
 extern void CheckPointBuffers(int flags);
 extern BlockNumber BufferGetBlockNumber(Buffer buffer);

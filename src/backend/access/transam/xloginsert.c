@@ -97,6 +97,8 @@ typedef struct
 	Buffer		buffer;
 	bool		from_shared_buffer;
 	bool		slot_shift_in_record;
+	bool		source_slot_capture_possible;
+	bool		source_slot_captured;
 	UmbraSlotShift slot_shift;
 #endif
 } registered_buffer;
@@ -268,6 +270,8 @@ XLogResetInsertion(void)
 		registered_buffers[i].buffer = InvalidBuffer;
 		registered_buffers[i].from_shared_buffer = false;
 		registered_buffers[i].slot_shift_in_record = false;
+		registered_buffers[i].source_slot_capture_possible = false;
+		registered_buffers[i].source_slot_captured = false;
 		MemSet(&registered_buffers[i].slot_shift, 0,
 				   sizeof(registered_buffers[i].slot_shift));
 		registered_buffers[i].slot_shift.map_slot_id = -1;
@@ -331,6 +335,8 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
 	regbuf->buffer = buffer;
 	regbuf->from_shared_buffer = true;
 	regbuf->slot_shift_in_record = false;
+	regbuf->source_slot_capture_possible = false;
+	regbuf->source_slot_captured = false;
 	MemSet(&regbuf->slot_shift, 0, sizeof(regbuf->slot_shift));
 	regbuf->slot_shift.map_slot_id = -1;
 #endif
@@ -391,6 +397,8 @@ XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator, ForkNumber forknum,
 	regbuf->buffer = InvalidBuffer;
 	regbuf->from_shared_buffer = false;
 	regbuf->slot_shift_in_record = false;
+	regbuf->source_slot_capture_possible = false;
+	regbuf->source_slot_captured = false;
 	MemSet(&regbuf->slot_shift, 0, sizeof(regbuf->slot_shift));
 	regbuf->slot_shift.map_slot_id = -1;
 #endif
@@ -776,6 +784,7 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 		bool		include_image;
 #ifdef USE_UMBRA
 		bool		include_slot_shift = false;
+		bool		image_free_slot_shift = false;
 		XLogRecordBlockSlotShiftHeader slot_shift_header;
 #endif
 
@@ -783,6 +792,7 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 			continue;
 #ifdef USE_UMBRA
 		regbuf->slot_shift_in_record = false;
+		regbuf->source_slot_captured = false;
 #endif
 
 		/* Determine if this block needs to be backed up */
@@ -810,10 +820,28 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 		}
 
 #ifdef USE_UMBRA
-		/* P9 moves only records that retain an applying full-page image. */
-		include_slot_shift = needs_backup && regbuf->slot_shift.prepared;
+		/*
+		 * A selected checkpoint writes the retained source slot.  Its exact
+		 * source baseline can replace the FPI, but only when ordinary redo has
+		 * page data to apply after it reaches the target slot.
+		 */
+		image_free_slot_shift = needs_backup &&
+			regbuf->slot_shift.prepared &&
+			regbuf->source_slot_capture_possible &&
+			regbuf->rdata_len != 0;
+		if (image_free_slot_shift)
+		{
+			needs_backup = false;
+			regbuf->source_slot_captured = true;
+		}
+		include_slot_shift = (needs_backup || image_free_slot_shift) &&
+			regbuf->slot_shift.prepared;
 		if (!include_slot_shift && regbuf->slot_shift.prepared)
+		{
 			UmAbortSlotShift(&regbuf->slot_shift);
+			regbuf->source_slot_capture_possible = false;
+			regbuf->source_slot_captured = false;
+		}
 #endif
 
 		/* Determine if the buffer data needs to included */
@@ -835,6 +863,9 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 		if (include_slot_shift)
 		{
 			slot_shift_header.source_slot = regbuf->slot_shift.source_slot;
+			if (image_free_slot_shift)
+				slot_shift_header.source_slot |=
+					XLR_SLOT_SHIFT_CAPTURED_SOURCE;
 			slot_shift_header.target_slot = regbuf->slot_shift.target_slot;
 			bkpb.fork_flags |= BKPBLOCK_HAS_SLOT_SHIFT;
 			regbuf->slot_shift_in_record = true;
@@ -1194,6 +1225,9 @@ XLogPrepareSlotShifts(RmgrId rmid, uint8 info, XLogRecPtr RedoRecPtr,
 			continue;
 		if (regbuf->slot_shift.prepared)
 		{
+			regbuf->source_slot_capture_possible =
+				BufferCheckpointSourceSlotCaptureIsPossible(regbuf->buffer,
+												  regbuf->slot_shift.source_slot);
 			prepared = true;
 			continue;
 		}
@@ -1203,7 +1237,12 @@ XLogPrepareSlotShifts(RmgrId rmid, uint8 info, XLogRecPtr RedoRecPtr,
 		if (XLogRecPtrIsValid(page_lsn) && page_lsn <= RedoRecPtr &&
 			UmPrepareSlotShift(reln, regbuf->forkno, regbuf->block,
 						   &regbuf->slot_shift))
+		{
+			regbuf->source_slot_capture_possible =
+				BufferCheckpointSourceSlotCaptureIsPossible(regbuf->buffer,
+												  regbuf->slot_shift.source_slot);
 			prepared = true;
+		}
 	}
 	return prepared;
 }
@@ -1218,10 +1257,14 @@ XLogPublishSlotShifts(XLogRecPtr record_endptr)
 		if (!regbuf->in_use || !regbuf->slot_shift_in_record)
 			continue;
 		Assert(regbuf->slot_shift.prepared);
-		BufferSaveCheckpointSourceSlot(regbuf->buffer,
-										regbuf->slot_shift.source_slot);
+		if (!BufferSaveCheckpointSourceSlot(regbuf->buffer,
+									 regbuf->slot_shift.source_slot) &&
+			regbuf->source_slot_captured)
+			elog(PANIC, "Umbra image-free slot shift lost its checkpoint source slot");
 		UmPublishSlotShift(&regbuf->slot_shift, record_endptr);
 		regbuf->slot_shift_in_record = false;
+		regbuf->source_slot_capture_possible = false;
+		regbuf->source_slot_captured = false;
 	}
 	curinsert_has_slot_shift = false;
 }
@@ -1236,6 +1279,8 @@ XLogAbortSlotShifts(void)
 		if (regbuf->slot_shift.prepared)
 			UmAbortSlotShift(&regbuf->slot_shift);
 		regbuf->slot_shift_in_record = false;
+		regbuf->source_slot_capture_possible = false;
+		regbuf->source_slot_captured = false;
 	}
 	curinsert_has_slot_shift = false;
 }
@@ -1254,6 +1299,8 @@ XLogReleaseSlotShiftsAtExit(int code, Datum arg)
 			if (regbuf->slot_shift.prepared)
 				UmReleaseSlotShiftOnExit(&regbuf->slot_shift);
 			regbuf->slot_shift_in_record = false;
+			regbuf->source_slot_capture_possible = false;
+			regbuf->source_slot_captured = false;
 		}
 	}
 	curinsert_has_slot_shift = false;

@@ -466,6 +466,18 @@ UmCheckpointWritebackSourceSlot(SMgrRelation reln, ForkNumber forknum,
 }
 
 void
+UmRedoSetActiveSlot(SMgrRelation reln, ForkNumber forknum,
+					BlockNumber logical_block, uint8 active_slot)
+{
+	if (reln == NULL || !InRecovery ||
+		!UmbraMainActiveSlotIsValid(active_slot) ||
+		!um_main_uses_slot0(reln, forknum))
+		elog(PANIC, "Umbra redo targets an inactive MAIN mapping");
+	MapRedoSetActiveSlot(um_get_filectx(reln), reln->smgr_rlocator,
+					 logical_block, active_slot);
+}
+
+void
 UmRedoSlotShift(SMgrRelation reln, ForkNumber forknum,
 				BlockNumber logical_block, uint8 source_slot,
 				uint8 target_slot)
@@ -473,7 +485,7 @@ UmRedoSlotShift(SMgrRelation reln, ForkNumber forknum,
 	if (!InRecovery || !um_main_uses_slot0(reln, forknum))
 		elog(PANIC, "Umbra slot-shift WAL targets an inactive MAIN mapping");
 	MapRedoSlotShift(um_get_filectx(reln), reln->smgr_rlocator,
-				 logical_block, source_slot, target_slot);
+					 logical_block, source_slot, target_slot);
 }
 
 void

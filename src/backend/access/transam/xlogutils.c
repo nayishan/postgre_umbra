@@ -382,13 +382,45 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 	{
 		SMgrRelation reln;
 
-		if (!XLogRecBlockImageApply(record, block_id))
-			elog(PANIC, "Umbra slot-shift WAL record has no applying full-page image");
 		reln = smgropen(rlocator, INVALID_PROC_NUMBER);
 		smgrprepareredo(reln, record->EndRecPtr);
 		if (!UmRedoDiscardingPrecreateRecords(reln))
-			UmRedoSlotShift(reln, forknum, blkno, blkref->source_slot,
-							blkref->target_slot);
+		{
+			if (XLogRecBlockImageApply(record, block_id))
+				UmRedoSlotShift(reln, forknum, blkno, blkref->source_slot,
+								blkref->target_slot);
+			else if (blkref->source_slot_captured)
+			{
+				/* Materialize the old baseline before publishing the target. */
+				UmRedoSetActiveSlot(reln, forknum, blkno,
+									 blkref->source_slot);
+				*buf = XLogReadBufferExtended(rlocator, forknum, blkno, mode,
+									  prefetch_buffer);
+				if (BufferIsValid(*buf))
+				{
+					if (mode != RBM_ZERO_AND_LOCK &&
+						mode != RBM_ZERO_AND_CLEANUP_LOCK)
+					{
+						if (get_cleanup_lock)
+							LockBufferForCleanup(*buf);
+						else
+							LockBuffer(*buf, BUFFER_LOCK_EXCLUSIVE);
+					}
+					MarkBufferDirty(*buf);
+					FlushOneBuffer(*buf);
+					UmRedoSlotShift(reln, forknum, blkno,
+										blkref->source_slot,
+										blkref->target_slot);
+					MarkBufferDirty(*buf);
+					if (lsn <= PageGetLSN(BufferGetPage(*buf)))
+						return BLK_DONE;
+					return BLK_NEEDS_REDO;
+				}
+				return BLK_NOTFOUND;
+			}
+			else
+				elog(PANIC, "Umbra slot-shift WAL record has no applying full-page image");
+		}
 	}
 #endif
 

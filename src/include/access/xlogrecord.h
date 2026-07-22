@@ -117,8 +117,8 @@ typedef struct XLogRecordBlockHeader
 #ifdef USE_UMBRA
 /*
  * A WAL block reference can move an Umbra MAIN page to its next active slot.
- * The P9 form always retains an applying full-page image, so redo can select
- * the target before reading or restoring the page.
+ * source_slot uses its high bit to identify the image-free form, leaving the
+ * original two-byte P9 layout unchanged.
  */
 typedef struct XLogRecordBlockSlotShiftHeader
 {
@@ -126,6 +126,8 @@ typedef struct XLogRecordBlockSlotShiftHeader
 	uint8		target_slot;
 } XLogRecordBlockSlotShiftHeader;
 
+#define XLR_SLOT_SHIFT_SOURCE_SLOT_MASK	0x03
+#define XLR_SLOT_SHIFT_CAPTURED_SOURCE	0x80
 #define SizeOfXLogRecordBlockSlotShiftHeader \
 	sizeof(XLogRecordBlockSlotShiftHeader)
 #else
