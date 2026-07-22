@@ -20,6 +20,7 @@
 #include "port/pg_crc32c.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
+#include "storage/map.h"
 #include "storage/umfile.h"
 #include "storage/ummap.h"
 #include "storage/umbra.h"
@@ -162,6 +163,12 @@ ummap_create(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 	Assert(ctx != NULL);
 	umfile_create(ctx, UMBRA_METADATA_FORKNUM, isRedo);
 	nblocks = umfile_nblocks(ctx, UMBRA_METADATA_FORKNUM);
+	if (isRedo && nblocks > 1)
+	{
+		/* CREATE redo rebuilds selector state from replay, not stale metadata. */
+		umfile_truncate(ctx, UMBRA_METADATA_FORKNUM, nblocks, 1);
+		nblocks = 1;
+	}
 
 	/*
 	 * MAIN CREATE redo deterministically reconstructs this bootstrap root.
@@ -191,7 +198,7 @@ ummap_is_empty(UmbraFileContext *ctx, RelFileLocatorBackend rlocator)
 	Assert(ctx != NULL);
 	(void) rlocator;
 	if (!ummap_exists(ctx) ||
-		umfile_nblocks(ctx, UMBRA_METADATA_FORKNUM) != 1)
+		umfile_nblocks(ctx, UMBRA_METADATA_FORKNUM) < 1)
 		return false;
 
 	MemSet(empty_sector, 0, sizeof(empty_sector));
@@ -479,6 +486,7 @@ ummap_flush_relation(UmbraFileContext *ctx, RelFileLocatorBackend rlocator)
 	UmbraMapRootEntry *entry;
 
 	Assert(ctx != NULL);
+	MapFlushRelation(ctx, rlocator);
 	if (UmbraMapRootCacheCtlData == NULL)
 		return;
 	ummap_root_cache_ensure_initialized();
@@ -494,6 +502,7 @@ ummap_flush_database_tablespace(Oid dbid, Oid spcOid)
 {
 	Assert(OidIsValid(dbid));
 	Assert(OidIsValid(spcOid));
+	MapFlushDatabaseTablespace(dbid, spcOid);
 	ummap_root_cache_flush_matching(dbid, spcOid);
 }
 
@@ -501,6 +510,7 @@ void
 ummap_invalidate_database(Oid dbid)
 {
 	Assert(OidIsValid(dbid));
+	MapInvalidateDatabase(dbid);
 	ummap_root_cache_invalidate_matching(dbid, InvalidOid);
 }
 
@@ -509,13 +519,16 @@ ummap_invalidate_database_tablespace(Oid dbid, Oid spcOid)
 {
 	Assert(OidIsValid(dbid));
 	Assert(OidIsValid(spcOid));
+	MapInvalidateDatabaseTablespace(dbid, spcOid);
 	ummap_root_cache_invalidate_matching(dbid, spcOid);
 }
 
 void
 ummap_checkpoint(void)
 {
+	MapCheckpoint();
 	ummap_root_cache_flush_matching(InvalidOid, InvalidOid);
+	MapCheckpoint();
 }
 
 void
@@ -547,6 +560,7 @@ ummap_unlink(RelFileLocatorBackend rlocator, bool isRedo)
 {
 	UmbraMapRootTag tag = {0};
 
+	MapInvalidateRelation(rlocator);
 	tag.rlocator = rlocator;
 	if (UmbraMapRootCacheCtlData != NULL)
 		ummap_root_cache_delete_entry(&tag);
@@ -652,7 +666,7 @@ ummap_root_read_valid_image(UmbraFileContext *ctx, char *image)
 	Assert(ctx != NULL);
 	Assert(image != NULL);
 	if (!ummap_exists(ctx) ||
-		umfile_nblocks(ctx, UMBRA_METADATA_FORKNUM) != 1)
+		umfile_nblocks(ctx, UMBRA_METADATA_FORKNUM) < 1)
 		return false;
 
 	umfile_read_bytes(ctx, UMBRA_METADATA_FORKNUM, 0, sector,

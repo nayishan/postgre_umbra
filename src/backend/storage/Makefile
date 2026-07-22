@@ -20,4 +20,9 @@ SUBDIRS = \
 	smgr \
 	sync
 
+ifeq ($(with_umbra), yes)
+SUBDIRS += \
+	map
+endif
+
 include $(top_srcdir)/src/backend/common.mk
