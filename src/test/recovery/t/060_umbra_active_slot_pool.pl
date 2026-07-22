@@ -73,11 +73,15 @@ for my $relation (@relations)
 	push @map_paths, $node->data_dir . "/${main_path}_map";
 }
 
-is(-s $map_paths[0], $block_size,
-	'new relation has only its metadata root before a selector is published');
+is(-s $map_paths[0], 2 * $block_size,
+	'extension materializes a zero selector page with the metadata root');
 
-# A restart forces a physical read through MapGetActiveSlot().
+# A restart forces a physical read through MapGetActiveSlot().  A missing
+# selector page remains a valid all-slot-0 representation and reads must not
+# recreate it.
 $node->stop;
+truncate($map_paths[0], $block_size)
+  or BAIL_OUT("could not remove selector page from \"$map_paths[0]\": $!");
 $node->start;
 is($node->safe_psql('postgres', 'SELECT count(*) FROM umbra_selector_anchor'),
 	'1', 'an absent selector page reads as slot 0');
@@ -87,6 +91,8 @@ is(-s $map_paths[0], $block_size,
 $node->stop;
 for my $map_path (@map_paths)
 {
+	truncate($map_path, $block_size)
+	  or BAIL_OUT("could not remove selector page from \"$map_path\": $!");
 	append_zero_block($map_path, $block_size);
 }
 $node->start;

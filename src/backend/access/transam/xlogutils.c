@@ -353,6 +353,9 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 	Page		page;
 	bool		zeromode;
 	bool		willinit;
+#ifdef USE_UMBRA
+	DecodedBkpBlock *blkref;
+#endif
 
 	if (!XLogRecGetBlockTagExtended(record, block_id, &rlocator, &forknum, &blkno,
 									&prefetch_buffer))
@@ -372,6 +375,22 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 		elog(PANIC, "block with WILL_INIT flag in WAL record must be zeroed by redo routine");
 	if (!willinit && zeromode)
 		elog(PANIC, "block to be initialized in redo routine must be marked with WILL_INIT flag in the WAL record");
+
+#ifdef USE_UMBRA
+	blkref = XLogRecGetBlock(record, block_id);
+	if (blkref->has_slot_shift)
+	{
+		SMgrRelation reln;
+
+		if (!XLogRecBlockImageApply(record, block_id))
+			elog(PANIC, "Umbra slot-shift WAL record has no applying full-page image");
+		reln = smgropen(rlocator, INVALID_PROC_NUMBER);
+		smgrprepareredo(reln, record->EndRecPtr);
+		if (!UmRedoDiscardingPrecreateRecords(reln))
+			UmRedoSlotShift(reln, forknum, blkno, blkref->source_slot,
+							blkref->target_slot);
+	}
+#endif
 
 	/* If it has a full-page image and it should be restored, do it. */
 	if (XLogRecBlockImageApply(record, block_id))

@@ -31,6 +31,16 @@
 
 #define UMBRA_CHUNK_ACTIVE_SLOTS 3U
 
+typedef struct UmbraSlotShift
+{
+	RelFileLocatorBackend rlocator;
+	BlockNumber logical_block;
+	uint8		source_slot;
+	uint8		target_slot;
+	int			map_slot_id;
+	bool		prepared;
+} UmbraSlotShift;
+
 /* MAIN pages are born in slot 0; persistent selectors can later choose 1/2. */
 static inline bool
 UmbraMainActiveSlotIsValid(uint8 active_slot)
@@ -140,6 +150,17 @@ extern void umimmedsync(SMgrRelation reln, ForkNumber forknum);
 extern void umregistersync(SMgrRelation reln, ForkNumber forknum);
 extern bool umpreparependingsync(SMgrRelation reln);
 extern int	umfd(SMgrRelation reln, ForkNumber forknum,
-				 BlockNumber blocknum, uint32 *off);
+					 BlockNumber blocknum, uint32 *off);
+extern bool UmWalOwnedSlotShiftAvailable(SMgrRelation reln,
+								 ForkNumber forknum);
+extern bool UmPrepareSlotShift(SMgrRelation reln, ForkNumber forknum,
+							   BlockNumber logical_block,
+							   UmbraSlotShift *shift);
+extern void UmAbortSlotShift(UmbraSlotShift *shift);
+extern void UmReleaseSlotShiftOnExit(UmbraSlotShift *shift);
+extern void UmPublishSlotShift(UmbraSlotShift *shift, XLogRecPtr lsn);
+extern void UmRedoSlotShift(SMgrRelation reln, ForkNumber forknum,
+						 BlockNumber logical_block, uint8 source_slot,
+						 uint8 target_slot);
 
 #endif							/* UMBRA_H */

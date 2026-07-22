@@ -952,6 +952,13 @@ ummap_root_cache_flush_locked(UmbraMapRootEntry *entry,
 		if ((((UmbraMapRootData *) entry->image)->flags &
 			 UMMAP_ROOT_FLAG_MAIN_SLOT0) != 0)
 			umfile_immedsync(write_ctx, MAIN_FORKNUM);
+		/*
+		 * Selector pages share the metadata file with the root.  Make their
+		 * WAL-protected contents durable before a root write can make this
+		 * metadata generation authoritative.
+		 */
+		MapFlushRelation(write_ctx, entry->tag.rlocator);
+		umfile_immedsync(write_ctx, UMBRA_METADATA_FORKNUM);
 		ummap_root_write_image(write_ctx, entry->image, !entry->needs_fsync);
 		if (temporary_ctx != NULL)
 		{

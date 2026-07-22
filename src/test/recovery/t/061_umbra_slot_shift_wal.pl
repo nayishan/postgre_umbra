@@ -1,0 +1,157 @@
+# Copyright (c) 2026, PostgreSQL Global Development Group
+
+# Verify FPI-backed active-slot shifts, their WAL header, and redo ordering.
+
+use strict;
+use warnings FATAL => 'all';
+
+use Fcntl qw(SEEK_SET);
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
+use Test::More;
+
+plan skip_all => 'requires an Umbra storage manager build'
+  unless check_pg_config('^#define USE_UMBRA 1$');
+
+sub read_active_slot
+{
+	my ($path, $block_size, $logical_block) = @_;
+	my $entries_per_page = $block_size * 4;
+	my $entry_index = $logical_block % $entries_per_page;
+	my $map_block = 1 + int($logical_block / $entries_per_page);
+	my $offset = $map_block * $block_size + int($entry_index / 4);
+	my $byte;
+
+	open(my $fh, '<', $path) or BAIL_OUT("could not open \"$path\": $!");
+	binmode($fh);
+	my $position = sysseek($fh, $offset, SEEK_SET);
+	defined($position) && $position == $offset
+	  or BAIL_OUT("could not seek in \"$path\": $!");
+	my $nread = sysread($fh, $byte, 1);
+	defined($nread) && $nread == 1
+	  or BAIL_OUT("could not read selector from \"$path\"");
+	close($fh) or BAIL_OUT("could not close \"$path\": $!");
+
+	return (unpack('C', $byte) >> (($entry_index % 4) * 2)) & 0x03;
+}
+
+sub assert_shift_wal
+{
+	my ($node, $filenode, $target_block, $start_lsn, $end_lsn,
+		$source_slot, $target_slot, $label) = @_;
+	my ($dump, $stderr) = run_command(
+		[
+			'pg_waldump', '--bkp-details',
+			'--path' => $node->data_dir . '/pg_wal',
+			'--start' => $start_lsn,
+			'--end' => $end_lsn,
+		]);
+
+	# --start can land between WAL records; pg_waldump reports that single
+	# skipped range on stderr before decoding the next complete record.
+	$stderr =~ s/^pg_waldump: first record is after [0-9A-F]+\/[0-9A-F]+, at [0-9A-F]+\/[0-9A-F]+, skipping over \d+ bytes?\n?//;
+	is($stderr, '', "$label: pg_waldump reads the update WAL");
+	my @records = grep {
+		/rel \d+\/\d+\/$filenode fork main blk $target_block\b/
+	} split(/\n/, $dump);
+	ok(
+		grep(
+			/\bFPW\b/ &&
+			  /slot shift: source_slot $source_slot target_slot $target_slot/,
+			@records),
+		"$label: WAL retains an FPI and records the slot transition");
+}
+
+my $node = PostgreSQL::Test::Cluster->new('umbra_slot_shift_wal');
+$node->init;
+$node->append_conf(
+	'postgresql.conf', q[
+autovacuum = off
+bgwriter_lru_maxpages = 0
+checkpoint_timeout = '1h'
+full_page_writes = on
+max_wal_size = '4GB'
+]);
+$node->start;
+
+$node->safe_psql(
+	'postgres', q[
+CREATE TABLE umbra_slot_shift_wal(id integer PRIMARY KEY, payload text)
+  WITH (autovacuum_enabled = false, fillfactor = 50);
+INSERT INTO umbra_slot_shift_wal VALUES (1, 'initial');
+]);
+
+my $block_size = 0 + $node->safe_psql('postgres', 'SHOW block_size');
+my $relpath = $node->safe_psql(
+	'postgres', q[SELECT pg_relation_filepath('umbra_slot_shift_wal'::regclass);]);
+my $filenode = $node->safe_psql(
+	'postgres', q[SELECT pg_relation_filenode('umbra_slot_shift_wal'::regclass);]);
+my $map_path = $node->data_dir . "/${relpath}_map";
+my $target_block = 0 + $node->safe_psql(
+	'postgres', q[
+SELECT (ctid::text::point)[0]::integer
+FROM umbra_slot_shift_wal WHERE id = 1;]);
+
+# Read the tuple before the FPI interval begins.  With checksums enabled, a
+# post-checkpoint visibility hint would otherwise consume that interval in a
+# separate XLOG_FPI_FOR_HINT record.
+$node->safe_psql('postgres', 'CHECKPOINT');
+
+is(-s $map_path, 2 * $block_size,
+	'initial insert and checkpoint seed the first selector page');
+is(read_active_slot($map_path, $block_size, $target_block), 0,
+	'initial selector is slot 0');
+
+my @steps = (
+	[0, 1, 'one'],
+	[1, 2, 'two'],
+	[2, 0, 'three'],
+);
+
+for my $step_index (0 .. $#steps)
+{
+	my ($source_slot, $target_slot, $payload) = @{ $steps[$step_index] };
+	my $label = "slot $source_slot to $target_slot";
+	my $start_lsn = $node->safe_psql(
+		'postgres', 'SELECT pg_current_wal_insert_lsn();');
+	my $updated_block = 0 + $node->safe_psql(
+		'postgres',
+		"UPDATE umbra_slot_shift_wal SET payload = '$payload' "
+		  . "WHERE id = 1 RETURNING (ctid::text::point)[0]::integer;");
+	my $end_lsn = $node->safe_psql(
+		'postgres', 'SELECT pg_current_wal_insert_lsn();');
+
+	is($updated_block, $target_block, "$label: update remains on one page");
+	assert_shift_wal($node, $filenode, $target_block, $start_lsn, $end_lsn,
+		$source_slot, $target_slot, $label);
+
+	# Each following update starts in a fresh full-page-write interval.
+	if ($step_index < $#steps)
+	{
+		$node->safe_psql('postgres', 'CHECKPOINT');
+		is(read_active_slot($map_path, $block_size, $target_block),
+			$target_slot, "$label: checkpoint persists the selector target");
+
+		# A fresh backend may set the prior update's commit hint when it next
+		# reads this tuple.  Let that separate FPI_FOR_HINT happen before the
+		# next checkpoint interval, so the next UPDATE owns its ordinary FPI.
+		$node->safe_psql('postgres', q[
+SELECT (ctid::text::point)[0]::integer
+FROM umbra_slot_shift_wal WHERE id = 1;]);
+		$node->safe_psql('postgres', 'CHECKPOINT');
+	}
+}
+
+# The final shift is intentionally not checkpointed.  Recovery must publish
+# its selector target before restoring the FPI into that target slot.
+$node->stop('immediate');
+$node->start;
+is(read_active_slot($map_path, $block_size, $target_block), 0,
+	'crash redo persists the final selector target');
+is($node->safe_psql('postgres',
+		q[SELECT payload FROM umbra_slot_shift_wal WHERE id = 1;]),
+	'three', 'crash redo restores the FPI through the final target slot');
+
+$node->stop;
+
+done_testing();
