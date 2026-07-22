@@ -72,6 +72,7 @@ tests += {
       't/061_umbra_slot_shift_wal.pl',
       't/062_umbra_slot_checkpoint_publication.pl',
       't/063_umbra_checkpoint_capture.pl',
+      't/064_umbra_checkpoint_source_slot.pl',
     ],
   },
 }

@@ -159,6 +159,13 @@ extern bool UmPrepareSlotShift(SMgrRelation reln, ForkNumber forknum,
 extern void UmAbortSlotShift(UmbraSlotShift *shift);
 extern void UmReleaseSlotShiftOnExit(UmbraSlotShift *shift);
 extern void UmPublishSlotShift(UmbraSlotShift *shift, XLogRecPtr lsn);
+extern bool UmCheckpointWriteSourceSlot(SMgrRelation reln, ForkNumber forknum,
+										BlockNumber lblkno, uint8 source_slot,
+										const void *buffer);
+extern void UmCheckpointWritebackSourceSlot(SMgrRelation reln,
+											ForkNumber forknum,
+											BlockNumber lblkno,
+											uint8 source_slot);
 extern void UmRedoSlotShift(SMgrRelation reln, ForkNumber forknum,
 						 BlockNumber logical_block, uint8 source_slot,
 						 uint8 target_slot);

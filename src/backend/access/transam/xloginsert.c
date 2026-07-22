@@ -94,6 +94,7 @@ typedef struct
 	/* buffer to store a compressed version of backup block image */
 	char		compressed_page[COMPRESS_BUFSIZE];
 #ifdef USE_UMBRA
+	Buffer		buffer;
 	bool		from_shared_buffer;
 	bool		slot_shift_in_record;
 	UmbraSlotShift slot_shift;
@@ -264,6 +265,7 @@ XLogResetInsertion(void)
 	{
 		registered_buffers[i].in_use = false;
 #ifdef USE_UMBRA
+		registered_buffers[i].buffer = InvalidBuffer;
 		registered_buffers[i].from_shared_buffer = false;
 		registered_buffers[i].slot_shift_in_record = false;
 		MemSet(&registered_buffers[i].slot_shift, 0,
@@ -326,6 +328,7 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
 	regbuf->rdata_tail = (XLogRecData *) &regbuf->rdata_head;
 	regbuf->rdata_len = 0;
 #ifdef USE_UMBRA
+	regbuf->buffer = buffer;
 	regbuf->from_shared_buffer = true;
 	regbuf->slot_shift_in_record = false;
 	MemSet(&regbuf->slot_shift, 0, sizeof(regbuf->slot_shift));
@@ -385,6 +388,7 @@ XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator, ForkNumber forknum,
 	regbuf->rdata_tail = (XLogRecData *) &regbuf->rdata_head;
 	regbuf->rdata_len = 0;
 #ifdef USE_UMBRA
+	regbuf->buffer = InvalidBuffer;
 	regbuf->from_shared_buffer = false;
 	regbuf->slot_shift_in_record = false;
 	MemSet(&regbuf->slot_shift, 0, sizeof(regbuf->slot_shift));
@@ -1214,6 +1218,8 @@ XLogPublishSlotShifts(XLogRecPtr record_endptr)
 		if (!regbuf->in_use || !regbuf->slot_shift_in_record)
 			continue;
 		Assert(regbuf->slot_shift.prepared);
+		BufferSaveCheckpointSourceSlot(regbuf->buffer,
+										regbuf->slot_shift.source_slot);
 		UmPublishSlotShift(&regbuf->slot_shift, record_endptr);
 		regbuf->slot_shift_in_record = false;
 	}
