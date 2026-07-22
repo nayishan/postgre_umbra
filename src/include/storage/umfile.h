@@ -18,6 +18,7 @@
 #include "storage/block.h"
 #include "storage/relfilelocator.h"
 #include "storage/sync.h"
+#include "storage/um_defs.h"
 
 typedef struct UmbraFileContext UmbraFileContext;
 
@@ -37,6 +38,11 @@ extern void umfile_extend(UmbraFileContext *ctx, ForkNumber forknum,
 extern void umfile_zeroextend(UmbraFileContext *ctx, ForkNumber forknum,
 							  BlockNumber blocknum, int nblocks,
 							  bool skipFsync);
+extern void umfile_read_bytes(UmbraFileContext *ctx, ForkNumber forknum,
+						  BlockNumber blocknum, void *buffer, int nbytes);
+extern void umfile_write_bytes(UmbraFileContext *ctx, ForkNumber forknum,
+						   BlockNumber blocknum, const void *buffer, int nbytes,
+						   bool skipFsync);
 extern bool umfile_prefetch(UmbraFileContext *ctx, ForkNumber forknum,
 							BlockNumber blocknum, int nblocks);
 extern uint32 umfile_maxcombine(UmbraFileContext *ctx, ForkNumber forknum,

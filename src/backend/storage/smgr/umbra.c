@@ -17,9 +17,11 @@
  */
 #include "postgres.h"
 
+#include "access/xlogutils.h"
 #include "storage/aio.h"
 #include "storage/smgr.h"
 #include "storage/umfile.h"
+#include "storage/ummap.h"
 #include "storage/umbra.h"
 #include "utils/memutils.h"
 
@@ -61,6 +63,10 @@ umopen(SMgrRelation reln)
 
 	if (state->filectx == NULL)
 		state->filectx = umfile_open(reln->smgr_rlocator);
+
+	/* CREATE redo repairs a deterministic root before normal validation. */
+	if (!InRecovery && !RelFileLocatorBackendIsTemp(reln->smgr_rlocator))
+		ummap_validate_if_exists(state->filectx);
 }
 
 void
@@ -69,7 +75,11 @@ umclose(SMgrRelation reln, ForkNumber forknum)
 	UmbraSmgrRelationState *state = reln->smgr_private;
 
 	if (state != NULL && state->filectx != NULL)
+	{
+		if (forknum == MAIN_FORKNUM)
+			umfile_close(state->filectx, UMBRA_METADATA_FORKNUM);
 		umfile_close(state->filectx, forknum);
+	}
 }
 
 void
@@ -89,7 +99,21 @@ umdestroy(SMgrRelation reln)
 void
 umcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 {
-	umfile_create(um_get_filectx(reln), forknum, isRedo);
+	UmbraFileContext *ctx = um_get_filectx(reln);
+
+	umfile_create(ctx, forknum, isRedo);
+	if (isRedo && forknum == MAIN_FORKNUM &&
+		!RelFileLocatorBackendIsTemp(reln->smgr_rlocator))
+		ummap_create(ctx, isRedo);
+}
+
+void
+uminitnewrelation(SMgrRelation reln, bool needs_wal)
+{
+	Assert(reln->smgr_private != NULL);
+
+	if (needs_wal)
+		ummap_create(um_get_filectx(reln), false);
 }
 
 bool
@@ -101,6 +125,8 @@ umexists(SMgrRelation reln, ForkNumber forknum)
 void
 umunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 {
+	if (forknum == MAIN_FORKNUM || forknum == InvalidForkNumber)
+		ummap_unlink(rlocator, isRedo);
 	umfile_unlink(rlocator, forknum, isRedo);
 }
 
@@ -181,13 +207,21 @@ umtruncate(SMgrRelation reln, ForkNumber forknum,
 void
 umimmedsync(SMgrRelation reln, ForkNumber forknum)
 {
-	umfile_immedsync(um_get_filectx(reln), forknum);
+	UmbraFileContext *ctx = um_get_filectx(reln);
+
+	umfile_immedsync(ctx, forknum);
+	if (forknum == MAIN_FORKNUM)
+		ummap_immedsync_if_exists(ctx);
 }
 
 void
 umregistersync(SMgrRelation reln, ForkNumber forknum)
 {
-	umfile_registersync(um_get_filectx(reln), forknum);
+	UmbraFileContext *ctx = um_get_filectx(reln);
+
+	umfile_registersync(ctx, forknum);
+	if (forknum == MAIN_FORKNUM)
+		ummap_registersync_if_exists(ctx);
 }
 
 int
