@@ -33,6 +33,7 @@
 #include "storage/proc.h"
 #include "storage/smgr.h"
 #include "utils/hsearch.h"
+#include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
@@ -190,16 +191,53 @@ void
 log_smgrcreate(const RelFileLocator *rlocator, ForkNumber forkNum)
 {
 	xl_smgr_create xlrec;
+#ifdef USE_UMBRA
+	XLogRecPtr	lsn;
+	bool		delay_started = false;
+
+	if (forkNum == MAIN_FORKNUM &&
+		(MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0)
+	{
+		MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+		delay_started = true;
+	}
+#endif
 
 	/*
 	 * Make an XLOG entry reporting the file creation.
 	 */
-	xlrec.rlocator = *rlocator;
-	xlrec.forkNum = forkNum;
+	PG_TRY();
+	{
+		xlrec.rlocator = *rlocator;
+		xlrec.forkNum = forkNum;
 
-	XLogBeginInsert();
-	XLogRegisterData(&xlrec, sizeof(xlrec));
-	XLogInsert(RM_SMGR_ID, XLOG_SMGR_CREATE | XLR_SPECIAL_REL_UPDATE);
+		XLogBeginInsert();
+		XLogRegisterData(&xlrec, sizeof(xlrec));
+
+#ifdef USE_UMBRA
+		lsn = XLogInsert(RM_SMGR_ID, XLOG_SMGR_CREATE | XLR_SPECIAL_REL_UPDATE);
+		INJECTION_POINT("umbra-create-after-wal-before-finish", NULL);
+		smgrfinishcreate(smgropen(*rlocator, INVALID_PROC_NUMBER), forkNum,
+							 lsn);
+
+#else
+		XLogInsert(RM_SMGR_ID, XLOG_SMGR_CREATE | XLR_SPECIAL_REL_UPDATE);
+#endif
+	}
+	PG_CATCH();
+	{
+#ifdef USE_UMBRA
+		if (delay_started)
+			MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+#endif
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+#ifdef USE_UMBRA
+	if (delay_started)
+		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+#endif
 }
 
 /*
@@ -341,6 +379,9 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 			nforks++;
 		}
 	}
+
+	/* Preload any selected-smgr state before entering the truncate critical section. */
+	smgrpreparetruncate(reln, forks, nforks, old_blocks, blocks);
 
 	RelationPreTruncate(rel);
 
@@ -784,8 +825,10 @@ smgrDoPendingSyncs(bool isCommit, bool isParallelWorker)
 		BlockNumber nblocks[MAX_FORKNUM + 1];
 		uint64		total_blocks = 0;
 		SMgrRelation srel;
+		bool		force_sync;
 
 		srel = smgropen(pendingsync->rlocator, INVALID_PROC_NUMBER);
+		force_sync = smgrpreparependingsync(srel);
 
 		/*
 		 * We emit newpage WAL records for smaller relations.
@@ -825,7 +868,7 @@ smgrDoPendingSyncs(bool isCommit, bool isParallelWorker)
 		 * the current main fork is longer than ever, but there's a case where
 		 * main fork is longer than ever but FSM fork gets shorter.
 		 */
-		if (pendingsync->is_truncated ||
+		if (pendingsync->is_truncated || force_sync ||
 			total_blocks >= wal_skip_threshold * (uint64) 1024 / BLCKSZ)
 		{
 			/* allocate the initial array, or extend it, if needed */
@@ -996,6 +1039,7 @@ smgr_redo(XLogReaderState *record)
 
 		reln = smgropen(xlrec->rlocator, INVALID_PROC_NUMBER);
 		smgrcreate(reln, xlrec->forkNum, true);
+		smgrfinishcreate(reln, xlrec->forkNum, lsn);
 	}
 	else if (info == XLOG_SMGR_TRUNCATE)
 	{
@@ -1077,6 +1121,7 @@ smgr_redo(XLogReaderState *record)
 		/* Do the real work to truncate relation forks */
 		if (nforks > 0)
 		{
+			smgrpreparetruncate(reln, forks, nforks, old_blocks, blocks);
 			START_CRIT_SECTION();
 			smgrtruncate(reln, forks, nforks, old_blocks, blocks);
 			END_CRIT_SECTION();

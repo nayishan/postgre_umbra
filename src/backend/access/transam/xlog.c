@@ -8062,8 +8062,15 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 	CheckPointSUBTRANS();
 	CheckPointMultiXact();
 	CheckPointPredicate();
+
+#ifdef USE_UMBRA
+	/* Umbra roots must not reach disk before the MAIN pages they name. */
+	CheckPointBuffers(flags);
+	smgrcheckpoint();
+#else
 	smgrcheckpoint();
 	CheckPointBuffers(flags);
+#endif
 
 	/* Perform all queued up fsyncs */
 	TRACE_POSTGRESQL_BUFFER_CHECKPOINT_SYNC_START();
