@@ -70,6 +70,7 @@ tests += {
       't/060_umbra_active_slot_pool.pl',
       't/061_umbra_slot_shift_wal.pl',
       't/062_umbra_slot_checkpoint_publication.pl',
+      't/063_umbra_checkpoint_capture.pl',
     ],
   },
 }
