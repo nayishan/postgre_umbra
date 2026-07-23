@@ -41,6 +41,31 @@ sub read_active_slot
 	return (unpack('C', $byte) >> (($entry_index % 4) * 2)) & 0x03;
 }
 
+sub assert_fpi_shift_wal
+{
+	my ($node, $filenode, $target_block, $start_lsn, $end_lsn) = @_;
+	my ($dump, $stderr) = run_command(
+		[
+			'pg_waldump', '--bkp-details',
+			'--path' => $node->data_dir . '/pg_wal',
+			'--start' => $start_lsn,
+			'--end' => $end_lsn,
+		]);
+
+	$stderr =~ s/^pg_waldump: first record is after [0-9A-F]+\/[0-9A-F]+, at [0-9A-F]+\/[0-9A-F]+, skipping over \d+ bytes?\n?//;
+	is($stderr, '', 'pg_waldump reads the pre-selection update WAL');
+	my @records = grep {
+		/rel \d+\/\d+\/$filenode fork main blk $target_block\b/
+	} split(/\n/, $dump);
+	is(scalar(@records), 1,
+		'pre-selection update emits one target-block WAL record');
+	like($records[0],
+		qr/\bFPW\b.*slot shift: source_slot 0 target_slot 1/,
+		'capture-before-selection shift retains an FPI');
+	unlike($records[0], qr/captured_source/,
+		'capture-before-selection shift does not claim a captured source');
+}
+
 my $node = PostgreSQL::Test::Cluster->new('umbra_checkpoint_capture');
 $node->init;
 $node->append_conf(
@@ -68,6 +93,9 @@ my $block_size = 0 + $node->safe_psql('postgres', 'SHOW block_size');
 my $relpath = $node->safe_psql(
 	'postgres',
 	q[SELECT pg_relation_filepath('umbra_checkpoint_capture'::regclass);]);
+my $filenode = $node->safe_psql(
+	'postgres',
+	q[SELECT pg_relation_filenode('umbra_checkpoint_capture'::regclass);]);
 my $map_path = $node->data_dir . "/${relpath}_map";
 my $target_block = 0 + $node->safe_psql(
 	'postgres', q[
@@ -96,6 +124,8 @@ pass('checkpoint publishes its capture before the fresh delay scan');
 # The selector publication point is cached in the writer, so preload it before
 # the actual update reaches the critical publication region.
 my $writer = $node->background_psql('postgres');
+my $wal_start = $node->safe_psql(
+	'postgres', 'SELECT pg_current_wal_insert_lsn();');
 $writer->query_until(
 	qr/preload_started/,
 	q(\echo preload_started
@@ -132,6 +162,10 @@ SELECT injection_points_wakeup(
          'umbra-mapping-after-wal-before-publish')]);
 $writer->query_until(qr/update_done/, '');
 $checkpoint->query_until(qr/checkpoint_done/, '');
+my $wal_end = $node->safe_psql(
+	'postgres', 'SELECT pg_current_wal_insert_lsn();');
+
+assert_fpi_shift_wal($node, $filenode, $target_block, $wal_start, $wal_end);
 
 is($node->safe_psql('postgres',
 		q[SELECT payload FROM umbra_checkpoint_capture WHERE id = 1;]),

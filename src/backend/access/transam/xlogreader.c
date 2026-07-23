@@ -1777,6 +1777,9 @@ DecodeXLogRecord(XLogReaderState *state,
 			/* XLogRecordBlockHeader */
 			DecodedBkpBlock *blk;
 			uint8		fork_flags;
+#ifdef USE_UMBRA
+			uint8		raw_source_slot;
+#endif
 
 			/* mark any intervening block IDs as not in use */
 			for (int i = decoded->max_block_id + 1; i < block_id; ++i)
@@ -1797,6 +1800,7 @@ DecodeXLogRecord(XLogReaderState *state,
 			blk->apply_image = false;
 #ifdef USE_UMBRA
 			blk->has_slot_shift = false;
+			blk->source_slot_captured = false;
 			blk->source_slot = 0;
 			blk->target_slot = 0;
 #endif
@@ -1833,8 +1837,21 @@ DecodeXLogRecord(XLogReaderState *state,
 				(fork_flags & BKPBLOCK_HAS_SLOT_SHIFT) != 0;
 			if (blk->has_slot_shift)
 			{
-				COPY_HEADER_FIELD(&blk->source_slot, sizeof(uint8));
+				COPY_HEADER_FIELD(&raw_source_slot, sizeof(uint8));
 				COPY_HEADER_FIELD(&blk->target_slot, sizeof(uint8));
+				if ((raw_source_slot &
+					 ~(XLR_SLOT_SHIFT_SOURCE_SLOT_MASK |
+					   XLR_SLOT_SHIFT_CAPTURED_SOURCE)) != 0)
+				{
+					report_invalid_record(state,
+								  "invalid Umbra source-slot flags at %X/%08X",
+								  LSN_FORMAT_ARGS(state->ReadRecPtr));
+					goto err;
+				}
+				blk->source_slot_captured =
+					(raw_source_slot & XLR_SLOT_SHIFT_CAPTURED_SOURCE) != 0;
+				blk->source_slot = raw_source_slot &
+					XLR_SLOT_SHIFT_SOURCE_SLOT_MASK;
 			}
 #endif
 
@@ -1942,7 +1959,10 @@ DecodeXLogRecord(XLogReaderState *state,
 				 blk->source_slot >= 3 || blk->target_slot >= 3 ||
 				 blk->source_slot == blk->target_slot ||
 				 (blk->flags & BKPBLOCK_WILL_INIT) != 0 ||
-				 !blk->has_image || !blk->apply_image))
+				 (blk->has_image && !blk->apply_image) ||
+				 (!blk->has_image &&
+				  (!blk->source_slot_captured || !blk->has_data)) ||
+				 (blk->has_image && blk->source_slot_captured)))
 			{
 				report_invalid_record(state,
 							  "invalid Umbra slot shift for block %u at %X/%08X",

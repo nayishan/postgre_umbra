@@ -163,6 +163,14 @@ log_invalid_page(RelFileLocator locator, ForkNumber forkno, BlockNumber blkno,
 	}
 }
 
+/* Record a recovery dependency on a later DROP or covering TRUNCATE. */
+void
+XLogRecordInvalidPage(RelFileLocator locator, ForkNumber forkno,
+					  BlockNumber blkno, bool present)
+{
+	log_invalid_page(locator, forkno, blkno, present);
+}
+
 /* Forget any invalid pages >= minblkno, because they've been dropped */
 static void
 forget_invalid_pages(RelFileLocator locator, ForkNumber forkno,
@@ -382,11 +390,46 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 	{
 		SMgrRelation reln;
 
-		if (!XLogRecBlockImageApply(record, block_id))
-			elog(PANIC, "Umbra slot-shift WAL record has no applying full-page image");
 		reln = smgropen(rlocator, INVALID_PROC_NUMBER);
-		UmRedoSlotShift(reln, forknum, blkno, blkref->source_slot,
-						blkref->target_slot, record->EndRecPtr);
+		if (XLogRecBlockImageApply(record, block_id))
+			UmRedoSlotShift(reln, forknum, blkno, blkref->source_slot,
+							blkref->target_slot, record->EndRecPtr);
+		else if (blkref->source_slot_captured)
+		{
+			/* Materialize the old baseline before publishing the target. */
+			if (!UmRedoSetActiveSlot(reln, forknum, blkno,
+									 blkref->source_slot))
+			{
+				XLogRecordInvalidPage(rlocator, forknum, blkno, false);
+				*buf = InvalidBuffer;
+				return BLK_NOTFOUND;
+			}
+			*buf = XLogReadBufferExtended(rlocator, forknum, blkno, mode,
+									  prefetch_buffer);
+			if (BufferIsValid(*buf))
+			{
+				if (mode != RBM_ZERO_AND_LOCK &&
+					mode != RBM_ZERO_AND_CLEANUP_LOCK)
+				{
+					if (get_cleanup_lock)
+						LockBufferForCleanup(*buf);
+					else
+						LockBuffer(*buf, BUFFER_LOCK_EXCLUSIVE);
+				}
+				MarkBufferDirty(*buf);
+				FlushOneBuffer(*buf);
+				UmRedoSlotShift(reln, forknum, blkno,
+								blkref->source_slot,
+								blkref->target_slot, record->EndRecPtr);
+				MarkBufferDirty(*buf);
+				if (lsn <= PageGetLSN(BufferGetPage(*buf)))
+					return BLK_DONE;
+				return BLK_NEEDS_REDO;
+			}
+			return BLK_NOTFOUND;
+		}
+		else
+			elog(PANIC, "Umbra slot-shift WAL record has no applying full-page image");
 	}
 #endif
 

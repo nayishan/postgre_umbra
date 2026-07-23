@@ -332,6 +332,42 @@ UmCheckpointWritebackSourceSlot(SMgrRelation reln, ForkNumber forknum,
 	umfile_writeback(um_get_filectx(reln), MAIN_FORKNUM, physical_block, 1);
 }
 
+bool
+UmRedoSetActiveSlot(SMgrRelation reln, ForkNumber forknum,
+					BlockNumber logical_block, uint8 active_slot)
+{
+	UmbraSmgrRelationState *state;
+	UmbraFileContext *ctx;
+	BlockNumber	logical_eof;
+	BlockNumber	physical_capacity;
+	bool		root_active = false;
+
+	if (!InRecovery || reln == NULL || forknum != MAIN_FORKNUM ||
+		RelFileLocatorBackendIsTemp(reln->smgr_rlocator) ||
+		!UmbraMainActiveSlotIsValid(active_slot))
+		elog(PANIC, "Umbra redo targets an invalid MAIN mapping");
+
+	state = reln->smgr_private;
+	ctx = um_get_filectx(reln);
+	Assert(state != NULL);
+
+	/* Image-free redo must never create or repair a missing source. */
+	if (!ummap_try_main_slot0_active(ctx, reln->smgr_rlocator,
+									&root_active) ||
+		!root_active)
+		return false;
+	state->uses_map = true;
+	state->main_slot0_active = true;
+	um_get_main_frontiers(reln, &logical_eof, &physical_capacity);
+	if (logical_block >= logical_eof ||
+		!umfile_exists(ctx, MAIN_FORKNUM) ||
+		umfile_nblocks(ctx, MAIN_FORKNUM) < physical_capacity)
+		return false;
+
+	MapRedoSetActiveSlot(ctx, reln->smgr_rlocator, logical_block, active_slot);
+	return true;
+}
+
 void
 UmRedoSlotShift(SMgrRelation reln, ForkNumber forknum,
 				BlockNumber logical_block, uint8 source_slot,
