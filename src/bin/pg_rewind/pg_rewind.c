@@ -235,6 +235,10 @@ main(int argc, char **argv)
 		}
 	}
 
+#ifdef USE_UMBRA
+	pg_fatal("pg_rewind is not supported with Umbra storage");
+#endif
+
 	if (datadir_source == NULL && connstr_source == NULL)
 	{
 		pg_log_error("no source specified (--source-pgdata or --source-server)");
