@@ -161,6 +161,40 @@ my $initial_blocks =
 cmp_ok($initial_blocks, '>', CHUNK_PAGES,
 	'initial grow crosses the first slot-0 chunk boundary');
 
+# A global SMGRRELEASE closes descriptors but retains SMgrRelation objects.
+# Leave a pending-unlink gate in an otherwise empty tablespace so that DROP
+# TABLESPACE must issue that barrier.  Open this relation while its root is
+# hidden so the retained handle first selects direct I/O, then restore the root
+# before the barrier.  The next size lookup must rediscover slot-0 policy
+# instead of reporting the three-slot physical capacity.
+$node->safe_psql(
+	'postgres', q{
+SET allow_in_place_tablespaces = on;
+CREATE TABLESPACE umbra_policy_ts LOCATION '';
+CREATE TABLE umbra_policy_gate (id integer) TABLESPACE umbra_policy_ts;
+DROP TABLE umbra_policy_gate;
+});
+my $map_file = $node->data_dir . "/${main_path}_map";
+my $hidden_map_file = "$map_file.policy_hidden";
+rename($map_file, $hidden_map_file)
+  or BAIL_OUT("could not hide mapped root \"$map_file\": $!");
+my $policy_session = $node->background_psql('postgres');
+my $direct_blocks = 0 + $policy_session->query_safe(q{
+SELECT pg_relation_size('umbra_slot0'::regclass) /
+       current_setting('block_size')::integer;
+});
+is($direct_blocks, expected_capacity($initial_blocks),
+	'retained handle initially observes the direct physical size');
+rename($hidden_map_file, $map_file)
+  or BAIL_OUT("could not restore mapped root \"$map_file\": $!");
+$node->safe_psql('postgres', 'DROP TABLESPACE umbra_policy_ts');
+is(0 + $policy_session->query_safe(q{
+SELECT pg_relation_size('umbra_slot0'::regclass) /
+       current_setting('block_size')::integer;
+}), $initial_blocks,
+	'retained handle refreshes MAIN slot-0 policy after SMGRRELEASE');
+$policy_session->quit;
+
 $node->stop;
 $node->start;
 is($node->safe_psql('postgres',
