@@ -135,6 +135,7 @@ extern void umprepareredo(SMgrRelation reln, XLogRecPtr replay_lsn);
 extern bool umredogenerationahead(SMgrRelation reln,
 								  XLogRecPtr replay_lsn);
 extern bool UmRedoDiscardingPrecreateRecords(SMgrRelation reln);
+extern bool UmRedoMainMappingRootExists(SMgrRelation reln);
 extern void umcheckpoint(void);
 extern void umflushdatabasetablespace(Oid dbid, Oid spcOid);
 extern void uminvalidatedatabase(Oid dbid);

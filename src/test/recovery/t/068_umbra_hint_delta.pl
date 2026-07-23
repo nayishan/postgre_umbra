@@ -184,6 +184,65 @@ is($node->safe_psql(
 		'postgres', q[SELECT payload FROM umbra_hint_delta WHERE id = 1;]),
 	'after', 'ordinary WAL follows the recovered hint delta');
 
+# A later TRUNCATE removes the old relfilenode's _map root before restart
+# redo reaches its HINT_DELTA.  The hint record must use normal missing-page
+# accounting instead of trying to publish a selector without a root.
+$node->safe_psql(
+	'postgres', q[
+CREATE TABLE umbra_hint_delta_replaced(id integer, payload text)
+  WITH (autovacuum_enabled = false, fillfactor = 50);
+INSERT INTO umbra_hint_delta_replaced VALUES (1, 'old generation');
+CHECKPOINT;
+]);
+my $replaced_relpath = $node->safe_psql(
+	'postgres', q[SELECT pg_relation_filepath('umbra_hint_delta_replaced'::regclass);]);
+my $replaced_filenode = $node->safe_psql(
+	'postgres', q[SELECT pg_relation_filenode('umbra_hint_delta_replaced'::regclass);]);
+my $replaced_map_path = $node->data_dir . "/${replaced_relpath}_map";
+ok(-e $replaced_map_path, 'old relation has a mapping root before its hint');
+is(xmin_is_committed($node, 'umbra_hint_delta_replaced'), 'f',
+	'old relation has no committed hint bit before replacement coverage');
+
+my $replaced_wal_start = $node->safe_psql(
+	'postgres', 'SELECT pg_current_wal_insert_lsn();');
+is($node->safe_psql(
+		'postgres', q[
+SELECT payload FROM umbra_hint_delta_replaced WHERE id = 1;]),
+	'old generation', 'visibility check creates an old-relation hint delta');
+$node->safe_psql('postgres', 'SELECT pg_switch_wal();');
+my $replaced_wal_end = $node->safe_psql(
+	'postgres', 'SELECT pg_current_wal_flush_lsn();');
+my @replaced_wal = dump_wal(
+	$node, $replaced_wal_start, $replaced_wal_end, 'replaced relation hint delta');
+my @replaced_hints = grep {
+	/rmgr: XLOG2/ && /desc: HINT_DELTA/ &&
+	/rel \d+\/\d+\/$replaced_filenode fork main blk 0\b/
+} @replaced_wal;
+is(scalar(@replaced_hints), 1,
+	'old relation emits one HINT_DELTA before replacement');
+unlike($replaced_hints[0] // '', qr/\bFPW\b/,
+	'old relation HINT_DELTA has no full-page image');
+
+$node->safe_psql('postgres', 'TRUNCATE umbra_hint_delta_replaced;');
+my $replacement_filenode = $node->safe_psql(
+	'postgres', q[SELECT pg_relation_filenode('umbra_hint_delta_replaced'::regclass);]);
+isnt($replacement_filenode, $replaced_filenode,
+	'TRUNCATE replaces the old relation storage');
+ok(!-e $replaced_map_path,
+	'TRUNCATE removes the old relation mapping root before crash recovery');
+
+$node->stop('immediate');
+is($node->start(fail_ok => 1), 1,
+	'crash redo accounts for the replaced relation hint delta safely');
+is($node->safe_psql(
+		'postgres', q[SELECT count(*) FROM umbra_hint_delta_replaced;]),
+	'0', 'replacement relation remains empty after crash redo');
+$node->safe_psql(
+	'postgres', q[INSERT INTO umbra_hint_delta_replaced VALUES (2, 'new generation');]);
+is($node->safe_psql(
+		'postgres', q[SELECT payload FROM umbra_hint_delta_replaced WHERE id = 2;]),
+	'new generation', 'replacement relation remains writable after crash redo');
+
 # A consistency-checking FPI is non-applying: Hint Delta still materializes
 # the old slot and applies its byte range, then recovery compares that result
 # against the recorded full page.
@@ -276,6 +335,53 @@ is(scalar(@fsm_hint_delta), 0,
 ok(!grep(/slot shift:/, @fsm_hint_fpi),
 	'FSM FPI_FOR_HINT has no MAIN slot-shift metadata');
 
-$node->stop;
+# A missing root without later lifecycle WAL must remain an invalid-page
+# dependency; otherwise a HINT_DELTA source baseline could be lost silently.
+$node->safe_psql(
+	'postgres', q[
+CREATE TABLE umbra_hint_delta_unresolved(id integer, payload text)
+  WITH (autovacuum_enabled = false, fillfactor = 50);
+INSERT INTO umbra_hint_delta_unresolved VALUES (1, 'unresolved');
+CHECKPOINT;
+]);
+my $unresolved_relpath = $node->safe_psql(
+	'postgres', q[SELECT pg_relation_filepath('umbra_hint_delta_unresolved'::regclass);]);
+my $unresolved_filenode = $node->safe_psql(
+	'postgres', q[SELECT pg_relation_filenode('umbra_hint_delta_unresolved'::regclass);]);
+my $unresolved_main_path = $node->data_dir . "/$unresolved_relpath";
+my $unresolved_map_path = "${unresolved_main_path}_map";
+is(xmin_is_committed($node, 'umbra_hint_delta_unresolved'), 'f',
+	'unresolved relation has no committed hint bit before its hint WAL');
+
+my $unresolved_wal_start = $node->safe_psql(
+	'postgres', 'SELECT pg_current_wal_insert_lsn();');
+is($node->safe_psql(
+		'postgres', q[
+SELECT payload FROM umbra_hint_delta_unresolved WHERE id = 1;]),
+	'unresolved', 'visibility check creates an unresolved hint delta');
+$node->safe_psql('postgres', 'SELECT pg_switch_wal();');
+my $unresolved_wal_end = $node->safe_psql(
+	'postgres', 'SELECT pg_current_wal_flush_lsn();');
+my @unresolved_wal = dump_wal(
+	$node, $unresolved_wal_start, $unresolved_wal_end,
+	'unresolved relation hint delta');
+my @unresolved_hints = grep {
+	/rmgr: XLOG2/ && /desc: HINT_DELTA/ &&
+	/rel \d+\/\d+\/$unresolved_filenode fork main blk 0\b/
+} @unresolved_wal;
+is(scalar(@unresolved_hints), 1,
+	'unresolved relation emits one HINT_DELTA');
+unlike($unresolved_hints[0] // '', qr/\bFPW\b/,
+	'unresolved HINT_DELTA has no full-page image');
+
+$node->stop('immediate');
+unlink $unresolved_map_path
+  or BAIL_OUT("could not remove \"$unresolved_map_path\": $!");
+truncate($unresolved_main_path, 0)
+  or BAIL_OUT("could not truncate \"$unresolved_main_path\": $!");
+is($node->start(fail_ok => 1), 0,
+	'crash redo rejects an unresolved hint delta baseline');
+like(slurp_file($node->logfile), qr/WAL contains references to invalid pages/,
+	'unresolved hint delta is reported through invalid-page accounting');
 
 done_testing();

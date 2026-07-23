@@ -441,6 +441,21 @@ UmRedoDiscardingPrecreateRecords(SMgrRelation reln)
 	return redo_state != NULL && redo_state->discard_precreate_redo;
 }
 
+bool
+UmRedoMainMappingRootExists(SMgrRelation reln)
+{
+	UmbraSmgrRelationState *state;
+
+	/* Callers preserve their existing failure paths for malformed redo state. */
+	if (reln == NULL || !InRecovery ||
+		RelFileLocatorBackendIsTemp(reln->smgr_rlocator))
+		return true;
+	state = reln->smgr_private;
+	if (state == NULL || state->filectx == NULL)
+		return true;
+	return ummap_exists(state->filectx);
+}
+
 void
 umcheckpoint(void)
 {

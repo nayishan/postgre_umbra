@@ -356,6 +356,7 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 #ifdef USE_UMBRA
 	DecodedBkpBlock *blkref;
 	bool		hint_delta;
+	bool		missing_hint_delta_root;
 #endif
 
 	if (!XLogRecGetBlockTagExtended(record, block_id, &rlocator, &forknum, &blkno,
@@ -387,7 +388,16 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 
 		reln = smgropen(rlocator, INVALID_PROC_NUMBER);
 		smgrprepareredo(reln, record->EndRecPtr);
-		if (!UmRedoDiscardingPrecreateRecords(reln))
+		/*
+		 * A later DROP or TRUNCATE can unlink the old mapping root before
+		 * restart redo reaches this hint-only record.  Let the ordinary
+		 * RBM_NORMAL path record its missing baseline for that lifecycle
+		 * record to clear, instead of publishing a selector without a root.
+		 */
+		missing_hint_delta_root = hint_delta &&
+			!UmRedoMainMappingRootExists(reln);
+		if (!UmRedoDiscardingPrecreateRecords(reln) &&
+			!missing_hint_delta_root)
 		{
 			if (XLogRecBlockImageApply(record, block_id))
 				UmRedoSlotShift(reln, forknum, blkno, blkref->source_slot,
