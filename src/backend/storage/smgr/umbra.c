@@ -66,6 +66,9 @@ static void um_publish_main_after_data(SMgrRelation reln,
 static void um_publish_main_before_truncate(SMgrRelation reln,
 									   BlockNumber logical_eof,
 									   BlockNumber physical_capacity);
+static void um_ensure_main_selector_pages(SMgrRelation reln,
+									 BlockNumber first_block,
+									 BlockNumber nblocks, bool skipFsync);
 
 void
 uminit(void)
@@ -207,6 +210,126 @@ umcheckpoint(void)
 	ummap_checkpoint();
 }
 
+bool
+UmWalOwnedSlotShiftAvailable(SMgrRelation reln, ForkNumber forknum)
+{
+	return reln != NULL && !InRecovery &&
+		!RelFileLocatorBackendIsTemp(reln->smgr_rlocator) &&
+		um_main_uses_slot0(reln, forknum);
+}
+
+bool
+UmPrepareSlotShift(SMgrRelation reln, ForkNumber forknum,
+				   BlockNumber logical_block, UmbraSlotShift *shift)
+{
+	MapSlotShift map_shift;
+
+	Assert(shift != NULL);
+	MemSet(shift, 0, sizeof(*shift));
+	shift->map_slot_id = -1;
+	if (!UmWalOwnedSlotShiftAvailable(reln, forknum) ||
+		!MapPrepareSlotShift(um_get_filectx(reln), reln->smgr_rlocator,
+						 logical_block, &map_shift))
+		return false;
+
+	shift->rlocator = map_shift.rlocator;
+	shift->logical_block = map_shift.logical_block;
+	shift->source_slot = map_shift.source_slot;
+	shift->target_slot = map_shift.target_slot;
+	shift->map_slot_id = map_shift.map_slot_id;
+	shift->prepared = map_shift.prepared;
+	return true;
+}
+
+void
+UmAbortSlotShift(UmbraSlotShift *shift)
+{
+	MapSlotShift map_shift;
+
+	Assert(shift != NULL);
+	if (!shift->prepared)
+		return;
+	map_shift.rlocator = shift->rlocator;
+	map_shift.logical_block = shift->logical_block;
+	map_shift.source_slot = shift->source_slot;
+	map_shift.target_slot = shift->target_slot;
+	map_shift.map_slot_id = shift->map_slot_id;
+	map_shift.prepared = shift->prepared;
+	MapAbortSlotShift(&map_shift);
+	shift->prepared = false;
+	shift->map_slot_id = -1;
+}
+
+void
+UmReleaseSlotShiftOnExit(UmbraSlotShift *shift)
+{
+	if (shift != NULL && shift->prepared)
+		UmAbortSlotShift(shift);
+}
+
+void
+UmPublishSlotShift(UmbraSlotShift *shift, XLogRecPtr lsn)
+{
+	MapSlotShift map_shift;
+
+	Assert(shift != NULL);
+	Assert(shift->prepared);
+	map_shift.rlocator = shift->rlocator;
+	map_shift.logical_block = shift->logical_block;
+	map_shift.source_slot = shift->source_slot;
+	map_shift.target_slot = shift->target_slot;
+	map_shift.map_slot_id = shift->map_slot_id;
+	map_shift.prepared = shift->prepared;
+	MapPublishSlotShift(&map_shift, lsn);
+	shift->prepared = false;
+	shift->map_slot_id = -1;
+}
+
+void
+UmRedoSlotShift(SMgrRelation reln, ForkNumber forknum,
+				BlockNumber logical_block, uint8 source_slot,
+				uint8 target_slot, XLogRecPtr shift_lsn)
+{
+	UmbraSmgrRelationState *state;
+	UmbraFileContext *ctx;
+
+	if (!InRecovery || reln == NULL || forknum != MAIN_FORKNUM ||
+		RelFileLocatorBackendIsTemp(reln->smgr_rlocator) ||
+		!XLogRecPtrIsValid(shift_lsn))
+		elog(PANIC, "Umbra slot-shift WAL targets an inactive MAIN mapping");
+	state = reln->smgr_private;
+	ctx = um_get_filectx(reln);
+	Assert(state != NULL);
+
+	/*
+	 * A prior recovery can replay a later DROP and remove both forks before
+	 * crashing.  Root activation syncs MAIN before making the mapping durable,
+	 * so recreate only a missing MAIN file before repairing the root.  Redo
+	 * create preserves any existing file from later lifecycle WAL.
+	 */
+	umfile_create(ctx, MAIN_FORKNUM, true);
+
+	/*
+	 * A later DROP can remove both forks before recovery starts, while the
+	 * checkpoint redo point still precedes this FPI-backed shift.  Recreate
+	 * only the missing mapping substrate; never replace an existing valid
+	 * root, which may belong to later lifecycle WAL at the same locator.
+	 */
+	if (!state->uses_map || !state->main_slot0_active)
+	{
+		ummap_create(ctx, reln->smgr_rlocator, true);
+		state->uses_map = true;
+	}
+	if (!state->main_slot0_active)
+	{
+		ummap_activate_main_slot0(ctx, reln->smgr_rlocator, shift_lsn);
+		state->main_slot0_active = true;
+	}
+
+	MapRedoSlotShift(ctx, reln->smgr_rlocator,
+					 logical_block, source_slot, target_slot);
+}
+
 void
 umflushdatabasetablespace(Oid dbid, Oid spcOid)
 {
@@ -282,6 +405,8 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		um_zero_main_range(reln, logical_eof, blocknum, skipFsync);
 	umfile_writev(ctx, MAIN_FORKNUM, physical_block, buffers, 1, skipFsync);
 	um_publish_main_after_data(reln, logical_end, physical_capacity);
+	um_ensure_main_selector_pages(reln, logical_eof,
+								 logical_end - logical_eof, skipFsync);
 }
 
 void
@@ -317,6 +442,8 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	/* A regrown page can retain slot-0 capacity after a prior truncate. */
 	um_zero_main_range(reln, logical_eof, logical_end, skipFsync);
 	um_publish_main_after_data(reln, logical_end, physical_capacity);
+	um_ensure_main_selector_pages(reln, logical_eof,
+								 logical_end - logical_eof, skipFsync);
 }
 
 bool
@@ -672,8 +799,20 @@ um_publish_main_before_truncate(SMgrRelation reln, BlockNumber logical_eof,
 								BlockNumber physical_capacity)
 {
 	ummap_publish_prepared_main_frontiers(um_get_filectx(reln),
-									reln->smgr_rlocator, logical_eof,
-									physical_capacity);
+										reln->smgr_rlocator, logical_eof,
+										physical_capacity);
+}
+
+/* Extension is the non-critical path that seeds selector pages for WAL shifts. */
+static void
+um_ensure_main_selector_pages(SMgrRelation reln, BlockNumber first_block,
+								  BlockNumber nblocks, bool skipFsync)
+{
+	if (nblocks == 0 || CritSectionCount != 0 || !IsUnderPostmaster ||
+		IsBootstrapProcessingMode() || IsInitProcessingMode())
+		return;
+	MapEnsureActiveSlotPages(um_get_filectx(reln), reln->smgr_rlocator,
+						  first_block, nblocks, skipFsync);
 }
 
 static UmbraFileContext *

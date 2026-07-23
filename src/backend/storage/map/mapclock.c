@@ -124,10 +124,16 @@ MapPagePoolShmemAttach(void)
 void
 MapPageEnsureInitialized(void)
 {
-	if (MapPagePoolCtlData == NULL || MapPageDescriptors == NULL ||
-		MapPageBlocks == NULL || MapPageCacheHash == NULL ||
-		MapPageCacheLocks == NULL || MapPageExtensionLocks == NULL)
+	if (!MapPagePoolIsInitialized())
 		elog(ERROR, "Umbra MAP page buffer pool is not initialized");
+}
+
+bool
+MapPagePoolIsInitialized(void)
+{
+	return MapPagePoolCtlData != NULL && MapPageDescriptors != NULL &&
+		MapPageBlocks != NULL && MapPageCacheHash != NULL &&
+		MapPageCacheLocks != NULL && MapPageExtensionLocks != NULL;
 }
 
 uint32

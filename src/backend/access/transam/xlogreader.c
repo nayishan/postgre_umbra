@@ -1795,6 +1795,11 @@ DecodeXLogRecord(XLogReaderState *state,
 			blk = &decoded->blocks[block_id];
 			blk->in_use = true;
 			blk->apply_image = false;
+#ifdef USE_UMBRA
+			blk->has_slot_shift = false;
+			blk->source_slot = 0;
+			blk->target_slot = 0;
+#endif
 
 			COPY_HEADER_FIELD(&fork_flags, sizeof(uint8));
 			blk->forknum = fork_flags & BKPBLOCK_FORK_MASK;
@@ -1822,6 +1827,16 @@ DecodeXLogRecord(XLogReaderState *state,
 				goto err;
 			}
 			datatotal += blk->data_len;
+
+#ifdef USE_UMBRA
+			blk->has_slot_shift =
+				(fork_flags & BKPBLOCK_HAS_SLOT_SHIFT) != 0;
+			if (blk->has_slot_shift)
+			{
+				COPY_HEADER_FIELD(&blk->source_slot, sizeof(uint8));
+				COPY_HEADER_FIELD(&blk->target_slot, sizeof(uint8));
+			}
+#endif
 
 			if (blk->has_image)
 			{
@@ -1921,6 +1936,21 @@ DecodeXLogRecord(XLogReaderState *state,
 				blk->rlocator = *rlocator;
 			}
 			COPY_HEADER_FIELD(&blk->blkno, sizeof(BlockNumber));
+#ifdef USE_UMBRA
+			if (blk->has_slot_shift &&
+				(blk->forknum != MAIN_FORKNUM ||
+				 blk->source_slot >= 3 || blk->target_slot >= 3 ||
+				 blk->source_slot == blk->target_slot ||
+				 (blk->flags & BKPBLOCK_WILL_INIT) != 0 ||
+				 !blk->has_image || !blk->apply_image))
+			{
+				report_invalid_record(state,
+							  "invalid Umbra slot shift for block %u at %X/%08X",
+							  blk->blkno,
+							  LSN_FORMAT_ARGS(state->ReadRecPtr));
+				goto err;
+			}
+#endif
 		}
 		else
 		{

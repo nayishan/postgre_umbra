@@ -164,9 +164,9 @@ ummap_create(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 	nblocks = umfile_nblocks(ctx, UMBRA_METADATA_FORKNUM);
 
 	/*
-	 * Only an actual CREATE finish path calls this during redo.  Preserve an
+	 * Redo callers repair only a missing or invalid root.  Preserve an
 	 * existing valid root: it can belong to later lifecycle WAL at the same
-	 * locator and must not be reset by an old CREATE record.
+	 * locator and must not be reset by an older record.
 	 */
 	if (nblocks == 0 || (isRedo && !ummap_root_read_valid_image(ctx, image)))
 	{
@@ -218,14 +218,14 @@ ummap_try_main_slot0_active(UmbraFileContext *ctx,
 void
 ummap_activate_main_slot0(UmbraFileContext *ctx,
 						  RelFileLocatorBackend rlocator,
-						  XLogRecPtr create_lsn)
+						  XLogRecPtr activation_lsn)
 {
 	UmbraMapRootEntry *entry;
 	UmbraMapRootData *root;
 	bool		immediate_sync = InRecovery;
 
 	Assert(ctx != NULL);
-	Assert(XLogRecPtrIsValid(create_lsn));
+	Assert(XLogRecPtrIsValid(activation_lsn));
 	entry = ummap_root_cache_get(ctx, rlocator, LW_EXCLUSIVE);
 	root = (UmbraMapRootData *) entry->image;
 	if ((root->flags & UMMAP_ROOT_FLAG_MAIN_SLOT0) == 0)
@@ -236,9 +236,9 @@ ummap_activate_main_slot0(UmbraFileContext *ctx,
 		ummap_root_refresh_crc(root);
 		entry->dirty = true;
 		entry->needs_fsync = true;
-		/* The create LSN is cache-local WAL-before-root ordering state. */
+		/* The activation LSN is cache-local WAL-before-root ordering state. */
 		entry->wal_flush_lsn = InRecovery ? InvalidXLogRecPtr :
-			Max(entry->wal_flush_lsn, create_lsn);
+			Max(entry->wal_flush_lsn, activation_lsn);
 	}
 	LWLockRelease(&entry->content_lock);
 
@@ -846,6 +846,13 @@ ummap_root_cache_flush_locked(UmbraMapRootEntry *entry,
 		if ((((UmbraMapRootData *) entry->image)->flags &
 			 UMMAP_ROOT_FLAG_MAIN_SLOT0) != 0)
 			umfile_immedsync(write_ctx, MAIN_FORKNUM);
+		/*
+		 * Selector pages share the metadata file with the root.  Make their
+		 * WAL-protected contents durable before a root write can make this
+		 * metadata state authoritative.
+		 */
+		MapFlushRelation(write_ctx, entry->tag.rlocator);
+		umfile_immedsync(write_ctx, UMBRA_METADATA_FORKNUM);
 		ummap_root_write_image(write_ctx, entry->image, !entry->needs_fsync);
 		if (temporary_ctx != NULL)
 		{

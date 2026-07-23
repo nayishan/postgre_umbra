@@ -39,6 +39,12 @@
 #include "replication/origin.h"
 #include "storage/bufmgr.h"
 #include "storage/proc.h"
+#ifdef USE_UMBRA
+#include "storage/ipc.h"
+#include "storage/smgr.h"
+#include "storage/umbra.h"
+#include "utils/injection_point.h"
+#endif
 #include "utils/memutils.h"
 #include "utils/pgstat_internal.h"
 #include "utils/rel.h"
@@ -87,6 +93,11 @@ typedef struct
 
 	/* buffer to store a compressed version of backup block image */
 	char		compressed_page[COMPRESS_BUFSIZE];
+#ifdef USE_UMBRA
+	bool		from_shared_buffer;
+	bool		slot_shift_in_record;
+	UmbraSlotShift slot_shift;
+#endif
 } registered_buffer;
 
 static registered_buffer *registered_buffers;
@@ -134,6 +145,12 @@ static int	max_rdatas;			/* allocated size */
 
 static bool begininsert_called = false;
 
+#ifdef USE_UMBRA
+static bool curinsert_has_slot_shift = false;
+static bool curinsert_slot_shift_delay_started = false;
+static bool xloginsert_exit_hook_registered = false;
+#endif
+
 /* Memory context to hold the registered buffer and data references. */
 static MemoryContext xloginsert_cxt;
 
@@ -144,6 +161,16 @@ static XLogRecData *XLogRecordAssemble(RmgrId rmid, uint8 info,
 									   bool *topxid_included);
 static bool XLogCompressBackupBlock(const PageData *page, uint16 hole_offset,
 									uint16 hole_length, void *dest, uint16 *dlen);
+#ifdef USE_UMBRA
+static bool XLogBlockSlotShiftEligible(registered_buffer *regbuf,
+									   RmgrId rmid, uint8 info,
+									   SMgrRelation *reln);
+static bool XLogPrepareSlotShifts(RmgrId rmid, uint8 info,
+								  XLogRecPtr RedoRecPtr, bool doPageWrites);
+static void XLogPublishSlotShifts(XLogRecPtr record_endptr);
+static void XLogAbortSlotShifts(void);
+static void XLogReleaseSlotShiftsAtExit(int code, Datum arg);
+#endif
 
 /*
  * Begin constructing a WAL record. This must be called before the
@@ -227,8 +254,23 @@ XLogResetInsertion(void)
 {
 	int			i;
 
+#ifdef USE_UMBRA
+	XLogAbortSlotShifts();
+	if (curinsert_slot_shift_delay_started && MyProc != NULL)
+		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+	curinsert_slot_shift_delay_started = false;
+#endif
 	for (i = 0; i < max_registered_block_id; i++)
+	{
 		registered_buffers[i].in_use = false;
+#ifdef USE_UMBRA
+		registered_buffers[i].from_shared_buffer = false;
+		registered_buffers[i].slot_shift_in_record = false;
+		MemSet(&registered_buffers[i].slot_shift, 0,
+				   sizeof(registered_buffers[i].slot_shift));
+		registered_buffers[i].slot_shift.map_slot_id = -1;
+#endif
+	}
 
 	num_rdatas = 0;
 	max_registered_block_id = 0;
@@ -283,6 +325,12 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
 	regbuf->flags = flags;
 	regbuf->rdata_tail = (XLogRecData *) &regbuf->rdata_head;
 	regbuf->rdata_len = 0;
+#ifdef USE_UMBRA
+	regbuf->from_shared_buffer = true;
+	regbuf->slot_shift_in_record = false;
+	MemSet(&regbuf->slot_shift, 0, sizeof(regbuf->slot_shift));
+	regbuf->slot_shift.map_slot_id = -1;
+#endif
 
 	/*
 	 * Check that this page hasn't already been registered with some other
@@ -336,6 +384,12 @@ XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator, ForkNumber forknum,
 	regbuf->flags = flags;
 	regbuf->rdata_tail = (XLogRecData *) &regbuf->rdata_head;
 	regbuf->rdata_len = 0;
+#ifdef USE_UMBRA
+	regbuf->from_shared_buffer = false;
+	regbuf->slot_shift_in_record = false;
+	MemSet(&regbuf->slot_shift, 0, sizeof(regbuf->slot_shift));
+	regbuf->slot_shift.map_slot_id = -1;
+#endif
 
 	/*
 	 * Check that this page hasn't already been registered with some other
@@ -518,6 +572,9 @@ XLogInsert(RmgrId rmid, uint8 info)
 		XLogRecData *rdt;
 		int			num_fpi = 0;
 		uint64		fpi_bytes = 0;
+#ifdef USE_UMBRA
+		bool		slot_shift_critical = false;
+#endif
 
 		/*
 		 * Get values needed to decide whether to do full-page writes. Since
@@ -526,12 +583,50 @@ XLogInsert(RmgrId rmid, uint8 info)
 		 */
 		GetFullPageWriteInfo(&RedoRecPtr, &doPageWrites);
 
+
+#ifdef USE_UMBRA
+		PG_TRY();
+		{
+			if (XLogPrepareSlotShifts(rmid, info, RedoRecPtr, doPageWrites) &&
+				(MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0)
+			{
+				MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+				curinsert_slot_shift_delay_started = true;
+			}
+			rdt = XLogRecordAssemble(rmid, info, RedoRecPtr, doPageWrites,
+									 &fpw_lsn, &num_fpi, &fpi_bytes,
+									 &topxid_included);
+		}
+		PG_CATCH();
+		{
+			XLogResetInsertion();
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+#else
 		rdt = XLogRecordAssemble(rmid, info, RedoRecPtr, doPageWrites,
 								 &fpw_lsn, &num_fpi, &fpi_bytes,
 								 &topxid_included);
+#endif
 
+#ifdef USE_UMBRA
+		if (curinsert_has_slot_shift)
+		{
+			START_CRIT_SECTION();
+			slot_shift_critical = true;
+		}
+#endif
 		EndPos = XLogInsertRecord(rdt, fpw_lsn, curinsert_flags, num_fpi,
 								  fpi_bytes, topxid_included);
+#ifdef USE_UMBRA
+		if (XLogRecPtrIsValid(EndPos) && curinsert_has_slot_shift)
+		{
+			INJECTION_POINT_CACHED("umbra-mapping-after-wal-before-publish", NULL);
+			XLogPublishSlotShifts(EndPos);
+		}
+		if (slot_shift_critical)
+			END_CRIT_SECTION();
+#endif
 	} while (!XLogRecPtrIsValid(EndPos));
 
 	XLogResetInsertion();
@@ -632,6 +727,10 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 	XLogRecord *rechdr;
 	char	   *scratch = hdr_scratch;
 
+#ifdef USE_UMBRA
+	curinsert_has_slot_shift = false;
+#endif
+
 	/*
 	 * Note: this function can be called multiple times for the same record.
 	 * All the modifications we do to the rdata chains below must handle that.
@@ -671,9 +770,16 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 		bool		samerel;
 		bool		is_compressed = false;
 		bool		include_image;
+#ifdef USE_UMBRA
+		bool		include_slot_shift = false;
+		XLogRecordBlockSlotShiftHeader slot_shift_header;
+#endif
 
 		if (!regbuf->in_use)
 			continue;
+#ifdef USE_UMBRA
+		regbuf->slot_shift_in_record = false;
+#endif
 
 		/* Determine if this block needs to be backed up */
 		if (regbuf->flags & REGBUF_FORCE_IMAGE)
@@ -699,6 +805,13 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 			}
 		}
 
+#ifdef USE_UMBRA
+		/* Slot shifts are emitted only with an applying full-page image. */
+		include_slot_shift = needs_backup && regbuf->slot_shift.prepared;
+		if (!include_slot_shift && regbuf->slot_shift.prepared)
+			UmAbortSlotShift(&regbuf->slot_shift);
+#endif
+
 		/* Determine if the buffer data needs to included */
 		if (regbuf->rdata_len == 0)
 			needs_data = false;
@@ -713,6 +826,17 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 
 		if ((regbuf->flags & REGBUF_WILL_INIT) == REGBUF_WILL_INIT)
 			bkpb.fork_flags |= BKPBLOCK_WILL_INIT;
+
+#ifdef USE_UMBRA
+		if (include_slot_shift)
+		{
+			slot_shift_header.source_slot = regbuf->slot_shift.source_slot;
+			slot_shift_header.target_slot = regbuf->slot_shift.target_slot;
+			bkpb.fork_flags |= BKPBLOCK_HAS_SLOT_SHIFT;
+			regbuf->slot_shift_in_record = true;
+			curinsert_has_slot_shift = true;
+		}
+#endif
 
 		/*
 		 * If needs_backup is true or WAL checking is enabled for current
@@ -894,6 +1018,14 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 		/* Ok, copy the header to the scratch buffer */
 		memcpy(scratch, &bkpb, SizeOfXLogRecordBlockHeader);
 		scratch += SizeOfXLogRecordBlockHeader;
+#ifdef USE_UMBRA
+		if (include_slot_shift)
+		{
+			memcpy(scratch, &slot_shift_header,
+				   SizeOfXLogRecordBlockSlotShiftHeader);
+			scratch += SizeOfXLogRecordBlockSlotShiftHeader;
+		}
+#endif
 		if (include_image)
 		{
 			memcpy(scratch, &bimg, SizeOfXLogRecordBlockImageHeader);
@@ -1009,6 +1141,121 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 
 	return &hdr_rdt;
 }
+
+#ifdef USE_UMBRA
+static bool
+XLogBlockSlotShiftEligible(registered_buffer *regbuf, RmgrId rmid,
+					   uint8 info, SMgrRelation *reln)
+{
+	Assert(regbuf != NULL);
+	Assert(reln != NULL);
+	*reln = NULL;
+	if (!regbuf->from_shared_buffer || regbuf->forkno != MAIN_FORKNUM ||
+		(regbuf->flags & (REGBUF_FORCE_IMAGE | REGBUF_NO_IMAGE |
+						  REGBUF_NO_CHANGE | REGBUF_WILL_INIT)) != 0 ||
+		(info & XLR_CHECK_CONSISTENCY) != 0 || wal_consistency_checking[rmid] ||
+		(rmid == RM_XLOG_ID &&
+		 (info & XLR_RMGR_INFO_MASK) == XLOG_FPI_FOR_HINT) ||
+		MyProc == NULL || !LocalTransactionIdIsValid(MyProc->vxid.lxid))
+		return false;
+
+	/* This is a pure lookup: WAL preparation must not allocate or open files. */
+	*reln = smgrlookup(regbuf->rlocator, INVALID_PROC_NUMBER);
+	return *reln != NULL &&
+		UmWalOwnedSlotShiftAvailable(*reln, regbuf->forkno);
+}
+
+static bool
+XLogPrepareSlotShifts(RmgrId rmid, uint8 info, XLogRecPtr RedoRecPtr,
+				  bool doPageWrites)
+{
+	bool		prepared = false;
+
+	if (!doPageWrites || IsBootstrapProcessingMode() ||
+		IsInitProcessingMode())
+		return false;
+
+	/*
+	 * This can run inside the caller's critical section.  A selector cache miss
+	 * deliberately retains the ordinary FPI; no allocation or metadata I/O is
+	 * allowed here.
+	 */
+	for (int block_id = 0; block_id < max_registered_block_id; block_id++)
+	{
+		registered_buffer *regbuf = &registered_buffers[block_id];
+		SMgrRelation reln;
+		XLogRecPtr	page_lsn;
+
+		if (!regbuf->in_use)
+			continue;
+		if (regbuf->slot_shift.prepared)
+		{
+			prepared = true;
+			continue;
+		}
+		if (!XLogBlockSlotShiftEligible(regbuf, rmid, info, &reln))
+			continue;
+		page_lsn = PageGetLSN(regbuf->page);
+		if (XLogRecPtrIsValid(page_lsn) && page_lsn <= RedoRecPtr &&
+			UmPrepareSlotShift(reln, regbuf->forkno, regbuf->block,
+						   &regbuf->slot_shift))
+			prepared = true;
+	}
+	return prepared;
+}
+
+static void
+XLogPublishSlotShifts(XLogRecPtr record_endptr)
+{
+	for (int block_id = 0; block_id < max_registered_block_id; block_id++)
+	{
+		registered_buffer *regbuf = &registered_buffers[block_id];
+
+		if (!regbuf->in_use || !regbuf->slot_shift_in_record)
+			continue;
+		Assert(regbuf->slot_shift.prepared);
+		UmPublishSlotShift(&regbuf->slot_shift, record_endptr);
+		regbuf->slot_shift_in_record = false;
+	}
+	curinsert_has_slot_shift = false;
+}
+
+static void
+XLogAbortSlotShifts(void)
+{
+	for (int block_id = 0; block_id < max_registered_block_id; block_id++)
+	{
+		registered_buffer *regbuf = &registered_buffers[block_id];
+
+		if (regbuf->slot_shift.prepared)
+			UmAbortSlotShift(&regbuf->slot_shift);
+		regbuf->slot_shift_in_record = false;
+	}
+	curinsert_has_slot_shift = false;
+}
+
+static void
+XLogReleaseSlotShiftsAtExit(int code, Datum arg)
+{
+	(void) code;
+	(void) arg;
+	if (registered_buffers != NULL)
+	{
+		for (int block_id = 0; block_id < max_registered_block_id; block_id++)
+		{
+			registered_buffer *regbuf = &registered_buffers[block_id];
+
+			if (regbuf->slot_shift.prepared)
+				UmReleaseSlotShiftOnExit(&regbuf->slot_shift);
+			regbuf->slot_shift_in_record = false;
+		}
+	}
+	curinsert_has_slot_shift = false;
+	if (curinsert_slot_shift_delay_started && MyProc != NULL)
+		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+	curinsert_slot_shift_delay_started = false;
+}
+#endif
 
 /*
  * Create a compressed version of a backup block image.
@@ -1438,4 +1685,11 @@ InitXLogInsert(void)
 	if (hdr_scratch == NULL)
 		hdr_scratch = MemoryContextAllocZero(xloginsert_cxt,
 											 HEADER_SCRATCH_SIZE);
+#ifdef USE_UMBRA
+	if (!xloginsert_exit_hook_registered)
+	{
+		before_shmem_exit(XLogReleaseSlotShiftsAtExit, 0);
+		xloginsert_exit_hook_registered = true;
+	}
+#endif
 }

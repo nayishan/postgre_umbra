@@ -28,7 +28,7 @@ extern bool ummap_try_main_slot0_active(UmbraFileContext *ctx,
 								RelFileLocatorBackend rlocator, bool *active);
 extern void ummap_activate_main_slot0(UmbraFileContext *ctx,
 							  RelFileLocatorBackend rlocator,
-							  XLogRecPtr create_lsn);
+							  XLogRecPtr activation_lsn);
 extern void ummap_get_main_frontiers(UmbraFileContext *ctx,
 							 RelFileLocatorBackend rlocator,
 							 BlockNumber *logical_eof,
