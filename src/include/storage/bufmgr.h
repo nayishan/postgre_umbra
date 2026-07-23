@@ -292,6 +292,7 @@ extern char *DebugPrintBufferRefcount(Buffer buffer);
 extern void CheckPointBuffersCaptureBegin(void);
 extern void CheckPointBuffersPrepare(int flags);
 extern void CheckPointBuffersAbort(void);
+extern void BufferSaveCheckpointSourceSlot(Buffer buffer, uint8 source_slot);
 #endif
 extern void CheckPointBuffers(int flags);
 extern BlockNumber BufferGetBlockNumber(Buffer buffer);

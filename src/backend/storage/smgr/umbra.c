@@ -285,6 +285,53 @@ UmPublishSlotShift(UmbraSlotShift *shift, XLogRecPtr lsn)
 	shift->map_slot_id = -1;
 }
 
+bool
+UmCheckpointWriteSourceSlot(SMgrRelation reln, ForkNumber forknum,
+							BlockNumber logical_block, uint8 source_slot,
+							const void *buffer)
+{
+	const void *buffers[1] = {buffer};
+	BlockNumber	physical_block;
+
+	if (reln == NULL || buffer == NULL ||
+		!UmbraMainActiveSlotIsValid(source_slot) ||
+		!um_main_uses_slot0(reln, forknum))
+		return false;
+	if (!UmbraMainActiveSlotPhysicalBlock(logical_block, source_slot,
+										 &physical_block))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("Umbra MAIN source-slot block mapping overflow for relation %u/%u/%u",
+						reln->smgr_rlocator.locator.spcOid,
+						reln->smgr_rlocator.locator.dbOid,
+						reln->smgr_rlocator.locator.relNumber)));
+
+	umfile_writev(um_get_filectx(reln), MAIN_FORKNUM, physical_block,
+				  buffers, 1, false);
+	return true;
+}
+
+void
+UmCheckpointWritebackSourceSlot(SMgrRelation reln, ForkNumber forknum,
+								BlockNumber logical_block, uint8 source_slot)
+{
+	BlockNumber	physical_block;
+
+	if (reln == NULL || !UmbraMainActiveSlotIsValid(source_slot) ||
+		!um_main_uses_slot0(reln, forknum))
+		return;
+	if (!UmbraMainActiveSlotPhysicalBlock(logical_block, source_slot,
+										 &physical_block))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("Umbra MAIN source-slot block mapping overflow for relation %u/%u/%u",
+						reln->smgr_rlocator.locator.spcOid,
+						reln->smgr_rlocator.locator.dbOid,
+						reln->smgr_rlocator.locator.relNumber)));
+
+	umfile_writeback(um_get_filectx(reln), MAIN_FORKNUM, physical_block, 1);
+}
+
 void
 UmRedoSlotShift(SMgrRelation reln, ForkNumber forknum,
 				BlockNumber logical_block, uint8 source_slot,
