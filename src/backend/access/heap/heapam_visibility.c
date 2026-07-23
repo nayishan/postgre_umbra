@@ -88,6 +88,23 @@
  * set. This enum serves as the necessary state space passed to
  * SetHintBitsExt().
  */
+#ifdef USE_UMBRA
+typedef enum SetHintBitsStatus
+{
+	/* not yet checked if hint bits may be set */
+	SHB_INITIAL,
+	/* failed to get permission to set hint bits, don't check again */
+	SHB_DISABLED,
+	/* allowed to set hint bits */
+	SHB_ENABLED,
+} SetHintBitsStatus;
+
+typedef struct SetHintBitsState
+{
+	SetHintBitsStatus status;
+	BufferHintDeltaContext delta;
+} SetHintBitsState;
+#else
 typedef enum SetHintBitsState
 {
 	/* not yet checked if hint bits may be set */
@@ -97,6 +114,7 @@ typedef enum SetHintBitsState
 	/* allowed to set hint bits */
 	SHB_ENABLED,
 } SetHintBitsState;
+#endif
 
 /*
  * SetHintBitsExt()
@@ -146,7 +164,11 @@ SetHintBitsExt(HeapTupleHeader tuple, Buffer buffer,
 	 * In batched mode, if we previously did not get permission to set hint
 	 * bits, don't try again - in all likelihood IO is still going on.
 	 */
+#ifdef USE_UMBRA
+	if (state && state->status == SHB_DISABLED)
+#else
 	if (state && *state == SHB_DISABLED)
+#endif
 		return;
 
 	if (TransactionIdIsValid(xid))
@@ -178,6 +200,18 @@ SetHintBitsExt(HeapTupleHeader tuple, Buffer buffer,
 		return;
 	}
 
+#ifdef USE_UMBRA
+	if (state->status == SHB_INITIAL)
+	{
+		if (!BufferBeginHintDelta(buffer, &state->delta))
+		{
+			state->status = SHB_DISABLED;
+			return;
+		}
+
+		state->status = SHB_ENABLED;
+	}
+#else
 	if (*state == SHB_INITIAL)
 	{
 		if (!BufferBeginSetHintBits(buffer))
@@ -188,6 +222,7 @@ SetHintBitsExt(HeapTupleHeader tuple, Buffer buffer,
 
 		*state = SHB_ENABLED;
 	}
+#endif
 	tuple->t_infomask |= infomask;
 }
 
@@ -1693,7 +1728,11 @@ HeapTupleSatisfiesMVCCBatch(Snapshot snapshot, Buffer buffer,
 							OffsetNumber *vistuples_dense)
 {
 	int			nvis = 0;
+#ifdef USE_UMBRA
+	SetHintBitsState state = {.status = SHB_INITIAL};
+#else
 	SetHintBitsState state = SHB_INITIAL;
+#endif
 
 	Assert(IsMVCCSnapshot(snapshot));
 
@@ -1712,8 +1751,14 @@ HeapTupleSatisfiesMVCCBatch(Snapshot snapshot, Buffer buffer,
 		}
 	}
 
+
+#ifdef USE_UMBRA
+	if (state.status == SHB_ENABLED)
+		BufferFinishHintDelta(&state.delta, true, true);
+#else
 	if (state == SHB_ENABLED)
 		BufferFinishSetHintBits(buffer, true, true);
+#endif
 
 	return nvis;
 }

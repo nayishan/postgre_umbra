@@ -363,6 +363,7 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 	bool		willinit;
 #ifdef USE_UMBRA
 	DecodedBkpBlock *blkref;
+	bool		hint_delta;
 #endif
 
 	if (!XLogRecGetBlockTagExtended(record, block_id, &rlocator, &forknum, &blkno,
@@ -386,6 +387,8 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 
 #ifdef USE_UMBRA
 	blkref = XLogRecGetBlock(record, block_id);
+	hint_delta = XLogRecGetRmid(record) == RM_XLOG2_ID &&
+		(XLogRecGetInfo(record) & ~XLR_INFO_MASK) == XLOG2_HINT_DELTA;
 	if (blkref->has_slot_shift)
 	{
 		SMgrRelation reln;
@@ -394,7 +397,7 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 		if (XLogRecBlockImageApply(record, block_id))
 			UmRedoSlotShift(reln, forknum, blkno, blkref->source_slot,
 							blkref->target_slot, record->EndRecPtr);
-		else if (blkref->source_slot_captured)
+		else if (blkref->source_slot_captured || hint_delta)
 		{
 			/* Materialize the old baseline before publishing the target. */
 			if (!UmRedoSetActiveSlot(reln, forknum, blkno,
