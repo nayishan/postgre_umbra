@@ -1845,6 +1845,17 @@ PerformWalRecovery(void)
 
 		RmgrCleanup();
 
+#ifdef USE_UMBRA
+		/*
+		 * Crash recovery does not necessarily reach the archive-recovery
+		 * consistency transition, where unresolved invalid pages are checked.
+		 * HINT_DELTA redo can defer a missing source baseline to a later
+		 * lifecycle record, so require that it has been resolved before redo
+		 * completes.
+		 */
+		XLogCheckInvalidPages();
+#endif
+
 		ereport(LOG,
 				errmsg("redo done at %X/%08X system usage: %s",
 					   LSN_FORMAT_ARGS(xlogreader->ReadRecPtr),

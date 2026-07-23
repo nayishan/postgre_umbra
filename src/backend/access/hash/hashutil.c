@@ -536,6 +536,9 @@ void
 _hash_kill_items(IndexScanDesc scan)
 {
 	HashScanOpaque so = (HashScanOpaque) scan->opaque;
+#ifdef USE_UMBRA
+	BufferHintDeltaContext hint_delta;
+#endif
 	Relation	rel = scan->indexRelation;
 	BlockNumber blkno;
 	Buffer		buf;
@@ -600,7 +603,11 @@ _hash_kill_items(IndexScanDesc scan)
 					 * update the page while just holding a share lock. If we
 					 * are not allowed, there's no point continuing.
 					 */
+#ifdef USE_UMBRA
+					if (!BufferBeginHintDelta(buf, &hint_delta))
+#else
 					if (!BufferBeginSetHintBits(buf))
+#endif
 						goto unlock_page;
 				}
 
@@ -621,7 +628,11 @@ _hash_kill_items(IndexScanDesc scan)
 	if (killedsomething)
 	{
 		opaque->hasho_flag |= LH_PAGE_HAS_DEAD_TUPLES;
+#ifdef USE_UMBRA
+		BufferFinishHintDelta(&hint_delta, true, true);
+#else
 		BufferFinishSetHintBits(buf, true, true);
+#endif
 	}
 
 unlock_page:

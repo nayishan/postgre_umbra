@@ -17,6 +17,7 @@
 #include "datatype/timestamp.h"
 #include "lib/stringinfo.h"
 #include "nodes/pg_list.h"
+#include "storage/block.h"
 
 
 /* Sync methods */
@@ -231,6 +232,7 @@ extern XLogRecPtr XLogGetReplicationSlotMinimumLSN(void);
 
 extern void xlog_redo(struct XLogReaderState *record);
 extern void xlog2_redo(struct XLogReaderState *record);
+extern void xlog2_mask(char *pagedata, BlockNumber blkno);
 extern void xlog_desc(StringInfo buf, struct XLogReaderState *record);
 extern void xlog2_desc(StringInfo buf, struct XLogReaderState *record);
 extern const char *xlog_identify(uint8 info);
