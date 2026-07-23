@@ -17,6 +17,8 @@
 
 typedef struct UmbraFileContext UmbraFileContext;
 
+extern void ummap_root_cache_backend_init(void);
+
 extern bool ummap_exists(UmbraFileContext *ctx);
 extern void ummap_create(UmbraFileContext *ctx,
 						 RelFileLocatorBackend rlocator, bool isRedo);

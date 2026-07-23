@@ -101,6 +101,7 @@ StaticAssertDecl(UMMAP_ROOT_DSA_INIT_SIZE <= UMMAP_ROOT_DSA_MAX_SIZE,
 static UmbraMapRootCacheCtl *UmbraMapRootCacheCtlData = NULL;
 static dsa_area *UmbraMapRootDSA = NULL;
 static dshash_table *UmbraMapRootHash = NULL;
+static bool ummap_root_cache_exit_handler_registered = false;
 
 static const dshash_parameters UmbraMapRootHashParams = {
 	.key_size = sizeof(UmbraMapRootTag),
@@ -121,7 +122,6 @@ static void ummap_root_write_image(UmbraFileContext *ctx, const char *image,
 static Size ummap_root_cache_shmem_size(void);
 static void ummap_root_cache_request(void *arg);
 static void ummap_root_cache_init(void *arg);
-static void ummap_root_cache_attach_callback(void *arg);
 static void ummap_root_cache_attach(void);
 static void ummap_root_cache_detach(int code, Datum arg);
 static void ummap_root_cache_ensure_initialized(void);
@@ -163,7 +163,6 @@ static bool ummap_root_aux_frontiers_valid(const UmbraMapRootData *root,
 const ShmemCallbacks UmbraMapRootShmemCallbacks = {
 	.request_fn = ummap_root_cache_request,
 	.init_fn = ummap_root_cache_init,
-	.attach_fn = ummap_root_cache_attach_callback,
 };
 
 bool
@@ -1067,10 +1066,14 @@ ummap_root_cache_init(void *arg)
 	dsa_detach(dsa);
 }
 
-static void
-ummap_root_cache_attach_callback(void *arg)
+void
+ummap_root_cache_backend_init(void)
 {
-	ummap_root_cache_attach();
+	if (IsUnderPostmaster && !ummap_root_cache_exit_handler_registered)
+	{
+		before_shmem_exit(ummap_root_cache_detach, 0);
+		ummap_root_cache_exit_handler_registered = true;
+	}
 }
 
 static void
@@ -1110,8 +1113,6 @@ ummap_root_cache_attach(void)
 
 	UmbraMapRootDSA = dsa;
 	UmbraMapRootHash = hash;
-	if (IsUnderPostmaster)
-		before_shmem_exit(ummap_root_cache_detach, 0);
 	MemoryContextSwitchTo(oldcontext);
 }
 
