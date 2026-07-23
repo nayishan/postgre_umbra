@@ -31,25 +31,39 @@
 
 #define UMBRA_CHUNK_ACTIVE_SLOTS 3U
 
-/* MAIN pages are born in slot 0 until a later patch adds selector pages. */
+/* MAIN pages are born in slot 0; persistent selectors can later choose 1/2. */
 static inline bool
-UmbraMainSlot0PhysicalBlock(BlockNumber logical_block,
-						BlockNumber *physical_block)
+UmbraMainActiveSlotIsValid(uint8 active_slot)
+{
+	return active_slot < UMBRA_CHUNK_ACTIVE_SLOTS;
+}
+
+static inline bool
+UmbraMainActiveSlotPhysicalBlock(BlockNumber logical_block, uint8 active_slot,
+								 BlockNumber *physical_block)
 {
 	uint64		chunk;
 	uint64		offset;
 	uint64		physical;
 
+	Assert(UmbraMainActiveSlotIsValid(active_slot));
 	chunk = (uint64) logical_block / UMBRA_CHUNK_PAIRED_PAGES;
 	offset = (uint64) logical_block % UMBRA_CHUNK_PAIRED_PAGES;
 	physical = chunk *
 		(UMBRA_CHUNK_ACTIVE_SLOTS * (uint64) UMBRA_CHUNK_PAIRED_PAGES) +
-		offset;
+		(uint64) active_slot * UMBRA_CHUNK_PAIRED_PAGES + offset;
 	if (physical > (uint64) MaxBlockNumber)
 		return false;
 
 	*physical_block = (BlockNumber) physical;
 	return true;
+}
+
+static inline bool
+UmbraMainSlot0PhysicalBlock(BlockNumber logical_block,
+						BlockNumber *physical_block)
+{
+	return UmbraMainActiveSlotPhysicalBlock(logical_block, 0, physical_block);
 }
 
 static inline bool
