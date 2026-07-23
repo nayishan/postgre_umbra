@@ -1366,6 +1366,26 @@ umfile_immedsync(UmbraFileContext *ctx, ForkNumber forknum)
 	}
 }
 
+/* Sync active segments that were opened before entering a critical section. */
+void
+umfile_immedsync_prepared(UmbraFileContext *ctx, ForkNumber forknum)
+{
+	int			segno;
+
+	Assert(ctx != NULL);
+	Assert(ctx->num_open_segs[forknum] > 0);
+	for (segno = 0; segno < ctx->num_open_segs[forknum]; segno++)
+	{
+		UmfdVec    *v = &ctx->seg_fds[forknum][segno];
+
+		if (FileSync(v->umfd_vfd, WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC) < 0)
+			ereport(data_sync_elevel(ERROR),
+					(errcode_for_file_access(),
+					 errmsg("could not fsync file \"%s\": %m",
+							FilePathName(v->umfd_vfd))));
+	}
+}
+
 int
 umfile_fd(UmbraFileContext *ctx, ForkNumber forknum, BlockNumber blocknum,
 		  uint32 *off)

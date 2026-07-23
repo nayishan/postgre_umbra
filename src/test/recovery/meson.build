@@ -75,6 +75,7 @@ tests += {
       't/064_umbra_checkpoint_source_slot.pl',
       't/065_umbra_checkpoint_overlap_image_free.pl',
       't/066_umbra_mapwriter.pl',
+      't/067_umbra_fsm_vm_mapping.pl',
     ],
   },
 }
