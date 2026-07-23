@@ -40,9 +40,37 @@ extern void ummap_set_main_frontiers(UmbraFileContext *ctx,
 extern void ummap_prepare_main_frontiers(UmbraFileContext *ctx,
 								 RelFileLocatorBackend rlocator);
 extern void ummap_publish_prepared_main_frontiers(UmbraFileContext *ctx,
-									  RelFileLocatorBackend rlocator,
-									  BlockNumber logical_eof,
-									  BlockNumber physical_capacity);
+										  RelFileLocatorBackend rlocator,
+										  BlockNumber logical_eof,
+										  BlockNumber physical_capacity);
+extern bool ummap_aux_slot0_active(UmbraFileContext *ctx,
+										ForkNumber forknum,
+									RelFileLocatorBackend rlocator);
+extern bool ummap_try_aux_slot0_active(UmbraFileContext *ctx,
+										ForkNumber forknum,
+										RelFileLocatorBackend rlocator,
+										bool *active);
+extern void ummap_activate_aux_slot0(UmbraFileContext *ctx,
+									 ForkNumber forknum,
+									 RelFileLocatorBackend rlocator);
+extern void ummap_get_aux_frontiers(UmbraFileContext *ctx,
+									 ForkNumber forknum,
+									 RelFileLocatorBackend rlocator,
+									 BlockNumber *logical_eof,
+									 BlockNumber *physical_capacity);
+extern void ummap_set_aux_frontiers(UmbraFileContext *ctx,
+									 ForkNumber forknum,
+									 RelFileLocatorBackend rlocator,
+									 BlockNumber logical_eof,
+									 BlockNumber physical_capacity);
+extern void ummap_prepare_aux_frontiers(UmbraFileContext *ctx,
+									 ForkNumber forknum,
+									 RelFileLocatorBackend rlocator);
+extern void ummap_publish_prepared_aux_frontiers(UmbraFileContext *ctx,
+											  ForkNumber forknum,
+												  RelFileLocatorBackend rlocator,
+												  BlockNumber logical_eof,
+												  BlockNumber physical_capacity);
 extern void ummap_validate_if_exists(UmbraFileContext *ctx,
 							 RelFileLocatorBackend rlocator);
 extern void ummap_immedsync_if_exists(UmbraFileContext *ctx,

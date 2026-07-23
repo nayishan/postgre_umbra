@@ -53,7 +53,7 @@ sub check_layout
 	  unpack('L', substr($root, ROOT_PHYSICAL_CAPACITY_OFFSET, 4));
 	my $physical_bytes = -s $node->data_dir . "/$main_path";
 
-	is($root_flags, ROOT_FLAG_MAIN_SLOT0,
+	is($root_flags & ROOT_FLAG_MAIN_SLOT0, ROOT_FLAG_MAIN_SLOT0,
 		"$label: root activates MAIN slot-0 mapping");
 	is($root_logical_eof, $logical_eof,
 		"$label: root stores the exact logical EOF");

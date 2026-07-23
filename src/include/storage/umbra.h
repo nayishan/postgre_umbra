@@ -70,15 +70,15 @@ UmbraMainActiveSlotPhysicalBlock(BlockNumber logical_block, uint8 active_slot,
 }
 
 static inline bool
-UmbraMainSlot0PhysicalBlock(BlockNumber logical_block,
-						BlockNumber *physical_block)
+UmbraSlot0PhysicalBlock(BlockNumber logical_block,
+					 BlockNumber *physical_block)
 {
 	return UmbraMainActiveSlotPhysicalBlock(logical_block, 0, physical_block);
 }
 
 static inline bool
-UmbraMainSlot0PhysicalCapacity(BlockNumber logical_eof,
-						   BlockNumber *physical_capacity)
+UmbraSlot0PhysicalCapacity(BlockNumber logical_eof,
+					  BlockNumber *physical_capacity)
 {
 	uint64		chunks;
 	uint64		capacity;
@@ -98,6 +98,27 @@ UmbraMainSlot0PhysicalCapacity(BlockNumber logical_eof,
 
 	*physical_capacity = (BlockNumber) capacity;
 	return true;
+}
+
+/* MAIN/FSM/VM share the slot-0 formula; only MAIN later selects other slots. */
+static inline bool
+UmbraMainSlot0PhysicalBlock(BlockNumber logical_block,
+						BlockNumber *physical_block)
+{
+	return UmbraSlot0PhysicalBlock(logical_block, physical_block);
+}
+
+static inline bool
+UmbraMainSlot0PhysicalCapacity(BlockNumber logical_eof,
+						   BlockNumber *physical_capacity)
+{
+	return UmbraSlot0PhysicalCapacity(logical_eof, physical_capacity);
+}
+
+static inline bool
+UmbraAuxiliaryForkUsesSlot0(ForkNumber forknum)
+{
+	return forknum == FSM_FORKNUM || forknum == VISIBILITYMAP_FORKNUM;
 }
 
 extern void uminit(void);
