@@ -75,6 +75,7 @@ checkpoint_timeout = '1h'
 full_page_writes = on
 wal_log_hints = off
 max_wal_size = '4GB'
+log_min_messages = debug1
 ]);
 $node->start;
 
@@ -156,8 +157,9 @@ is($node->safe_psql('postgres',
 	'three', 'crash redo restores the FPI through the final target slot');
 
 # A later DROP can remove the mapping files before a crash even though the
-# checkpoint redo point still precedes the shift.  Redo must reconstruct the
-# FPI-backed target long enough to reach that lifecycle record.
+# checkpoint redo point still precedes the shift.  The FPI does not identify
+# the missing root's lifecycle, so redo must record a dependency and let DROP
+# clear it.
 $node->safe_psql(
 	'postgres', q[
 CREATE TABLE umbra_slot_shift_drop(id integer PRIMARY KEY, payload text)
@@ -228,8 +230,8 @@ ok(!-e $drop_main_path && !-e $zero_main_path,
 	'repeated recovery starts with both dropped MAIN files absent');
 
 # A crash during metadata unlink can instead leave an existing but zero-length
-# fork.  On the next recovery, smgropen() sees the fork while no valid root is
-# available; shift redo must repair the root before publishing its target.
+# fork.  It is not mapping authority either, so shift redo must account for it
+# without repairing the root.
 open(my $zero_map_fh, '>', $zero_map_path)
   or BAIL_OUT("could not create \"$zero_map_path\": $!");
 close($zero_map_fh)
@@ -237,13 +239,22 @@ close($zero_map_fh)
 ok(-z $zero_map_path,
 	'interrupted drop leaves a zero-length selector mapping before crash');
 
+my $recovery_log_offset = -s $node->logfile;
 $node->start;
+ok($node->log_contains(
+		qr/page $drop_target_block of relation .*\/$drop_filenode does not exist/,
+		$recovery_log_offset),
+	'missing mapping records the FPI shift as an invalid-page dependency');
+ok($node->log_contains(
+		qr/page $zero_target_block of relation .*\/$zero_filenode does not exist/,
+		$recovery_log_offset),
+	'zero-length mapping records the FPI shift as an invalid-page dependency');
 is($node->safe_psql(
 		'postgres', q[SELECT to_regclass('umbra_slot_shift_drop') IS NULL;]),
-	't', 'redo reconstructs a missing mapping and reaches the later drop');
+	't', 'later DROP clears the missing-mapping dependency');
 is($node->safe_psql(
 		'postgres', q[SELECT to_regclass('umbra_slot_shift_zero_map') IS NULL;]),
-	't', 'redo repairs a zero-length mapping and reaches the later drop');
+	't', 'later DROP clears the zero-length-mapping dependency');
 
 $node->stop;
 

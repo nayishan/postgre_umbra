@@ -58,11 +58,11 @@ HotStandbyState standbyState = STANDBY_DISABLED;
 /*
  * During XLOG replay, we may see XLOG records for incremental updates of
  * pages that no longer exist, because their relation was later dropped or
- * truncated.  (Note: this is only possible when full_page_writes = OFF,
- * since when it's ON, the first reference we see to a page should always
- * be a full-page rewrite not an incremental update.)  Rather than simply
- * ignoring such records, we make a note of the referenced page, and then
- * complain if we don't actually see a drop or truncate covering the page
+ * truncated.  This normally requires full_page_writes = OFF.  Umbra can also
+ * decline a slot-shift FPI when its MAP lifecycle authority is missing, since
+ * the page image cannot reconstruct that relation-wide state.  Rather than
+ * simply ignoring such records, we make a note of the referenced page, and
+ * then complain if we don't actually see a drop or truncate covering the page
  * later in replay.
  */
 typedef struct xl_invalid_page_key
@@ -395,8 +395,16 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 
 		reln = smgropen(rlocator, INVALID_PROC_NUMBER);
 		if (XLogRecBlockImageApply(record, block_id))
-			UmRedoSlotShift(reln, forknum, blkno, blkref->source_slot,
-							blkref->target_slot, record->EndRecPtr);
+		{
+			if (!UmRedoSlotShift(reln, forknum, blkno,
+								 blkref->source_slot,
+								 blkref->target_slot, record->EndRecPtr))
+			{
+				XLogRecordInvalidPage(rlocator, forknum, blkno, false);
+				*buf = InvalidBuffer;
+				return BLK_NOTFOUND;
+			}
+		}
 		else if (blkref->source_slot_captured || hint_delta)
 		{
 			/* Materialize the old baseline before publishing the target. */
@@ -421,9 +429,11 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 				}
 				MarkBufferDirty(*buf);
 				FlushOneBuffer(*buf);
-				UmRedoSlotShift(reln, forknum, blkno,
-								blkref->source_slot,
-								blkref->target_slot, record->EndRecPtr);
+				if (!UmRedoSlotShift(reln, forknum, blkno,
+									 blkref->source_slot,
+									 blkref->target_slot,
+									 record->EndRecPtr))
+					elog(PANIC, "Umbra mapping disappeared during slot-shift redo");
 				MarkBufferDirty(*buf);
 				if (lsn <= PageGetLSN(BufferGetPage(*buf)))
 					return BLK_DONE;

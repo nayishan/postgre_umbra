@@ -183,7 +183,7 @@ extern void UmCheckpointWritebackSourceSlot(SMgrRelation reln,
 											uint8 source_slot);
 extern bool UmRedoSetActiveSlot(SMgrRelation reln, ForkNumber forknum,
 								 BlockNumber logical_block, uint8 active_slot);
-extern void UmRedoSlotShift(SMgrRelation reln, ForkNumber forknum,
+extern bool UmRedoSlotShift(SMgrRelation reln, ForkNumber forknum,
 							BlockNumber logical_block, uint8 source_slot,
 							uint8 target_slot, XLogRecPtr shift_lsn);
 

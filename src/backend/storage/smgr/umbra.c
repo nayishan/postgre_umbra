@@ -463,13 +463,14 @@ UmRedoSetActiveSlot(SMgrRelation reln, ForkNumber forknum,
 	return true;
 }
 
-void
+bool
 UmRedoSlotShift(SMgrRelation reln, ForkNumber forknum,
 				BlockNumber logical_block, uint8 source_slot,
 				uint8 target_slot, XLogRecPtr shift_lsn)
 {
 	UmbraSmgrRelationState *state;
 	UmbraFileContext *ctx;
+	bool		root_active = false;
 
 	if (!InRecovery || reln == NULL || forknum != MAIN_FORKNUM ||
 		RelFileLocatorBackendIsTemp(reln->smgr_rlocator) ||
@@ -481,32 +482,26 @@ UmRedoSlotShift(SMgrRelation reln, ForkNumber forknum,
 	Assert(state != NULL);
 
 	/*
-	 * A prior recovery can replay a later DROP and remove both forks before
-	 * crashing.  Root activation syncs MAIN before making the mapping durable,
-	 * so recreate only a missing MAIN file before repairing the root.  Redo
-	 * create preserves any existing file from later lifecycle WAL.
+	 * A full-page image proves that the logical page can be reconstructed, but
+	 * it does not identify the lifecycle that owned a missing metadata root.
+	 * Only CREATE redo may rebuild that authority.  A later DROP or covering
+	 * TRUNCATE will clear the dependency recorded by the caller.
 	 */
-	umfile_create(ctx, MAIN_FORKNUM, true);
+	if (!ummap_try_main_slot0_active(ctx, reln->smgr_rlocator,
+									&root_active) || !root_active)
+		return false;
 
-	/*
-	 * A later DROP can remove both forks before recovery starts, while the
-	 * checkpoint redo point still precedes this FPI-backed shift.  Recreate
-	 * only the missing mapping substrate; never replace an existing valid
-	 * root, which may belong to later lifecycle WAL at the same locator.
-	 */
-	if (!state->uses_map || !state->main_slot0_active)
-	{
-		ummap_create(ctx, reln->smgr_rlocator, true);
-		state->uses_map = true;
-	}
-	if (!state->main_slot0_active)
-	{
-		ummap_activate_main_slot0(ctx, reln->smgr_rlocator, shift_lsn);
-		state->main_slot0_active = true;
-	}
+	state->uses_map = true;
+	state->map_policy_probe_done = true;
+	state->main_slot0_active = true;
+	reln->smgr_cached_nblocks[MAIN_FORKNUM] = InvalidBlockNumber;
+
+	/* With mapping authority established, the FPI may recreate MAIN. */
+	umfile_create(ctx, MAIN_FORKNUM, true);
 
 	MapRedoSlotShift(ctx, reln->smgr_rlocator,
 					 logical_block, source_slot, target_slot);
+	return true;
 }
 
 void
