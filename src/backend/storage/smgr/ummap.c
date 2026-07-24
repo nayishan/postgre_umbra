@@ -28,7 +28,7 @@
 #include "utils/memutils.h"
 
 #define UMMAP_ROOT_MAGIC		0x554D4252U	/* "UMBR" */
-#define UMMAP_ROOT_VERSION		1U
+#define UMMAP_ROOT_VERSION		2U
 #define UMMAP_ROOT_FLAGS_V1	0x00000001U
 #define UMMAP_ROOT_FLAG_MAIN_SLOT0 0x00000002U
 #define UMMAP_ROOT_FLAG_FSM_SLOT0 0x00000004U
@@ -303,9 +303,9 @@ ummap_set_main_frontiers(UmbraFileContext *ctx,
 	BlockNumber	expected_capacity;
 
 	Assert(ctx != NULL);
-	if (!UmbraMainSlot0PhysicalCapacity(logical_eof, &expected_capacity) ||
+	if (!UmbraMappedPhysicalCapacity(logical_eof, &expected_capacity) ||
 		physical_capacity != expected_capacity)
-		elog(PANIC, "invalid Umbra MAIN slot-0 frontiers");
+		elog(PANIC, "invalid Umbra MAIN mapped frontiers");
 
 	entry = ummap_root_cache_get(ctx, rlocator, LW_EXCLUSIVE);
 	root = (UmbraMapRootData *) entry->image;
@@ -362,14 +362,14 @@ ummap_publish_prepared_main_frontiers(UmbraFileContext *ctx,
 	BlockNumber	expected_capacity;
 
 	Assert(ctx != NULL);
-	if (!UmbraMainSlot0PhysicalCapacity(logical_eof, &expected_capacity) ||
+	if (!UmbraMappedPhysicalCapacity(logical_eof, &expected_capacity) ||
 		physical_capacity != expected_capacity)
-		elog(PANIC, "invalid Umbra MAIN slot-0 frontiers");
+		elog(PANIC, "invalid Umbra MAIN mapped frontiers");
 
 	tag.rlocator = rlocator;
 	if (!ummap_root_cache_find_locked(&tag, LW_EXCLUSIVE, &entry) ||
 		!entry->valid)
-		elog(PANIC, "Umbra MAIN slot-0 frontiers were not prepared");
+		elog(PANIC, "Umbra MAIN mapped frontiers were not prepared");
 	root = (UmbraMapRootData *) entry->image;
 	if ((root->flags & UMMAP_ROOT_FLAG_MAIN_SLOT0) == 0)
 	{
@@ -403,7 +403,7 @@ ummap_aux_slot0_active(UmbraFileContext *ctx, ForkNumber forknum,
 	bool		active;
 
 	Assert(ctx != NULL);
-	Assert(UmbraAuxiliaryForkUsesSlot0(forknum));
+	Assert(UmbraIsMappedAuxiliaryFork(forknum));
 	entry = ummap_root_cache_get(ctx, rlocator, LW_SHARED);
 	root = (UmbraMapRootData *) entry->image;
 	active = ummap_root_aux_slot0_active(root, forknum);
@@ -419,7 +419,7 @@ ummap_try_aux_slot0_active(UmbraFileContext *ctx, ForkNumber forknum,
 	UmbraMapRootData *root;
 
 	Assert(ctx != NULL);
-	Assert(UmbraAuxiliaryForkUsesSlot0(forknum));
+	Assert(UmbraIsMappedAuxiliaryFork(forknum));
 	Assert(active != NULL);
 	(void) rlocator;
 	if (!ummap_root_read_valid_image(ctx, image))
@@ -437,7 +437,7 @@ ummap_activate_aux_slot0(UmbraFileContext *ctx, ForkNumber forknum,
 	UmbraMapRootData *root;
 
 	Assert(ctx != NULL);
-	Assert(UmbraAuxiliaryForkUsesSlot0(forknum));
+	Assert(UmbraIsMappedAuxiliaryFork(forknum));
 	entry = ummap_root_cache_get(ctx, rlocator, LW_EXCLUSIVE);
 	root = (UmbraMapRootData *) entry->image;
 	if ((root->flags & UMMAP_ROOT_FLAG_MAIN_SLOT0) == 0)
@@ -472,7 +472,7 @@ ummap_get_aux_frontiers(UmbraFileContext *ctx, ForkNumber forknum,
 	UmbraMapRootData *root;
 
 	Assert(ctx != NULL);
-	Assert(UmbraAuxiliaryForkUsesSlot0(forknum));
+	Assert(UmbraIsMappedAuxiliaryFork(forknum));
 	Assert(logical_eof != NULL);
 	Assert(physical_capacity != NULL);
 	entry = ummap_root_cache_get(ctx, rlocator, LW_SHARED);
@@ -500,10 +500,10 @@ ummap_set_aux_frontiers(UmbraFileContext *ctx, ForkNumber forknum,
 	BlockNumber	current_physical_capacity;
 
 	Assert(ctx != NULL);
-	Assert(UmbraAuxiliaryForkUsesSlot0(forknum));
-	if (!UmbraSlot0PhysicalCapacity(logical_eof, &expected_capacity) ||
+	Assert(UmbraIsMappedAuxiliaryFork(forknum));
+	if (!UmbraMappedPhysicalCapacity(logical_eof, &expected_capacity) ||
 		physical_capacity != expected_capacity)
-		elog(PANIC, "invalid Umbra auxiliary slot-0 frontiers");
+		elog(PANIC, "invalid Umbra auxiliary mapped frontiers");
 
 	entry = ummap_root_cache_get(ctx, rlocator, LW_EXCLUSIVE);
 	root = (UmbraMapRootData *) entry->image;
@@ -537,7 +537,7 @@ ummap_prepare_aux_frontiers(UmbraFileContext *ctx, ForkNumber forknum,
 	uint32		flags;
 
 	Assert(ctx != NULL);
-	Assert(UmbraAuxiliaryForkUsesSlot0(forknum));
+	Assert(UmbraIsMappedAuxiliaryFork(forknum));
 	entry = ummap_root_cache_get(ctx, rlocator, LW_SHARED);
 	root = (UmbraMapRootData *) entry->image;
 	if (!ummap_root_aux_slot0_active(root, forknum))
@@ -566,15 +566,15 @@ ummap_publish_prepared_aux_frontiers(UmbraFileContext *ctx,
 	BlockNumber	current_physical_capacity;
 
 	Assert(ctx != NULL);
-	Assert(UmbraAuxiliaryForkUsesSlot0(forknum));
-	if (!UmbraSlot0PhysicalCapacity(logical_eof, &expected_capacity) ||
+	Assert(UmbraIsMappedAuxiliaryFork(forknum));
+	if (!UmbraMappedPhysicalCapacity(logical_eof, &expected_capacity) ||
 		physical_capacity != expected_capacity)
-		elog(PANIC, "invalid Umbra auxiliary slot-0 frontiers");
+		elog(PANIC, "invalid Umbra auxiliary mapped frontiers");
 
 	tag.rlocator = rlocator;
 	if (!ummap_root_cache_find_locked(&tag, LW_EXCLUSIVE, &entry) ||
 		!entry->valid)
-		elog(PANIC, "Umbra auxiliary slot-0 frontiers were not prepared");
+		elog(PANIC, "Umbra auxiliary mapped frontiers were not prepared");
 	root = (UmbraMapRootData *) entry->image;
 	if (!ummap_root_aux_slot0_active(root, forknum))
 	{
@@ -712,7 +712,7 @@ ummap_aux_slot0_flag(ForkNumber forknum)
 		case VISIBILITYMAP_FORKNUM:
 			return UMMAP_ROOT_FLAG_VM_SLOT0;
 		default:
-			elog(PANIC, "invalid Umbra auxiliary slot-0 fork %d",
+			elog(PANIC, "invalid Umbra mapped auxiliary fork %d",
 				 (int) forknum);
 	}
 	return 0;
@@ -745,7 +745,7 @@ ummap_root_get_aux_frontiers(const UmbraMapRootData *root,
 			*physical_capacity = root->physical_capacity_vm;
 			break;
 		default:
-			elog(PANIC, "invalid Umbra auxiliary slot-0 fork %d",
+			elog(PANIC, "invalid Umbra mapped auxiliary fork %d",
 				 (int) forknum);
 	}
 }
@@ -767,7 +767,7 @@ ummap_root_set_aux_frontiers(UmbraMapRootData *root, ForkNumber forknum,
 			root->physical_capacity_vm = physical_capacity;
 			break;
 		default:
-			elog(PANIC, "invalid Umbra auxiliary slot-0 fork %d",
+			elog(PANIC, "invalid Umbra mapped auxiliary fork %d",
 				 (int) forknum);
 	}
 }
@@ -787,7 +787,7 @@ ummap_root_aux_frontiers_valid(const UmbraMapRootData *root,
 			!BlockNumberIsValid(physical_capacity);
 	return BlockNumberIsValid(logical_eof) &&
 		BlockNumberIsValid(physical_capacity) &&
-		UmbraSlot0PhysicalCapacity(logical_eof, &expected_capacity) &&
+		UmbraMappedPhysicalCapacity(logical_eof, &expected_capacity) &&
 		physical_capacity == expected_capacity;
 }
 
@@ -854,8 +854,8 @@ ummap_root_is_valid(const UmbraMapRootData *root)
 			root->physical_capacity_main != 0)
 			return false;
 	}
-	else if (!UmbraMainSlot0PhysicalCapacity(root->logical_eof_main,
-											 &expected_capacity) ||
+	else if (!UmbraMappedPhysicalCapacity(root->logical_eof_main,
+									 &expected_capacity) ||
 				 root->physical_capacity_main != expected_capacity)
 		return false;
 
@@ -1183,7 +1183,7 @@ ummap_root_cache_flush_internal_locked(UmbraMapRootEntry *entry,
 		if (XLogRecPtrIsValid(entry->wal_flush_lsn))
 			XLogFlush(entry->wal_flush_lsn);
 		/*
-		 * Slot-0 frontiers make their physical capacities authoritative.  Do
+		 * Mapped-fork frontiers make their physical capacities authoritative. Do
 		 * not allow the root to become durable before any activated data fork
 		 * it describes: checkpoint fsync requests have no ordering guarantee
 		 * between forks.

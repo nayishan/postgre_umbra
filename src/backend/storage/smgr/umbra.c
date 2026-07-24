@@ -29,13 +29,13 @@
 #include "storage/umbra.h"
 #include "utils/memutils.h"
 
-typedef struct UmbraSlot0TruncateState
+typedef struct UmbraMappedTruncateState
 {
 	bool		prepared;
 	BlockNumber	logical_eof;
 	BlockNumber	physical_capacity;
 	BlockNumber	current_physical;
-} UmbraSlot0TruncateState;
+} UmbraMappedTruncateState;
 
 typedef struct UmbraSmgrRelationState
 {
@@ -48,46 +48,43 @@ typedef struct UmbraSmgrRelationState
 	UmbraFileContext *filectx;
 	bool		uses_map;
 	bool		map_policy_probe_done;
+	/* Root-format activation bits, not the current per-page selector values. */
 	bool		main_slot0_active;
 	bool		fsm_slot0_active;
 	bool		vm_slot0_active;
-	UmbraSlot0TruncateState slot0_truncate[MAX_FORKNUM + 1];
+	UmbraMappedTruncateState mapped_truncate[MAX_FORKNUM + 1];
 } UmbraSmgrRelationState;
 
 static UmbraFileContext *um_get_filectx(SMgrRelation reln);
-static void um_refresh_slot0_policy(SMgrRelation reln, ForkNumber forknum);
-static bool um_main_uses_slot0(SMgrRelation reln, ForkNumber forknum);
-static bool um_fork_uses_slot0(SMgrRelation reln, ForkNumber forknum);
-static BlockNumber um_main_active_pblk(SMgrRelation reln,
-								   BlockNumber logical_block);
-static BlockNumber um_slot0_active_pblk(SMgrRelation reln,
-									 ForkNumber forknum,
-									 BlockNumber logical_block);
-static BlockNumber um_slot0_range_end(SMgrRelation reln, ForkNumber forknum,
+static void um_refresh_mapping_policy(SMgrRelation reln, ForkNumber forknum);
+static bool um_fork_uses_mapped_slots(SMgrRelation reln, ForkNumber forknum);
+static BlockNumber um_active_pblk(SMgrRelation reln, ForkNumber forknum,
+								  BlockNumber logical_block);
+static BlockNumber um_mapped_range_end(SMgrRelation reln, ForkNumber forknum,
 									  BlockNumber blocknum, BlockNumber nblocks);
-static void um_get_slot0_frontiers(SMgrRelation reln, ForkNumber forknum,
+static void um_get_mapped_frontiers(SMgrRelation reln, ForkNumber forknum,
 									   BlockNumber *logical_eof,
 									   BlockNumber *physical_capacity);
-static void um_require_slot0_range(SMgrRelation reln, ForkNumber forknum,
+static void um_require_mapped_range(SMgrRelation reln, ForkNumber forknum,
 									  BlockNumber blocknum, BlockNumber nblocks);
-static void um_ensure_slot0_capacity(SMgrRelation reln, ForkNumber forknum,
+static void um_ensure_mapped_capacity(SMgrRelation reln, ForkNumber forknum,
 									  BlockNumber physical_capacity,
 									  bool skipFsync);
-static void um_ensure_aux_slot0_recovery_capacity(SMgrRelation reln,
+static void um_ensure_aux_recovery_capacity(SMgrRelation reln,
 												 ForkNumber forknum);
-static void um_zero_slot0_range(SMgrRelation reln, ForkNumber forknum,
-								  BlockNumber first_block, BlockNumber end_block,
-								  bool skipFsync);
-static void um_publish_slot0_after_data(SMgrRelation reln, ForkNumber forknum,
+static void um_zero_active_range(SMgrRelation reln, ForkNumber forknum,
+								 BlockNumber first_block, BlockNumber end_block,
+								 bool skipFsync);
+static void um_publish_mapped_after_data(SMgrRelation reln, ForkNumber forknum,
 									BlockNumber logical_eof,
 									BlockNumber physical_capacity);
-static void um_publish_slot0_before_truncate(SMgrRelation reln,
+static void um_publish_mapped_before_truncate(SMgrRelation reln,
 										  ForkNumber forknum,
 										  BlockNumber logical_eof,
 										  BlockNumber physical_capacity);
-static void um_ensure_main_selector_pages(SMgrRelation reln,
-									 BlockNumber first_block,
-									 BlockNumber nblocks, bool skipFsync);
+static void um_ensure_selector_pages(SMgrRelation reln, ForkNumber forknum,
+									BlockNumber first_block,
+									BlockNumber nblocks, bool skipFsync);
 
 void
 uminit(void)
@@ -165,7 +162,7 @@ umclose(SMgrRelation reln, ForkNumber forknum)
 			state->fsm_slot0_active = false;
 			state->vm_slot0_active = false;
 			for (int forkidx = 0; forkidx <= MAX_FORKNUM; forkidx++)
-				state->slot0_truncate[forkidx].prepared = false;
+				state->mapped_truncate[forkidx].prepared = false;
 		}
 		umfile_close(state->filectx, forknum);
 	}
@@ -194,15 +191,15 @@ umcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 	bool		fork_existed = false;
 
 	Assert(state != NULL);
-	um_refresh_slot0_policy(reln, forknum);
+	um_refresh_mapping_policy(reln, forknum);
 	/*
 	 * Ordinary page redo marks a permanent relation as map-capable before an
 	 * authoritative CREATE has established its root.  Only a relation whose
-	 * MAIN fork has already entered slot-0 policy may activate an auxiliary
-	 * slot-0 fork; bootstrap system relations have no _map fork at all.
+	 * MAIN fork has already entered mapped policy may activate a mapped
+	 * auxiliary fork; bootstrap system relations have no _map fork at all.
 	 */
 	map_auxiliary = state->main_slot0_active &&
-		UmbraAuxiliaryForkUsesSlot0(forknum);
+		UmbraIsMappedAuxiliaryFork(forknum);
 	if (map_auxiliary)
 	{
 		fork_existed = umfile_exists(ctx, forknum);
@@ -240,7 +237,7 @@ umcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 		else
 			state->vm_slot0_active = active;
 		if (isRedo && active)
-			um_ensure_aux_slot0_recovery_capacity(reln, forknum);
+			um_ensure_aux_recovery_capacity(reln, forknum);
 	}
 }
 
@@ -304,7 +301,7 @@ UmWalOwnedSlotShiftAvailable(SMgrRelation reln, ForkNumber forknum)
 {
 	return reln != NULL && !InRecovery &&
 		!RelFileLocatorBackendIsTemp(reln->smgr_rlocator) &&
-		um_main_uses_slot0(reln, forknum);
+		um_fork_uses_mapped_slots(reln, forknum);
 }
 
 bool
@@ -318,10 +315,11 @@ UmPrepareSlotShift(SMgrRelation reln, ForkNumber forknum,
 	shift->map_slot_id = -1;
 	if (!UmWalOwnedSlotShiftAvailable(reln, forknum) ||
 		!MapPrepareSlotShift(um_get_filectx(reln), reln->smgr_rlocator,
-						 logical_block, &map_shift))
+						 forknum, logical_block, &map_shift))
 		return false;
 
 	shift->rlocator = map_shift.rlocator;
+	shift->forknum = map_shift.forknum;
 	shift->logical_block = map_shift.logical_block;
 	shift->source_slot = map_shift.source_slot;
 	shift->target_slot = map_shift.target_slot;
@@ -339,6 +337,7 @@ UmAbortSlotShift(UmbraSlotShift *shift)
 	if (!shift->prepared)
 		return;
 	map_shift.rlocator = shift->rlocator;
+	map_shift.forknum = shift->forknum;
 	map_shift.logical_block = shift->logical_block;
 	map_shift.source_slot = shift->source_slot;
 	map_shift.target_slot = shift->target_slot;
@@ -364,6 +363,7 @@ UmPublishSlotShift(UmbraSlotShift *shift, XLogRecPtr lsn)
 	Assert(shift != NULL);
 	Assert(shift->prepared);
 	map_shift.rlocator = shift->rlocator;
+	map_shift.forknum = shift->forknum;
 	map_shift.logical_block = shift->logical_block;
 	map_shift.source_slot = shift->source_slot;
 	map_shift.target_slot = shift->target_slot;
@@ -383,21 +383,21 @@ UmCheckpointWriteSourceSlot(SMgrRelation reln, ForkNumber forknum,
 	BlockNumber	physical_block;
 
 	if (reln == NULL || buffer == NULL ||
-		!UmbraMainActiveSlotIsValid(source_slot))
+		!UmbraActiveSlotIsValid(source_slot))
 		return false;
-	um_refresh_slot0_policy(reln, MAIN_FORKNUM);
-	if (!um_main_uses_slot0(reln, forknum))
+	um_refresh_mapping_policy(reln, forknum);
+	if (!um_fork_uses_mapped_slots(reln, forknum))
 		return false;
-	if (!UmbraMainActiveSlotPhysicalBlock(logical_block, source_slot,
-										 &physical_block))
+	if (!UmbraActiveSlotPhysicalBlock(logical_block, source_slot,
+									 &physical_block))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("Umbra MAIN source-slot block mapping overflow for relation %u/%u/%u",
+				 errmsg("Umbra source-slot block mapping overflow for relation %u/%u/%u fork %d",
 						reln->smgr_rlocator.locator.spcOid,
 						reln->smgr_rlocator.locator.dbOid,
-						reln->smgr_rlocator.locator.relNumber)));
+						reln->smgr_rlocator.locator.relNumber, (int) forknum)));
 
-	umfile_writev(um_get_filectx(reln), MAIN_FORKNUM, physical_block,
+	umfile_writev(um_get_filectx(reln), forknum, physical_block,
 				  buffers, 1, false);
 	return true;
 }
@@ -408,21 +408,21 @@ UmCheckpointWritebackSourceSlot(SMgrRelation reln, ForkNumber forknum,
 {
 	BlockNumber	physical_block;
 
-	if (reln == NULL || !UmbraMainActiveSlotIsValid(source_slot))
+	if (reln == NULL || !UmbraActiveSlotIsValid(source_slot))
 		return;
-	um_refresh_slot0_policy(reln, MAIN_FORKNUM);
-	if (!um_main_uses_slot0(reln, forknum))
+	um_refresh_mapping_policy(reln, forknum);
+	if (!um_fork_uses_mapped_slots(reln, forknum))
 		return;
-	if (!UmbraMainActiveSlotPhysicalBlock(logical_block, source_slot,
-										 &physical_block))
+	if (!UmbraActiveSlotPhysicalBlock(logical_block, source_slot,
+									 &physical_block))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("Umbra MAIN source-slot block mapping overflow for relation %u/%u/%u",
+				 errmsg("Umbra source-slot block mapping overflow for relation %u/%u/%u fork %d",
 						reln->smgr_rlocator.locator.spcOid,
 						reln->smgr_rlocator.locator.dbOid,
-						reln->smgr_rlocator.locator.relNumber)));
+						reln->smgr_rlocator.locator.relNumber, (int) forknum)));
 
-	umfile_writeback(um_get_filectx(reln), MAIN_FORKNUM, physical_block, 1);
+	umfile_writeback(um_get_filectx(reln), forknum, physical_block, 1);
 }
 
 bool
@@ -435,31 +435,47 @@ UmRedoSetActiveSlot(SMgrRelation reln, ForkNumber forknum,
 	BlockNumber	physical_capacity;
 	bool		root_active = false;
 
-	if (!InRecovery || reln == NULL || forknum != MAIN_FORKNUM ||
+	if (!InRecovery || reln == NULL ||
+		!UmbraForkUsesActiveSlots(forknum) ||
 		RelFileLocatorBackendIsTemp(reln->smgr_rlocator) ||
-		!UmbraMainActiveSlotIsValid(active_slot))
-		elog(PANIC, "Umbra redo targets an invalid MAIN mapping");
+		!UmbraActiveSlotIsValid(active_slot))
+		elog(PANIC, "Umbra redo targets an invalid active-slot mapping");
 
-	um_refresh_slot0_policy(reln, MAIN_FORKNUM);
+	um_refresh_mapping_policy(reln, forknum);
 	state = reln->smgr_private;
 	ctx = um_get_filectx(reln);
 	Assert(state != NULL);
 
 	/* Image-free redo must never create or repair a missing source. */
-	if (!ummap_try_main_slot0_active(ctx, reln->smgr_rlocator,
-									&root_active) ||
-		!root_active)
-		return false;
+	if (forknum == MAIN_FORKNUM)
+	{
+		if (!ummap_try_main_slot0_active(ctx, reln->smgr_rlocator,
+										&root_active) || !root_active)
+			return false;
+		state->main_slot0_active = true;
+	}
+	else
+	{
+		if (!ummap_try_aux_slot0_active(ctx, forknum, reln->smgr_rlocator,
+									   &root_active) || !root_active)
+			return false;
+		/* Root validation requires MAIN activation before either auxiliary. */
+		state->main_slot0_active = true;
+		if (forknum == FSM_FORKNUM)
+			state->fsm_slot0_active = true;
+		else
+			state->vm_slot0_active = true;
+	}
 	state->uses_map = true;
-	state->main_slot0_active = true;
-	um_get_slot0_frontiers(reln, MAIN_FORKNUM, &logical_eof,
-						   &physical_capacity);
+	um_get_mapped_frontiers(reln, forknum, &logical_eof,
+							   &physical_capacity);
 	if (logical_block >= logical_eof ||
-		!umfile_exists(ctx, MAIN_FORKNUM) ||
-		umfile_nblocks(ctx, MAIN_FORKNUM) < physical_capacity)
+		!umfile_exists(ctx, forknum) ||
+		umfile_nblocks(ctx, forknum) < physical_capacity)
 		return false;
 
-	MapRedoSetActiveSlot(ctx, reln->smgr_rlocator, logical_block, active_slot);
+	MapRedoSetActiveSlot(ctx, reln->smgr_rlocator, forknum, logical_block,
+						 active_slot);
 	return true;
 }
 
@@ -472,11 +488,12 @@ UmRedoSlotShift(SMgrRelation reln, ForkNumber forknum,
 	UmbraFileContext *ctx;
 	bool		root_active = false;
 
-	if (!InRecovery || reln == NULL || forknum != MAIN_FORKNUM ||
+	if (!InRecovery || reln == NULL ||
+		!UmbraForkUsesActiveSlots(forknum) ||
 		RelFileLocatorBackendIsTemp(reln->smgr_rlocator) ||
 		!XLogRecPtrIsValid(shift_lsn))
-		elog(PANIC, "Umbra slot-shift WAL targets an inactive MAIN mapping");
-	um_refresh_slot0_policy(reln, MAIN_FORKNUM);
+		elog(PANIC, "Umbra slot-shift WAL targets an inactive mapping");
+	um_refresh_mapping_policy(reln, forknum);
 	state = reln->smgr_private;
 	ctx = um_get_filectx(reln);
 	Assert(state != NULL);
@@ -496,10 +513,20 @@ UmRedoSlotShift(SMgrRelation reln, ForkNumber forknum,
 	state->main_slot0_active = true;
 	reln->smgr_cached_nblocks[MAIN_FORKNUM] = InvalidBlockNumber;
 
-	/* With mapping authority established, the FPI may recreate MAIN. */
-	umfile_create(ctx, MAIN_FORKNUM, true);
+	/* With mapping authority established, the FPI may recreate its fork. */
+	umfile_create(ctx, forknum, true);
+	if (UmbraIsMappedAuxiliaryFork(forknum) &&
+		!um_fork_uses_mapped_slots(reln, forknum))
+	{
+		ummap_activate_aux_slot0(ctx, forknum, reln->smgr_rlocator);
+		if (forknum == FSM_FORKNUM)
+			state->fsm_slot0_active = true;
+		else
+			state->vm_slot0_active = true;
+		reln->smgr_cached_nblocks[forknum] = InvalidBlockNumber;
+	}
 
-	MapRedoSlotShift(ctx, reln->smgr_rlocator,
+	MapRedoSlotShift(ctx, reln->smgr_rlocator, forknum,
 					 logical_block, source_slot, target_slot);
 	return true;
 }
@@ -527,7 +554,7 @@ umexists(SMgrRelation reln, ForkNumber forknum)
 {
 	UmbraFileContext *ctx;
 
-	um_refresh_slot0_policy(reln, forknum);
+	um_refresh_mapping_policy(reln, forknum);
 	ctx = um_get_filectx(reln);
 
 	/*
@@ -535,8 +562,8 @@ umexists(SMgrRelation reln, ForkNumber forknum)
 	 * has not recreated its physical file yet.  In particular, truncate redo
 	 * must retain that fork in its prepared list so it can lower its frontier.
 	 */
-	if (InRecovery && UmbraAuxiliaryForkUsesSlot0(forknum) &&
-		um_fork_uses_slot0(reln, forknum))
+	if (InRecovery && UmbraIsMappedAuxiliaryFork(forknum) &&
+		um_fork_uses_mapped_slots(reln, forknum))
 		return true;
 	return umfile_exists(ctx, forknum);
 }
@@ -560,16 +587,16 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	BlockNumber	logical_end;
 	const void *buffers[1];
 
-	um_refresh_slot0_policy(reln, forknum);
-	if (!um_fork_uses_slot0(reln, forknum))
+	um_refresh_mapping_policy(reln, forknum);
+	if (!um_fork_uses_mapped_slots(reln, forknum))
 	{
 		umfile_extend(um_get_filectx(reln), forknum, blocknum, buffer,
 					  skipFsync);
 		return;
 	}
 
-	um_get_slot0_frontiers(reln, forknum, &logical_eof, &physical_capacity);
-	physical_block = um_slot0_active_pblk(reln, forknum, blocknum);
+	um_get_mapped_frontiers(reln, forknum, &logical_eof, &physical_capacity);
+	physical_block = um_active_pblk(reln, forknum, blocknum);
 	buffers[0] = buffer;
 	if (blocknum < logical_eof)
 	{
@@ -578,24 +605,23 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		return;
 	}
 
-	logical_end = um_slot0_range_end(reln, forknum, blocknum, 1);
-	if (!UmbraSlot0PhysicalCapacity(logical_end, &physical_capacity))
+	logical_end = um_mapped_range_end(reln, forknum, blocknum, 1);
+	if (!UmbraMappedPhysicalCapacity(logical_end, &physical_capacity))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("Umbra slot-0 capacity overflow for relation %u/%u/%u fork %d",
+				 errmsg("Umbra mapped capacity overflow for relation %u/%u/%u fork %d",
 						reln->smgr_rlocator.locator.spcOid,
 						reln->smgr_rlocator.locator.dbOid,
 						reln->smgr_rlocator.locator.relNumber, (int) forknum)));
 
 	ctx = um_get_filectx(reln);
-	um_ensure_slot0_capacity(reln, forknum, physical_capacity, skipFsync);
+	um_ensure_mapped_capacity(reln, forknum, physical_capacity, skipFsync);
 	if (blocknum > logical_eof)
-		um_zero_slot0_range(reln, forknum, logical_eof, blocknum, skipFsync);
+		um_zero_active_range(reln, forknum, logical_eof, blocknum, skipFsync);
 	umfile_writev(ctx, forknum, physical_block, buffers, 1, skipFsync);
-	um_publish_slot0_after_data(reln, forknum, logical_end, physical_capacity);
-	if (forknum == MAIN_FORKNUM)
-		um_ensure_main_selector_pages(reln, logical_eof,
-									 logical_end - logical_eof, skipFsync);
+	um_publish_mapped_after_data(reln, forknum, logical_end, physical_capacity);
+	um_ensure_selector_pages(reln, forknum, logical_eof,
+						 logical_end - logical_eof, skipFsync);
 }
 
 void
@@ -606,8 +632,8 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	BlockNumber	physical_capacity;
 	BlockNumber	logical_end;
 
-	um_refresh_slot0_policy(reln, forknum);
-	if (!um_fork_uses_slot0(reln, forknum))
+	um_refresh_mapping_policy(reln, forknum);
+	if (!um_fork_uses_mapped_slots(reln, forknum))
 	{
 		umfile_zeroextend(um_get_filectx(reln), forknum, blocknum, nblocks,
 						  skipFsync);
@@ -616,34 +642,37 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	if (nblocks <= 0)
 		return;
 
-	logical_end = um_slot0_range_end(reln, forknum, blocknum,
+	logical_end = um_mapped_range_end(reln, forknum, blocknum,
 									 (BlockNumber) nblocks);
-	um_get_slot0_frontiers(reln, forknum, &logical_eof, &physical_capacity);
+	um_get_mapped_frontiers(reln, forknum, &logical_eof, &physical_capacity);
 	if (logical_end <= logical_eof)
 		return;
-	if (!UmbraSlot0PhysicalCapacity(logical_end, &physical_capacity))
+	if (!UmbraMappedPhysicalCapacity(logical_end, &physical_capacity))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("Umbra slot-0 capacity overflow for relation %u/%u/%u fork %d",
+				 errmsg("Umbra mapped capacity overflow for relation %u/%u/%u fork %d",
 						reln->smgr_rlocator.locator.spcOid,
 						reln->smgr_rlocator.locator.dbOid,
 						reln->smgr_rlocator.locator.relNumber, (int) forknum)));
 
-	um_ensure_slot0_capacity(reln, forknum, physical_capacity, skipFsync);
-	/* A regrown page can still occupy retained slot-0 capacity after truncate. */
-	um_zero_slot0_range(reln, forknum, logical_eof, logical_end, skipFsync);
-	um_publish_slot0_after_data(reln, forknum, logical_end, physical_capacity);
-	if (forknum == MAIN_FORKNUM)
-		um_ensure_main_selector_pages(reln, logical_eof,
-								 logical_end - logical_eof, skipFsync);
+	um_ensure_mapped_capacity(reln, forknum, physical_capacity, skipFsync);
+	/*
+	 * Selector state is independent of logical EOF.  Truncate can retain a
+	 * selector for slot 1 or 2, so initialize that selected physical page
+	 * before publishing the larger EOF.  No selector-reset protocol is needed.
+	 */
+	um_zero_active_range(reln, forknum, logical_eof, logical_end, skipFsync);
+	um_publish_mapped_after_data(reln, forknum, logical_end, physical_capacity);
+	um_ensure_selector_pages(reln, forknum, logical_eof,
+						 logical_end - logical_eof, skipFsync);
 }
 
 bool
 umprefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		   int nblocks)
 {
-	um_refresh_slot0_policy(reln, forknum);
-	if (um_fork_uses_slot0(reln, forknum))
+	um_refresh_mapping_policy(reln, forknum);
+	if (um_fork_uses_mapped_slots(reln, forknum))
 		return true;
 	return umfile_prefetch(um_get_filectx(reln), forknum, blocknum, nblocks);
 }
@@ -651,8 +680,8 @@ umprefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 uint32
 ummaxcombine(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
 {
-	um_refresh_slot0_policy(reln, forknum);
-	if (um_fork_uses_slot0(reln, forknum))
+	um_refresh_mapping_policy(reln, forknum);
+	if (um_fork_uses_mapped_slots(reln, forknum))
 		return 1;
 	return umfile_maxcombine(um_get_filectx(reln), forknum, blocknum);
 }
@@ -663,8 +692,8 @@ umreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 {
 	UmbraFileContext *ctx;
 
-	um_refresh_slot0_policy(reln, forknum);
-	if (!um_fork_uses_slot0(reln, forknum))
+	um_refresh_mapping_policy(reln, forknum);
+	if (!um_fork_uses_mapped_slots(reln, forknum))
 	{
 		umfile_readv(um_get_filectx(reln), forknum, blocknum, buffers, nblocks);
 		return;
@@ -672,14 +701,14 @@ umreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	if (nblocks == 0)
 		return;
 
-	if (InRecovery && UmbraAuxiliaryForkUsesSlot0(forknum))
-		um_ensure_aux_slot0_recovery_capacity(reln, forknum);
-	um_require_slot0_range(reln, forknum, blocknum, nblocks);
+	if (InRecovery && UmbraIsMappedAuxiliaryFork(forknum))
+		um_ensure_aux_recovery_capacity(reln, forknum);
+	um_require_mapped_range(reln, forknum, blocknum, nblocks);
 	ctx = um_get_filectx(reln);
 	for (BlockNumber i = 0; i < nblocks; i++)
 	{
 		BlockNumber physical_block =
-			um_slot0_active_pblk(reln, forknum, blocknum + i);
+			um_active_pblk(reln, forknum, blocknum + i);
 
 		umfile_readv(ctx, forknum, physical_block, &buffers[i], 1);
 	}
@@ -692,8 +721,8 @@ umstartreadv(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknum,
 	PgAioTargetData *target;
 	BlockNumber	physical_block;
 
-	um_refresh_slot0_policy(reln, forknum);
-	if (!um_fork_uses_slot0(reln, forknum))
+	um_refresh_mapping_policy(reln, forknum);
+	if (!um_fork_uses_mapped_slots(reln, forknum))
 	{
 		pgaio_io_set_target_smgr(ioh, reln, forknum, blocknum, nblocks, false);
 		pgaio_io_register_callbacks(ioh, PGAIO_HCB_MD_READV, 0);
@@ -704,12 +733,12 @@ umstartreadv(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknum,
 	if (nblocks != 1)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("Umbra slot-0 AIO requires a single logical block")));
+				 errmsg("Umbra active-slot AIO requires a single logical block")));
 
-	if (InRecovery && UmbraAuxiliaryForkUsesSlot0(forknum))
-		um_ensure_aux_slot0_recovery_capacity(reln, forknum);
-	um_require_slot0_range(reln, forknum, blocknum, nblocks);
-	physical_block = um_slot0_active_pblk(reln, forknum, blocknum);
+	if (InRecovery && UmbraIsMappedAuxiliaryFork(forknum))
+		um_ensure_aux_recovery_capacity(reln, forknum);
+	um_require_mapped_range(reln, forknum, blocknum, nblocks);
+	physical_block = um_active_pblk(reln, forknum, blocknum);
 	pgaio_io_set_target_smgr(ioh, reln, forknum, blocknum, nblocks, false);
 	target = pgaio_io_get_target_data(ioh);
 	target->smgr.physicalBlockNum = physical_block;
@@ -725,8 +754,8 @@ umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 {
 	UmbraFileContext *ctx;
 
-	um_refresh_slot0_policy(reln, forknum);
-	if (!um_fork_uses_slot0(reln, forknum))
+	um_refresh_mapping_policy(reln, forknum);
+	if (!um_fork_uses_mapped_slots(reln, forknum))
 	{
 		umfile_writev(um_get_filectx(reln), forknum, blocknum, buffers, nblocks,
 					  skipFsync);
@@ -735,12 +764,12 @@ umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	if (nblocks == 0)
 		return;
 
-	um_require_slot0_range(reln, forknum, blocknum, nblocks);
+	um_require_mapped_range(reln, forknum, blocknum, nblocks);
 	ctx = um_get_filectx(reln);
 	for (BlockNumber i = 0; i < nblocks; i++)
 	{
 		BlockNumber physical_block =
-			um_slot0_active_pblk(reln, forknum, blocknum + i);
+			um_active_pblk(reln, forknum, blocknum + i);
 
 		umfile_writev(ctx, forknum, physical_block, &buffers[i], 1,
 					  skipFsync);
@@ -751,8 +780,8 @@ void
 umwriteback(SMgrRelation reln, ForkNumber forknum,
 			BlockNumber blocknum, BlockNumber nblocks)
 {
-	um_refresh_slot0_policy(reln, forknum);
-	if (um_fork_uses_slot0(reln, forknum))
+	um_refresh_mapping_policy(reln, forknum);
+	if (um_fork_uses_mapped_slots(reln, forknum))
 		return;
 	umfile_writeback(um_get_filectx(reln), forknum, blocknum, nblocks);
 }
@@ -763,10 +792,10 @@ umnblocks(SMgrRelation reln, ForkNumber forknum)
 	BlockNumber	logical_eof;
 	BlockNumber	physical_capacity;
 
-	um_refresh_slot0_policy(reln, forknum);
-	if (um_fork_uses_slot0(reln, forknum))
+	um_refresh_mapping_policy(reln, forknum);
+	if (um_fork_uses_mapped_slots(reln, forknum))
 	{
-		um_get_slot0_frontiers(reln, forknum, &logical_eof,
+		um_get_mapped_frontiers(reln, forknum, &logical_eof,
 							  &physical_capacity);
 		return logical_eof;
 	}
@@ -778,26 +807,26 @@ umtruncate(SMgrRelation reln, ForkNumber forknum,
 		   BlockNumber old_blocks, BlockNumber nblocks)
 {
 	UmbraSmgrRelationState *state = reln->smgr_private;
-	UmbraSlot0TruncateState *truncate;
+	UmbraMappedTruncateState *truncate;
 	UmbraFileContext *ctx;
 
-	if (!um_fork_uses_slot0(reln, forknum))
+	if (!um_fork_uses_mapped_slots(reln, forknum))
 	{
 		umfile_truncate(um_get_filectx(reln), forknum, old_blocks, nblocks);
 		return;
 	}
-	truncate = &state->slot0_truncate[forknum];
+	truncate = &state->mapped_truncate[forknum];
 
 	/*
 	 * Redo can find a lower root that was persisted just before a crash but a
-	 * still-longer slot-0 file.  A prepared physical cleanup is required even
+	 * still-longer mapped file.  A prepared physical cleanup is required even
 	 * when the logical truncation is already a no-op.
 	 */
 	if (!truncate->prepared)
 		return;
 
 	/* Persist the target root before removing physical tail blocks. */
-	um_publish_slot0_before_truncate(reln, forknum, truncate->logical_eof,
+	um_publish_mapped_before_truncate(reln, forknum, truncate->logical_eof,
 										  truncate->physical_capacity);
 	ctx = um_get_filectx(reln);
 	umfile_truncate(ctx, forknum, truncate->current_physical,
@@ -820,11 +849,11 @@ umpreparetruncate(SMgrRelation reln, ForkNumber *forknum, int nforks,
 
 	Assert(state != NULL);
 	Assert(old_blocks != NULL);
-	um_refresh_slot0_policy(reln, MAIN_FORKNUM);
-	um_refresh_slot0_policy(reln, FSM_FORKNUM);
-	um_refresh_slot0_policy(reln, VISIBILITYMAP_FORKNUM);
+	um_refresh_mapping_policy(reln, MAIN_FORKNUM);
+	um_refresh_mapping_policy(reln, FSM_FORKNUM);
+	um_refresh_mapping_policy(reln, VISIBILITYMAP_FORKNUM);
 	for (int forkidx = 0; forkidx <= MAX_FORKNUM; forkidx++)
-		state->slot0_truncate[forkidx].prepared = false;
+		state->mapped_truncate[forkidx].prepared = false;
 	/*
 	 * Root publication orders every activated fork, including an auxiliary fork
 	 * not selected by this truncate record.  Recovery must recreate any missing
@@ -832,27 +861,27 @@ umpreparetruncate(SMgrRelation reln, ForkNumber *forknum, int nforks,
 	 */
 	if (InRecovery)
 	{
-		if (um_fork_uses_slot0(reln, FSM_FORKNUM))
-			um_ensure_aux_slot0_recovery_capacity(reln, FSM_FORKNUM);
-		if (um_fork_uses_slot0(reln, VISIBILITYMAP_FORKNUM))
-			um_ensure_aux_slot0_recovery_capacity(reln,
+		if (um_fork_uses_mapped_slots(reln, FSM_FORKNUM))
+			um_ensure_aux_recovery_capacity(reln, FSM_FORKNUM);
+		if (um_fork_uses_mapped_slots(reln, VISIBILITYMAP_FORKNUM))
+			um_ensure_aux_recovery_capacity(reln,
 										VISIBILITYMAP_FORKNUM);
 	}
 	for (int i = 0; i < nforks; i++)
 	{
-		UmbraSlot0TruncateState *truncate;
+		UmbraMappedTruncateState *truncate;
 
-		if (!um_fork_uses_slot0(reln, forknum[i]))
+		if (!um_fork_uses_mapped_slots(reln, forknum[i]))
 			continue;
 
-		um_get_slot0_frontiers(reln, forknum[i], &root_logical_eof,
+		um_get_mapped_frontiers(reln, forknum[i], &root_logical_eof,
 								  &root_physical_capacity);
 		target_logical_eof = Min(nblocks[i], root_logical_eof);
-		if (!UmbraSlot0PhysicalCapacity(target_logical_eof,
+		if (!UmbraMappedPhysicalCapacity(target_logical_eof,
 									 &target_physical_capacity))
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("Umbra slot-0 truncate frontier overflow")));
+					 errmsg("Umbra mapped truncate frontier overflow")));
 
 		ctx = um_get_filectx(reln);
 		if (forknum[i] == MAIN_FORKNUM)
@@ -864,12 +893,12 @@ umpreparetruncate(SMgrRelation reln, ForkNumber *forknum, int nforks,
 		if (current_physical < root_physical_capacity)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("Umbra slot-0 physical capacity precedes its metadata root")));
+					 errmsg("Umbra mapped physical capacity precedes its metadata root")));
 		if (target_logical_eof == root_logical_eof &&
 			current_physical == target_physical_capacity)
 			continue;
 
-		truncate = &state->slot0_truncate[forknum[i]];
+		truncate = &state->mapped_truncate[forknum[i]];
 		truncate->logical_eof = target_logical_eof;
 		truncate->physical_capacity = target_physical_capacity;
 		truncate->current_physical = current_physical;
@@ -882,10 +911,10 @@ umimmedsync(SMgrRelation reln, ForkNumber forknum)
 {
 	UmbraFileContext *ctx;
 
-	um_refresh_slot0_policy(reln, forknum);
+	um_refresh_mapping_policy(reln, forknum);
 	ctx = um_get_filectx(reln);
 	umfile_immedsync(ctx, forknum);
-	if (um_fork_uses_slot0(reln, forknum))
+	if (um_fork_uses_mapped_slots(reln, forknum))
 		ummap_immedsync_if_exists(ctx, reln->smgr_rlocator);
 }
 
@@ -894,22 +923,22 @@ umregistersync(SMgrRelation reln, ForkNumber forknum)
 {
 	UmbraFileContext *ctx;
 
-	um_refresh_slot0_policy(reln, forknum);
+	um_refresh_mapping_policy(reln, forknum);
 	ctx = um_get_filectx(reln);
 	umfile_registersync(ctx, forknum);
-	if (um_fork_uses_slot0(reln, forknum))
+	if (um_fork_uses_mapped_slots(reln, forknum))
 		ummap_registersync_if_exists(ctx, reln->smgr_rlocator);
 }
 
 bool
 umpreparependingsync(SMgrRelation reln)
 {
-	um_refresh_slot0_policy(reln, MAIN_FORKNUM);
-	um_refresh_slot0_policy(reln, FSM_FORKNUM);
-	um_refresh_slot0_policy(reln, VISIBILITYMAP_FORKNUM);
-	return um_fork_uses_slot0(reln, MAIN_FORKNUM) ||
-		um_fork_uses_slot0(reln, FSM_FORKNUM) ||
-		um_fork_uses_slot0(reln, VISIBILITYMAP_FORKNUM);
+	um_refresh_mapping_policy(reln, MAIN_FORKNUM);
+	um_refresh_mapping_policy(reln, FSM_FORKNUM);
+	um_refresh_mapping_policy(reln, VISIBILITYMAP_FORKNUM);
+	return um_fork_uses_mapped_slots(reln, MAIN_FORKNUM) ||
+		um_fork_uses_mapped_slots(reln, FSM_FORKNUM) ||
+		um_fork_uses_mapped_slots(reln, VISIBILITYMAP_FORKNUM);
 }
 
 int
@@ -919,18 +948,9 @@ umfd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint32 *off)
 	return umfile_fd(um_get_filectx(reln), forknum, blocknum, off);
 }
 
-static bool
-um_main_uses_slot0(SMgrRelation reln, ForkNumber forknum)
-{
-	UmbraSmgrRelationState *state = reln->smgr_private;
-
-	return forknum == MAIN_FORKNUM && state != NULL &&
-		state->main_slot0_active;
-}
-
 /* Refresh one cached policy bit only from paths that may perform metadata I/O. */
 static void
-um_refresh_slot0_policy(SMgrRelation reln, ForkNumber forknum)
+um_refresh_mapping_policy(SMgrRelation reln, ForkNumber forknum)
 {
 	UmbraSmgrRelationState *state;
 	bool		active = false;
@@ -973,7 +993,7 @@ um_refresh_slot0_policy(SMgrRelation reln, ForkNumber forknum)
 	}
 
 	/* Auxiliary mapping never exists before the MAIN root policy. */
-	um_refresh_slot0_policy(reln, MAIN_FORKNUM);
+	um_refresh_mapping_policy(reln, MAIN_FORKNUM);
 	if (!state->main_slot0_active)
 		return;
 	if (forknum == FSM_FORKNUM)
@@ -1010,7 +1030,7 @@ um_refresh_slot0_policy(SMgrRelation reln, ForkNumber forknum)
 }
 
 static bool
-um_fork_uses_slot0(SMgrRelation reln, ForkNumber forknum)
+um_fork_uses_mapped_slots(SMgrRelation reln, ForkNumber forknum)
 {
 	UmbraSmgrRelationState *state = reln->smgr_private;
 
@@ -1026,36 +1046,19 @@ um_fork_uses_slot0(SMgrRelation reln, ForkNumber forknum)
 }
 
 static BlockNumber
-um_main_active_pblk(SMgrRelation reln, BlockNumber logical_block)
+um_active_pblk(SMgrRelation reln, ForkNumber forknum,
+			   BlockNumber logical_block)
 {
 	BlockNumber	physical_block;
 	uint8		active_slot;
 
 	active_slot = MapGetActiveSlot(um_get_filectx(reln), reln->smgr_rlocator,
-							   logical_block);
-	if (!UmbraMainActiveSlotPhysicalBlock(logical_block, active_slot,
-										 &physical_block))
+								   forknum, logical_block);
+	if (!UmbraActiveSlotPhysicalBlock(logical_block, active_slot,
+									 &physical_block))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("Umbra MAIN active-slot block mapping overflow for relation %u/%u/%u",
-						reln->smgr_rlocator.locator.spcOid,
-						reln->smgr_rlocator.locator.dbOid,
-						reln->smgr_rlocator.locator.relNumber)));
-	return physical_block;
-}
-
-static BlockNumber
-um_slot0_active_pblk(SMgrRelation reln, ForkNumber forknum,
-						 BlockNumber logical_block)
-{
-	BlockNumber	physical_block;
-
-	if (forknum == MAIN_FORKNUM)
-		return um_main_active_pblk(reln, logical_block);
-	if (!UmbraSlot0PhysicalBlock(logical_block, &physical_block))
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("Umbra slot-0 block mapping overflow for relation %u/%u/%u fork %d",
+				 errmsg("Umbra active-slot block mapping overflow for relation %u/%u/%u fork %d",
 						reln->smgr_rlocator.locator.spcOid,
 						reln->smgr_rlocator.locator.dbOid,
 						reln->smgr_rlocator.locator.relNumber, (int) forknum)));
@@ -1063,7 +1066,7 @@ um_slot0_active_pblk(SMgrRelation reln, ForkNumber forknum,
 }
 
 static BlockNumber
-um_slot0_range_end(SMgrRelation reln, ForkNumber forknum,
+um_mapped_range_end(SMgrRelation reln, ForkNumber forknum,
 				   BlockNumber blocknum, BlockNumber nblocks)
 {
 	uint64		end = (uint64) blocknum + nblocks;
@@ -1071,7 +1074,7 @@ um_slot0_range_end(SMgrRelation reln, ForkNumber forknum,
 	if (end >= (uint64) InvalidBlockNumber)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("Umbra slot-0 logical block range overflow for relation %u/%u/%u fork %d",
+				 errmsg("Umbra mapped logical block range overflow for relation %u/%u/%u fork %d",
 						reln->smgr_rlocator.locator.spcOid,
 						reln->smgr_rlocator.locator.dbOid,
 						reln->smgr_rlocator.locator.relNumber, (int) forknum)));
@@ -1079,7 +1082,7 @@ um_slot0_range_end(SMgrRelation reln, ForkNumber forknum,
 }
 
 static void
-um_get_slot0_frontiers(SMgrRelation reln, ForkNumber forknum,
+um_get_mapped_frontiers(SMgrRelation reln, ForkNumber forknum,
 					   BlockNumber *logical_eof,
 					   BlockNumber *physical_capacity)
 {
@@ -1093,24 +1096,24 @@ um_get_slot0_frontiers(SMgrRelation reln, ForkNumber forknum,
 }
 
 static void
-um_require_slot0_range(SMgrRelation reln, ForkNumber forknum,
+um_require_mapped_range(SMgrRelation reln, ForkNumber forknum,
 					   BlockNumber blocknum, BlockNumber nblocks)
 {
 	BlockNumber	logical_eof;
 	BlockNumber	physical_capacity;
 	BlockNumber	logical_end;
 
-	logical_end = um_slot0_range_end(reln, forknum, blocknum, nblocks);
-	um_get_slot0_frontiers(reln, forknum, &logical_eof, &physical_capacity);
+	logical_end = um_mapped_range_end(reln, forknum, blocknum, nblocks);
+	um_get_mapped_frontiers(reln, forknum, &logical_eof, &physical_capacity);
 	if (logical_end > logical_eof)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("could not access logical block %u beyond Umbra slot-0 EOF %u for fork %d",
+				 errmsg("could not access logical block %u beyond Umbra mapped EOF %u for fork %d",
 						blocknum, logical_eof, (int) forknum)));
 }
 
 static void
-um_ensure_slot0_capacity(SMgrRelation reln, ForkNumber forknum,
+um_ensure_mapped_capacity(SMgrRelation reln, ForkNumber forknum,
 					 BlockNumber physical_capacity, bool skipFsync)
 {
 	UmbraFileContext *ctx = um_get_filectx(reln);
@@ -1131,28 +1134,28 @@ um_ensure_slot0_capacity(SMgrRelation reln, ForkNumber forknum,
 /*
  * Auxiliary redo can find a durable root whose mapped physical fork was lost
  * in the same crash.  RBM_ZERO_ON_ERROR callers still enter AIO through the
- * physical slot-0 address, so make the root's declared capacity readable
+ * mapped physical address, so make the root's declared capacity readable
  * before dispatching that I/O.
  */
 static void
-um_ensure_aux_slot0_recovery_capacity(SMgrRelation reln, ForkNumber forknum)
+um_ensure_aux_recovery_capacity(SMgrRelation reln, ForkNumber forknum)
 {
 	UmbraFileContext *ctx = um_get_filectx(reln);
 	BlockNumber	logical_eof;
 	BlockNumber	physical_capacity;
 
 	Assert(InRecovery);
-	Assert(UmbraAuxiliaryForkUsesSlot0(forknum));
+	Assert(UmbraIsMappedAuxiliaryFork(forknum));
 	/* A truncate record can arrive before any page redo recreates this fork. */
 	if (!umfile_exists(ctx, forknum))
 		umfile_create(ctx, forknum, true);
-	um_get_slot0_frontiers(reln, forknum, &logical_eof, &physical_capacity);
-	um_ensure_slot0_capacity(reln, forknum, physical_capacity, true);
+	um_get_mapped_frontiers(reln, forknum, &logical_eof, &physical_capacity);
+	um_ensure_mapped_capacity(reln, forknum, physical_capacity, true);
 }
 
 static void
-um_zero_slot0_range(SMgrRelation reln, ForkNumber forknum,
-				BlockNumber first_block, BlockNumber end_block, bool skipFsync)
+um_zero_active_range(SMgrRelation reln, ForkNumber forknum,
+					 BlockNumber first_block, BlockNumber end_block, bool skipFsync)
 {
 	UmbraFileContext *ctx = um_get_filectx(reln);
 	PGIOAlignedBlock zero_page = {0};
@@ -1163,7 +1166,7 @@ um_zero_slot0_range(SMgrRelation reln, ForkNumber forknum,
 		 logical_block++)
 	{
 		BlockNumber physical_block =
-			um_slot0_active_pblk(reln, forknum, logical_block);
+			um_active_pblk(reln, forknum, logical_block);
 
 		umfile_writev(ctx, forknum, physical_block, buffers, 1,
 					  skipFsync);
@@ -1172,7 +1175,7 @@ um_zero_slot0_range(SMgrRelation reln, ForkNumber forknum,
 
 /* Publish only after the full three-slot capacity has been materialized. */
 static void
-um_publish_slot0_after_data(SMgrRelation reln, ForkNumber forknum,
+um_publish_mapped_after_data(SMgrRelation reln, ForkNumber forknum,
 							BlockNumber logical_eof, BlockNumber physical_capacity)
 {
 	/*
@@ -1191,7 +1194,7 @@ um_publish_slot0_after_data(SMgrRelation reln, ForkNumber forknum,
 
 /* A lower root is safe before the physical tail is removed. */
 static void
-um_publish_slot0_before_truncate(SMgrRelation reln, ForkNumber forknum,
+um_publish_mapped_before_truncate(SMgrRelation reln, ForkNumber forknum,
 										  BlockNumber logical_eof,
 									  BlockNumber physical_capacity)
 {
@@ -1208,14 +1211,15 @@ um_publish_slot0_before_truncate(SMgrRelation reln, ForkNumber forknum,
 
 /* Extension is the non-critical path that seeds selector pages for WAL shifts. */
 static void
-um_ensure_main_selector_pages(SMgrRelation reln, BlockNumber first_block,
-								  BlockNumber nblocks, bool skipFsync)
+um_ensure_selector_pages(SMgrRelation reln, ForkNumber forknum,
+						 BlockNumber first_block, BlockNumber nblocks,
+						 bool skipFsync)
 {
 	if (nblocks == 0 || CritSectionCount != 0 || !IsUnderPostmaster ||
 		IsBootstrapProcessingMode() || IsInitProcessingMode())
 		return;
 	MapEnsureActiveSlotPages(um_get_filectx(reln), reln->smgr_rlocator,
-						  first_block, nblocks, skipFsync);
+							  forknum, first_block, nblocks, skipFsync);
 }
 
 static UmbraFileContext *

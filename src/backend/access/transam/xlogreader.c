@@ -2026,7 +2026,9 @@ DecodeXLogRecord(XLogReaderState *state,
 			COPY_HEADER_FIELD(&blk->blkno, sizeof(BlockNumber));
 #ifdef USE_UMBRA
 			if (blk->has_slot_shift &&
-				(blk->forknum != MAIN_FORKNUM ||
+				((blk->forknum != MAIN_FORKNUM &&
+				  blk->forknum != FSM_FORKNUM &&
+				  blk->forknum != VISIBILITYMAP_FORKNUM) ||
 				 blk->source_slot >= 3 || blk->target_slot >= 3 ||
 				 blk->source_slot == blk->target_slot ||
 				 (blk->flags & BKPBLOCK_WILL_INIT) != 0 ||

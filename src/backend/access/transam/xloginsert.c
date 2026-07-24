@@ -1272,12 +1272,14 @@ XLogBlockSlotShiftEligible(registered_buffer *regbuf, RmgrId rmid,
 	Assert(regbuf != NULL);
 	Assert(reln != NULL);
 	*reln = NULL;
-	if (!regbuf->from_shared_buffer || regbuf->forkno != MAIN_FORKNUM ||
+	if (!regbuf->from_shared_buffer ||
+		!UmbraForkUsesActiveSlots(regbuf->forkno) ||
 		(regbuf->flags & (REGBUF_FORCE_IMAGE | REGBUF_NO_IMAGE |
 						  REGBUF_NO_CHANGE | REGBUF_WILL_INIT)) != 0 ||
 		(info & XLR_CHECK_CONSISTENCY) != 0 || wal_consistency_checking[rmid] ||
 		(rmid == RM_XLOG_ID &&
-		 (info & XLR_RMGR_INFO_MASK) == XLOG_FPI_FOR_HINT) ||
+		 (info & XLR_RMGR_INFO_MASK) == XLOG_FPI_FOR_HINT &&
+		 regbuf->forkno == MAIN_FORKNUM) ||
 		MyProc == NULL || !LocalTransactionIdIsValid(MyProc->vxid.lxid))
 		return false;
 

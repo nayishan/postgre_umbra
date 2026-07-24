@@ -1098,10 +1098,22 @@ smgr_redo(XLogReaderState *record)
 			smgrexists(reln, FSM_FORKNUM))
 		{
 			blocks[nforks] = FreeSpaceMapPrepareTruncateRel(rel, xlrec->blkno);
+#ifdef USE_UMBRA
+			/*
+			 * An interrupted Umbra recovery can persist the lower logical root
+			 * before removing the old physical tail.  Keep a logical no-op in
+			 * the truncate list so the smgr prepare callback can finish that
+			 * physical cleanup on the next recovery.
+			 */
+			if (!BlockNumberIsValid(blocks[nforks]))
+				blocks[nforks] = smgrnblocks(reln, FSM_FORKNUM);
+#endif
 			if (BlockNumberIsValid(blocks[nforks]))
 			{
 				forks[nforks] = FSM_FORKNUM;
 				old_blocks[nforks] = smgrnblocks(reln, FSM_FORKNUM);
+				XLogTruncateRelation(xlrec->rlocator, FSM_FORKNUM,
+								 blocks[nforks]);
 				nforks++;
 				need_fsm_vacuum = true;
 			}
@@ -1110,10 +1122,18 @@ smgr_redo(XLogReaderState *record)
 			smgrexists(reln, VISIBILITYMAP_FORKNUM))
 		{
 			blocks[nforks] = visibilitymap_prepare_truncate(rel, xlrec->blkno);
+#ifdef USE_UMBRA
+			if (!BlockNumberIsValid(blocks[nforks]))
+				blocks[nforks] = smgrnblocks(reln,
+											 VISIBILITYMAP_FORKNUM);
+#endif
 			if (BlockNumberIsValid(blocks[nforks]))
 			{
 				forks[nforks] = VISIBILITYMAP_FORKNUM;
 				old_blocks[nforks] = smgrnblocks(reln, VISIBILITYMAP_FORKNUM);
+				XLogTruncateRelation(xlrec->rlocator,
+								 VISIBILITYMAP_FORKNUM,
+								 blocks[nforks]);
 				nforks++;
 			}
 		}

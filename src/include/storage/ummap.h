@@ -17,6 +17,12 @@
 
 typedef struct UmbraFileContext UmbraFileContext;
 
+/*
+ * The slot0 names below expose root-format activation bits.  Activation
+ * enables the mapped three-slot layout whose zero selectors initially choose
+ * slot 0; individual MAIN, FSM, and VM pages may later select slots 1 or 2.
+ */
+
 extern void ummap_root_cache_backend_init(void);
 
 extern bool ummap_exists(UmbraFileContext *ctx);

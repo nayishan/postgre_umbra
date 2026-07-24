@@ -23,8 +23,10 @@ sub read_active_slot
 {
 	my ($path, $block_size, $logical_block) = @_;
 	my $entries_per_page = $block_size * 4;
+	my $page_index = int($logical_block / $entries_per_page);
 	my $entry_index = $logical_block % $entries_per_page;
-	my $map_block = 1 + int($logical_block / $entries_per_page);
+	my $group = int($page_index / 256);
+	my $map_block = 1 + $group * 258 + 2 + ($page_index % 256);
 	my $offset = $map_block * $block_size + int($entry_index / 4);
 	my $byte;
 

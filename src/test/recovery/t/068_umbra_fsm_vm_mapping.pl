@@ -1,7 +1,7 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 # Verify mapped FSM/VM root frontiers, redo birth, zero-on-error reads, and
-# truncate publication for Umbra slot-0 auxiliary forks.
+# truncate publication for Umbra auxiliary forks.
 
 use strict;
 use warnings FATAL => 'all';
@@ -76,9 +76,9 @@ sub check_aux_layout
 			"$label: VM logical EOF is tracked");
 	}
 	is($state->{fsm_capacity}, expected_capacity($state->{fsm_eof}),
-		"$label: FSM capacity follows the slot-0 formula");
+		"$label: FSM capacity follows the mapped three-slot formula");
 	is($state->{vm_capacity}, expected_capacity($state->{vm_eof}),
-		"$label: VM capacity follows the slot-0 formula");
+		"$label: VM capacity follows the mapped three-slot formula");
 	is(-s $fsm_path, $state->{fsm_capacity} * $block_size,
 		"$label: FSM physical file reaches its published capacity");
 	is(-s $vm_path, $state->{vm_capacity} * $block_size,
@@ -159,7 +159,7 @@ cmp_ok($node->safe_psql('postgres',
 	'VM fork was created');
 
 # Model a crash where physical auxiliary forks survive but their root
-# activation did not. Redo must activate slot-0 even for an existing file.
+# activation did not. Redo must activate mapping even for an existing file.
 $node->stop('immediate');
 overwrite_binary_file($map_path, $root_without_aux);
 $node->start;
@@ -168,7 +168,7 @@ is($node->safe_psql('postgres', 'SELECT count(*) FROM umbra_aux_map'), '5000',
 check_aux_layout($node, $main_path, $block_size, 'after auxiliary redo birth', 1);
 
 # Persist active frontiers, generate new auxiliary redo, and remove both
-# physical forks. Recovery must materialize their declared slot-0 capacity.
+# physical forks. Recovery must materialize their declared mapped capacity.
 $node->safe_psql('postgres', 'CHECKPOINT');
 $node->safe_psql(
 	'postgres', q{
@@ -218,6 +218,8 @@ my $pre_truncate =
 		'checkpointed pre-truncate state', 0);
 my $main_before_truncate = slurp_file($node->data_dir . "/$main_path");
 my $map_before_truncate = slurp_file($map_path);
+my $fsm_before_truncate = slurp_file($fsm_path);
+my $vm_before_truncate = slurp_file($vm_path);
 cmp_ok($pre_truncate->{vm_eof}, '>', 0,
 	'checkpointed pre-truncate VM still has a logical page');
 
@@ -227,6 +229,8 @@ VACUUM (TRUNCATE, DISABLE_PAGE_SKIPPING) umbra_aux_map;
 });
 
 $node->stop('immediate');
+my $control_path = $node->data_dir . '/global/pg_control';
+my $control_before_truncate_recovery = slurp_file($control_path);
 overwrite_binary_file($node->data_dir . "/$main_path", $main_before_truncate);
 overwrite_binary_file($map_path, $map_before_truncate);
 unlink $fsm_path or BAIL_OUT("could not remove \"$fsm_path\": $!");
@@ -247,6 +251,20 @@ cmp_ok($after_truncate_recovery->{fsm_capacity}, '<=',
 cmp_ok($after_truncate_recovery->{vm_capacity}, '<',
 	$pre_truncate->{vm_capacity},
 	'VM capacity is lowered by truncate redo');
+
+# Model a recovery crash after the lower auxiliary root was persisted but
+# before the old physical tails were removed.  The repeated truncate redo must
+# still enter Umbra's prepare callback even when the generic FSM/VM helpers see
+# that the logical fork sizes are already at their targets.
+$node->stop('immediate');
+overwrite_binary_file($fsm_path, $fsm_before_truncate);
+overwrite_binary_file($vm_path, $vm_before_truncate);
+overwrite_binary_file($control_path, $control_before_truncate_recovery);
+$node->start;
+is($node->safe_psql('postgres', 'SELECT count(*) FROM umbra_aux_map'), '0',
+	'repeated truncate recovery preserves the empty relation');
+check_aux_layout($node, $main_path, $block_size,
+	'after repeated truncate recovery cleans stale auxiliary tails', 0);
 
 $node->stop;
 done_testing();
