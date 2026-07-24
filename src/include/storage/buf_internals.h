@@ -415,9 +415,8 @@ extern PGDLLIMPORT BufferDescPadded *BufferDescriptors;
 extern PGDLLIMPORT ConditionVariableMinimallyPadded *BufferIOCVArray;
 extern PGDLLIMPORT WritebackContext BackendWritebackContext;
 #ifdef USE_UMBRA
-extern PGDLLIMPORT uint8 *CkptBufferSourceSlots;
-extern PGDLLIMPORT uint64 *CkptBufferSourceSlotEpochs;
-extern PGDLLIMPORT pg_atomic_uint64 *CkptBufferCaptureEpoch;
+extern PGDLLIMPORT uint64 *CkptBufferShiftEpochs;
+extern PGDLLIMPORT pg_atomic_uint64 *CkptBufferShiftEpochState;
 #endif
 
 /* in localbuf.c */

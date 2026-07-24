@@ -1,7 +1,8 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# Verify that a checkpoint writes a buffer shifted after selection to its
-# captured source slot, leaving the current slot dirty for the next checkpoint.
+# Verify that a checkpoint writes a buffer shifted after selection to the
+# current selector's predecessor, leaving the active slot dirty for the next
+# checkpoint.
 
 use strict;
 use warnings FATAL => 'all';
@@ -148,7 +149,7 @@ $node->safe_psql(
 SELECT injection_points_detach('umbra-checkpoint-after-map')]);
 
 is(read_active_slot($map_path, $block_size, $target_block), 1,
-	'C1 leaves its on-disk selector at the captured source slot');
+	'C1 leaves its on-disk selector at the predecessor slot');
 ok(index(read_physical_block($main_path, $block_size,
 			source_slot_block($target_block, 1)), $marker) >= 0,
 	'C1 writes the post-shift page image to source slot 1');

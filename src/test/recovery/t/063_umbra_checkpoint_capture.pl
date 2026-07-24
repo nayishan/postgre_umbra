@@ -1,7 +1,7 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# Verify that a checkpoint recaptures slot-shift publication after its first
-# delay scan and before it selects buffers.
+# Verify that a checkpoint starts its shift epoch before the fresh delay scan
+# and records a later image-free publication before selecting buffers.
 
 use strict;
 use warnings FATAL => 'all';
@@ -43,7 +43,34 @@ sub read_active_slot
 	return (unpack('C', $byte) >> (($entry_index % 4) * 2)) & 0x03;
 }
 
-sub assert_fpi_shift_wal
+sub source_slot_block
+{
+	my ($logical_block, $slot) = @_;
+	my $chunk = int($logical_block / 32);
+
+	return $chunk * (3 * 32) + $slot * 32 + $logical_block % 32;
+}
+
+sub read_physical_block
+{
+	my ($path, $block_size, $physical_block) = @_;
+	my $offset = $physical_block * $block_size;
+	my $page;
+
+	open(my $fh, '<', $path) or BAIL_OUT("could not open \"$path\": $!");
+	binmode($fh);
+	my $position = sysseek($fh, $offset, SEEK_SET);
+	defined($position) && $position == $offset
+	  or BAIL_OUT("could not seek in \"$path\": $!");
+	my $nread = sysread($fh, $page, $block_size);
+	defined($nread) && $nread == $block_size
+	  or BAIL_OUT("could not read block $physical_block from \"$path\"");
+	close($fh) or BAIL_OUT("could not close \"$path\": $!");
+
+	return $page;
+}
+
+sub assert_image_free_shift_wal
 {
 	my ($node, $filenode, $target_block, $start_lsn, $end_lsn) = @_;
 	my ($dump, $stderr) = run_command(
@@ -61,11 +88,11 @@ sub assert_fpi_shift_wal
 	} split(/\n/, $dump);
 	is(scalar(@records), 1,
 		'pre-selection update emits one target-block WAL record');
+	unlike($records[0], qr/\bFPW\b/,
+		'shift-epoch update omits its full-page image');
 	like($records[0],
-		qr/\bFPW\b.*slot shift: source_slot 0 target_slot 1/,
-		'capture-before-selection shift retains an FPI');
-	unlike($records[0], qr/captured_source/,
-		'capture-before-selection shift does not claim a captured source');
+		qr/slot shift: source_slot 0 target_slot 1\b/,
+		'shift-epoch update records its source and target');
 }
 
 my $node = PostgreSQL::Test::Cluster->new('umbra_checkpoint_capture');
@@ -73,6 +100,8 @@ $node->init;
 $node->append_conf(
 	'postgresql.conf', q[
 autovacuum = off
+bgwriter_lru_maxpages = 0
+checkpoint_flush_after = 1
 mapwriter_lru_maxpages = 0
 checkpoint_timeout = '1h'
 full_page_writes = on
@@ -96,6 +125,7 @@ my $block_size = 0 + $node->safe_psql('postgres', 'SHOW block_size');
 my $relpath = $node->safe_psql(
 	'postgres',
 	q[SELECT pg_relation_filepath('umbra_checkpoint_capture'::regclass);]);
+my $main_path = $node->data_dir . "/$relpath";
 my $filenode = $node->safe_psql(
 	'postgres',
 	q[SELECT pg_relation_filenode('umbra_checkpoint_capture'::regclass);]);
@@ -108,7 +138,7 @@ FROM umbra_checkpoint_capture WHERE id = 1;]);
 $node->safe_psql('postgres', 'CHECKPOINT');
 $node->safe_psql(
 	'postgres', q[
-SELECT injection_points_attach('umbra-checkpoint-after-capture', 'wait')]);
+SELECT injection_points_attach('umbra-checkpoint-after-shift-epoch', 'wait')]);
 $node->safe_psql(
 	'postgres', q[
 SELECT injection_points_attach(
@@ -121,8 +151,8 @@ $checkpoint->query_until(
 CHECKPOINT;
 \echo checkpoint_done
 ));
-$node->wait_for_event('checkpointer', 'umbra-checkpoint-after-capture');
-pass('checkpoint publishes its capture before the fresh delay scan');
+$node->wait_for_event('checkpointer', 'umbra-checkpoint-after-shift-epoch');
+pass('checkpoint publishes its shift epoch before the fresh delay scan');
 
 # The selector publication point is cached in the writer, so preload it before
 # the actual update reaches the critical publication region.
@@ -143,10 +173,11 @@ SELECT injection_points_wakeup(
          'umbra-mapping-after-wal-before-publish')]);
 $writer->query_until(qr/preload_done/, '');
 
+my $marker = 'shift-epoch-marker';
 $writer->query_until(
 	qr/update_started/,
-	q(\echo update_started
-UPDATE umbra_checkpoint_capture SET payload = 'shifted' WHERE id = 1;
+	qq(\echo update_started
+UPDATE umbra_checkpoint_capture SET payload = '$marker' WHERE id = 1;
 \echo update_done
 ));
 $node->wait_for_event('client backend',
@@ -155,9 +186,9 @@ pass('slot shift pauses after WAL and before selector publication');
 
 $node->safe_psql(
 	'postgres', q[
-SELECT injection_points_wakeup('umbra-checkpoint-after-capture')]);
+SELECT injection_points_wakeup('umbra-checkpoint-after-shift-epoch')]);
 $node->wait_for_event('checkpointer', 'CheckpointDelayStart');
-pass('fresh delay scan catches the post-capture slot shift');
+pass('fresh delay scan catches the post-epoch slot shift');
 
 $node->safe_psql(
 	'postgres', q[
@@ -168,17 +199,29 @@ $checkpoint->query_until(qr/checkpoint_done/, '');
 my $wal_end = $node->safe_psql(
 	'postgres', 'SELECT pg_current_wal_insert_lsn();');
 
-assert_fpi_shift_wal($node, $filenode, $target_block, $wal_start, $wal_end);
+assert_image_free_shift_wal(
+	$node, $filenode, $target_block, $wal_start, $wal_end);
 
 is($node->safe_psql('postgres',
 		q[SELECT payload FROM umbra_checkpoint_capture WHERE id = 1;]),
-	'shifted', 'update and checkpoint complete after selector publication');
+	$marker, 'update and checkpoint complete after selector publication');
 is(read_active_slot($map_path, $block_size, $target_block), 1,
-	'checkpoint persists the captured selector target');
+	'checkpoint persists the published selector target');
+ok(index(read_physical_block($main_path, $block_size,
+			source_slot_block($target_block, 0)), $marker) >= 0,
+	'C1 writes the selected page to the target selector predecessor');
+ok(index(read_physical_block($main_path, $block_size,
+			source_slot_block($target_block, 1)), $marker) < 0,
+	'C1 leaves the published target dirty for the next checkpoint');
+
+$node->safe_psql('postgres', 'CHECKPOINT');
+ok(index(read_physical_block($main_path, $block_size,
+			source_slot_block($target_block, 1)), $marker) >= 0,
+	'C2 writes the retained page to the published target');
 
 $node->safe_psql(
 	'postgres', q[
-SELECT injection_points_detach('umbra-checkpoint-after-capture')]);
+SELECT injection_points_detach('umbra-checkpoint-after-shift-epoch')]);
 $node->safe_psql(
 	'postgres', q[
 SELECT injection_points_detach(

@@ -88,9 +88,6 @@ extern PGDLLIMPORT const PgAioTargetInfo aio_smgr_target_info;
 
 extern void smgrinit(void);
 extern SMgrRelation smgropen(RelFileLocator rlocator, ProcNumber backend);
-#ifdef USE_UMBRA
-extern SMgrRelation smgrlookup(RelFileLocator rlocator, ProcNumber backend);
-#endif
 extern bool smgrexists(SMgrRelation reln, ForkNumber forknum);
 extern void smgrpin(SMgrRelation reln);
 extern void smgrunpin(SMgrRelation reln);

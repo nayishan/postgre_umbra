@@ -15,18 +15,6 @@
 
 typedef struct UmbraFileContext UmbraFileContext;
 
-/* A raw pin held from WAL preparation through selector publication. */
-typedef struct MapSlotShift
-{
-	RelFileLocatorBackend rlocator;
-	ForkNumber	forknum;
-	BlockNumber logical_block;
-	uint8		source_slot;
-	uint8		target_slot;
-	int			map_slot_id;
-	bool		prepared;
-} MapSlotShift;
-
 /*
  * Block zero is the resident root.  Each following 258-page group contains
  * one FSM selector, one VM selector, and 256 MAIN selectors.
@@ -61,12 +49,17 @@ extern void MapEnsureActiveSlotPages(UmbraFileContext *ctx,
 							 ForkNumber forknum,
 							 BlockNumber first_block, BlockNumber nblocks,
 							 bool skipFsync);
-extern bool MapPrepareSlotShift(UmbraFileContext *ctx,
-								 RelFileLocatorBackend rlocator,
-								 ForkNumber forknum,
-								 BlockNumber logical_block, MapSlotShift *shift);
-extern void MapAbortSlotShift(MapSlotShift *shift);
-extern void MapPublishSlotShift(MapSlotShift *shift, XLogRecPtr lsn);
+extern void MapChooseSlotShift(UmbraFileContext *ctx,
+							   RelFileLocatorBackend rlocator,
+							   ForkNumber forknum,
+							   BlockNumber logical_block,
+							   uint8 *source_slot, uint8 *target_slot);
+extern void MapPublishSlotShift(UmbraFileContext *ctx,
+								RelFileLocatorBackend rlocator,
+								ForkNumber forknum,
+								BlockNumber logical_block,
+								uint8 source_slot, uint8 target_slot,
+								XLogRecPtr lsn);
 extern void MapRedoSetActiveSlot(UmbraFileContext *ctx,
 								 RelFileLocatorBackend rlocator,
 								 ForkNumber forknum,

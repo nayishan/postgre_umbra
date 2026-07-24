@@ -363,7 +363,6 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 	bool		willinit;
 #ifdef USE_UMBRA
 	DecodedBkpBlock *blkref;
-	bool		hint_delta;
 #endif
 
 	if (!XLogRecGetBlockTagExtended(record, block_id, &rlocator, &forknum, &blkno,
@@ -387,8 +386,6 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 
 #ifdef USE_UMBRA
 	blkref = XLogRecGetBlock(record, block_id);
-	hint_delta = XLogRecGetRmid(record) == RM_XLOG2_ID &&
-		(XLogRecGetInfo(record) & ~XLR_INFO_MASK) == XLOG2_HINT_DELTA;
 	if (blkref->has_slot_shift)
 	{
 		SMgrRelation reln;
@@ -405,7 +402,7 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 				return BLK_NOTFOUND;
 			}
 		}
-		else if (blkref->source_slot_captured || hint_delta)
+		else
 		{
 			/* Materialize the old baseline before publishing the target. */
 			if (!UmRedoSetActiveSlot(reln, forknum, blkno,
@@ -441,8 +438,6 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 			}
 			return BLK_NOTFOUND;
 		}
-		else
-			elog(PANIC, "Umbra slot-shift WAL record has no applying full-page image");
 	}
 #endif
 

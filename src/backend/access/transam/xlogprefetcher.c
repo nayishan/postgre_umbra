@@ -673,7 +673,7 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 			}
 
 #ifdef USE_UMBRA
-			/* Redo selects the target slot before it can safely read this page. */
+			/* Redo restores the source slot before it can safely read this page. */
 			if (block->has_slot_shift)
 			{
 				XLogPrefetcherAddFilter(prefetcher, block->rlocator,

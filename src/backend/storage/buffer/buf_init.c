@@ -27,9 +27,8 @@ ConditionVariableMinimallyPadded *BufferIOCVArray;
 WritebackContext BackendWritebackContext;
 CkptSortItem *CkptBufferIds;
 #ifdef USE_UMBRA
-uint8	   *CkptBufferSourceSlots;
-uint64	   *CkptBufferSourceSlotEpochs;
-pg_atomic_uint64 *CkptBufferCaptureEpoch;
+uint64	   *CkptBufferShiftEpochs;
+pg_atomic_uint64 *CkptBufferShiftEpochState;
 #endif
 
 static void BufferManagerShmemRequest(void *arg);
@@ -115,17 +114,13 @@ BufferManagerShmemRequest(void *arg)
 		);
 
 #ifdef USE_UMBRA
-	ShmemRequestStruct(.name = "Checkpoint Buffer Source Slots",
-					   .size = NBuffers * sizeof(uint8),
-					   .ptr = (void **) &CkptBufferSourceSlots,
-		);
-	ShmemRequestStruct(.name = "Checkpoint Buffer Source Slot Epochs",
+	ShmemRequestStruct(.name = "Checkpoint Buffer Shift Epochs",
 					   .size = NBuffers * sizeof(uint64),
-					   .ptr = (void **) &CkptBufferSourceSlotEpochs,
+					   .ptr = (void **) &CkptBufferShiftEpochs,
 		);
-	ShmemRequestStruct(.name = "Checkpoint Buffer Capture Epoch",
+	ShmemRequestStruct(.name = "Checkpoint Buffer Shift Epoch State",
 					   .size = sizeof(pg_atomic_uint64),
-					   .ptr = (void **) &CkptBufferCaptureEpoch,
+					   .ptr = (void **) &CkptBufferShiftEpochState,
 		);
 #endif
 }
@@ -140,7 +135,7 @@ static void
 BufferManagerShmemInit(void *arg)
 {
 #ifdef USE_UMBRA
-	pg_atomic_init_u64(CkptBufferCaptureEpoch, 0);
+	pg_atomic_init_u64(CkptBufferShiftEpochState, 0);
 #endif
 
 	/*
@@ -158,8 +153,7 @@ BufferManagerShmemInit(void *arg)
 		buf->buf_id = i;
 
 #ifdef USE_UMBRA
-		CkptBufferSourceSlots[i] = UINT8_MAX;
-		CkptBufferSourceSlotEpochs[i] = 0;
+		CkptBufferShiftEpochs[i] = 0;
 #endif
 		pgaio_wref_clear(&buf->io_wref);
 

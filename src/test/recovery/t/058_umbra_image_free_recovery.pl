@@ -48,8 +48,9 @@ sub assert_image_free_shift_wal
 			"$target->{name} emits one target-block WAL record");
 		unlike($records[0], qr/\bFPW\b/,
 			"$target->{name} shift is image-free");
-		like($records[0], qr/captured_source/,
-			"$target->{name} records its captured source slot");
+		like($records[0],
+			qr/slot shift: source_slot 1 target_slot 2\b/,
+			"$target->{name} records its slot 1 to slot 2 transition");
 	}
 }
 
@@ -161,9 +162,8 @@ is($reuse_low_block, 0, 'reuse target overlaps a future block zero');
 cmp_ok($reuse_high_block, '>', 1,
 	'exact-reuse target also has a block above the future EOF');
 
-# Set initial tuple commit hints before the baseline checkpoint.  This keeps
-# FPI_FOR_HINT from consuming the first post-checkpoint modification, so the
-# first updates advance every target from slot 0 to slot 1.
+# Set initial tuple commit hints before the baseline checkpoint, so later
+# updates are the only operations under test in their FPW intervals.
 $primary->safe_psql(
 	'postgres', qq[
 SELECT payload FROM image_free_drop WHERE id = 1;
@@ -185,10 +185,9 @@ is(updated_block($primary, 'image_free_reuse_old', $reuse_high_id, 'slot-one'),
 	$reuse_high_block,
 	'reuse high first update remains on its logical block');
 
-# Set commit hints for the first-update tuples before C1 starts.  Otherwise the
-# second updates can emit FPI_FOR_HINT records after the restartpoint boundary,
-# making those records, rather than the image-free shifts, reconstruct the
-# source pages during crash recovery.
+# Set commit hints for the first-update tuples before C1 starts.  Otherwise a
+# MAIN HINT_DELTA could become the first post-redo transition and obscure the
+# ordinary image-free shifts under test.
 $primary->safe_psql(
 	'postgres', qq[
 SELECT payload FROM image_free_drop WHERE id = 1;
@@ -262,7 +261,7 @@ is($primary->safe_psql(
 		"SELECT redo_lsn >= '$first_updates_end'::pg_lsn "
 		  . "AND redo_lsn <= '$image_free_start'::pg_lsn "
 		  . 'FROM pg_control_checkpoint();'),
-	't', 'crash redo excludes the first FPI shifts but includes image-free WAL');
+	't', 'crash redo excludes the first shifts but includes the later shifts');
 
 # Preserve C1's control file.  Later checkpoints establish the physical state
 # needed by the test, but restoring this copy after the crash forces redo to

@@ -33,13 +33,12 @@
 
 typedef struct UmbraSlotShift
 {
-	RelFileLocatorBackend rlocator;
+	SMgrRelation reln;
 	ForkNumber	forknum;
 	BlockNumber logical_block;
 	uint8		source_slot;
 	uint8		target_slot;
-	int			map_slot_id;
-	bool		prepared;
+	bool		selected;
 } UmbraSlotShift;
 
 /* A zero selector chooses slot 0; WAL-backed shifts can choose slots 1 or 2. */
@@ -47,6 +46,13 @@ static inline bool
 UmbraActiveSlotIsValid(uint8 active_slot)
 {
 	return active_slot < UMBRA_CHUNK_ACTIVE_SLOTS;
+}
+
+static inline uint8
+UmbraPreviousActiveSlot(uint8 active_slot)
+{
+	Assert(UmbraActiveSlotIsValid(active_slot));
+	return active_slot == 0 ? UMBRA_CHUNK_ACTIVE_SLOTS - 1 : active_slot - 1;
 }
 
 static inline bool
@@ -152,17 +158,15 @@ extern void umregistersync(SMgrRelation reln, ForkNumber forknum);
 extern bool umpreparependingsync(SMgrRelation reln);
 extern int	umfd(SMgrRelation reln, ForkNumber forknum,
 					 BlockNumber blocknum, uint32 *off);
-extern bool UmWalOwnedSlotShiftAvailable(SMgrRelation reln,
-									 ForkNumber forknum);
-extern bool UmPrepareSlotShift(SMgrRelation reln, ForkNumber forknum,
-							   BlockNumber logical_block,
-							   UmbraSlotShift *shift);
-extern void UmAbortSlotShift(UmbraSlotShift *shift);
-extern void UmReleaseSlotShiftOnExit(UmbraSlotShift *shift);
+extern bool UmChooseSlotShift(SMgrRelation reln, ForkNumber forknum,
+								  BlockNumber logical_block,
+								  UmbraSlotShift *shift);
 extern void UmPublishSlotShift(UmbraSlotShift *shift, XLogRecPtr lsn);
-extern bool UmCheckpointWriteSourceSlot(SMgrRelation reln, ForkNumber forknum,
-										BlockNumber lblkno, uint8 source_slot,
-										const void *buffer);
+extern bool UmCheckpointWritePredecessorSlot(SMgrRelation reln,
+										 ForkNumber forknum,
+										 BlockNumber lblkno,
+										 const void *buffer,
+										 uint8 *source_slot);
 extern void UmCheckpointWritebackSourceSlot(SMgrRelation reln,
 											ForkNumber forknum,
 											BlockNumber lblkno,

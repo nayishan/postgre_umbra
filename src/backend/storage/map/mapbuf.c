@@ -236,63 +236,6 @@ MapPageBufferGetData(MapPageBuffer buffer)
 	return MapPageGetBlock(desc->slot_id);
 }
 
-/*
- * Take a raw pin on a resident selector page without allocating or starting
- * I/O.  WAL preparation can run inside a critical section, so a cache miss or
- * lock conflict leaves the caller with its ordinary full-page image.
- */
-bool
-MapPageBufferTryReadCached(RelFileLocatorBackend rlocator,
-						   BlockNumber map_block, LWLockMode mode,
-						   MapPageBuffer *buffer)
-{
-	MapPageTag tag = {0};
-	MapPageDesc *desc;
-	uint32		hashcode;
-	uint64		state;
-	int			slot_id;
-
-	Assert(buffer != NULL);
-	Assert(mode == LW_SHARED || mode == LW_EXCLUSIVE);
-	buffer->desc = NULL;
-	if (!MapPagePoolIsInitialized())
-		return false;
-
-	tag.rlocator = rlocator;
-	tag.map_block = map_block;
-	hashcode = MapPageCacheHashCode(&tag);
-	if (!LWLockConditionalAcquire(MapPageCachePartitionLock(hashcode),
-							  LW_SHARED))
-		return false;
-	slot_id = MapPageCacheLookup(&tag, hashcode);
-	if (slot_id >= 0 && !MapPagePinBufferNoOwner(slot_id, false))
-		slot_id = -1;
-	LWLockRelease(MapPageCachePartitionLock(hashcode));
-	if (slot_id < 0)
-		return false;
-
-	desc = &MapPageDescriptors[slot_id];
-	state = pg_atomic_read_u64(&desc->state);
-	if ((state & MAP_PAGE_IO_IN_PROGRESS) != 0 ||
-		!LWLockConditionalAcquire(&desc->content_lock, mode))
-	{
-		MapPageUnpinBufferNoOwner(slot_id);
-		return false;
-	}
-	state = pg_atomic_read_u64(&desc->state);
-	if ((state & (MAP_PAGE_TAG_VALID | MAP_PAGE_VALID)) !=
-		(MAP_PAGE_TAG_VALID | MAP_PAGE_VALID) ||
-		!MapPageTagEquals(&desc->tag, &tag))
-	{
-		LWLockRelease(&desc->content_lock);
-		MapPageUnpinBufferNoOwner(slot_id);
-		return false;
-	}
-
-	buffer->desc = desc;
-	return true;
-}
-
 void
 MapPageMarkBufferDirty(MapPageBuffer buffer, XLogRecPtr wal_flush_lsn,
 					   bool skipFsync)
@@ -319,27 +262,6 @@ MapPageReleaseBuffer(MapPageBuffer buffer)
 	Assert(LWLockHeldByMe(&desc->content_lock));
 	LWLockRelease(&desc->content_lock);
 	MapPageUnpinBuffer(desc->slot_id);
-}
-
-void
-MapPageReleaseBufferNoOwner(MapPageBuffer buffer)
-{
-	MapPageDesc *desc = buffer.desc;
-
-	Assert(desc != NULL);
-	Assert(LWLockHeldByMe(&desc->content_lock));
-	LWLockRelease(&desc->content_lock);
-	MapPageUnpinBufferNoOwner(desc->slot_id);
-}
-
-void
-MapPageUnlockBufferKeepPin(MapPageBuffer buffer)
-{
-	MapPageDesc *desc = buffer.desc;
-
-	Assert(desc != NULL);
-	Assert(LWLockHeldByMe(&desc->content_lock));
-	LWLockRelease(&desc->content_lock);
 }
 
 uint8
@@ -413,94 +335,66 @@ MapEnsureActiveSlotPages(UmbraFileContext *ctx,
 	}
 }
 
-bool
-MapPrepareSlotShift(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
-					ForkNumber forknum, BlockNumber logical_block,
-					MapSlotShift *shift)
+void
+MapChooseSlotShift(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
+				   ForkNumber forknum, BlockNumber logical_block,
+				   uint8 *source_slot, uint8 *target_slot)
 {
 	MapPageBuffer buffer;
 	BlockNumber map_block;
 	int			byte_offset;
 	int			bit_offset;
-	uint8		source_slot;
 
-	Assert(shift != NULL);
-	MemSet(shift, 0, sizeof(*shift));
-	shift->map_slot_id = -1;
-	(void) ctx;
+	Assert(ctx != NULL);
+	Assert(source_slot != NULL);
+	Assert(target_slot != NULL);
 	MapSelectorLocation(forknum, logical_block, &map_block, &byte_offset,
 						&bit_offset);
-	if (!MapPageBufferTryReadCached(rlocator, map_block, LW_SHARED, &buffer))
-		return false;
+	buffer = MapPageBufferRead(ctx, rlocator, map_block, true, false,
+							   LW_SHARED);
 
-	source_slot = MapSelectorRead(MapPageBufferGetData(buffer), byte_offset,
-							  bit_offset);
-	if (source_slot >= 3)
+	*source_slot = MapSelectorRead(MapPageBufferGetData(buffer), byte_offset,
+							   bit_offset);
+	if (*source_slot >= 3)
 	{
-		MapPageReleaseBufferNoOwner(buffer);
+		MapPageReleaseBuffer(buffer);
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("invalid Umbra active slot %u for fork %d logical block %u",
-						source_slot, (int) forknum, logical_block)));
+						*source_slot, (int) forknum, logical_block)));
 	}
-	shift->rlocator = rlocator;
-	shift->forknum = forknum;
-	shift->logical_block = logical_block;
-	shift->source_slot = source_slot;
-	shift->target_slot = (source_slot + 1) % 3;
-	shift->map_slot_id = buffer.desc->slot_id;
-	shift->prepared = true;
-	MapPageUnlockBufferKeepPin(buffer);
-	return true;
+	*target_slot = (*source_slot + 1) % 3;
+	MapPageReleaseBuffer(buffer);
 }
 
 void
-MapAbortSlotShift(MapSlotShift *shift)
-{
-	Assert(shift != NULL);
-	if (shift->prepared)
-	{
-		MapPageUnpinBufferNoOwner(shift->map_slot_id);
-		shift->prepared = false;
-		shift->map_slot_id = -1;
-	}
-}
-
-void
-MapPublishSlotShift(MapSlotShift *shift, XLogRecPtr lsn)
+MapPublishSlotShift(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
+					ForkNumber forknum, BlockNumber logical_block,
+					uint8 source_slot, uint8 target_slot, XLogRecPtr lsn)
 {
 	MapPageBuffer buffer;
-	MapPageDesc *desc;
 	BlockNumber map_block;
 	int			byte_offset;
 	int			bit_offset;
-	uint8		source_slot;
-	uint64		state;
+	uint8		current_slot;
 
-	Assert(shift != NULL);
-	Assert(shift->prepared);
+	Assert(ctx != NULL);
+	Assert(source_slot < 3);
+	Assert(target_slot < 3);
+	Assert(source_slot != target_slot);
 	Assert(XLogRecPtrIsValid(lsn));
-	desc = &MapPageDescriptors[shift->map_slot_id];
-	buffer.desc = desc;
-	MapSelectorLocation(shift->forknum, shift->logical_block, &map_block,
+	MapSelectorLocation(forknum, logical_block, &map_block,
 						&byte_offset, &bit_offset);
-	LWLockAcquire(&desc->content_lock, LW_EXCLUSIVE);
-	state = pg_atomic_read_u64(&desc->state);
-	if ((state & (MAP_PAGE_TAG_VALID | MAP_PAGE_VALID)) !=
-		(MAP_PAGE_TAG_VALID | MAP_PAGE_VALID) ||
-		desc->tag.map_block != map_block ||
-		!RelFileLocatorBackendEquals(desc->tag.rlocator, shift->rlocator))
-		elog(PANIC, "Umbra prepared slot selector changed before publication");
-	source_slot = MapSelectorRead(MapPageBufferGetData(buffer), byte_offset,
-							  bit_offset);
-	if (source_slot != shift->source_slot)
+	buffer = MapPageBufferRead(ctx, rlocator, map_block, false, false,
+							   LW_EXCLUSIVE);
+	current_slot = MapSelectorRead(MapPageBufferGetData(buffer), byte_offset,
+							   bit_offset);
+	if (current_slot != source_slot)
 		elog(PANIC, "Umbra active slot changed before publication");
 	MapSelectorWrite(MapPageBufferGetData(buffer), byte_offset, bit_offset,
-					 shift->target_slot);
+					 target_slot);
 	MapPageMarkBufferDirty(buffer, lsn, false);
-	MapPageReleaseBufferNoOwner(buffer);
-	shift->prepared = false;
-	shift->map_slot_id = -1;
+	MapPageReleaseBuffer(buffer);
 }
 
 void

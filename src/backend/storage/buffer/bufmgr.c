@@ -671,15 +671,15 @@ static void FlushBuffer(BufferDesc *buf, SMgrRelation reln,
 						bool checkpoint_flush,
 						uint8 *writeback_source_slot);
 #ifdef USE_UMBRA
-#define CKPT_BUFFER_EPOCH_ACTIVE	(UINT64CONST(1) << 63)
-#define CKPT_BUFFER_EPOCH_MASK	(~CKPT_BUFFER_EPOCH_ACTIVE)
+#define CKPT_BUFFER_SHIFT_EPOCH_ACTIVE	(UINT64CONST(1) << 63)
+#define CKPT_BUFFER_SHIFT_EPOCH_MASK	(~CKPT_BUFFER_SHIFT_EPOCH_ACTIVE)
 #define CKPT_BUFFER_SOURCE_SLOT_INVALID UINT8_MAX
 static bool CkptBufferIdsPrepared = false;
 static int	CkptBufferIdsPreparedCount = 0;
-static uint64 CheckpointBufferActiveEpoch(void);
-static void CheckpointBufferCaptureBegin(void);
-static void CheckpointBufferCaptureEnd(void);
-static void ClearCheckpointBufferSourceSlot(BufferDesc *buf);
+static uint64 CheckpointBufferShiftEpochGetActive(void);
+static void CheckpointBufferShiftEpochBegin(void);
+static void CheckpointBufferShiftEpochEnd(void);
+static void ClearCheckpointBufferShiftEpoch(BufferDesc *buf);
 static void TerminateCheckpointBufferIO(BufferDesc *buf);
 #endif
 static void FindAndDropRelationBuffers(RelFileLocator rlocator,
@@ -2350,7 +2350,7 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	Assert(!(victim_buf_state & (BM_TAG_VALID | BM_VALID | BM_DIRTY | BM_IO_IN_PROGRESS)));
 
 #ifdef USE_UMBRA
-	ClearCheckpointBufferSourceSlot(victim_buf_hdr);
+	ClearCheckpointBufferShiftEpoch(victim_buf_hdr);
 #endif
 	victim_buf_hdr->tag = newTag;
 
@@ -2467,7 +2467,7 @@ retry:
 	 */
 	oldFlags = buf_state & BUF_FLAG_MASK;
 #ifdef USE_UMBRA
-	ClearCheckpointBufferSourceSlot(buf);
+	ClearCheckpointBufferShiftEpoch(buf);
 #endif
 	ClearBufferTag(&buf->tag);
 
@@ -2554,7 +2554,7 @@ InvalidateVictimBuffer(BufferDesc *buf_hdr)
 	 * tag (see e.g. FlushDatabaseBuffers()).
 	 */
 #ifdef USE_UMBRA
-	ClearCheckpointBufferSourceSlot(buf_hdr);
+	ClearCheckpointBufferShiftEpoch(buf_hdr);
 #endif
 	ClearBufferTag(&buf_hdr->tag);
 	UnlockBufHdrExt(buf_hdr, buf_state,
@@ -3020,7 +3020,7 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 			Assert(BUF_STATE_GET_REFCOUNT(buf_state) == 1);
 
 #ifdef USE_UMBRA
-			ClearCheckpointBufferSourceSlot(victim_buf_hdr);
+			ClearCheckpointBufferShiftEpoch(victim_buf_hdr);
 #endif
 			victim_buf_hdr->tag = tag;
 
@@ -3593,8 +3593,7 @@ BufferSyncPrepare(int flags)
 	uint64		mask = BM_DIRTY;
 
 #ifdef USE_UMBRA
-	if (CheckpointBufferActiveEpoch() == 0)
-		CheckpointBufferCaptureBegin();
+	Assert(CheckpointBufferShiftEpochGetActive() != 0);
 #endif
 
 	/*
@@ -3697,7 +3696,7 @@ BufferSync(int flags)
 	if (num_to_scan == 0)
 	{
 #ifdef USE_UMBRA
-		CheckpointBufferCaptureEnd();
+		CheckpointBufferShiftEpochEnd();
 #endif
 		return;					/* nothing to do */
 	}
@@ -3891,7 +3890,7 @@ BufferSync(int flags)
 	TRACE_POSTGRESQL_BUFFER_SYNC_DONE(NBuffers, num_written, num_to_scan);
 
 #ifdef USE_UMBRA
-	CheckpointBufferCaptureEnd();
+	CheckpointBufferShiftEpochEnd();
 #endif
 }
 
@@ -3904,9 +3903,9 @@ CheckPointBuffersPrepare(int flags)
 }
 
 void
-CheckPointBuffersCaptureBegin(void)
+CheckPointBuffersShiftEpochBegin(void)
 {
-	CheckpointBufferCaptureBegin();
+	CheckpointBufferShiftEpochBegin();
 }
 
 void
@@ -3914,112 +3913,73 @@ CheckPointBuffersAbort(void)
 {
 	CkptBufferIdsPrepared = false;
 	CkptBufferIdsPreparedCount = 0;
-	CheckpointBufferCaptureEnd();
+	CheckpointBufferShiftEpochEnd();
 }
 
 static void
-CheckpointBufferCaptureBegin(void)
+CheckpointBufferShiftEpochBegin(void)
 {
 	uint64		epoch_state;
 	uint64		epoch;
 
-	epoch_state = pg_atomic_read_u64(CkptBufferCaptureEpoch);
-	epoch = (epoch_state & CKPT_BUFFER_EPOCH_MASK) + 1;
-	if (epoch == 0 || epoch > CKPT_BUFFER_EPOCH_MASK)
+	epoch_state = pg_atomic_read_u64(CkptBufferShiftEpochState);
+	epoch = (epoch_state & CKPT_BUFFER_SHIFT_EPOCH_MASK) + 1;
+	if (epoch == 0 || epoch > CKPT_BUFFER_SHIFT_EPOCH_MASK)
 		epoch = 1;
-	pg_atomic_write_u64(CkptBufferCaptureEpoch,
-						CKPT_BUFFER_EPOCH_ACTIVE | epoch);
+	pg_atomic_write_u64(CkptBufferShiftEpochState,
+						CKPT_BUFFER_SHIFT_EPOCH_ACTIVE | epoch);
 }
 
 static void
-CheckpointBufferCaptureEnd(void)
+CheckpointBufferShiftEpochEnd(void)
 {
 	uint64		epoch_state;
 
-	epoch_state = pg_atomic_read_u64(CkptBufferCaptureEpoch);
-	pg_atomic_write_u64(CkptBufferCaptureEpoch,
-						epoch_state & CKPT_BUFFER_EPOCH_MASK);
+	epoch_state = pg_atomic_read_u64(CkptBufferShiftEpochState);
+	pg_atomic_write_u64(CkptBufferShiftEpochState,
+						epoch_state & CKPT_BUFFER_SHIFT_EPOCH_MASK);
 }
 
 static uint64
-CheckpointBufferActiveEpoch(void)
+CheckpointBufferShiftEpochGetActive(void)
 {
 	uint64		epoch_state;
 
-	epoch_state = pg_atomic_read_u64(CkptBufferCaptureEpoch);
-	if ((epoch_state & CKPT_BUFFER_EPOCH_ACTIVE) == 0)
+	epoch_state = pg_atomic_read_u64(CkptBufferShiftEpochState);
+	if ((epoch_state & CKPT_BUFFER_SHIFT_EPOCH_ACTIVE) == 0)
 		return 0;
-	return epoch_state & CKPT_BUFFER_EPOCH_MASK;
+	return epoch_state & CKPT_BUFFER_SHIFT_EPOCH_MASK;
 }
 
-bool
-BufferCheckpointSourceSlotCaptureIsPossible(Buffer buffer, uint8 source_slot)
+void
+BufferSaveCheckpointShiftEpoch(Buffer buffer, XLogRecPtr shift_end_lsn)
 {
 	BufferDesc *buf;
-	uint64		buf_state;
 	uint64		epoch;
-	bool		possible;
 
 	if (!BufferIsValid(buffer) || BufferIsLocal(buffer) ||
-		!UmbraActiveSlotIsValid(source_slot))
-		return false;
+		!XLogRecPtrIsValid(shift_end_lsn))
+		return;
+
+	epoch = CheckpointBufferShiftEpochGetActive();
+	/*
+	 * A record ending at or before redo belongs to the checkpoint input even
+	 * if its selector is published after the shift epoch starts.
+	 */
+	if (epoch == 0 || shift_end_lsn <= GetRedoRecPtr())
+		return;
 
 	buf = GetBufferDescriptor(buffer - 1);
-	buf_state = LockBufHdr(buf);
-	epoch = CheckpointBufferActiveEpoch();
-	possible = (buf_state & BM_CHECKPOINT_NEEDED) != 0 && epoch != 0 &&
-		(CkptBufferSourceSlotEpochs[buf->buf_id] != epoch ||
-		 !UmbraActiveSlotIsValid(CkptBufferSourceSlots[buf->buf_id]) ||
-		 CkptBufferSourceSlots[buf->buf_id] == source_slot);
+	(void) LockBufHdr(buf);
+	if (CheckpointBufferShiftEpochGetActive() == epoch)
+		CkptBufferShiftEpochs[buf->buf_id] = epoch;
 	UnlockBufHdr(buf);
-	return possible;
-}
-
-bool
-BufferSaveCheckpointSourceSlot(Buffer buffer, uint8 source_slot)
-{
-	BufferDesc *buf;
-	uint64		buf_state;
-	uint64		epoch;
-	bool		captured = false;
-
-	if (!BufferIsValid(buffer) || BufferIsLocal(buffer) ||
-		!UmbraActiveSlotIsValid(source_slot))
-		return false;
-
-	buf = GetBufferDescriptor(buffer - 1);
-	buf_state = LockBufHdr(buf);
-	if ((buf_state & BM_CHECKPOINT_NEEDED) == 0)
-	{
-		UnlockBufHdr(buf);
-		return false;
-	}
-
-	epoch = CheckpointBufferActiveEpoch();
-	if (epoch == 0)
-	{
-		UnlockBufHdr(buf);
-		return false;
-	}
-
-	if (CkptBufferSourceSlotEpochs[buf->buf_id] != epoch ||
-		!UmbraActiveSlotIsValid(CkptBufferSourceSlots[buf->buf_id]))
-	{
-		CkptBufferSourceSlots[buf->buf_id] = source_slot;
-		CkptBufferSourceSlotEpochs[buf->buf_id] = epoch;
-		captured = true;
-	}
-	else
-		captured = CkptBufferSourceSlots[buf->buf_id] == source_slot;
-	UnlockBufHdr(buf);
-	return captured;
 }
 
 static void
-ClearCheckpointBufferSourceSlot(BufferDesc *buf)
+ClearCheckpointBufferShiftEpoch(BufferDesc *buf)
 {
-	CkptBufferSourceSlots[buf->buf_id] = CKPT_BUFFER_SOURCE_SLOT_INVALID;
-	CkptBufferSourceSlotEpochs[buf->buf_id] = 0;
+	CkptBufferShiftEpochs[buf->buf_id] = 0;
 }
 #endif
 
@@ -4746,11 +4706,10 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 		uint64		epoch;
 
 		buf_state = LockBufHdr(buf);
-		epoch = CheckpointBufferActiveEpoch();
+		epoch = CheckpointBufferShiftEpochGetActive();
 		if (epoch != 0 && (buf_state & BM_CHECKPOINT_NEEDED) != 0 &&
-			CkptBufferSourceSlotEpochs[buf->buf_id] == epoch &&
-			UmbraActiveSlotIsValid(CkptBufferSourceSlots[buf->buf_id]))
-			checkpoint_source_slot = CkptBufferSourceSlots[buf->buf_id];
+			CkptBufferShiftEpochs[buf->buf_id] == epoch)
+			checkpoint_directed = true;
 		UnlockBufHdr(buf);
 	}
 #endif
@@ -4811,12 +4770,11 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	io_start = pgstat_prepare_io_time(track_io_timing);
 
 #ifdef USE_UMBRA
-	if (UmbraActiveSlotIsValid(checkpoint_source_slot))
-		checkpoint_directed = UmCheckpointWriteSourceSlot(reln,
+	if (checkpoint_directed)
+		checkpoint_directed = UmCheckpointWritePredecessorSlot(reln,
 											  BufTagGetForkNum(&buf->tag),
-											  buf->tag.blockNum,
-											  checkpoint_source_slot,
-											  bufBlock);
+											  buf->tag.blockNum, bufBlock,
+											  &checkpoint_source_slot);
 	if (checkpoint_directed)
 	{
 		if (!checkpoint_flush)
@@ -6148,9 +6106,8 @@ MarkSharedBufferDirtyHint(Buffer buffer, BufferDesc *bufHdr, uint64 lockstate,
 				}
 				if (delta_len >= BLCKSZ)
 				{
-					/* The decoder reserves page-sized records for full images. */
 					XLogResetInsertion();
-					hint_delta_prepared = false;
+					elog(ERROR, "Umbra hint delta is too large");
 				}
 			}
 
@@ -7904,7 +7861,7 @@ TerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint64 set_flag_bits,
 	{
 		unset_flag_bits |= BM_DIRTY | BM_CHECKPOINT_NEEDED;
 #ifdef USE_UMBRA
-		ClearCheckpointBufferSourceSlot(buf);
+		ClearCheckpointBufferShiftEpoch(buf);
 #endif
 	}
 
@@ -7948,7 +7905,7 @@ TerminateCheckpointBufferIO(BufferDesc *buf)
 	buf_state = LockBufHdr(buf);
 	Assert(buf_state & BM_IO_IN_PROGRESS);
 	Assert(buf_state & BM_DIRTY);
-	ClearCheckpointBufferSourceSlot(buf);
+	ClearCheckpointBufferShiftEpoch(buf);
 	buf_state = UnlockBufHdrExt(buf, buf_state, 0,
 								BM_IO_IN_PROGRESS | BM_IO_ERROR |
 								BM_CHECKPOINT_NEEDED, 0);

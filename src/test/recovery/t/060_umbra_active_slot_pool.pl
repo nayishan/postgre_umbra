@@ -37,11 +37,34 @@ sub write_byte
 	close($fh) or BAIL_OUT("could not close \"$path\": $!");
 }
 
+sub read_active_slot
+{
+	my ($path, $block_size, $logical_block) = @_;
+	my $entries_per_page = $block_size * 4;
+	my $page_index = int($logical_block / $entries_per_page);
+	my $entry_index = $logical_block % $entries_per_page;
+	my $group = int($page_index / 256);
+	my $map_block = 1 + $group * 258 + 2 + ($page_index % 256);
+	my $offset = $map_block * $block_size + int($entry_index / 4);
+	my $byte;
+
+	open(my $fh, '<', $path) or BAIL_OUT("could not open \"$path\": $!");
+	binmode($fh);
+	defined(sysseek($fh, $offset, SEEK_SET))
+	  or BAIL_OUT("could not seek \"$path\": $!");
+	my $nread = sysread($fh, $byte, 1);
+	defined($nread) && $nread == 1
+	  or BAIL_OUT("could not read selector from \"$path\"");
+	close($fh) or BAIL_OUT("could not close \"$path\": $!");
+
+	return (unpack('C', $byte) >> (($entry_index % 4) * 2)) & 0x03;
+}
+
 my $node = PostgreSQL::Test::Cluster->new('active_slot_pool');
-$node->init;
+$node->init(no_data_checksums => 1);
 $node->append_conf(
 	'postgresql.conf',
-	"shared_buffers = '128kB'\nautovacuum = off\ncheckpoint_timeout = '1h'\nmax_wal_size = '4GB'");
+	"shared_buffers = '128kB'\nautovacuum = off\ncheckpoint_timeout = '1h'\nmax_wal_size = '4GB'\nwal_log_hints = off");
 $node->start;
 
 $node->safe_psql(
@@ -62,6 +85,9 @@ CHECKPOINT;
 });
 
 my $block_size = 0 + $node->safe_psql('postgres', 'SHOW block_size');
+my $anchor_filenode = $node->safe_psql(
+	'postgres',
+	q[SELECT pg_relation_filenode('umbra_selector_anchor'::regclass)]);
 my @relations = ('umbra_selector_anchor',
 	map { "umbra_selector_pool_$_" } 1 .. 24);
 my @map_paths;
@@ -87,6 +113,42 @@ is($node->safe_psql('postgres', 'SELECT count(*) FROM umbra_selector_anchor'),
 	'1', 'an absent selector page reads as slot 0');
 is(-s $map_paths[0], $block_size,
 	'ordinary slot-0 reads do not materialize a selector page');
+
+# A page that crosses the next redo boundary must choose its source and target
+# before WAL insertion.  That synchronous choice materializes an absent
+# selector page instead of falling back to an FPI.
+$node->safe_psql('postgres', 'CHECKPOINT');
+my $shift_wal_start = $node->safe_psql(
+	'postgres', 'SELECT pg_current_wal_insert_lsn();');
+$node->safe_psql(
+	'postgres', 'UPDATE umbra_selector_anchor SET id = 2 WHERE id = 1');
+my $shift_wal_end = $node->safe_psql(
+	'postgres', 'SELECT pg_current_wal_insert_lsn();');
+is(-s $map_paths[0], 4 * $block_size,
+	'WAL slot selection materializes the missing selector group');
+my ($shift_wal, $shift_stderr) = run_command(
+	[
+		'pg_waldump', '--bkp-details',
+		'--path' => $node->data_dir . '/pg_wal',
+		'--start' => $shift_wal_start,
+		'--end' => $shift_wal_end,
+	]);
+$shift_stderr =~ s/^pg_waldump: first record is after [0-9A-F]+\/[0-9A-F]+, at [0-9A-F]+\/[0-9A-F]+, skipping over \d+ bytes?\n?//;
+is($shift_stderr, '', 'pg_waldump reads the cache-miss update WAL');
+my @shift_records = grep {
+	/rel \d+\/\d+\/$anchor_filenode fork main blk 0\b/
+} split(/\n/, $shift_wal);
+my @selector_shifts = grep { /slot shift:/ } @shift_records;
+is(scalar(@selector_shifts), 1,
+	'cache-miss update records one selector transition');
+unlike($selector_shifts[0] // '', qr/\bFPW\b/,
+	'cache-miss selector transition is image-free');
+like($selector_shifts[0] // '',
+	qr/slot shift: source_slot 0 target_slot 1\b/,
+	'cache-miss update records the slot 0 to slot 1 transition');
+$node->safe_psql('postgres', 'CHECKPOINT');
+is(read_active_slot($map_paths[0], $block_size, 0), 1,
+	'checkpoint persists the selector chosen after a cache miss');
 
 $node->stop;
 for my $map_path (@map_paths)

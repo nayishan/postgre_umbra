@@ -289,12 +289,11 @@ extern void AssertBufferLocksPermitCatalogRead(void);
 #endif
 extern char *DebugPrintBufferRefcount(Buffer buffer);
 #ifdef USE_UMBRA
-extern void CheckPointBuffersCaptureBegin(void);
+extern void CheckPointBuffersShiftEpochBegin(void);
 extern void CheckPointBuffersPrepare(int flags);
 extern void CheckPointBuffersAbort(void);
-extern bool BufferCheckpointSourceSlotCaptureIsPossible(Buffer buffer,
-											 uint8 source_slot);
-extern bool BufferSaveCheckpointSourceSlot(Buffer buffer, uint8 source_slot);
+extern void BufferSaveCheckpointShiftEpoch(Buffer buffer,
+										XLogRecPtr shift_end_lsn);
 #endif
 extern void CheckPointBuffers(int flags);
 extern BlockNumber BufferGetBlockNumber(Buffer buffer);

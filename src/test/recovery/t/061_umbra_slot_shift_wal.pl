@@ -1,6 +1,6 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# Verify FPI-backed active-slot shifts, their WAL header, and redo ordering.
+# Verify image-free active-slot shifts, their WAL header, and redo ordering.
 
 use strict;
 use warnings FATAL => 'all';
@@ -56,16 +56,18 @@ sub assert_shift_wal
 	my @records = grep {
 		/rel \d+\/\d+\/$filenode fork main blk $target_block\b/
 	} split(/\n/, $dump);
-	ok(
-		grep(
-			/\bFPW\b/ &&
-			  /slot shift: source_slot $source_slot target_slot $target_slot/,
-			@records),
-		"$label: WAL retains an FPI and records the slot transition");
+	my @selector_shifts = grep { /slot shift:/ } @records;
+	is(scalar(@selector_shifts), 1,
+		"$label: WAL records one selector transition");
+	unlike($selector_shifts[0] // '', qr/\bFPW\b/,
+		"$label: selector transition omits the FPI");
+	like($selector_shifts[0] // '',
+		qr/slot shift: source_slot $source_slot target_slot $target_slot\b/,
+		"$label: WAL records the expected slot transition");
 }
 
 my $node = PostgreSQL::Test::Cluster->new('umbra_slot_shift_wal');
-# Keep this test focused on ordinary FPI-backed shifts.  HINT_DELTA has
+# Keep this test focused on ordinary image-free shifts.  HINT_DELTA has
 # dedicated coverage in 069, so disable both reasons for logging hints here.
 $node->init(no_data_checksums => 1);
 $node->append_conf(
@@ -100,7 +102,7 @@ SELECT (ctid::text::point)[0]::integer
 FROM umbra_slot_shift_wal WHERE id = 1;]);
 
 # The lookup above may set the tuple's commit hint.  Persist it before the
-# first FPI interval so each following UPDATE is the operation under test.
+# first FPW interval so each following UPDATE is the operation under test.
 $node->safe_psql('postgres', 'CHECKPOINT');
 
 is(-s $map_path, 4 * $block_size,
@@ -148,20 +150,20 @@ FROM umbra_slot_shift_wal WHERE id = 1;]);
 	}
 }
 
-# The final shift is intentionally not checkpointed.  Recovery must publish
-# its selector target before restoring the FPI into that target slot.
+# The final shift is intentionally not checkpointed.  Recovery must
+# materialize the recorded source before publishing and replaying the target.
 $node->stop('immediate');
 $node->start;
 is(read_active_slot($map_path, $block_size, $target_block), 0,
 	'crash redo persists the final selector target');
 is($node->safe_psql('postgres',
 		q[SELECT payload FROM umbra_slot_shift_wal WHERE id = 1;]),
-	'three', 'crash redo restores the FPI through the final target slot');
+	'three', 'crash redo restores the update through the final target slot');
 
 # A later DROP can remove the mapping files before a crash even though the
-# checkpoint redo point still precedes the shift.  The FPI does not identify
-# the missing root's lifecycle, so redo must record a dependency and let DROP
-# clear it.
+# checkpoint redo point still precedes the shift.  The record does not
+# identify the missing root's lifecycle, so redo must record a dependency and
+# let DROP clear it.
 $node->safe_psql(
 	'postgres', q[
 CREATE TABLE umbra_slot_shift_drop(id integer PRIMARY KEY, payload text)
@@ -246,11 +248,11 @@ $node->start;
 ok($node->log_contains(
 		qr/page $drop_target_block of relation .*\/$drop_filenode does not exist/,
 		$recovery_log_offset),
-	'missing mapping records the FPI shift as an invalid-page dependency');
+	'missing mapping records the shift as an invalid-page dependency');
 ok($node->log_contains(
 		qr/page $zero_target_block of relation .*\/$zero_filenode does not exist/,
 		$recovery_log_offset),
-	'zero-length mapping records the FPI shift as an invalid-page dependency');
+	'zero-length mapping records the shift as an invalid-page dependency');
 is($node->safe_psql(
 		'postgres', q[SELECT to_regclass('umbra_slot_shift_drop') IS NULL;]),
 	't', 'later DROP clears the missing-mapping dependency');
