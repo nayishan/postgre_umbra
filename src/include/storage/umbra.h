@@ -41,6 +41,12 @@ typedef struct UmbraSlotShift
 	bool		selected;
 } UmbraSlotShift;
 
+typedef struct UmbraCheckpointWritebackRequest
+{
+	BlockNumber lblkno;
+	uint8		checkpoint_slot;
+} UmbraCheckpointWritebackRequest;
+
 /* A zero selector chooses slot 0; WAL-backed shifts can choose slots 1 or 2. */
 static inline bool
 UmbraActiveSlotIsValid(uint8 active_slot)
@@ -167,10 +173,10 @@ extern bool UmCheckpointWritePredecessorSlot(SMgrRelation reln,
 										 BlockNumber lblkno,
 										 const void *buffer,
 										 uint8 *source_slot);
-extern void UmCheckpointWritebackSourceSlot(SMgrRelation reln,
-											ForkNumber forknum,
-											BlockNumber lblkno,
-											uint8 source_slot);
+extern void UmCheckpointWritebackSourceSlots(SMgrRelation reln,
+											 ForkNumber forknum,
+											 const UmbraCheckpointWritebackRequest *requests,
+											 int nrequests);
 extern bool UmRedoSetActiveSlot(SMgrRelation reln, ForkNumber forknum,
 								 BlockNumber logical_block, uint8 active_slot);
 extern bool UmRedoSlotShift(SMgrRelation reln, ForkNumber forknum,
