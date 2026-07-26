@@ -930,14 +930,19 @@ um_refresh_mapping_policy(SMgrRelation reln, ForkNumber forknum)
 		return;
 	}
 
+	if ((forknum == FSM_FORKNUM && state->fsm_slot0_active) ||
+		(forknum == VISIBILITYMAP_FORKNUM && state->vm_slot0_active))
+	{
+		Assert(state->main_slot0_active);
+		return;
+	}
+
 	/* Auxiliary mapping never exists before the MAIN root policy. */
 	um_refresh_mapping_policy(reln, MAIN_FORKNUM);
 	if (!state->main_slot0_active)
 		return;
 	if (forknum == FSM_FORKNUM)
 	{
-		if (state->fsm_slot0_active)
-			return;
 		if (InRecovery)
 		{
 			if (!ummap_try_aux_slot0_active(state->filectx, FSM_FORKNUM,
@@ -952,8 +957,6 @@ um_refresh_mapping_policy(SMgrRelation reln, ForkNumber forknum)
 		return;
 	}
 
-	if (state->vm_slot0_active)
-		return;
 	if (InRecovery)
 	{
 		if (!ummap_try_aux_slot0_active(state->filectx, VISIBILITYMAP_FORKNUM,
