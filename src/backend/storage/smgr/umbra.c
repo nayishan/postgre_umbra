@@ -396,7 +396,9 @@ UmRedoSetActiveSlot(SMgrRelation reln, ForkNumber forknum,
 	UmbraSmgrRelationState *state;
 	UmbraFileContext *ctx;
 	BlockNumber	logical_eof;
+	BlockNumber	physical_block;
 	BlockNumber	physical_capacity;
+	BlockNumber	required_eof;
 	bool		root_active = false;
 
 	if (!InRecovery || reln == NULL ||
@@ -410,33 +412,67 @@ UmRedoSetActiveSlot(SMgrRelation reln, ForkNumber forknum,
 	ctx = um_get_filectx(reln);
 	Assert(state != NULL);
 
-	/* Image-free redo must never create or repair a missing source. */
+	/* Image-free MAIN redo must never create or repair a missing source. */
 	if (forknum == MAIN_FORKNUM)
 	{
 		if (!ummap_try_main_slot0_active(ctx, reln->smgr_rlocator,
 										&root_active) || !root_active)
 			return false;
 		state->main_slot0_active = true;
+		state->uses_map = true;
+		logical_eof = um_get_mapped_frontier(reln, forknum);
+		physical_capacity = um_mapped_capacity(reln, forknum, logical_eof);
+		if (logical_block >= logical_eof ||
+			!umfile_exists(ctx, forknum) ||
+			umfile_nblocks(ctx, forknum) < physical_capacity)
+			return false;
 	}
 	else
 	{
-		if (!ummap_try_aux_slot0_active(ctx, forknum, reln->smgr_rlocator,
-									   &root_active) || !root_active)
+		/* MAIN root authority is required before auxiliary birth recovery. */
+		if (!ummap_try_main_slot0_active(ctx, reln->smgr_rlocator,
+										&root_active) || !root_active)
 			return false;
-		/* Root validation requires MAIN activation before either auxiliary. */
 		state->main_slot0_active = true;
+		state->uses_map = true;
+
+		/*
+		 * The block reference proves only the minimum auxiliary frontier.  Do
+		 * not materialize capacity until the recorded source slot is known to
+		 * have survived the crash, or zero-extension could fabricate it.
+		 */
+		if (!UmbraActiveSlotPhysicalBlock(logical_block, active_slot,
+										   &physical_block) ||
+			!umfile_exists(ctx, forknum) ||
+			umfile_nblocks(ctx, forknum) <= physical_block)
+			return false;
+
+		if (!ummap_try_aux_slot0_active(ctx, forknum, reln->smgr_rlocator,
+									   &root_active))
+			return false;
+		if (!root_active)
+			ummap_activate_aux_slot0(ctx, forknum, reln->smgr_rlocator);
 		if (forknum == FSM_FORKNUM)
 			state->fsm_slot0_active = true;
 		else
 			state->vm_slot0_active = true;
+
+		logical_eof = um_get_mapped_frontier(reln, forknum);
+		required_eof = um_mapped_range_end(reln, forknum, logical_block, 1);
+		if (logical_eof < required_eof)
+		{
+			logical_eof = required_eof;
+			physical_capacity = um_mapped_capacity(reln, forknum, logical_eof);
+			um_ensure_mapped_capacity(reln, forknum, physical_capacity, true);
+			um_publish_mapped_after_data(reln, forknum, logical_eof);
+		}
+		else
+		{
+			physical_capacity = um_mapped_capacity(reln, forknum, logical_eof);
+			um_ensure_mapped_capacity(reln, forknum, physical_capacity, true);
+		}
+		reln->smgr_cached_nblocks[forknum] = InvalidBlockNumber;
 	}
-	state->uses_map = true;
-	logical_eof = um_get_mapped_frontier(reln, forknum);
-	physical_capacity = um_mapped_capacity(reln, forknum, logical_eof);
-	if (logical_block >= logical_eof ||
-		!umfile_exists(ctx, forknum) ||
-		umfile_nblocks(ctx, forknum) < physical_capacity)
-		return false;
 
 	MapRedoSetActiveSlot(ctx, reln->smgr_rlocator, forknum, logical_block,
 						 active_slot);
