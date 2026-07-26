@@ -873,11 +873,7 @@ bool
 umpreparependingsync(SMgrRelation reln)
 {
 	um_refresh_mapping_policy(reln, MAIN_FORKNUM);
-	um_refresh_mapping_policy(reln, FSM_FORKNUM);
-	um_refresh_mapping_policy(reln, VISIBILITYMAP_FORKNUM);
-	return um_fork_uses_mapped_slots(reln, MAIN_FORKNUM) ||
-		um_fork_uses_mapped_slots(reln, FSM_FORKNUM) ||
-		um_fork_uses_mapped_slots(reln, VISIBILITYMAP_FORKNUM);
+	return um_fork_uses_mapped_slots(reln, MAIN_FORKNUM);
 }
 
 int
