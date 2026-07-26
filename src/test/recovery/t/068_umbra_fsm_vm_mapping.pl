@@ -21,8 +21,6 @@ use constant ROOT_FLAG_VM_SLOT0 => 0x00000008;
 use constant ROOT_FLAGS_OFFSET => 16;
 use constant ROOT_LOGICAL_FSM_OFFSET => 24;
 use constant ROOT_LOGICAL_VM_OFFSET => 28;
-use constant ROOT_PHYSICAL_FSM_OFFSET => 44;
-use constant ROOT_PHYSICAL_VM_OFFSET => 48;
 
 sub expected_capacity
 {
@@ -44,13 +42,15 @@ sub aux_root_state
 {
 	my ($map_path) = @_;
 	my $root = slurp_file($map_path);
+	my $fsm_eof = root_u32($root, ROOT_LOGICAL_FSM_OFFSET);
+	my $vm_eof = root_u32($root, ROOT_LOGICAL_VM_OFFSET);
 
 	return {
 		flags => root_u32($root, ROOT_FLAGS_OFFSET),
-		fsm_eof => root_u32($root, ROOT_LOGICAL_FSM_OFFSET),
-		vm_eof => root_u32($root, ROOT_LOGICAL_VM_OFFSET),
-		fsm_capacity => root_u32($root, ROOT_PHYSICAL_FSM_OFFSET),
-		vm_capacity => root_u32($root, ROOT_PHYSICAL_VM_OFFSET),
+		fsm_eof => $fsm_eof,
+		vm_eof => $vm_eof,
+		fsm_capacity => expected_capacity($fsm_eof),
+		vm_capacity => expected_capacity($vm_eof),
 	};
 }
 
@@ -75,14 +75,10 @@ sub check_aux_layout
 		cmp_ok($state->{vm_eof}, '>', 0,
 			"$label: VM logical EOF is tracked");
 	}
-	is($state->{fsm_capacity}, expected_capacity($state->{fsm_eof}),
-		"$label: FSM capacity follows the mapped three-slot formula");
-	is($state->{vm_capacity}, expected_capacity($state->{vm_eof}),
-		"$label: VM capacity follows the mapped three-slot formula");
 	is(-s $fsm_path, $state->{fsm_capacity} * $block_size,
-		"$label: FSM physical file reaches its published capacity");
+		"$label: FSM physical file reaches its derived capacity");
 	is(-s $vm_path, $state->{vm_capacity} * $block_size,
-		"$label: VM physical file reaches its published capacity");
+		"$label: VM physical file reaches its derived capacity");
 
 	return $state;
 }

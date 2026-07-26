@@ -18,8 +18,7 @@ use constant ROOT_FLAG_MAIN_SLOT0 => 0x00000003;
 use constant ROOT_FLAGS_OFFSET => 16;
 use constant ROOT_LOGICAL_EOF_OFFSET => 20;
 use constant ROOT_RESERVED_OFFSET => 32;
-use constant ROOT_PHYSICAL_CAPACITY_OFFSET => 40;
-use constant ROOT_TRAILING_RESERVED_OFFSET => 52;
+use constant ROOT_RESERVED_LENGTH => 28;
 
 sub expected_capacity
 {
@@ -49,20 +48,15 @@ sub check_layout
 	my $root_flags = unpack('L', substr($root, ROOT_FLAGS_OFFSET, 4));
 	my $root_logical_eof =
 	  unpack('L', substr($root, ROOT_LOGICAL_EOF_OFFSET, 4));
-	my $root_physical_capacity =
-	  unpack('L', substr($root, ROOT_PHYSICAL_CAPACITY_OFFSET, 4));
 	my $physical_bytes = -s $node->data_dir . "/$main_path";
 
 	is($root_flags & ROOT_FLAG_MAIN_SLOT0, ROOT_FLAG_MAIN_SLOT0,
 		"$label: root activates MAIN slot-0 mapping");
 	is($root_logical_eof, $logical_eof,
 		"$label: root stores the exact logical EOF");
-	is(substr($root, ROOT_RESERVED_OFFSET, 8), "\0" x 8,
-		"$label: root keeps the reserved generation bytes zero");
-	is($root_physical_capacity, $physical_capacity,
-		"$label: root stores chunk-aligned physical capacity");
-	is(substr($root, ROOT_TRAILING_RESERVED_OFFSET, 8), "\0" x 8,
-		"$label: root keeps trailing reserved bytes zero");
+	is(substr($root, ROOT_RESERVED_OFFSET, ROOT_RESERVED_LENGTH),
+		"\0" x ROOT_RESERVED_LENGTH,
+		"$label: root leaves derived capacity unstored");
 	is($physical_bytes, $physical_capacity * $block_size,
 		"$label: durable MAIN file has the published physical capacity");
 
