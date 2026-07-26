@@ -560,14 +560,9 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	}
 
 	logical_eof = um_get_mapped_frontier(reln, forknum);
+	Assert(blocknum >= logical_eof);
 	physical_block = um_active_pblk(reln, forknum, blocknum);
 	buffers[0] = buffer;
-	if (blocknum < logical_eof)
-	{
-		umfile_writev(um_get_filectx(reln), forknum, physical_block,
-					  buffers, 1, skipFsync);
-		return;
-	}
 
 	logical_end = um_mapped_range_end(reln, forknum, blocknum, 1);
 	physical_capacity = um_mapped_capacity(reln, forknum, logical_end);
