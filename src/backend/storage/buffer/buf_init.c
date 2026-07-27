@@ -20,6 +20,9 @@
 #include "storage/proclist.h"
 #include "storage/shmem.h"
 #include "storage/subsystems.h"
+#ifdef USE_UMBRA
+#include "storage/umbra.h"
+#endif
 
 BufferDescPadded *BufferDescriptors;
 char	   *BufferBlocks;
@@ -28,6 +31,8 @@ WritebackContext BackendWritebackContext;
 CkptSortItem *CkptBufferIds;
 #ifdef USE_UMBRA
 uint64	   *CkptBufferShiftEpochs;
+uint8	   *UmbraBufferActiveSlots;
+bool	   *UmbraBufferSelectorPagePresent;
 pg_atomic_uint64 *CkptBufferShiftEpochState;
 #endif
 
@@ -118,6 +123,14 @@ BufferManagerShmemRequest(void *arg)
 					   .size = NBuffers * sizeof(uint64),
 					   .ptr = (void **) &CkptBufferShiftEpochs,
 		);
+	ShmemRequestStruct(.name = "Umbra Buffer Active Slots",
+					   .size = NBuffers * sizeof(uint8),
+					   .ptr = (void **) &UmbraBufferActiveSlots,
+		);
+	ShmemRequestStruct(.name = "Umbra Buffer Selector Page Presence",
+					   .size = NBuffers * sizeof(bool),
+					   .ptr = (void **) &UmbraBufferSelectorPagePresent,
+		);
 	ShmemRequestStruct(.name = "Checkpoint Buffer Shift Epoch State",
 					   .size = sizeof(pg_atomic_uint64),
 					   .ptr = (void **) &CkptBufferShiftEpochState,
@@ -154,6 +167,8 @@ BufferManagerShmemInit(void *arg)
 
 #ifdef USE_UMBRA
 		CkptBufferShiftEpochs[i] = 0;
+		UmbraBufferActiveSlots[i] = UMBRA_ACTIVE_SLOT_INVALID;
+		UmbraBufferSelectorPagePresent[i] = false;
 #endif
 		pgaio_wref_clear(&buf->io_wref);
 

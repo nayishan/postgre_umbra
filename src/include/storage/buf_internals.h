@@ -399,10 +399,18 @@ typedef enum PendingWritebackKind
 	PENDING_WB_KIND_COUNT
 } PendingWritebackKind;
 
+typedef enum PendingWritebackTargetKind
+{
+	PENDING_WB_TARGET_PHYSICAL,
+	PENDING_WB_TARGET_UMBRA_SLOT
+} PendingWritebackTargetKind;
+
 typedef struct PendingWriteback
 {
 	BufferTag	tag;
 	BlockNumber physical_block;
+	uint8		umbra_slot;
+	uint8		target_kind;
 	uint8		kind;
 } PendingWriteback;
 
@@ -434,6 +442,8 @@ extern PGDLLIMPORT ConditionVariableMinimallyPadded *BufferIOCVArray;
 extern PGDLLIMPORT WritebackContext BackendWritebackContext;
 #ifdef USE_UMBRA
 extern PGDLLIMPORT uint64 *CkptBufferShiftEpochs;
+extern PGDLLIMPORT uint8 *UmbraBufferActiveSlots;
+extern PGDLLIMPORT bool *UmbraBufferSelectorPagePresent;
 extern PGDLLIMPORT pg_atomic_uint64 *CkptBufferShiftEpochState;
 #endif
 

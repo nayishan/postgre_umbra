@@ -292,8 +292,15 @@ extern char *DebugPrintBufferRefcount(Buffer buffer);
 extern void CheckPointBuffersShiftEpochBegin(void);
 extern void CheckPointBuffersPrepare(int flags);
 extern void CheckPointBuffersAbort(void);
-extern void BufferSaveCheckpointShiftEpoch(Buffer buffer,
-										XLogRecPtr shift_end_lsn);
+extern bool BufferGetUmbraActiveSlot(Buffer buffer, uint8 *active_slot,
+									 bool *selector_page_present);
+extern void BufferRememberUmbraActiveSlot(Buffer buffer, uint8 active_slot,
+										  bool selector_page_present);
+extern void BufferPublishUmbraSlotShift(Buffer buffer,
+										XLogRecPtr shift_end_lsn,
+										uint8 source_slot,
+										uint8 target_slot,
+										bool capture_checkpoint_source);
 #endif
 extern void CheckPointBuffers(int flags);
 extern BlockNumber BufferGetBlockNumber(Buffer buffer);

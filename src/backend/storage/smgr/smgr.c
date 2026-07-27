@@ -367,6 +367,25 @@ smgropen(RelFileLocator rlocator, ProcNumber backend)
 	return reln;
 }
 
+#ifdef USE_UMBRA
+/*
+ * Find an already-open relation handle without allocating.  WAL assembly can
+ * run inside a critical section, so a miss must retain the ordinary FPI.
+ */
+SMgrRelation
+smgrlookup(RelFileLocator rlocator, ProcNumber backend)
+{
+	RelFileLocatorBackend brlocator;
+
+	if (SMgrRelationHash == NULL)
+		return NULL;
+	brlocator.locator = rlocator;
+	brlocator.backend = backend;
+	return (SMgrRelation) hash_search(SMgrRelationHash, &brlocator,
+									 HASH_FIND, NULL);
+}
+#endif
+
 /*
  * smgrpin() -- Prevent an SMgrRelation object from being destroyed at end of
  *				transaction
@@ -1249,6 +1268,8 @@ pgaio_io_set_target_smgr(PgAioHandle *ioh,
 	sd->smgr.blockNum = blocknum;
 	sd->smgr.physicalBlockNum = blocknum;
 	sd->smgr.nblocks = nblocks;
+	sd->smgr.umbraActiveSlot = UINT8_MAX;
+	sd->smgr.umbraSelectorPagePresent = false;
 	sd->smgr.is_temp = SmgrIsTemp(smgr);
 	/* Temp relations should never be fsync'd */
 	sd->smgr.skip_fsync = skip_fsync && !SmgrIsTemp(smgr);
