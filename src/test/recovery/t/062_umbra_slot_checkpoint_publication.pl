@@ -135,9 +135,9 @@ $update->query_until(qr/preload_done/, '');
 my $marker = 'pre-redo-publication-marker';
 $update->query_until(
 	qr/update_started/,
-	qq(\echo update_started
+	qq(\\echo update_started
 UPDATE umbra_slot_checkpoint_publication SET payload = '$marker' WHERE id = 1;
-\echo update_done
+\\echo update_done
 ));
 $node->wait_for_event('client backend',
 	'umbra-mapping-after-wal-before-publish');

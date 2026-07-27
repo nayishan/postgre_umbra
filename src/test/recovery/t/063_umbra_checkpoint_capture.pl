@@ -176,9 +176,9 @@ $writer->query_until(qr/preload_done/, '');
 my $marker = 'shift-epoch-marker';
 $writer->query_until(
 	qr/update_started/,
-	qq(\echo update_started
+	qq(\\echo update_started
 UPDATE umbra_checkpoint_capture SET payload = '$marker' WHERE id = 1;
-\echo update_done
+\\echo update_done
 ));
 $node->wait_for_event('client backend',
 	'umbra-mapping-after-wal-before-publish');
@@ -214,14 +214,14 @@ ok(index(read_physical_block($main_path, $block_size,
 			source_slot_block($target_block, 1)), $marker) < 0,
 	'C1 leaves the published target dirty for the next checkpoint');
 
+$node->safe_psql(
+	'postgres', q[
+SELECT injection_points_detach('umbra-checkpoint-after-shift-epoch')]);
 $node->safe_psql('postgres', 'CHECKPOINT');
 ok(index(read_physical_block($main_path, $block_size,
 			source_slot_block($target_block, 1)), $marker) >= 0,
 	'C2 writes the retained page to the published target');
 
-$node->safe_psql(
-	'postgres', q[
-SELECT injection_points_detach('umbra-checkpoint-after-shift-epoch')]);
 $node->safe_psql(
 	'postgres', q[
 SELECT injection_points_detach(
