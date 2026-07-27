@@ -41,12 +41,6 @@ typedef struct UmbraSlotShift
 	bool		selected;
 } UmbraSlotShift;
 
-typedef struct UmbraCheckpointWritebackRequest
-{
-	BlockNumber lblkno;
-	uint8		checkpoint_slot;
-} UmbraCheckpointWritebackRequest;
-
 /* A zero selector chooses slot 0; WAL-backed shifts can choose slots 1 or 2. */
 static inline bool
 UmbraActiveSlotIsValid(uint8 active_slot)
@@ -135,9 +129,11 @@ extern bool umexists(SMgrRelation reln, ForkNumber forknum);
 extern void umunlink(RelFileLocatorBackend rlocator, ForkNumber forknum,
 					 bool isRedo);
 extern void umextend(SMgrRelation reln, ForkNumber forknum,
-					 BlockNumber blocknum, const void *buffer, bool skipFsync);
+					 BlockNumber blocknum, const void *buffer, bool skipFsync,
+					 BlockNumber *physical_block);
 extern void umzeroextend(SMgrRelation reln, ForkNumber forknum,
-						 BlockNumber blocknum, int nblocks, bool skipFsync);
+						 BlockNumber blocknum, int nblocks, bool skipFsync,
+						 BlockNumber *physical_blocks);
 extern bool umprefetch(SMgrRelation reln, ForkNumber forknum,
 					   BlockNumber blocknum, int nblocks);
 extern uint32 ummaxcombine(SMgrRelation reln, ForkNumber forknum,
@@ -150,9 +146,12 @@ extern void umstartreadv(PgAioHandle *ioh,
 						 void **buffers, BlockNumber nblocks);
 extern void umwritev(SMgrRelation reln, ForkNumber forknum,
 					 BlockNumber blocknum, const void **buffers,
-					 BlockNumber nblocks, bool skipFsync);
+					 BlockNumber nblocks, bool skipFsync,
+					 BlockNumber *physical_blocks);
 extern void umwriteback(SMgrRelation reln, ForkNumber forknum,
 						BlockNumber blocknum, BlockNumber nblocks);
+extern void umwritebackphysical(SMgrRelation reln, ForkNumber forknum,
+								BlockNumber blocknum, BlockNumber nblocks);
 extern BlockNumber umnblocks(SMgrRelation reln, ForkNumber forknum);
 extern void umpreparetruncate(SMgrRelation reln, ForkNumber *forknum,
 						 int nforks, BlockNumber *old_blocks,
@@ -172,11 +171,7 @@ extern bool UmCheckpointWritePredecessorSlot(SMgrRelation reln,
 										 ForkNumber forknum,
 										 BlockNumber lblkno,
 										 const void *buffer,
-										 uint8 *source_slot);
-extern void UmCheckpointWritebackSourceSlots(SMgrRelation reln,
-											 ForkNumber forknum,
-											 const UmbraCheckpointWritebackRequest *requests,
-											 int nrequests);
+										 BlockNumber *physical_block);
 extern bool UmRedoSetActiveSlot(SMgrRelation reln, ForkNumber forknum,
 								 BlockNumber logical_block, uint8 active_slot);
 extern bool UmRedoSlotShift(SMgrRelation reln, ForkNumber forknum,

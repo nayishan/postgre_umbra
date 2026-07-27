@@ -486,7 +486,7 @@ mdunlinkfork(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
  */
 void
 mdextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
-		 const void *buffer, bool skipFsync)
+		 const void *buffer, bool skipFsync, BlockNumber *physical_block)
 {
 	pgoff_t		seekpos;
 	int			nbytes;
@@ -519,6 +519,8 @@ mdextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	seekpos = (pgoff_t) BLCKSZ * (blocknum % ((BlockNumber) RELSEG_SIZE));
 
 	Assert(seekpos < (pgoff_t) BLCKSZ * RELSEG_SIZE);
+	if (physical_block != NULL)
+		*physical_block = InvalidBlockNumber;
 
 	if ((nbytes = FileWrite(v->mdfd_vfd, buffer, BLCKSZ, seekpos, WAIT_EVENT_DATA_FILE_EXTEND)) != BLCKSZ)
 	{
@@ -539,6 +541,8 @@ mdextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 	if (!skipFsync && !SmgrIsTemp(reln))
 		register_dirty_segment(reln, forknum, v);
+	if (physical_block != NULL)
+		*physical_block = blocknum;
 
 	Assert(_mdnblocks(reln, forknum, v) <= ((BlockNumber) RELSEG_SIZE));
 }
@@ -551,13 +555,19 @@ mdextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
  */
 void
 mdzeroextend(SMgrRelation reln, ForkNumber forknum,
-			 BlockNumber blocknum, int nblocks, bool skipFsync)
+			 BlockNumber blocknum, int nblocks, bool skipFsync,
+			 BlockNumber *physical_blocks)
 {
 	MdfdVec    *v;
 	BlockNumber curblocknum = blocknum;
 	int			remblocks = nblocks;
 
 	Assert(nblocks > 0);
+	if (physical_blocks != NULL)
+	{
+		for (int i = 0; i < nblocks; i++)
+			physical_blocks[i] = InvalidBlockNumber;
+	}
 
 	/* This assert is too expensive to have on normally ... */
 #ifdef CHECK_WRITE_VS_EXTEND
@@ -654,6 +664,11 @@ mdzeroextend(SMgrRelation reln, ForkNumber forknum,
 
 		if (!skipFsync && !SmgrIsTemp(reln))
 			register_dirty_segment(reln, forknum, v);
+		if (physical_blocks != NULL)
+		{
+			for (int i = 0; i < numblocks; i++)
+				physical_blocks[(curblocknum - blocknum) + i] = curblocknum + i;
+		}
 
 		Assert(_mdnblocks(reln, forknum, v) <= ((BlockNumber) RELSEG_SIZE));
 
@@ -1069,7 +1084,8 @@ mdstartreadv(PgAioHandle *ioh,
  */
 void
 mdwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
-		 const void **buffers, BlockNumber nblocks, bool skipFsync)
+		 const void **buffers, BlockNumber nblocks, bool skipFsync,
+		 BlockNumber *physical_blocks)
 {
 	/* This assert is too expensive to have on normally ... */
 #ifdef CHECK_WRITE_VS_EXTEND
@@ -1158,6 +1174,12 @@ mdwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 		if (!skipFsync && !SmgrIsTemp(reln))
 			register_dirty_segment(reln, forknum, v);
+		if (physical_blocks != NULL)
+		{
+			for (BlockNumber i = 0; i < nblocks_this_segment; i++)
+				physical_blocks[i] = blocknum + i;
+			physical_blocks += nblocks_this_segment;
+		}
 
 		nblocks -= nblocks_this_segment;
 		buffers += nblocks_this_segment;
@@ -1221,6 +1243,13 @@ mdwriteback(SMgrRelation reln, ForkNumber forknum,
 		nblocks -= nflush;
 		blocknum += nflush;
 	}
+}
+
+void
+mdwritebackphysical(SMgrRelation reln, ForkNumber forknum,
+					BlockNumber blocknum, BlockNumber nblocks)
+{
+	mdwriteback(reln, forknum, blocknum, nblocks);
 }
 
 /*
@@ -1810,7 +1839,7 @@ _mdfd_getseg(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 
 				mdextend(reln, forknum,
 						 nextsegno * ((BlockNumber) RELSEG_SIZE) - 1,
-						 zerobuf, skipFsync);
+						 zerobuf, skipFsync, NULL);
 				pfree(zerobuf);
 			}
 			flags = O_CREAT;
