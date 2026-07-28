@@ -94,12 +94,20 @@ gistkillitems(IndexScanDesc scan)
 
 		offnum = so->killedItems[i];
 		iid = PageGetItemId(page, offnum);
+#ifdef USE_UMBRA
+		BufferRegisterHintDeltaRange(&hint_delta, iid, sizeof(ItemIdData));
+#endif
 		ItemIdMarkDead(iid);
 		killedsomething = true;
 	}
 
 	if (killedsomething)
 	{
+#ifdef USE_UMBRA
+		BufferRegisterHintDeltaRange(&hint_delta,
+								 &GistPageGetOpaque(page)->flags,
+								 sizeof(GistPageGetOpaque(page)->flags));
+#endif
 		GistMarkPageHasGarbage(page);
 #ifdef USE_UMBRA
 		BufferFinishHintDelta(&hint_delta, true, true);

@@ -365,6 +365,9 @@ _bt_killitems(IndexScanDesc scan)
 				}
 
 				/* found the item/all posting list items */
+#ifdef USE_UMBRA
+				BufferRegisterHintDeltaRange(&hint_delta, iid, sizeof(ItemIdData));
+#endif
 				ItemIdMarkDead(iid);
 				killedsomething = true;
 				break;			/* out of inner search loop */
@@ -382,6 +385,10 @@ _bt_killitems(IndexScanDesc scan)
 	 */
 	if (killedsomething)
 	{
+#ifdef USE_UMBRA
+		BufferRegisterHintDeltaRange(&hint_delta, &opaque->btpo_flags,
+								 sizeof(opaque->btpo_flags));
+#endif
 		opaque->btpo_flags |= BTP_HAS_GARBAGE;
 #ifdef USE_UMBRA
 		BufferFinishHintDelta(&hint_delta, true, true);
