@@ -62,6 +62,9 @@ typedef struct UmfdVec
 struct UmbraFileContext
 {
 	RelFileLocatorBackend rlocator;
+	/* Registered contexts belong to normal relation handles in the hash. */
+	/* Unregistered contexts exist for one shared-cache writeback only. */
+	bool		registered;
 	int			num_open_segs[UMBRA_NUM_FORKS];
 	UmfdVec    *seg_fds[UMBRA_NUM_FORKS];
 };
@@ -588,6 +591,7 @@ umfile_write_bytes(UmbraFileContext *ctx, ForkNumber forknum,
 	int			written;
 
 	Assert(ctx != NULL);
+	Assert(UmbraForkNumberIsValid(forknum));
 	Assert(forknum == UMBRA_METADATA_FORKNUM);
 	Assert(buffer != NULL);
 	Assert(nbytes > 0 && nbytes <= BLCKSZ);
@@ -667,9 +671,30 @@ umfile_open(RelFileLocatorBackend rlocator)
 		elog(ERROR, "duplicate Umbra file context");
 
 	ctx->rlocator = rlocator;
+	ctx->registered = true;
 	memset(ctx->num_open_segs, 0, sizeof(ctx->num_open_segs));
 	memset(ctx->seg_fds, 0, sizeof(ctx->seg_fds));
 
+	return ctx;
+}
+
+/*
+ * Create an unregistered, backend-local context for one shared-cache
+ * writeback.  Shared root-cache entries have no owning relation handle, but
+ * file descriptors remain local to the backend that performs I/O.  Keep this
+ * context out of the relation registry so it cannot collide with a normal
+ * relation context.  The caller must destroy it when that writeback completes.
+ */
+UmbraFileContext *
+umfile_open_temporary(RelFileLocatorBackend rlocator)
+{
+	UmbraFileContext *ctx;
+
+	if (UmFileContextHash == NULL)
+		umfile_init();
+
+	ctx = MemoryContextAllocZero(UmFileCxt, sizeof(UmbraFileContext));
+	ctx->rlocator = rlocator;
 	return ctx;
 }
 
@@ -697,12 +722,15 @@ umfile_close(UmbraFileContext *ctx, ForkNumber forknum)
 	}
 }
 
-/* Release a registered Umbra file context. */
+/*
+ * Release a backend-local Umbra file context and its cached descriptors.
+ * Registered contexts are removed from the relation registry; unregistered
+ * cache-writeback contexts are freed directly.
+ */
 void
 umfile_destroy(UmbraFileContext *ctx)
 {
 	ForkNumber	forknum;
-	RelFileLocatorBackend rlocator;
 
 	if (ctx == NULL)
 		return;
@@ -710,9 +738,15 @@ umfile_destroy(UmbraFileContext *ctx)
 	for (forknum = 0; forknum <= UMBRA_METADATA_FORKNUM; forknum++)
 		umfile_close(ctx, forknum);
 
-	rlocator = ctx->rlocator;
-	if (hash_search(UmFileContextHash, &rlocator, HASH_REMOVE, NULL) == NULL)
-		elog(ERROR, "Umbra file context registry corrupted");
+	if (ctx->registered)
+	{
+		RelFileLocatorBackend rlocator = ctx->rlocator;
+
+		if (hash_search(UmFileContextHash, &rlocator, HASH_REMOVE, NULL) == NULL)
+			elog(ERROR, "Umbra file context registry corrupted");
+	}
+	else
+		pfree(ctx);
 }
 
 /* Initiate asynchronous read of relation blocks. */

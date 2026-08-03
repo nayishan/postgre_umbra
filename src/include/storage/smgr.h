@@ -99,6 +99,25 @@ extern void smgrcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
 extern void smgrinitnewrelation(SMgrRelation reln, bool needs_wal);
 /* Complete authoritative CREATE redo after the physical fork exists. */
 extern void smgrfinishcreate(SMgrRelation reln, ForkNumber forknum);
+/* Complete selected-smgr checkpoint work at the caller's ordering point. */
+extern void smgrcheckpoint(void);
+/*
+ * Flush selected-smgr private cache state for dbid/spcOid after ordinary
+ * buffer writeback and before copying files.  This callback may perform I/O.
+ */
+extern void smgrflushdatabasetablespacecache(Oid dbid, Oid spcOid);
+/*
+ * Discard selected-smgr private cache state for a database after ordinary
+ * buffers are dropped and before its files disappear.  It must not perform
+ * I/O.
+ */
+extern void smgrinvalidatedatabasecache(Oid dbid);
+/*
+ * Discard selected-smgr private cache state for one database tablespace after
+ * ordinary buffers are dropped and before its files move.  It must not
+ * perform I/O.
+ */
+extern void smgrinvalidatedatabasetablespacecache(Oid dbid, Oid spcOid);
 extern void smgrdosyncall(SMgrRelation *rels, int nrels);
 extern void smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo);
 extern void smgrextend(SMgrRelation reln, ForkNumber forknum,

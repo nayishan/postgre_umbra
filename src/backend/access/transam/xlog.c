@@ -95,6 +95,7 @@
 #include "storage/procarray.h"
 #include "storage/procsignal.h"
 #include "storage/reinit.h"
+#include "storage/smgr.h"
 #include "storage/spin.h"
 #include "storage/subsystems.h"
 #include "storage/sync.h"
@@ -8061,7 +8062,14 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 	CheckPointSUBTRANS();
 	CheckPointMultiXact();
 	CheckPointPredicate();
+
+	/*
+	 * Issue buffer writes before checkpointing storage-manager metadata.  The
+	 * hook may synchronize relation data before publishing metadata that makes
+	 * those pages reachable.
+	 */
 	CheckPointBuffers(flags);
+	smgrcheckpoint();
 
 	/* Perform all queued up fsyncs */
 	TRACE_POSTGRESQL_BUFFER_CHECKPOINT_SYNC_START();

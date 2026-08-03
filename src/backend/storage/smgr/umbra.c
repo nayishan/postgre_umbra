@@ -64,9 +64,9 @@ umopen(SMgrRelation reln)
 	if (state->filectx == NULL)
 		state->filectx = umfile_open(reln->smgr_rlocator);
 
-	/* Normal opens validate an existing root before using its metadata. */
+	/* CREATE redo repairs a deterministic root before normal validation. */
 	if (!InRecovery && !RelFileLocatorBackendIsTemp(reln->smgr_rlocator))
-		ummap_validate_if_exists(state->filectx);
+		ummap_validate_if_exists(state->filectx, reln->smgr_rlocator);
 }
 
 void
@@ -99,6 +99,12 @@ umdestroy(SMgrRelation reln)
 void
 umcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 {
+	/*
+	 * Page redo can reach this generic path to recreate a missing MAIN fork.
+	 * Its locator and isRedo flag do not identify persistence, and catalog
+	 * lookup is not safe during recovery.  Only XLOG_SMGR_CREATE redo calls
+	 * smgrfinishcreate() to establish the private relation metadata.
+	 */
 	umfile_create(um_get_filectx(reln), forknum, isRedo);
 }
 
@@ -108,7 +114,7 @@ uminitnewrelation(SMgrRelation reln, bool needs_wal)
 	Assert(reln->smgr_private != NULL);
 
 	if (needs_wal)
-		ummap_create(um_get_filectx(reln), false);
+		ummap_create(um_get_filectx(reln), reln->smgr_rlocator, false);
 }
 
 void
@@ -119,8 +125,35 @@ umfinishcreate(SMgrRelation reln, ForkNumber forknum)
 		return;
 
 	Assert(InRecovery);
-	/* Only XLOG_SMGR_CREATE redo may establish relation-wide metadata. */
-	ummap_create(um_get_filectx(reln), true);
+	ummap_create(um_get_filectx(reln), reln->smgr_rlocator, true);
+}
+
+/* Flush Umbra's private metadata-root cache at the checkpoint boundary. */
+void
+umcheckpoint(void)
+{
+	ummap_checkpoint();
+}
+
+/* Flush Umbra's metadata-root cache before copying a database tablespace. */
+void
+umflushdatabasetablespacecache(Oid dbid, Oid spcOid)
+{
+	ummap_flush_database_tablespace_cache(dbid, spcOid);
+}
+
+/* Discard Umbra's metadata-root cache entries for a database without I/O. */
+void
+uminvalidatedatabasecache(Oid dbid)
+{
+	ummap_invalidate_database_cache(dbid);
+}
+
+/* Discard one tablespace's metadata-root cache entries without I/O. */
+void
+uminvalidatedatabasetablespacecache(Oid dbid, Oid spcOid)
+{
+	ummap_invalidate_database_tablespace_cache(dbid, spcOid);
 }
 
 bool
@@ -218,7 +251,7 @@ umimmedsync(SMgrRelation reln, ForkNumber forknum)
 
 	umfile_immedsync(ctx, forknum);
 	if (forknum == MAIN_FORKNUM)
-		ummap_immedsync_if_exists(ctx);
+		ummap_immedsync_if_exists(ctx, reln->smgr_rlocator);
 }
 
 void
@@ -228,7 +261,7 @@ umregistersync(SMgrRelation reln, ForkNumber forknum)
 
 	umfile_registersync(ctx, forknum);
 	if (forknum == MAIN_FORKNUM)
-		ummap_registersync_if_exists(ctx);
+		ummap_registersync_if_exists(ctx, reln->smgr_rlocator);
 }
 
 int

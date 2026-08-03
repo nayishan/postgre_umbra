@@ -86,5 +86,9 @@ PG_SHMEM_SUBSYSTEM(WaitLSNShmemCallbacks)
 PG_SHMEM_SUBSYSTEM(LogicalDecodingCtlShmemCallbacks)
 PG_SHMEM_SUBSYSTEM(DataChecksumsShmemCallbacks)
 
+#ifdef USE_UMBRA
+PG_SHMEM_SUBSYSTEM(UmbraMapRootShmemCallbacks)
+#endif
+
 /* AIO subsystem. This delegates to the method-specific callbacks */
 PG_SHMEM_SUBSYSTEM(AioShmemCallbacks)

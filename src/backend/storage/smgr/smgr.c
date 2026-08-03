@@ -102,6 +102,23 @@ typedef struct f_smgr
 	/* Complete authoritative CREATE redo after the physical fork exists. */
 	void		(*smgr_finish_create) (SMgrRelation reln,
 								 ForkNumber forknum); /* may be NULL */
+	/*
+	 * The caller establishes checkpoint ordering with ordinary buffer writeback.
+	 */
+	void		(*smgr_checkpoint) (void); /* may be NULL */
+	/*
+	 * These database lifecycle hooks cover only selected-smgr private cache
+	 * state.  Core separately owns ordinary buffers, sync requests, and
+	 * backend-local SMgrRelation descriptors.  The caller runs flush after
+	 * ordinary buffer writeback and may perform I/O.  It runs invalidation
+	 * after dropping buffers and before a filesystem operation, so invalidation
+	 * must not perform I/O.
+	 */
+	void		(*smgr_flush_database_tablespace_cache) (Oid dbid,
+											 Oid spcOid); /* may be NULL */
+	void		(*smgr_invalidate_database_cache) (Oid dbid); /* may be NULL */
+	void		(*smgr_invalidate_database_tablespace_cache) (Oid dbid,
+													Oid spcOid); /* may be NULL */
 	bool		(*smgr_exists) (SMgrRelation reln, ForkNumber forknum);
 	void		(*smgr_unlink) (RelFileLocatorBackend rlocator, ForkNumber forknum,
 								bool isRedo);
@@ -153,6 +170,10 @@ static const f_smgr smgrsw[] = {
 		.smgr_create = mdcreate,
 		.smgr_init_new_relation = NULL,
 		.smgr_finish_create = NULL,
+		.smgr_checkpoint = NULL,
+		.smgr_flush_database_tablespace_cache = NULL,
+		.smgr_invalidate_database_cache = NULL,
+		.smgr_invalidate_database_tablespace_cache = NULL,
 		.smgr_exists = mdexists,
 		.smgr_unlink = mdunlink,
 		.smgr_extend = mdextend,
@@ -180,6 +201,12 @@ static const f_smgr smgrsw[] = {
 		.smgr_create = umcreate,
 		.smgr_init_new_relation = uminitnewrelation,
 		.smgr_finish_create = umfinishcreate,
+		.smgr_checkpoint = umcheckpoint,
+		.smgr_flush_database_tablespace_cache =
+			umflushdatabasetablespacecache,
+		.smgr_invalidate_database_cache = uminvalidatedatabasecache,
+		.smgr_invalidate_database_tablespace_cache =
+			uminvalidatedatabasetablespacecache,
 		.smgr_exists = umexists,
 		.smgr_unlink = umunlink,
 		.smgr_extend = umextend,
@@ -560,6 +587,51 @@ smgrfinishcreate(SMgrRelation reln, ForkNumber forknum)
 	if (smgrsw[reln->smgr_which].smgr_finish_create != NULL)
 		smgrsw[reln->smgr_which].smgr_finish_create(reln, forknum);
 	RESUME_INTERRUPTS();
+}
+
+/* Run selected-smgr checkpoint work at the caller's chosen ordering point. */
+void
+smgrcheckpoint(void)
+{
+	if (smgrsw[SMGR_DEFAULT].smgr_checkpoint != NULL)
+		smgrsw[SMGR_DEFAULT].smgr_checkpoint();
+}
+
+/*
+ * Flush selected-smgr private cache state after ordinary buffer writeback and
+ * before copying one database tablespace.  This callback may perform I/O.
+ */
+void
+smgrflushdatabasetablespacecache(Oid dbid, Oid spcOid)
+{
+	if (smgrsw[SMGR_DEFAULT].smgr_flush_database_tablespace_cache != NULL)
+		smgrsw[SMGR_DEFAULT].smgr_flush_database_tablespace_cache(dbid,
+																			  spcOid);
+}
+
+/*
+ * Discard selected-smgr private database cache state after ordinary buffers
+ * are dropped and before database files disappear.  This callback must not
+ * perform I/O.
+ */
+void
+smgrinvalidatedatabasecache(Oid dbid)
+{
+	if (smgrsw[SMGR_DEFAULT].smgr_invalidate_database_cache != NULL)
+		smgrsw[SMGR_DEFAULT].smgr_invalidate_database_cache(dbid);
+}
+
+/*
+ * Discard selected-smgr private cache state for one database tablespace after
+ * ordinary buffers are dropped and before its files move.  This callback must
+ * not perform I/O.
+ */
+void
+smgrinvalidatedatabasetablespacecache(Oid dbid, Oid spcOid)
+{
+	if (smgrsw[SMGR_DEFAULT].smgr_invalidate_database_tablespace_cache != NULL)
+		smgrsw[SMGR_DEFAULT].smgr_invalidate_database_tablespace_cache(dbid,
+																					spcOid);
 }
 
 /*

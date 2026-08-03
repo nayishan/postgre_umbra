@@ -36,6 +36,16 @@ extern void umdestroy(SMgrRelation reln);
 extern void umcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
 extern void uminitnewrelation(SMgrRelation reln, bool needs_wal);
 extern void umfinishcreate(SMgrRelation reln, ForkNumber forknum);
+/* Flush Umbra's private metadata-root cache at the checkpoint boundary. */
+extern void umcheckpoint(void);
+/* Flush Umbra's metadata-root cache before copying a database tablespace. */
+extern void umflushdatabasetablespacecache(Oid dbid, Oid spcOid);
+/* Forget a database's metadata-root cache entries without touching files. */
+extern void uminvalidatedatabasecache(Oid dbid);
+/*
+ * Forget one tablespace's metadata-root cache entries without touching files.
+ */
+extern void uminvalidatedatabasetablespacecache(Oid dbid, Oid spcOid);
 extern bool umexists(SMgrRelation reln, ForkNumber forknum);
 extern void umunlink(RelFileLocatorBackend rlocator, ForkNumber forknum,
 					 bool isRedo);
