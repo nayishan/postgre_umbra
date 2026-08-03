@@ -442,7 +442,9 @@ UmRedoSetActiveSlot(SMgrRelation reln, ForkNumber forknum,
 	UmbraSmgrRelationState *state;
 	UmbraFileContext *ctx;
 	BlockNumber	logical_eof;
+	BlockNumber	physical_block;
 	BlockNumber	physical_capacity;
+	BlockNumber	required_eof;
 	bool		active = false;
 
 	if (!InRecovery || reln == NULL ||
@@ -456,27 +458,58 @@ UmRedoSetActiveSlot(SMgrRelation reln, ForkNumber forknum,
 	ctx = um_get_filectx(reln);
 	Assert(state != NULL);
 
-	/* Image-free redo must never create or repair missing mapping authority. */
+	/* Image-free redo must never create or repair the MAIN root authority. */
 	if (!ummap_try_validate(ctx))
 		return false;
 	um_set_map_policy_mapped(reln);
-	if (UmbraIsMappedAuxiliaryFork(forknum))
+	if (forknum == MAIN_FORKNUM)
 	{
-		if (!ummap_try_aux_slot0_active(ctx, forknum, reln->smgr_rlocator,
-									   &active) || !active)
+		logical_eof = um_get_mapped_frontier(reln, forknum);
+		physical_capacity = um_mapped_capacity(reln, forknum, logical_eof);
+		if (logical_block >= logical_eof ||
+			!umfile_exists(ctx, forknum) ||
+			umfile_nblocks(ctx, forknum) < physical_capacity)
 			return false;
+	}
+	else
+	{
+		/*
+		 * The block reference proves only the minimum auxiliary frontier.  Do
+		 * not materialize capacity until the recorded source slot is known to
+		 * have survived the crash, or zero-extension could fabricate it.
+		 */
+		if (!UmbraActiveSlotPhysicalBlock(logical_block, active_slot,
+										   &physical_block) ||
+			!umfile_exists(ctx, forknum) ||
+			umfile_nblocks(ctx, forknum) <= physical_block)
+			return false;
+
+		if (!ummap_try_aux_slot0_active(ctx, forknum, reln->smgr_rlocator,
+									   &active))
+			return false;
+		if (!active)
+			ummap_activate_aux_slot0(ctx, forknum, reln->smgr_rlocator);
 		if (forknum == FSM_FORKNUM)
 			state->fsm_slot0_active = true;
 		else
 			state->vm_slot0_active = true;
+
+		logical_eof = um_get_mapped_frontier(reln, forknum);
+		required_eof = um_mapped_range_end(reln, forknum, logical_block, 1);
+		if (logical_eof < required_eof)
+		{
+			logical_eof = required_eof;
+			physical_capacity = um_mapped_capacity(reln, forknum, logical_eof);
+			um_ensure_mapped_capacity(reln, forknum, physical_capacity, true);
+			um_publish_mapped_after_data(reln, forknum, logical_eof);
+		}
+		else
+		{
+			physical_capacity = um_mapped_capacity(reln, forknum, logical_eof);
+			um_ensure_mapped_capacity(reln, forknum, physical_capacity, true);
+		}
 		reln->smgr_cached_nblocks[forknum] = InvalidBlockNumber;
 	}
-	logical_eof = um_get_mapped_frontier(reln, forknum);
-	physical_capacity = um_mapped_capacity(reln, forknum, logical_eof);
-	if (logical_block >= logical_eof ||
-		!umfile_exists(ctx, forknum) ||
-		umfile_nblocks(ctx, forknum) < physical_capacity)
-		return false;
 
 	MapRedoSetActiveSlot(ctx, reln->smgr_rlocator, forknum, logical_block,
 						 active_slot);
@@ -846,29 +879,22 @@ umpreparetruncate(SMgrRelation reln, ForkNumber *forknum, int nforks,
 	Assert(state != NULL);
 	Assert(old_blocks != NULL);
 	um_refresh_mapping_policy(reln, MAIN_FORKNUM);
-	um_refresh_mapping_policy(reln, FSM_FORKNUM);
-	um_refresh_mapping_policy(reln, VISIBILITYMAP_FORKNUM);
+	/*
+	 * Mapped umnblocks() returns the root's logical EOF, so unlike mdnblocks()
+	 * it does not open the physical segments.  Prepare the root and each
+	 * selected physical fork before umtruncate() enters its allocation-free
+	 * critical section.
+	 */
 	for (int forkidx = 0; forkidx <= MAX_FORKNUM; forkidx++)
 		state->mapped_truncate[forkidx].prepared = false;
-	/*
-	 * Root publication orders every activated fork, including an auxiliary fork
-	 * not selected by this truncate record.  Recovery must recreate any missing
-	 * physical fork before root preparation opens and syncs those descriptors.
-	 */
-	if (InRecovery)
-	{
-		if (um_fork_uses_mapped_slots(reln, FSM_FORKNUM))
-			um_ensure_aux_recovery_capacity(reln, FSM_FORKNUM);
-		if (um_fork_uses_mapped_slots(reln, VISIBILITYMAP_FORKNUM))
-			um_ensure_aux_recovery_capacity(reln,
-										VISIBILITYMAP_FORKNUM);
-	}
 	for (int i = 0; i < nforks; i++)
 	{
 		UmbraMappedTruncateState *truncate;
 
 		if (!um_fork_uses_mapped_slots(reln, forknum[i]))
 			continue;
+		if (InRecovery && UmbraIsMappedAuxiliaryFork(forknum[i]))
+			um_ensure_aux_recovery_capacity(reln, forknum[i]);
 
 		root_logical_eof = um_get_mapped_frontier(reln, forknum[i]);
 		root_physical_capacity =
@@ -925,15 +951,9 @@ umregistersync(SMgrRelation reln, ForkNumber forknum)
 }
 
 bool
-umforcependingsync(SMgrRelation reln)
+umpreparependingsync(SMgrRelation reln)
 {
 	um_refresh_mapping_policy(reln, MAIN_FORKNUM);
-	/*
-	 * This predicate is used only by commit-time pending-sync finalization of a
-	 * WAL-skipping relation.  A mapped MAIN root is a prerequisite for mapped
-	 * FSM or VM, and generic full-page WAL omits that private authority.  The
-	 * MAIN policy alone therefore selects the real file-sync path.
-	 */
 	return um_fork_uses_mapped_slots(reln, MAIN_FORKNUM);
 }
 
