@@ -158,11 +158,19 @@ static bool xloginsert_exit_hook_registered = false;
 /* Memory context to hold the registered buffer and data references. */
 static MemoryContext xloginsert_cxt;
 
-static XLogRecData *XLogRecordAssemble(RmgrId rmid, uint8 info,
-									   XLogRecPtr RedoRecPtr, bool doPageWrites,
-									   XLogRecPtr *fpw_lsn, int *num_fpi,
-									   uint64 *fpi_bytes,
-									   bool *topxid_included);
+#ifndef USE_UMBRA
+static XLogRecData *XLogRecordAssembleMd(RmgrId rmid, uint8 info,
+										 XLogRecPtr RedoRecPtr, bool doPageWrites,
+										 XLogRecPtr *fpw_lsn, int *num_fpi,
+										 uint64 *fpi_bytes,
+										 bool *topxid_included);
+#else
+static XLogRecData *XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
+											XLogRecPtr RedoRecPtr, bool doPageWrites,
+											XLogRecPtr *fpw_lsn, int *num_fpi,
+											uint64 *fpi_bytes,
+											bool *topxid_included);
+#endif
 static bool XLogCompressBackupBlock(const PageData *page, uint16 hole_offset,
 									uint16 hole_length, void *dest, uint16 *dlen);
 #ifdef USE_UMBRA
@@ -678,9 +686,9 @@ XLogInsert(RmgrId rmid, uint8 info)
 				MyProc->delayChkptFlags |= DELAY_CHKPT_START;
 				curinsert_slot_shift_delay_started = true;
 			}
-			rdt = XLogRecordAssemble(rmid, info, RedoRecPtr, doPageWrites,
-									 &fpw_lsn, &num_fpi, &fpi_bytes,
-									 &topxid_included);
+			rdt = XLogRecordAssembleUmbra(rmid, info, RedoRecPtr,
+									  doPageWrites, &fpw_lsn, &num_fpi,
+									  &fpi_bytes, &topxid_included);
 		}
 		PG_CATCH();
 		{
@@ -689,9 +697,9 @@ XLogInsert(RmgrId rmid, uint8 info)
 		}
 		PG_END_TRY();
 #else
-		rdt = XLogRecordAssemble(rmid, info, RedoRecPtr, doPageWrites,
-								 &fpw_lsn, &num_fpi, &fpi_bytes,
-								 &topxid_included);
+		rdt = XLogRecordAssembleMd(rmid, info, RedoRecPtr, doPageWrites,
+								   &fpw_lsn, &num_fpi, &fpi_bytes,
+								   &topxid_included);
 #endif
 
 #ifdef USE_UMBRA
@@ -797,8 +805,405 @@ XLogGetFakeLSN(Relation rel)
  * *topxid_included is set if the topmost transaction ID is logged with the
  * current subtransaction.
  */
+#ifndef USE_UMBRA
+/* Keep the PostgreSQL assembler unchanged for md builds. */
 static XLogRecData *
-XLogRecordAssemble(RmgrId rmid, uint8 info,
+XLogRecordAssembleMd(RmgrId rmid, uint8 info,
+					 XLogRecPtr RedoRecPtr, bool doPageWrites,
+					 XLogRecPtr *fpw_lsn, int *num_fpi, uint64 *fpi_bytes,
+					 bool *topxid_included)
+{
+	XLogRecData *rdt;
+	uint64		total_len = 0;
+	int			block_id;
+	pg_crc32c	rdata_crc;
+	registered_buffer *prev_regbuf = NULL;
+	XLogRecData *rdt_datas_last;
+	XLogRecord *rechdr;
+	char	   *scratch = hdr_scratch;
+
+	/*
+	 * Note: this function can be called multiple times for the same record.
+	 * All the modifications we do to the rdata chains below must handle that.
+	 */
+
+	/* The record begins with the fixed-size header */
+	rechdr = (XLogRecord *) scratch;
+	scratch += SizeOfXLogRecord;
+
+	hdr_rdt.next = NULL;
+	rdt_datas_last = &hdr_rdt;
+	hdr_rdt.data = hdr_scratch;
+
+	/*
+	 * Enforce consistency checks for this record if user is looking for it.
+	 * Do this before at the beginning of this routine to give the possibility
+	 * for callers of XLogInsert() to pass XLR_CHECK_CONSISTENCY directly for
+	 * a record.
+	 */
+	if (wal_consistency_checking[rmid])
+		info |= XLR_CHECK_CONSISTENCY;
+
+	/*
+	 * Make an rdata chain containing all the data portions of all block
+	 * references. This includes the data for full-page images. Also append
+	 * the headers for the block references in the scratch buffer.
+	 */
+	*fpw_lsn = InvalidXLogRecPtr;
+	for (block_id = 0; block_id < max_registered_block_id; block_id++)
+	{
+		registered_buffer *regbuf = &registered_buffers[block_id];
+		bool		needs_backup;
+		bool		needs_data;
+		XLogRecordBlockHeader bkpb;
+		XLogRecordBlockImageHeader bimg;
+		XLogRecordBlockCompressHeader cbimg = {0};
+		bool		samerel;
+		bool		is_compressed = false;
+		bool		include_image;
+
+		if (!regbuf->in_use)
+			continue;
+
+		/* Determine if this block needs to be backed up */
+		if (regbuf->flags & REGBUF_FORCE_IMAGE)
+			needs_backup = true;
+		else if (regbuf->flags & REGBUF_NO_IMAGE)
+			needs_backup = false;
+		else if (!doPageWrites)
+			needs_backup = false;
+		else
+		{
+			/*
+			 * We assume page LSN is first data on *every* page that can be
+			 * passed to XLogInsert, whether it has the standard page layout
+			 * or not.
+			 */
+			XLogRecPtr	page_lsn = PageGetLSN(regbuf->page);
+
+			needs_backup = (page_lsn <= RedoRecPtr);
+			if (!needs_backup)
+			{
+				if (!XLogRecPtrIsValid(*fpw_lsn) || page_lsn < *fpw_lsn)
+					*fpw_lsn = page_lsn;
+			}
+		}
+
+		/* Determine if the buffer data needs to included */
+		if (regbuf->rdata_len == 0)
+			needs_data = false;
+		else if ((regbuf->flags & REGBUF_KEEP_DATA) != 0)
+			needs_data = true;
+		else
+			needs_data = !needs_backup;
+
+		bkpb.id = block_id;
+		bkpb.fork_flags = regbuf->forkno;
+		bkpb.data_length = 0;
+
+		if ((regbuf->flags & REGBUF_WILL_INIT) == REGBUF_WILL_INIT)
+			bkpb.fork_flags |= BKPBLOCK_WILL_INIT;
+
+		/*
+		 * If needs_backup is true or WAL checking is enabled for current
+		 * resource manager, log a full-page write for the current block.
+		 */
+		include_image = needs_backup || (info & XLR_CHECK_CONSISTENCY) != 0;
+
+		if (include_image)
+		{
+			const PageData *page = regbuf->page;
+			uint16		compressed_len = 0;
+
+			/*
+			 * The page needs to be backed up, so calculate its hole length
+			 * and offset.
+			 */
+			if (regbuf->flags & REGBUF_STANDARD)
+			{
+				/* Assume we can omit data between pd_lower and pd_upper */
+				uint16		lower = ((const PageHeaderData *) page)->pd_lower;
+				uint16		upper = ((const PageHeaderData *) page)->pd_upper;
+
+				if (lower >= SizeOfPageHeaderData &&
+					upper > lower &&
+					upper <= BLCKSZ)
+				{
+					bimg.hole_offset = lower;
+					cbimg.hole_length = upper - lower;
+				}
+				else
+				{
+					/* No "hole" to remove */
+					bimg.hole_offset = 0;
+					cbimg.hole_length = 0;
+				}
+			}
+			else
+			{
+				/* Not a standard page header, don't try to eliminate "hole" */
+				bimg.hole_offset = 0;
+				cbimg.hole_length = 0;
+			}
+
+			/*
+			 * Try to compress a block image if wal_compression is enabled
+			 */
+			if (wal_compression != WAL_COMPRESSION_NONE)
+			{
+				is_compressed =
+					XLogCompressBackupBlock(page, bimg.hole_offset,
+											cbimg.hole_length,
+											regbuf->compressed_page,
+											&compressed_len);
+			}
+
+			/*
+			 * Fill in the remaining fields in the XLogRecordBlockHeader
+			 * struct
+			 */
+			bkpb.fork_flags |= BKPBLOCK_HAS_IMAGE;
+
+			/* Report a full page image constructed for the WAL record */
+			*num_fpi += 1;
+
+			/*
+			 * Construct XLogRecData entries for the page content.
+			 */
+			rdt_datas_last->next = &regbuf->bkp_rdatas[0];
+			rdt_datas_last = rdt_datas_last->next;
+
+			bimg.bimg_info = (cbimg.hole_length == 0) ? 0 : BKPIMAGE_HAS_HOLE;
+
+			/*
+			 * If WAL consistency checking is enabled for the resource manager
+			 * of this WAL record, a full-page image is included in the record
+			 * for the block modified. During redo, the full-page is replayed
+			 * only if BKPIMAGE_APPLY is set.
+			 */
+			if (needs_backup)
+				bimg.bimg_info |= BKPIMAGE_APPLY;
+
+			if (is_compressed)
+			{
+				/* The current compression is stored in the WAL record */
+				bimg.length = compressed_len;
+
+				/* Set the compression method used for this block */
+				switch ((WalCompression) wal_compression)
+				{
+					case WAL_COMPRESSION_PGLZ:
+						bimg.bimg_info |= BKPIMAGE_COMPRESS_PGLZ;
+						break;
+
+					case WAL_COMPRESSION_LZ4:
+#ifdef USE_LZ4
+						bimg.bimg_info |= BKPIMAGE_COMPRESS_LZ4;
+#else
+						elog(ERROR, "LZ4 is not supported by this build");
+#endif
+						break;
+
+					case WAL_COMPRESSION_ZSTD:
+#ifdef USE_ZSTD
+						bimg.bimg_info |= BKPIMAGE_COMPRESS_ZSTD;
+#else
+						elog(ERROR, "zstd is not supported by this build");
+#endif
+						break;
+
+					case WAL_COMPRESSION_NONE:
+						Assert(false);	/* cannot happen */
+						break;
+						/* no default case, so that compiler will warn */
+				}
+
+				rdt_datas_last->data = regbuf->compressed_page;
+				rdt_datas_last->len = compressed_len;
+			}
+			else
+			{
+				bimg.length = BLCKSZ - cbimg.hole_length;
+
+				if (cbimg.hole_length == 0)
+				{
+					rdt_datas_last->data = page;
+					rdt_datas_last->len = BLCKSZ;
+				}
+				else
+				{
+					/* must skip the hole */
+					rdt_datas_last->data = page;
+					rdt_datas_last->len = bimg.hole_offset;
+
+					rdt_datas_last->next = &regbuf->bkp_rdatas[1];
+					rdt_datas_last = rdt_datas_last->next;
+
+					rdt_datas_last->data =
+						page + (bimg.hole_offset + cbimg.hole_length);
+					rdt_datas_last->len =
+						BLCKSZ - (bimg.hole_offset + cbimg.hole_length);
+				}
+			}
+
+			total_len += bimg.length;
+
+			/* Track the WAL full page images in bytes */
+			*fpi_bytes += bimg.length;
+		}
+
+		if (needs_data)
+		{
+			/*
+			 * When copying to XLogRecordBlockHeader, the length is narrowed
+			 * to an uint16.  Double-check that it is still correct.
+			 */
+			Assert(regbuf->rdata_len <= UINT16_MAX);
+
+			/*
+			 * Link the caller-supplied rdata chain for this buffer to the
+			 * overall list.
+			 */
+			bkpb.fork_flags |= BKPBLOCK_HAS_DATA;
+			bkpb.data_length = (uint16) regbuf->rdata_len;
+			total_len += regbuf->rdata_len;
+
+			rdt_datas_last->next = regbuf->rdata_head;
+			rdt_datas_last = regbuf->rdata_tail;
+		}
+
+		if (prev_regbuf && RelFileLocatorEquals(regbuf->rlocator, prev_regbuf->rlocator))
+		{
+			samerel = true;
+			bkpb.fork_flags |= BKPBLOCK_SAME_REL;
+		}
+		else
+			samerel = false;
+		prev_regbuf = regbuf;
+
+		/* Ok, copy the header to the scratch buffer */
+		memcpy(scratch, &bkpb, SizeOfXLogRecordBlockHeader);
+		scratch += SizeOfXLogRecordBlockHeader;
+		if (include_image)
+		{
+			memcpy(scratch, &bimg, SizeOfXLogRecordBlockImageHeader);
+			scratch += SizeOfXLogRecordBlockImageHeader;
+			if (cbimg.hole_length != 0 && is_compressed)
+			{
+				memcpy(scratch, &cbimg,
+					   SizeOfXLogRecordBlockCompressHeader);
+				scratch += SizeOfXLogRecordBlockCompressHeader;
+			}
+		}
+		if (!samerel)
+		{
+			memcpy(scratch, &regbuf->rlocator, sizeof(RelFileLocator));
+			scratch += sizeof(RelFileLocator);
+		}
+		memcpy(scratch, &regbuf->block, sizeof(BlockNumber));
+		scratch += sizeof(BlockNumber);
+	}
+
+	/* followed by the record's origin, if any */
+	if ((curinsert_flags & XLOG_INCLUDE_ORIGIN) &&
+		replorigin_xact_state.origin != InvalidReplOriginId)
+	{
+		*(scratch++) = (char) XLR_BLOCK_ID_ORIGIN;
+		memcpy(scratch, &replorigin_xact_state.origin, sizeof(replorigin_xact_state.origin));
+		scratch += sizeof(replorigin_xact_state.origin);
+	}
+
+	/* followed by toplevel XID, if not already included in previous record */
+	if (IsSubxactTopXidLogPending())
+	{
+		TransactionId xid = GetTopTransactionIdIfAny();
+
+		/* Set the flag that the top xid is included in the WAL */
+		*topxid_included = true;
+
+		*(scratch++) = (char) XLR_BLOCK_ID_TOPLEVEL_XID;
+		memcpy(scratch, &xid, sizeof(TransactionId));
+		scratch += sizeof(TransactionId);
+	}
+
+	/* followed by main data, if any */
+	if (mainrdata_len > 0)
+	{
+		if (mainrdata_len > 255)
+		{
+			uint32		mainrdata_len_4b;
+
+			if (mainrdata_len > PG_UINT32_MAX)
+				ereport(ERROR,
+						(errmsg_internal("too much WAL data"),
+						 errdetail_internal("Main data length is %" PRIu64 " bytes for a maximum of %u bytes.",
+											mainrdata_len,
+											PG_UINT32_MAX)));
+
+			mainrdata_len_4b = (uint32) mainrdata_len;
+			*(scratch++) = (char) XLR_BLOCK_ID_DATA_LONG;
+			memcpy(scratch, &mainrdata_len_4b, sizeof(uint32));
+			scratch += sizeof(uint32);
+		}
+		else
+		{
+			*(scratch++) = (char) XLR_BLOCK_ID_DATA_SHORT;
+			*(scratch++) = (uint8) mainrdata_len;
+		}
+		rdt_datas_last->next = mainrdata_head;
+		rdt_datas_last = mainrdata_last;
+		total_len += mainrdata_len;
+	}
+	rdt_datas_last->next = NULL;
+
+	hdr_rdt.len = (scratch - hdr_scratch);
+	total_len += hdr_rdt.len;
+
+	/*
+	 * Calculate CRC of the data
+	 *
+	 * Note that the record header isn't added into the CRC initially since we
+	 * don't know the prev-link yet.  Thus, the CRC will represent the CRC of
+	 * the whole record in the order: rdata, then backup blocks, then record
+	 * header.
+	 */
+	INIT_CRC32C(rdata_crc);
+	COMP_CRC32C(rdata_crc, hdr_scratch + SizeOfXLogRecord, hdr_rdt.len - SizeOfXLogRecord);
+	for (rdt = hdr_rdt.next; rdt != NULL; rdt = rdt->next)
+		COMP_CRC32C(rdata_crc, rdt->data, rdt->len);
+
+	/*
+	 * Ensure that the XLogRecord is not too large.
+	 *
+	 * XLogReader machinery is only able to handle records up to a certain
+	 * size (ignoring machine resource limitations), so make sure that we will
+	 * not emit records larger than the sizes advertised to be supported.
+	 */
+	if (total_len > XLogRecordMaxSize)
+		ereport(ERROR,
+				(errmsg_internal("oversized WAL record"),
+				 errdetail_internal("WAL record would be %" PRIu64 " bytes (of maximum %u bytes); rmid %u flags %u.",
+									total_len, XLogRecordMaxSize, rmid, info)));
+
+	/*
+	 * Fill in the fields in the record header. Prev-link is filled in later,
+	 * once we know where in the WAL the record will be inserted. The CRC does
+	 * not include the record header yet.
+	 */
+	rechdr->xl_xid = GetCurrentTransactionIdIfAny();
+	rechdr->xl_tot_len = (uint32) total_len;
+	rechdr->xl_info = info;
+	rechdr->xl_rmid = rmid;
+	rechdr->xl_prev = InvalidXLogRecPtr;
+	rechdr->xl_crc = rdata_crc;
+
+	return &hdr_rdt;
+}
+#endif
+
+#ifdef USE_UMBRA
+static XLogRecData *
+XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 				   XLogRecPtr RedoRecPtr, bool doPageWrites,
 				   XLogRecPtr *fpw_lsn, int *num_fpi, uint64 *fpi_bytes,
 				   bool *topxid_included)
@@ -1262,6 +1667,8 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 
 	return &hdr_rdt;
 }
+
+#endif
 
 #ifdef USE_UMBRA
 static bool
