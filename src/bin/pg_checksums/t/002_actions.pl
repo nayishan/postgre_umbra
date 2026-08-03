@@ -12,6 +12,32 @@ use PostgreSQL::Test::Utils;
 
 use Test::More;
 
+if (check_pg_config('^#define USE_UMBRA 1$'))
+{
+	my $node = PostgreSQL::Test::Cluster->new('node_checksum_umbra');
+	$node->init(extra => ['--data-checksums']);
+	my $pgdata = $node->data_dir;
+
+	command_fails_like(
+		[ 'pg_checksums', '--check', '--pgdata' => $pgdata ],
+		qr/checking or enabling data checksums is not supported with Umbra storage/,
+		'checking checksums is rejected with Umbra storage');
+	command_fails_like(
+		[ 'pg_checksums', '--enable', '--pgdata' => $pgdata ],
+		qr/checking or enabling data checksums is not supported with Umbra storage/,
+		'enabling checksums is rejected with Umbra storage');
+	command_ok(
+		[ 'pg_checksums', '--disable', '--no-sync', '--pgdata' => $pgdata ],
+		'disabling checksums is supported with Umbra storage');
+	command_like(
+		[ 'pg_controldata', $pgdata ],
+		qr/Data page checksum version:.*0/,
+		'checksums disabled in Umbra control file');
+
+	done_testing();
+	exit;
+}
+
 
 # Utility routine to create and check a table with corrupted checksums
 # on a wanted tablespace.  Note that this stops and starts the node

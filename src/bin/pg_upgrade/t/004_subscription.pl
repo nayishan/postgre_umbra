@@ -12,6 +12,9 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
+plan skip_all => 'pg_upgrade is not supported with Umbra storage'
+  if check_pg_config('^#define USE_UMBRA 1$');
+
 # Can be changed to test the other modes.
 my $mode = $ENV{PG_TEST_PG_UPGRADE_MODE} || '--copy';
 
