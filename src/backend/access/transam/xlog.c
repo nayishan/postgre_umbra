@@ -8099,6 +8099,7 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 		/* Select MAIN buffers before storage metadata can publish a new slot. */
 		CheckPointBuffersPrepare(flags);
 		smgrcheckpoint();
+		INJECTION_POINT("umbra-checkpoint-after-map", NULL);
 		CheckPointBuffers(flags);
 	}
 	PG_CATCH();
