@@ -412,27 +412,103 @@ UmCheckpointWritePredecessorSlot(SMgrRelation reln, ForkNumber forknum,
 	return true;
 }
 
-void
-UmCheckpointWritebackSourceSlot(SMgrRelation reln, ForkNumber forknum,
-								BlockNumber logical_block, uint8 source_slot)
+static int
+um_checkpoint_pblk_comparator(const void *a, const void *b)
 {
-	BlockNumber	physical_block;
+	BlockNumber pblk_a = *(const BlockNumber *) a;
+	BlockNumber pblk_b = *(const BlockNumber *) b;
 
-	if (reln == NULL || !UmbraActiveSlotIsValid(source_slot))
+	if (pblk_a < pblk_b)
+		return -1;
+	if (pblk_a > pblk_b)
+		return 1;
+	return 0;
+}
+
+/*
+ * Convert a relation/fork batch of checkpoint source slots to physical
+ * blocks, then sort, deduplicate, and coalesce adjacent blocks into
+ * segment-local writeback ranges.
+ */
+void
+UmCheckpointWritebackSourceSlots(SMgrRelation reln, ForkNumber forknum,
+								 const UmbraCheckpointWritebackRequest *requests,
+								 int nrequests)
+{
+	UmbraFileContext *ctx;
+	BlockNumber pblks[WRITEBACK_MAX_PENDING_FLUSHES];
+	BlockNumber run_start_pblk = InvalidBlockNumber;
+	BlockNumber run_blocks = 0;
+	int			npblks = 0;
+
+	if (reln == NULL || requests == NULL || nrequests <= 0)
 		return;
+	if (nrequests > lengthof(pblks))
+		elog(ERROR, "too many Umbra checkpoint writeback requests: %d",
+			 nrequests);
+
 	um_refresh_mapping_policy(reln, forknum);
 	if (!um_fork_uses_mapped_slots(reln, forknum))
 		return;
-	if (!UmbraActiveSlotPhysicalBlock(logical_block, source_slot,
-									 &physical_block))
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("Umbra source-slot block mapping overflow for relation %u/%u/%u fork %d",
-						reln->smgr_rlocator.locator.spcOid,
-						reln->smgr_rlocator.locator.dbOid,
-						reln->smgr_rlocator.locator.relNumber, (int) forknum)));
 
-	umfile_writeback(um_get_filectx(reln), forknum, physical_block, 1);
+	ctx = um_get_filectx(reln);
+	for (int i = 0; i < nrequests; i++)
+	{
+		BlockNumber physical_block;
+
+		if (!UmbraActiveSlotIsValid(requests[i].checkpoint_slot))
+		{
+			Assert(false);
+			continue;
+		}
+		if (!UmbraActiveSlotPhysicalBlock(requests[i].lblkno,
+										  requests[i].checkpoint_slot,
+										  &physical_block))
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("Umbra source-slot block mapping overflow for relation %u/%u/%u fork %d",
+							reln->smgr_rlocator.locator.spcOid,
+							reln->smgr_rlocator.locator.dbOid,
+							reln->smgr_rlocator.locator.relNumber, (int) forknum)));
+
+		pblks[npblks++] = physical_block;
+	}
+
+	if (npblks == 0)
+		return;
+
+	qsort(pblks, npblks, sizeof(BlockNumber),
+		  um_checkpoint_pblk_comparator);
+
+	for (int i = 0; i < npblks; i++)
+	{
+		BlockNumber pblk = pblks[i];
+		bool		same_segment;
+
+		if (i > 0 && pblk == pblks[i - 1])
+			continue;
+
+		same_segment =
+			run_blocks > 0 &&
+			run_start_pblk / ((BlockNumber) RELSEG_SIZE) ==
+			pblk / ((BlockNumber) RELSEG_SIZE);
+
+		if (run_blocks == 0)
+		{
+			run_start_pblk = pblk;
+			run_blocks = 1;
+		}
+		else if (same_segment && pblk == run_start_pblk + run_blocks)
+			run_blocks++;
+		else
+		{
+			umfile_writeback(ctx, forknum, run_start_pblk, run_blocks);
+			run_start_pblk = pblk;
+			run_blocks = 1;
+		}
+	}
+
+	umfile_writeback(ctx, forknum, run_start_pblk, run_blocks);
 }
 
 bool
