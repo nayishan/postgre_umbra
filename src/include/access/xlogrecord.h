@@ -116,7 +116,7 @@ typedef struct XLogRecordBlockHeader
 
 #ifdef USE_UMBRA
 /*
- * A WAL block reference can move an Umbra MAIN page to its next active slot.
+ * A WAL block reference can move an Umbra mapped page to its next active slot.
  * target_slot uses its high bit to identify the image-free form. Its low bits
  * identify the target, from which the reader derives the preceding source.
  */

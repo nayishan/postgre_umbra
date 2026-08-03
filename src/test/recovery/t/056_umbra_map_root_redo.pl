@@ -48,7 +48,7 @@ is($node->safe_psql('postgres', 'SELECT id FROM umbra_redo_root'), '42',
 $root = slurp_file($map_path);
 my ($magic, $version) = unpack('L2', substr($root, 0, 8));
 is($magic, 0x554d4252, 'CREATE redo reconstructs root magic');
-is($version, 1, 'CREATE redo reconstructs root version');
+is($version, 2, 'CREATE redo reconstructs root version');
 is(substr($root, 64, 448), "\0" x 448,
 	'CREATE redo reconstructs zeroed root sector padding');
 

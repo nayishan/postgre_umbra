@@ -78,6 +78,7 @@ tests += {
       't/067_umbra_mapwriter.pl',
       't/068_umbra_fsm_vm_mapping.pl',
       't/069_umbra_hint_delta.pl',
+      't/070_umbra_aux_slot_shift.pl',
     ],
   },
 }

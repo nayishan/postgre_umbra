@@ -3961,7 +3961,7 @@ BufferCheckpointSourceSlotCaptureIsPossible(Buffer buffer, uint8 source_slot)
 	bool		possible;
 
 	if (!BufferIsValid(buffer) || BufferIsLocal(buffer) ||
-		!UmbraMainActiveSlotIsValid(source_slot))
+		!UmbraActiveSlotIsValid(source_slot))
 		return false;
 
 	buf = GetBufferDescriptor(buffer - 1);
@@ -3969,7 +3969,7 @@ BufferCheckpointSourceSlotCaptureIsPossible(Buffer buffer, uint8 source_slot)
 	epoch = CheckpointBufferActiveEpoch();
 	possible = (buf_state & BM_CHECKPOINT_NEEDED) != 0 && epoch != 0 &&
 		(CkptBufferSourceSlotEpochs[buf->buf_id] != epoch ||
-		 !UmbraMainActiveSlotIsValid(CkptBufferSourceSlots[buf->buf_id]) ||
+		 !UmbraActiveSlotIsValid(CkptBufferSourceSlots[buf->buf_id]) ||
 		 CkptBufferSourceSlots[buf->buf_id] == source_slot);
 	UnlockBufHdr(buf);
 	return possible;
@@ -3984,7 +3984,7 @@ BufferSaveCheckpointSourceSlot(Buffer buffer, uint8 source_slot)
 	bool		captured = false;
 
 	if (!BufferIsValid(buffer) || BufferIsLocal(buffer) ||
-		!UmbraMainActiveSlotIsValid(source_slot))
+		!UmbraActiveSlotIsValid(source_slot))
 		return false;
 
 	buf = GetBufferDescriptor(buffer - 1);
@@ -4003,7 +4003,7 @@ BufferSaveCheckpointSourceSlot(Buffer buffer, uint8 source_slot)
 	}
 
 	if (CkptBufferSourceSlotEpochs[buf->buf_id] != epoch ||
-		!UmbraMainActiveSlotIsValid(CkptBufferSourceSlots[buf->buf_id]))
+		!UmbraActiveSlotIsValid(CkptBufferSourceSlots[buf->buf_id]))
 	{
 		CkptBufferSourceSlots[buf->buf_id] = source_slot;
 		CkptBufferSourceSlotEpochs[buf->buf_id] = epoch;
@@ -4749,7 +4749,7 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 		epoch = CheckpointBufferActiveEpoch();
 		if (epoch != 0 && (buf_state & BM_CHECKPOINT_NEEDED) != 0 &&
 			CkptBufferSourceSlotEpochs[buf->buf_id] == epoch &&
-			UmbraMainActiveSlotIsValid(CkptBufferSourceSlots[buf->buf_id]))
+			UmbraActiveSlotIsValid(CkptBufferSourceSlots[buf->buf_id]))
 			checkpoint_source_slot = CkptBufferSourceSlots[buf->buf_id];
 		UnlockBufHdr(buf);
 	}
@@ -4811,7 +4811,7 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	io_start = pgstat_prepare_io_time(track_io_timing);
 
 #ifdef USE_UMBRA
-	if (UmbraMainActiveSlotIsValid(checkpoint_source_slot))
+	if (UmbraActiveSlotIsValid(checkpoint_source_slot))
 		checkpoint_directed = UmCheckpointWriteSourceSlot(reln,
 											  BufTagGetForkNum(&buf->tag),
 											  buf->tag.blockNum,
@@ -6100,7 +6100,8 @@ MarkSharedBufferDirtyHint(Buffer buffer, BufferDesc *bufHdr, uint64 lockstate,
 		/*
 		 * If we need to protect hint bit updates from torn writes, WAL-log the
 		 * first change to a clean page. Umbra MAIN pages can use a claimed byte
-		 * delta; auxiliary forks retain the full-page-image path.
+		 * delta; auxiliary forks retain the full-page-image path and rotate with
+		 * that image.
 		 *
 		 * We don't check full_page_writes here because that logic is included
 		 * when we call XLogInsert() since the value changes dynamically.
@@ -8333,7 +8334,7 @@ IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
 		currlocator = BufTagGetRelFileLocator(&tag);
 
 #ifdef USE_UMBRA
-		if (UmbraMainActiveSlotIsValid(cur->checkpoint_source_slot))
+		if (UmbraActiveSlotIsValid(cur->checkpoint_source_slot))
 		{
 			reln = smgropen(currlocator, INVALID_PROC_NUMBER);
 			UmCheckpointWritebackSourceSlot(reln, BufTagGetForkNum(&tag),
@@ -8353,7 +8354,7 @@ IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
 			next = &wb_context->pending_writebacks[i + ahead + 1];
 
 #ifdef USE_UMBRA
-			if (UmbraMainActiveSlotIsValid(next->checkpoint_source_slot))
+			if (UmbraActiveSlotIsValid(next->checkpoint_source_slot))
 				break;
 #endif
 

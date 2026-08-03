@@ -27,8 +27,10 @@ sub read_active_slot
 {
 	my ($path, $block_size, $logical_block) = @_;
 	my $entries_per_page = $block_size * 4;
+	my $page_index = int($logical_block / $entries_per_page);
 	my $entry_index = $logical_block % $entries_per_page;
-	my $map_block = 1 + int($logical_block / $entries_per_page);
+	my $group = int($page_index / 256);
+	my $map_block = 1 + $group * 258 + 2 + ($page_index % 256);
 	my $offset = $map_block * $block_size + int($entry_index / 4);
 	my $byte;
 
@@ -285,8 +287,8 @@ is($node->safe_psql(
 		'postgres', q[SELECT payload FROM umbra_hint_delta_consistency WHERE id = 1;]),
 	'consistency', 'consistency-checked HINT_DELTA retains tuple data');
 
-# FSM uses MarkBufferDirtyHint() directly and must retain the normal
-# FPI_FOR_HINT representation rather than acquiring a MAIN-fork slot shift.
+# FSM uses MarkBufferDirtyHint() directly and retains FPI_FOR_HINT while using
+# that image to rotate its own selector.
 $node->safe_psql(
 	'postgres', q[
 CREATE TABLE umbra_hint_delta_fsm(id integer, payload text)
@@ -332,8 +334,8 @@ my @fsm_hint_delta = grep {
 } @fsm_wal;
 is(scalar(@fsm_hint_delta), 0,
 	'FSM maintenance never emits HINT_DELTA');
-ok(!grep(/slot shift:/, @fsm_hint_fpi),
-	'FSM FPI_FOR_HINT has no MAIN slot-shift metadata');
+ok(grep(/slot shift: source_slot [0-2] target_slot [0-2]/, @fsm_hint_fpi),
+	'FSM FPI_FOR_HINT carries its active-slot transition');
 
 # A missing root without later lifecycle WAL must remain an invalid-page
 # dependency; otherwise a HINT_DELTA source baseline could be lost silently.
