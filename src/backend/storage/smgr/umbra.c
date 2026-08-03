@@ -73,8 +73,6 @@ static BlockNumber um_get_mapped_frontier(SMgrRelation reln,
 									  ForkNumber forknum);
 static BlockNumber um_mapped_capacity(SMgrRelation reln, ForkNumber forknum,
 									 BlockNumber logical_eof);
-static void um_require_mapped_range(SMgrRelation reln, ForkNumber forknum,
-								  BlockNumber blocknum, BlockNumber nblocks);
 static void um_ensure_mapped_capacity(SMgrRelation reln, ForkNumber forknum,
 									  BlockNumber physical_capacity,
 									  bool skipFsync);
@@ -706,7 +704,6 @@ umreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 	if (InRecovery && UmbraIsMappedAuxiliaryFork(forknum))
 		um_ensure_aux_recovery_capacity(reln, forknum);
-	um_require_mapped_range(reln, forknum, blocknum, nblocks);
 	ctx = um_get_filectx(reln);
 	for (BlockNumber i = 0; i < nblocks; i++)
 	{
@@ -740,7 +737,6 @@ umstartreadv(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknum,
 
 	if (InRecovery && UmbraIsMappedAuxiliaryFork(forknum))
 		um_ensure_aux_recovery_capacity(reln, forknum);
-	um_require_mapped_range(reln, forknum, blocknum, nblocks);
 	physical_block = um_active_pblk(reln, forknum, blocknum);
 	pgaio_io_set_target_smgr(ioh, reln, forknum, blocknum, nblocks, false);
 	target = pgaio_io_get_target_data(ioh);
@@ -767,7 +763,6 @@ umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	if (nblocks == 0)
 		return;
 
-	um_require_mapped_range(reln, forknum, blocknum, nblocks);
 	ctx = um_get_filectx(reln);
 	for (BlockNumber i = 0; i < nblocks; i++)
 	{
@@ -1127,22 +1122,6 @@ um_mapped_capacity(SMgrRelation reln, ForkNumber forknum,
 						reln->smgr_rlocator.locator.dbOid,
 						reln->smgr_rlocator.locator.relNumber, (int) forknum)));
 	return physical_capacity;
-}
-
-static void
-um_require_mapped_range(SMgrRelation reln, ForkNumber forknum,
-						BlockNumber blocknum, BlockNumber nblocks)
-{
-	BlockNumber logical_eof;
-	BlockNumber logical_end;
-
-	logical_end = um_mapped_range_end(reln, forknum, blocknum, nblocks);
-	logical_eof = um_get_mapped_frontier(reln, forknum);
-	if (logical_end > logical_eof)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("could not access logical block %u beyond Umbra mapped EOF %u for fork %d",
-						blocknum, logical_eof, (int) forknum)));
 }
 
 static void
