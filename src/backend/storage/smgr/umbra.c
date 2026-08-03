@@ -929,14 +929,16 @@ umregistersync(SMgrRelation reln, ForkNumber forknum)
 }
 
 bool
-umpreparependingsync(SMgrRelation reln)
+umforcependingsync(SMgrRelation reln)
 {
 	um_refresh_mapping_policy(reln, MAIN_FORKNUM);
-	um_refresh_mapping_policy(reln, FSM_FORKNUM);
-	um_refresh_mapping_policy(reln, VISIBILITYMAP_FORKNUM);
-	return um_fork_uses_mapped_slots(reln, MAIN_FORKNUM) ||
-		um_fork_uses_mapped_slots(reln, FSM_FORKNUM) ||
-		um_fork_uses_mapped_slots(reln, VISIBILITYMAP_FORKNUM);
+	/*
+	 * This predicate is used only by commit-time pending-sync finalization of a
+	 * WAL-skipping relation.  A mapped MAIN root is a prerequisite for mapped
+	 * FSM or VM, and generic full-page WAL omits that private authority.  The
+	 * MAIN policy alone therefore selects the real file-sync path.
+	 */
+	return um_fork_uses_mapped_slots(reln, MAIN_FORKNUM);
 }
 
 int

@@ -103,7 +103,12 @@ extern void smgrcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
 extern void smgrinitnewrelation(SMgrRelation reln, bool needs_wal);
 /* Complete authoritative CREATE redo after the physical fork exists. */
 extern void smgrfinishcreate(SMgrRelation reln, ForkNumber forknum);
-extern bool smgrpreparependingsync(SMgrRelation reln);
+/*
+ * Return true when a WAL-skipping relation's commit-time finalization must
+ * sync files because generic full-page WAL cannot make private metadata
+ * durable.
+ */
+extern bool smgrforcependingsync(SMgrRelation reln);
 /* Complete selected-smgr checkpoint work at the caller's ordering point. */
 extern void smgrcheckpoint(void);
 /*

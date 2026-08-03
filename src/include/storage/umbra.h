@@ -163,7 +163,7 @@ extern void umtruncate(SMgrRelation reln, ForkNumber forknum,
 					   BlockNumber old_blocks, BlockNumber nblocks);
 extern void umimmedsync(SMgrRelation reln, ForkNumber forknum);
 extern void umregistersync(SMgrRelation reln, ForkNumber forknum);
-extern bool umpreparependingsync(SMgrRelation reln);
+extern bool umforcependingsync(SMgrRelation reln);
 extern int	umfd(SMgrRelation reln, ForkNumber forknum,
 					 BlockNumber blocknum, uint32 *off);
 extern bool UmWalOwnedSlotShiftAvailable(SMgrRelation reln,
