@@ -1671,6 +1671,10 @@ backtrack:
 			{
 #ifdef USE_UMBRA
 				hint_delta_started = BufferBeginHintDelta(buf, &hint_delta);
+				if (hint_delta_started)
+					BufferRegisterHintDeltaRange(&hint_delta,
+										 &opaque->btpo_cycleid,
+										 sizeof(opaque->btpo_cycleid));
 #endif
 				opaque->btpo_cycleid = 0;
 #ifdef USE_UMBRA

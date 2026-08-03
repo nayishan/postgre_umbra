@@ -550,6 +550,9 @@ brin_start_evacuating_page(Relation idxRel, Buffer buf)
 			 */
 #ifdef USE_UMBRA
 			hint_delta_started = BufferBeginHintDelta(buf, &hint_delta);
+			if (hint_delta_started)
+				BufferRegisterHintDeltaRange(&hint_delta, &BrinPageFlags(page),
+										 sizeof(BrinPageFlags(page)));
 #endif
 			BrinPageFlags(page) |= BRIN_EVACUATE_PAGE;
 #ifdef USE_UMBRA

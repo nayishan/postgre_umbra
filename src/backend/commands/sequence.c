@@ -1229,6 +1229,15 @@ read_seq_tuple(Relation rel, Buffer *buf, HeapTuple seqdatatuple)
 	{
 #ifdef USE_UMBRA
 		hint_delta_started = BufferBeginHintDelta(*buf, &hint_delta);
+		if (hint_delta_started)
+		{
+			BufferRegisterHintDeltaRange(&hint_delta,
+									 &seqdatatuple->t_data->t_choice.t_heap.t_xmax,
+									 sizeof(TransactionId));
+			BufferRegisterHintDeltaRange(&hint_delta,
+									 &seqdatatuple->t_data->t_infomask,
+									 sizeof(seqdatatuple->t_data->t_infomask));
+		}
 #endif
 		HeapTupleHeaderSetXmax(seqdatatuple->t_data, InvalidTransactionId);
 		seqdatatuple->t_data->t_infomask &= ~HEAP_XMAX_COMMITTED;

@@ -612,6 +612,9 @@ _hash_kill_items(IndexScanDesc scan)
 				}
 
 				/* found the item */
+#ifdef USE_UMBRA
+				BufferRegisterHintDeltaRange(&hint_delta, iid, sizeof(ItemIdData));
+#endif
 				ItemIdMarkDead(iid);
 				killedsomething = true;
 				break;			/* out of inner search loop */
@@ -627,6 +630,10 @@ _hash_kill_items(IndexScanDesc scan)
 	 */
 	if (killedsomething)
 	{
+#ifdef USE_UMBRA
+		BufferRegisterHintDeltaRange(&hint_delta, &opaque->hasho_flag,
+								 sizeof(opaque->hasho_flag));
+#endif
 		opaque->hasho_flag |= LH_PAGE_HAS_DEAD_TUPLES;
 #ifdef USE_UMBRA
 		BufferFinishHintDelta(&hint_delta, true, true);

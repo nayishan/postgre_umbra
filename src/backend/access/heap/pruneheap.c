@@ -929,6 +929,10 @@ heap_page_fix_vm_corruption(PruneState *prstate, OffsetNumber offnum,
 #ifdef USE_UMBRA
 		hint_delta_started =
 			BufferBeginHintDelta(prstate->buffer, &hint_delta);
+		if (hint_delta_started)
+			BufferRegisterHintDeltaRange(&hint_delta,
+									 &((PageHeader) prstate->page)->pd_flags,
+									 sizeof(((PageHeader) prstate->page)->pd_flags));
 #endif
 		PageClearAllVisible(prstate->page);
 #ifdef USE_UMBRA
@@ -1043,6 +1047,10 @@ prune_freeze_fast_path(PruneState *prstate, PruneFreezeResult *presult)
 #ifdef USE_UMBRA
 		hint_delta_started =
 			BufferBeginHintDelta(prstate->buffer, &hint_delta);
+		if (hint_delta_started)
+			BufferRegisterHintDeltaRange(&hint_delta,
+									 &((PageHeader) page)->pd_prune_xid,
+									 sizeof(((PageHeader) page)->pd_prune_xid));
 #endif
 		PageClearPrunable(page);
 #ifdef USE_UMBRA
@@ -1265,7 +1273,18 @@ heap_page_prune_and_freeze(PruneFreezeParams *params,
 	/* Capture before the critical section can apply the hint-only change. */
 #ifdef USE_UMBRA
 	if (do_hint_prune && !do_freeze && !do_prune && !do_set_vm)
+	{
 		hint_delta_started = BufferBeginHintDelta(prstate.buffer, &hint_delta);
+		if (hint_delta_started)
+		{
+			BufferRegisterHintDeltaRange(&hint_delta,
+									 &((PageHeader) prstate.page)->pd_prune_xid,
+									 sizeof(((PageHeader) prstate.page)->pd_prune_xid));
+			BufferRegisterHintDeltaRange(&hint_delta,
+									 &((PageHeader) prstate.page)->pd_flags,
+									 sizeof(((PageHeader) prstate.page)->pd_flags));
+		}
+	}
 #endif
 
 	/* Any error while applying the changes is critical */

@@ -331,12 +331,21 @@ extern void BufferGetTag(Buffer buffer, RelFileLocator *rlocator,
 extern void MarkBufferDirtyHint(Buffer buffer, bool buffer_std);
 
 #ifdef USE_UMBRA
+#define BUFFER_HINT_DELTA_INLINE_RANGES 16
+
+typedef struct BufferHintDeltaRange
+{
+	uint16		offset;
+	uint16		length;
+} BufferHintDeltaRange;
+
 typedef struct BufferHintDeltaContext
 {
 	Buffer		buffer;
-	char	   *before;
-	char	   *delta;
+	uint64	   *bitmap;
+	uint16		nranges;
 	bool		prepared;
+	BufferHintDeltaRange inline_ranges[BUFFER_HINT_DELTA_INLINE_RANGES];
 } BufferHintDeltaContext;
 #endif
 
@@ -347,6 +356,16 @@ extern void BufferFinishSetHintBits(Buffer buffer, bool mark_dirty, bool buffer_
 #ifdef USE_UMBRA
 extern bool BufferBeginHintDelta(Buffer buffer,
 							 BufferHintDeltaContext *context);
+extern void BufferRegisterHintDeltaRangeImpl(BufferHintDeltaContext *context,
+											 const void *ptr, Size length);
+static inline void
+BufferRegisterHintDeltaRange(BufferHintDeltaContext *context,
+							 const void *ptr, Size length)
+{
+	/* Most hint updates hit an already-dirty page and need no WAL delta. */
+	if (unlikely(context->prepared))
+		BufferRegisterHintDeltaRangeImpl(context, ptr, length);
+}
 extern void BufferFinishHintDelta(BufferHintDeltaContext *context,
 							  bool mark_dirty, bool buffer_std);
 #endif

@@ -710,6 +710,13 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 					if (BufferBeginSetHintBits(buf))
 #endif
 					{
+#ifdef USE_UMBRA
+						BufferRegisterHintDeltaRange(&hint_delta, curitemid,
+											 sizeof(ItemIdData));
+						BufferRegisterHintDeltaRange(&hint_delta,
+											 &opaque->btpo_flags,
+											 sizeof(opaque->btpo_flags));
+#endif
 						ItemIdMarkDead(curitemid);
 						opaque->btpo_flags |= BTP_HAS_GARBAGE;
 #ifdef USE_UMBRA

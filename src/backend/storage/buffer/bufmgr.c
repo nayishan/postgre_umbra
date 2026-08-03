@@ -52,6 +52,9 @@
 #include "executor/instrument.h"
 #include "lib/binaryheap.h"
 #include "miscadmin.h"
+#ifdef USE_UMBRA
+#include "port/pg_bitutils.h"
+#endif
 #include "pg_trace.h"
 #include "pgstat.h"
 #include "postmaster/bgwriter.h"
@@ -71,6 +74,9 @@
 #include "storage/umbra.h"
 #endif
 #include "utils/memdebug.h"
+#ifdef USE_UMBRA
+#include "utils/memutils.h"
+#endif
 #include "utils/ps_status.h"
 #include "utils/rel.h"
 #include "utils/resowner.h"
@@ -6183,50 +6189,236 @@ IncrBufferRefCount(Buffer buffer)
  */
 #ifdef USE_UMBRA
 #define HINT_DELTA_MAX_SIZE (BLCKSZ + SizeOfXLogHintDeltaFragment)
-#define HINT_DELTA_MATCH_THRESHOLD SizeOfXLogHintDeltaFragment
+#define HINT_DELTA_MERGE_GAP SizeOfXLogHintDeltaFragment
+#define HINT_DELTA_BITMAP_WORDS (BLCKSZ / 64)
+#define HINT_DELTA_BITMAP_BYTES (HINT_DELTA_BITMAP_WORDS * sizeof(uint64))
 
-/* Build sorted final-byte ranges, merging gaps smaller than a range header. */
+/* One reusable pair of scratch areas per single-threaded backend process. */
+static char *HintDeltaDataScratch = NULL;
+static uint64 *HintDeltaBitmapScratch = NULL;
+
+static inline void
+BufferHintDeltaSetBitmapRange(uint64 *bitmap, uint32 start, uint32 end)
+{
+	while (start < end)
+	{
+		uint32		wordno = start / 64;
+		uint32		bitno = start % 64;
+		uint32		nbits = Min(64 - bitno, end - start);
+		uint64		mask;
+
+		if (nbits == 64)
+			mask = UINT64_MAX;
+		else
+			mask = ((UINT64CONST(1) << nbits) - 1) << bitno;
+		bitmap[wordno] |= mask;
+		start += nbits;
+	}
+}
+
+static pg_noinline void
+BufferHintDeltaSwitchToBitmap(BufferHintDeltaContext *context,
+							  uint32 start, uint32 end)
+{
+	Assert(context->prepared);
+	Assert(context->bitmap == NULL);
+	Assert(HintDeltaBitmapScratch != NULL);
+	MemSet(HintDeltaBitmapScratch, 0, HINT_DELTA_BITMAP_BYTES);
+	context->bitmap = HintDeltaBitmapScratch;
+
+	for (int i = 0; i < context->nranges; i++)
+	{
+		BufferHintDeltaRange *range = &context->inline_ranges[i];
+
+		BufferHintDeltaSetBitmapRange(context->bitmap, range->offset,
+									  (uint32) range->offset + range->length);
+	}
+	BufferHintDeltaSetBitmapRange(context->bitmap, start, end);
+	context->nranges = 0;
+}
+
+void
+BufferRegisterHintDeltaRangeImpl(BufferHintDeltaContext *context,
+								 const void *ptr, Size length)
+{
+	Page		page;
+	uint32		start;
+	uint32		end;
+	BufferHintDeltaRange *ranges;
+
+	Assert(context != NULL);
+	Assert(context->prepared);
+	Assert(BufferIsValid(context->buffer));
+	Assert(length > 0 && length <= BLCKSZ);
+
+	page = BufferGetPage(context->buffer);
+	Assert((const char *) ptr >= page + offsetof(PageHeaderData, pd_flags));
+	Assert((const char *) ptr + length <= page + BLCKSZ);
+	start = (const char *) ptr - page;
+	end = start + length;
+
+	if (context->bitmap != NULL)
+	{
+		BufferHintDeltaSetBitmapRange(context->bitmap, start, end);
+		return;
+	}
+
+	ranges = context->inline_ranges;
+	if (context->nranges == 0)
+	{
+		ranges[0].offset = start;
+		ranges[0].length = end - start;
+		context->nranges = 1;
+		return;
+	}
+
+	/* Ordered page walks normally merge with, or append after, the last range. */
+	{
+		BufferHintDeltaRange *last = &ranges[context->nranges - 1];
+		uint32		last_end = (uint32) last->offset + last->length;
+
+		if (start >= last->offset)
+		{
+			if (start <= last_end + HINT_DELTA_MERGE_GAP)
+			{
+				if (end > last_end)
+					last->length = end - last->offset;
+				return;
+			}
+			if (context->nranges < BUFFER_HINT_DELTA_INLINE_RANGES)
+			{
+				last++;
+				last->offset = start;
+				last->length = end - start;
+				context->nranges++;
+				return;
+			}
+
+			BufferHintDeltaSwitchToBitmap(context, start, end);
+			return;
+		}
+	}
+
+	/* Rare out-of-order registrations use insertion/merge in the 16 slots. */
+	{
+		int			first = 0;
+		int			past = 0;
+		uint32		merged_start = start;
+		uint32		merged_end = end;
+		int			new_count;
+
+		while (first < context->nranges)
+		{
+			uint32		range_end = (uint32) ranges[first].offset +
+				ranges[first].length;
+
+			if (range_end + HINT_DELTA_MERGE_GAP >= merged_start)
+				break;
+			first++;
+		}
+
+		past = first;
+		while (past < context->nranges &&
+			   ranges[past].offset <= merged_end + HINT_DELTA_MERGE_GAP)
+		{
+			uint32		range_end = (uint32) ranges[past].offset +
+				ranges[past].length;
+
+			merged_start = Min(merged_start, (uint32) ranges[past].offset);
+			merged_end = Max(merged_end, range_end);
+			past++;
+		}
+
+		new_count = context->nranges - (past - first) + 1;
+		if (new_count > BUFFER_HINT_DELTA_INLINE_RANGES)
+		{
+			BufferHintDeltaSwitchToBitmap(context, start, end);
+			return;
+		}
+
+		memmove(&ranges[first + 1], &ranges[past],
+				(context->nranges - past) * sizeof(BufferHintDeltaRange));
+		ranges[first].offset = merged_start;
+		ranges[first].length = merged_end - merged_start;
+		context->nranges = new_count;
+	}
+}
+
+static inline char *
+BufferHintDeltaAppendFragment(char *ptr, const char *page,
+							  uint32 start, uint32 end)
+{
+	xl_hint_delta_fragment fragment;
+
+	fragment.offset = start;
+	fragment.length = end - start;
+	memcpy(ptr, &fragment, SizeOfXLogHintDeltaFragment);
+	ptr += SizeOfXLogHintDeltaFragment;
+	memcpy(ptr, page + start, fragment.length);
+	return ptr + fragment.length;
+}
+
+/* Build sorted final-byte ranges from inline ranges or the overflow bitmap. */
 static uint32
-BuildBufferHintDelta(const char *before, const char *after, char *delta)
+BuildBufferHintDelta(const BufferHintDeltaContext *context, const char *page,
+					 char *delta)
 {
 	char	   *ptr;
-	int			i = 0;
 
-	Assert(before != NULL);
-	Assert(after != NULL);
+	Assert(context != NULL);
+	Assert(page != NULL);
 	Assert(delta != NULL);
 
 	ptr = delta;
-	while (i < BLCKSZ)
+	if (context->bitmap == NULL)
 	{
-		xl_hint_delta_fragment fragment;
-		int			last_changed;
-
-		while (i < BLCKSZ && before[i] == after[i])
-			i++;
-		if (i == BLCKSZ)
-			break;
-
-		fragment.offset = i;
-		last_changed = i++;
-		while (i < BLCKSZ)
+		for (int i = 0; i < context->nranges; i++)
 		{
-			if (before[i] != after[i])
-				last_changed = i;
-			else if (i - last_changed > HINT_DELTA_MATCH_THRESHOLD)
-				break;
-			i++;
+			const BufferHintDeltaRange *range = &context->inline_ranges[i];
+			uint32		end = (uint32) range->offset + range->length;
+
+			ptr = BufferHintDeltaAppendFragment(ptr, page, range->offset, end);
+		}
+	}
+	else
+	{
+		bool		have_range = false;
+		uint32		range_start = 0;
+		uint32		range_end = 0;
+
+		for (int wordno = 0; wordno < HINT_DELTA_BITMAP_WORDS; wordno++)
+		{
+			uint64		word = context->bitmap[wordno];
+
+			while (word != 0)
+			{
+				uint32		pos = wordno * 64 + pg_rightmost_one_pos64(word);
+
+				word &= word - 1;
+				if (!have_range)
+				{
+					range_start = pos;
+					range_end = pos + 1;
+					have_range = true;
+				}
+				else if (pos <= range_end + HINT_DELTA_MERGE_GAP)
+					range_end = pos + 1;
+				else
+				{
+					ptr = BufferHintDeltaAppendFragment(ptr, page,
+													  range_start, range_end);
+					range_start = pos;
+					range_end = pos + 1;
+				}
+			}
 		}
 
-		fragment.length = last_changed + 1 - fragment.offset;
-		Assert(ptr + SizeOfXLogHintDeltaFragment + fragment.length <=
-			   delta + HINT_DELTA_MAX_SIZE);
-		memcpy(ptr, &fragment, SizeOfXLogHintDeltaFragment);
-		ptr += SizeOfXLogHintDeltaFragment;
-		memcpy(ptr, after + fragment.offset, fragment.length);
-		ptr += fragment.length;
+		if (have_range)
+			ptr = BufferHintDeltaAppendFragment(ptr, page,
+										  range_start, range_end);
 	}
 
+	Assert(ptr <= delta + HINT_DELTA_MAX_SIZE);
 	return ptr - delta;
 }
 
@@ -6243,8 +6435,7 @@ BufferHintDeltaCaptureNeeded(BufferDesc *bufHdr, uint64 lockstate)
 }
 
 static bool
-CaptureBufferHintPreimage(Buffer buffer, BufferDesc *bufHdr, uint64 lockstate,
-					  BufferHintDeltaContext *context)
+PrepareBufferHintDelta(Buffer buffer, BufferDesc *bufHdr, uint64 lockstate)
 {
 	if (!BufferHintDeltaCaptureNeeded(bufHdr, lockstate))
 		return false;
@@ -6253,18 +6444,25 @@ CaptureBufferHintPreimage(Buffer buffer, BufferDesc *bufHdr, uint64 lockstate,
 	if (!XLogPrepareBufferHintDelta(buffer))
 		return false;
 
-	PG_TRY();
+	if (HintDeltaDataScratch == NULL || HintDeltaBitmapScratch == NULL)
 	{
-		context->before = palloc(BLCKSZ + HINT_DELTA_MAX_SIZE);
-		context->delta = context->before + BLCKSZ;
-		memcpy(context->before, BufferGetPage(buffer), BLCKSZ);
+		PG_TRY();
+		{
+			if (HintDeltaDataScratch == NULL)
+				HintDeltaDataScratch =
+					MemoryContextAlloc(TopMemoryContext, HINT_DELTA_MAX_SIZE);
+			if (HintDeltaBitmapScratch == NULL)
+				HintDeltaBitmapScratch =
+					MemoryContextAlloc(TopMemoryContext,
+								   HINT_DELTA_BITMAP_BYTES);
+		}
+		PG_CATCH();
+		{
+			XLogResetInsertion();
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
 	}
-	PG_CATCH();
-	{
-		XLogResetInsertion();
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
 
 	return true;
 }
@@ -6273,8 +6471,7 @@ CaptureBufferHintPreimage(Buffer buffer, BufferDesc *bufHdr, uint64 lockstate,
 #ifdef USE_UMBRA
 static inline void
 MarkSharedBufferDirtyHint(Buffer buffer, BufferDesc *bufHdr, uint64 lockstate,
-						  bool buffer_std, const char *before,
-						  char *delta_data, uint32 delta_len,
+						  bool buffer_std, char *delta_data, uint32 delta_len,
 						  bool hint_delta_prepared)
 #else
 static inline void
@@ -6354,26 +6551,16 @@ MarkSharedBufferDirtyHint(Buffer buffer, BufferDesc *bufHdr, uint64 lockstate,
 				XLogResetInsertion();
 				hint_delta_prepared = false;
 			}
-			else if (before != NULL)
-			{
-				Assert(delta_data != NULL);
-				delta_len = BuildBufferHintDelta(before, page, delta_data);
-				if (delta_len == 0)
-				{
-					XLogResetInsertion();
-					return;
-				}
-				if (delta_len >= BLCKSZ)
-				{
-					XLogResetInsertion();
-					elog(ERROR, "Umbra hint delta is too large");
-				}
-			}
 
 			if (hint_delta_prepared)
 			{
 				Assert(delta_data != NULL);
 				Assert(delta_len != 0);
+				if (delta_len >= BLCKSZ)
+				{
+					XLogResetInsertion();
+					elog(ERROR, "Umbra hint delta is too large");
+				}
 			}
 		}
 #endif
@@ -6476,7 +6663,7 @@ MarkBufferDirtyHint(Buffer buffer, bool buffer_std)
 #ifdef USE_UMBRA
 	MarkSharedBufferDirtyHint(buffer, bufHdr,
 							  pg_atomic_read_u64(&bufHdr->state),
-							  buffer_std, NULL, NULL, 0, false);
+							  buffer_std, NULL, 0, false);
 #else
 	MarkSharedBufferDirtyHint(buffer, bufHdr,
 							  pg_atomic_read_u64(&bufHdr->state), buffer_std);
@@ -7713,8 +7900,8 @@ BufferBeginHintDelta(Buffer buffer, BufferHintDeltaContext *context)
 
 	Assert(context != NULL);
 	context->buffer = buffer;
-	context->before = NULL;
-	context->delta = NULL;
+	context->bitmap = NULL;
+	context->nranges = 0;
 	context->prepared = false;
 
 	if (BufferIsLocal(buffer))
@@ -7724,8 +7911,7 @@ BufferBeginHintDelta(Buffer buffer, BufferHintDeltaContext *context)
 	if (!SharedBufferBeginSetHintBits(buffer, buf_hdr, &lockstate))
 		return false;
 
-	context->prepared =
-		CaptureBufferHintPreimage(buffer, buf_hdr, lockstate, context);
+	context->prepared = PrepareBufferHintDelta(buffer, buf_hdr, lockstate);
 	return true;
 }
 #endif
@@ -7755,6 +7941,8 @@ BufferFinishHintDelta(BufferHintDeltaContext *context, bool mark_dirty,
 					  bool buffer_std)
 {
 	Buffer		buffer;
+	char	   *delta_data = NULL;
+	uint32		delta_len = 0;
 
 	Assert(context != NULL);
 	buffer = context->buffer;
@@ -7767,24 +7955,38 @@ BufferFinishHintDelta(BufferHintDeltaContext *context, bool mark_dirty,
 		else
 		{
 			BufferDesc *buf_hdr = GetBufferDescriptor(buffer - 1);
+			uint64		lockstate;
 
 			Assert(BufferIsLockedByMeInMode(buffer,
 								  BUFFER_LOCK_SHARE_EXCLUSIVE) ||
 				   BufferIsLockedByMeInMode(buffer, BUFFER_LOCK_EXCLUSIVE));
+			lockstate = pg_atomic_read_u64(&buf_hdr->state);
+			if (context->prepared && !(lockstate & BM_DIRTY))
+			{
+				if (context->bitmap == NULL && context->nranges == 0)
+				{
+					XLogResetInsertion();
+					context->prepared = false;
+					elog(ERROR, "Umbra hint delta has no registered byte ranges");
+				}
+
+				Assert(HintDeltaDataScratch != NULL);
+				delta_data = HintDeltaDataScratch;
+				delta_len = BuildBufferHintDelta(context,
+										 BufferGetPage(buffer), delta_data);
+			}
 			MarkSharedBufferDirtyHint(buffer, buf_hdr,
-								  pg_atomic_read_u64(&buf_hdr->state),
-								  buffer_std, context->before, context->delta, 0,
+								  lockstate,
+								  buffer_std, delta_data, delta_len,
 								  context->prepared);
 		}
 	}
 	else if (context->prepared)
 		XLogResetInsertion();
 
-	if (context->before != NULL)
-		pfree(context->before);
 	context->buffer = InvalidBuffer;
-	context->before = NULL;
-	context->delta = NULL;
+	context->bitmap = NULL;
+	context->nranges = 0;
 	context->prepared = false;
 }
 #endif
@@ -7858,7 +8060,7 @@ BufferSetHintBits16(uint16 *ptr, uint16 val, Buffer buffer)
 		*ptr = val;
 
 #ifdef USE_UMBRA
-		MarkSharedBufferDirtyHint(buffer, buf_hdr, lockstate, true, NULL,
+		MarkSharedBufferDirtyHint(buffer, buf_hdr, lockstate, true,
 							  hint_delta_prepared ? delta : NULL, delta_len,
 							  hint_delta_prepared);
 #else

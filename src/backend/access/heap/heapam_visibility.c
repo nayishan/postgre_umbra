@@ -211,6 +211,8 @@ SetHintBitsExt(HeapTupleHeader tuple, Buffer buffer,
 
 		state->status = SHB_ENABLED;
 	}
+	BufferRegisterHintDeltaRange(&state->delta, &tuple->t_infomask,
+								 sizeof(tuple->t_infomask));
 #else
 	if (*state == SHB_INITIAL)
 	{
