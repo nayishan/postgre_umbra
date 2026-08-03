@@ -592,7 +592,6 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	BlockNumber	physical_capacity;
 	BlockNumber	physical_block;
 	BlockNumber	logical_end;
-	const void *buffers[1];
 
 	um_refresh_mapping_policy(reln, forknum);
 	if (!um_fork_uses_mapped_slots(reln, forknum))
@@ -603,14 +602,11 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	}
 
 	logical_eof = um_get_mapped_frontier(reln, forknum);
-	physical_block = um_active_pblk(reln, forknum, blocknum);
-	buffers[0] = buffer;
 	if (blocknum < logical_eof)
-	{
-		umfile_writev(um_get_filectx(reln), forknum, physical_block,
-					  buffers, 1, skipFsync);
-		return;
-	}
+		ereport(ERROR,
+				(errmsg("cannot extend mapped Umbra fork below logical EOF")));
+	Assert(blocknum >= logical_eof);
+	physical_block = um_active_pblk(reln, forknum, blocknum);
 
 	logical_end = um_mapped_range_end(reln, forknum, blocknum, 1);
 	physical_capacity = um_mapped_capacity(reln, forknum, logical_end);
@@ -619,7 +615,7 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	um_ensure_mapped_capacity(reln, forknum, physical_capacity, skipFsync);
 	if (blocknum > logical_eof)
 		um_zero_active_range(reln, forknum, logical_eof, blocknum, skipFsync);
-	umfile_writev(ctx, forknum, physical_block, buffers, 1, skipFsync);
+	umfile_writev(ctx, forknum, physical_block, &buffer, 1, skipFsync);
 	um_publish_mapped_after_data(reln, forknum, logical_end);
 	um_ensure_selector_pages(reln, forknum, logical_eof,
 						 logical_end - logical_eof, skipFsync);
