@@ -3949,30 +3949,54 @@ CheckpointBufferActiveEpoch(void)
 	return epoch_state & CKPT_BUFFER_EPOCH_MASK;
 }
 
-void
+bool
+BufferCheckpointSourceSlotCaptureIsPossible(Buffer buffer, uint8 source_slot)
+{
+	BufferDesc *buf;
+	uint64		buf_state;
+	uint64		epoch;
+	bool		possible;
+
+	if (!BufferIsValid(buffer) || BufferIsLocal(buffer) ||
+		!UmbraMainActiveSlotIsValid(source_slot))
+		return false;
+
+	buf = GetBufferDescriptor(buffer - 1);
+	buf_state = LockBufHdr(buf);
+	epoch = CheckpointBufferActiveEpoch();
+	possible = (buf_state & BM_CHECKPOINT_NEEDED) != 0 && epoch != 0 &&
+		(CkptBufferSourceSlotEpochs[buf->buf_id] != epoch ||
+		 !UmbraMainActiveSlotIsValid(CkptBufferSourceSlots[buf->buf_id]) ||
+		 CkptBufferSourceSlots[buf->buf_id] == source_slot);
+	UnlockBufHdr(buf);
+	return possible;
+}
+
+bool
 BufferSaveCheckpointSourceSlot(Buffer buffer, uint8 source_slot)
 {
 	BufferDesc *buf;
 	uint64		buf_state;
 	uint64		epoch;
+	bool		captured = false;
 
 	if (!BufferIsValid(buffer) || BufferIsLocal(buffer) ||
 		!UmbraMainActiveSlotIsValid(source_slot))
-		return;
+		return false;
 
 	buf = GetBufferDescriptor(buffer - 1);
 	buf_state = LockBufHdr(buf);
 	if ((buf_state & BM_CHECKPOINT_NEEDED) == 0)
 	{
 		UnlockBufHdr(buf);
-		return;
+		return false;
 	}
 
 	epoch = CheckpointBufferActiveEpoch();
 	if (epoch == 0)
 	{
 		UnlockBufHdr(buf);
-		return;
+		return false;
 	}
 
 	if (CkptBufferSourceSlotEpochs[buf->buf_id] != epoch ||
@@ -3980,8 +4004,12 @@ BufferSaveCheckpointSourceSlot(Buffer buffer, uint8 source_slot)
 	{
 		CkptBufferSourceSlots[buf->buf_id] = source_slot;
 		CkptBufferSourceSlotEpochs[buf->buf_id] = epoch;
+		captured = true;
 	}
+	else
+		captured = CkptBufferSourceSlots[buf->buf_id] == source_slot;
 	UnlockBufHdr(buf);
+	return captured;
 }
 
 static void

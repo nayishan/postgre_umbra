@@ -1845,6 +1845,15 @@ PerformWalRecovery(void)
 
 		RmgrCleanup();
 
+#ifdef USE_UMBRA
+		/*
+		 * Crash recovery need not pass through the archive-recovery
+		 * consistency transition.  Require every missing Umbra source
+		 * dependency to be resolved by later lifecycle WAL before redo ends.
+		 */
+		XLogCheckInvalidPages();
+#endif
+
 		ereport(LOG,
 				errmsg("redo done at %X/%08X system usage: %s",
 					   LSN_FORMAT_ARGS(xlogreader->ReadRecPtr),
