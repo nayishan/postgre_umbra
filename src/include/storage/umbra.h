@@ -154,6 +154,7 @@ extern void umwritev(SMgrRelation reln, ForkNumber forknum,
 					 BlockNumber nblocks, bool skipFsync);
 extern void umwriteback(SMgrRelation reln, ForkNumber forknum,
 						BlockNumber blocknum, BlockNumber nblocks);
+	/* Mapped forks return metadata-root logical EOF rather than physical length. */
 extern BlockNumber umnblocks(SMgrRelation reln, ForkNumber forknum);
 extern void umpreparetruncate(SMgrRelation reln, ForkNumber *forknum,
 						 int nforks, BlockNumber *old_blocks,

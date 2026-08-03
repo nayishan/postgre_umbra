@@ -17,9 +17,9 @@
 typedef struct UmbraFileContext UmbraFileContext;
 
 /*
- * The slot0 names below expose root-format activation bits.  Activation
- * enables the mapped three-slot layout whose zero selectors initially choose
- * slot 0; individual MAIN, FSM, and VM pages may later select slots 1 or 2.
+ * A valid root enables MAIN mapping.  The auxiliary slot0 names below expose
+ * the FSM and VM activation bits; zero selectors initially choose slot 0, and
+ * individual mapped pages may later select slots 1 or 2.
  */
 
 extern void ummap_root_cache_backend_init(void);
@@ -29,20 +29,16 @@ extern void ummap_create(UmbraFileContext *ctx,
 					 RelFileLocatorBackend rlocator, bool isRedo);
 /* Nonfatal on-disk root probe used by recovery and layout discovery. */
 extern bool ummap_try_validate(UmbraFileContext *ctx);
-extern void ummap_get_main_frontiers(UmbraFileContext *ctx,
-							 RelFileLocatorBackend rlocator,
-							 BlockNumber *logical_eof,
-							 BlockNumber *physical_capacity);
-extern void ummap_set_main_frontiers(UmbraFileContext *ctx,
-							 RelFileLocatorBackend rlocator,
-							 BlockNumber logical_eof,
-							 BlockNumber physical_capacity);
-extern void ummap_prepare_main_frontiers(UmbraFileContext *ctx,
-								 RelFileLocatorBackend rlocator);
-extern void ummap_publish_prepared_main_frontiers(UmbraFileContext *ctx,
-										  RelFileLocatorBackend rlocator,
-										  BlockNumber logical_eof,
-										  BlockNumber physical_capacity);
+extern BlockNumber ummap_get_main_frontier(UmbraFileContext *ctx,
+										RelFileLocatorBackend rlocator);
+extern void ummap_set_main_frontier(UmbraFileContext *ctx,
+								RelFileLocatorBackend rlocator,
+								BlockNumber logical_eof);
+extern void ummap_prepare_main_frontier(UmbraFileContext *ctx,
+									RelFileLocatorBackend rlocator);
+extern void ummap_publish_prepared_main_frontier(UmbraFileContext *ctx,
+											 RelFileLocatorBackend rlocator,
+											 BlockNumber logical_eof);
 extern bool ummap_aux_slot0_active(UmbraFileContext *ctx,
 										ForkNumber forknum,
 									RelFileLocatorBackend rlocator);
@@ -53,24 +49,20 @@ extern bool ummap_try_aux_slot0_active(UmbraFileContext *ctx,
 extern void ummap_activate_aux_slot0(UmbraFileContext *ctx,
 									 ForkNumber forknum,
 									 RelFileLocatorBackend rlocator);
-extern void ummap_get_aux_frontiers(UmbraFileContext *ctx,
-									 ForkNumber forknum,
-									 RelFileLocatorBackend rlocator,
-									 BlockNumber *logical_eof,
-									 BlockNumber *physical_capacity);
-extern void ummap_set_aux_frontiers(UmbraFileContext *ctx,
-									 ForkNumber forknum,
-									 RelFileLocatorBackend rlocator,
-									 BlockNumber logical_eof,
-									 BlockNumber physical_capacity);
-extern void ummap_prepare_aux_frontiers(UmbraFileContext *ctx,
-									 ForkNumber forknum,
-									 RelFileLocatorBackend rlocator);
-extern void ummap_publish_prepared_aux_frontiers(UmbraFileContext *ctx,
-											  ForkNumber forknum,
-												  RelFileLocatorBackend rlocator,
-												  BlockNumber logical_eof,
-												  BlockNumber physical_capacity);
+extern BlockNumber ummap_get_aux_frontier(UmbraFileContext *ctx,
+										ForkNumber forknum,
+										RelFileLocatorBackend rlocator);
+extern void ummap_set_aux_frontier(UmbraFileContext *ctx,
+								ForkNumber forknum,
+								RelFileLocatorBackend rlocator,
+								BlockNumber logical_eof);
+extern void ummap_prepare_aux_frontier(UmbraFileContext *ctx,
+									ForkNumber forknum,
+									RelFileLocatorBackend rlocator);
+extern void ummap_publish_prepared_aux_frontier(UmbraFileContext *ctx,
+											ForkNumber forknum,
+											RelFileLocatorBackend rlocator,
+											BlockNumber logical_eof);
 extern void ummap_validate_if_exists(UmbraFileContext *ctx,
 							 RelFileLocatorBackend rlocator);
 extern void ummap_immedsync_if_exists(UmbraFileContext *ctx,
