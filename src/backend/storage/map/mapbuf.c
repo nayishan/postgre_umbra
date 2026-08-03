@@ -28,7 +28,7 @@ static void MapPageLockPartitions(uint32 old_hash, bool old_valid,
 static void MapPageUnlockPartitions(uint32 old_hash, bool old_valid,
 								uint32 new_hash);
 static void MapPageLoad(UmbraFileContext *ctx, const MapPageTag *tag,
-						bool extend, bool skipFsync, char *page);
+						bool skipFsync, bool known_exists, char *page);
 static bool MapPageDiscardFailedLoad(MapPageDesc *desc,
 								 const MapPageTag *tag, uint32 hashcode);
 static void MapPageRememberIO(int slot_id);
@@ -62,6 +62,7 @@ static const ResourceOwnerDesc map_page_io_resowner_desc =
 	.DebugPrint = NULL
 };
 
+/* A non-extending disk miss returns an invalid buffer. */
 MapPageBuffer
 MapPageBufferRead(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 				  BlockNumber map_block, bool extend, bool skipFsync,
@@ -69,6 +70,7 @@ MapPageBufferRead(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 {
 	MapPageTag tag = {0};
 	uint32      hashcode;
+	bool        known_exists = false;
 
 	Assert(ctx != NULL);
 	Assert(map_block >= UMBRA_MAP_SELECTOR_FIRST_BLOCK);
@@ -126,6 +128,22 @@ MapPageBufferRead(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 			LWLockRelease(&desc->content_lock);
 			MapPageUnpinBuffer(slot_id);
 			continue;
+		}
+
+		/* Check the metadata fork only after a cache miss. */
+		if (!extend && !known_exists)
+		{
+			LWLock     *extension_lock = MapPageExtensionLock(rlocator);
+
+			LWLockAcquire(extension_lock, LW_SHARED);
+			known_exists = map_block <
+				umfile_nblocks(ctx, UMBRA_METADATA_FORKNUM);
+			LWLockRelease(extension_lock);
+			if (!known_exists)
+			{
+				buffer.desc = NULL;
+				return buffer;
+			}
 		}
 
 		slot_id = MapPageClockGetBuffer();
@@ -207,7 +225,8 @@ MapPageBufferRead(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 		LWLockRelease(&desc->content_lock);
 
 		/* ResourceOwner cleanup clears an unfinished input I/O on ERROR. */
-		MapPageLoad(ctx, &tag, extend, skipFsync, MapPageGetBlock(slot_id));
+		MapPageLoad(ctx, &tag, skipFsync, known_exists,
+					MapPageGetBlock(slot_id));
 
 		LWLockAcquire(&desc->content_lock, LW_EXCLUSIVE);
 		MapPageUpdateState(desc, MAP_PAGE_VALID,
@@ -351,24 +370,17 @@ MapGetActiveSlot(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 	int         byte_offset;
 	int         bit_offset;
 	uint8       active_slot;
-	LWLock     *extension_lock;
 
 	MapSelectorLocation(forknum, logical_block, &map_block, &byte_offset,
 						&bit_offset);
 
 	/* A missing selector page has the on-disk default: every entry is slot 0. */
-	extension_lock = MapPageExtensionLock(rlocator);
-	LWLockAcquire(extension_lock, LW_SHARED);
-	if (map_block >= umfile_nblocks(ctx, UMBRA_METADATA_FORKNUM))
-	{
-		LWLockRelease(extension_lock);
-		return 0;
-	}
 	buffer = MapPageBufferRead(ctx, rlocator, map_block, false, false,
 						   LW_SHARED);
-	LWLockRelease(extension_lock);
+	if (buffer.desc == NULL)
+		return 0;
 	active_slot = MapSelectorRead(MapPageBufferGetData(buffer), byte_offset,
-							 bit_offset);
+								bit_offset);
 	MapPageReleaseBuffer(buffer);
 	if (active_slot >= 3)
 		ereport(ERROR,
@@ -835,7 +847,7 @@ MapPageUnlockPartitions(uint32 old_hash, bool old_valid, uint32 new_hash)
 
 static void
 MapPageLoad(UmbraFileContext *ctx, const MapPageTag *tag,
-			bool extend, bool skipFsync, char *page)
+			bool skipFsync, bool known_exists, char *page)
 {
 	PGIOAlignedBlock empty_page;
 	BlockNumber nblocks;
@@ -843,13 +855,16 @@ MapPageLoad(UmbraFileContext *ctx, const MapPageTag *tag,
 	void       *buffers[1];
 	bool        extended_target = false;
 
+	if (known_exists)
+	{
+		buffers[0] = page;
+		umfile_readv(ctx, UMBRA_METADATA_FORKNUM, tag->map_block, buffers, 1);
+		return;
+	}
+
 	nblocks = umfile_nblocks(ctx, UMBRA_METADATA_FORKNUM);
 	if (tag->map_block >= nblocks)
 	{
-		if (!extend)
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("missing Umbra active-slot page %u", tag->map_block)));
 		extension_lock = MapPageExtensionLock(tag->rlocator);
 		LWLockAcquire(extension_lock, LW_EXCLUSIVE);
 		nblocks = umfile_nblocks(ctx, UMBRA_METADATA_FORKNUM);
