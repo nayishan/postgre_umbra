@@ -546,6 +546,11 @@ main(int argc, char *argv[])
 		exit(1);
 	}
 
+#ifdef USE_UMBRA
+	if (mode != PG_MODE_DISABLE)
+		pg_fatal("checking or enabling data checksums is not supported with Umbra storage");
+#endif
+
 	/*
 	 * Retrieve the contents of this cluster's PG_VERSION.  We require
 	 * compatibility with the same major version as the one this tool is

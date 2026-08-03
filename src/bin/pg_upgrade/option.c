@@ -244,6 +244,12 @@ parseCommandLine(int argc, char *argv[])
 	if (optind < argc)
 		pg_fatal("too many command-line arguments (first is \"%s\")", argv[optind]);
 
+#ifdef USE_UMBRA
+	fprintf(stderr, _("%s: pg_upgrade is not supported with Umbra storage\n"),
+			os_info.progname);
+	exit(1);
+#endif
+
 	if (!user_opts.sync_method)
 		user_opts.sync_method = pg_strdup("fsync");
 

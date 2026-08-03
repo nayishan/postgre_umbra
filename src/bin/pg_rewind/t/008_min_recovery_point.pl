@@ -36,6 +36,9 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
+plan skip_all => 'pg_rewind is not supported with Umbra storage'
+  if check_pg_config('^#define USE_UMBRA 1$');
+
 use File::Copy;
 
 my $tmp_folder = PostgreSQL::Test::Utils::tempdir;

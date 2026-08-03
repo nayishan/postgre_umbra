@@ -18,6 +18,9 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
+plan skip_all => 'pg_upgrade is not supported with Umbra storage'
+  if check_pg_config('^#define USE_UMBRA 1$');
+
 # Temp dir for a dumps.
 my $tempdir = PostgreSQL::Test::Utils::tempdir;
 
