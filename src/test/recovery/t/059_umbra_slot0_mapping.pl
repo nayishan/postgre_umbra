@@ -49,7 +49,6 @@ sub check_layout
 	my $root_physical_capacity =
 	  unpack('L', substr($root, ROOT_PHYSICAL_CAPACITY_OFFSET, 4));
 	my $physical_bytes = -s $node->data_dir . "/$main_path";
-
 	is($root_logical_eof, $logical_eof,
 		"$label: root stores the exact logical EOF");
 	is(substr($root, ROOT_RESERVED_OFFSET, 8), "\0" x 8,

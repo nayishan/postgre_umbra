@@ -65,6 +65,8 @@ extern BlockNumber umfile_nblocks(UmbraFileContext *ctx, ForkNumber forknum);
 extern void umfile_truncate(UmbraFileContext *ctx, ForkNumber forknum,
 							BlockNumber curnblk, BlockNumber nblocks);
 extern void umfile_immedsync(UmbraFileContext *ctx, ForkNumber forknum);
+extern void umfile_immedsync_prepared(UmbraFileContext *ctx,
+									  ForkNumber forknum);
 extern void umfile_registersync(UmbraFileContext *ctx, ForkNumber forknum);
 extern int	umfile_fd(UmbraFileContext *ctx, ForkNumber forknum,
 					  BlockNumber blocknum, uint32 *off);
