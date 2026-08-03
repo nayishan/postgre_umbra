@@ -64,11 +64,9 @@ extern void ummap_publish_prepared_aux_frontier(UmbraFileContext *ctx,
 											RelFileLocatorBackend rlocator,
 											BlockNumber logical_eof);
 extern void ummap_validate_if_exists(UmbraFileContext *ctx,
-							 RelFileLocatorBackend rlocator);
-extern void ummap_immedsync_if_exists(UmbraFileContext *ctx,
-							  RelFileLocatorBackend rlocator);
-extern void ummap_registersync_if_exists(UmbraFileContext *ctx,
-							   RelFileLocatorBackend rlocator);
+								 RelFileLocatorBackend rlocator);
+extern void ummap_sync_relation_metadata(UmbraFileContext *ctx,
+								  RelFileLocatorBackend rlocator);
 extern void ummap_unlink(RelFileLocatorBackend rlocator, bool isRedo);
 
 extern void ummap_flush_relation(UmbraFileContext *ctx,

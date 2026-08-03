@@ -43,12 +43,6 @@ typedef struct UmbraSlotShift
 	bool		selected;
 } UmbraSlotShift;
 
-typedef struct UmbraCheckpointWritebackRequest
-{
-	BlockNumber lblkno;
-	uint8		checkpoint_slot;
-} UmbraCheckpointWritebackRequest;
-
 /* A zero selector chooses slot 0; WAL-backed shifts can choose slots 1 or 2. */
 static inline bool
 UmbraActiveSlotIsValid(uint8 active_slot)
@@ -128,6 +122,7 @@ extern void umdestroy(SMgrRelation reln);
 extern void umcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
 extern void uminitnewrelation(SMgrRelation reln, bool needs_wal);
 extern void umfinishcreate(SMgrRelation reln, ForkNumber forknum);
+extern void umsyncrelationmetadata(SMgrRelation reln);
 /* Flush Umbra's private metadata-root cache at the checkpoint boundary. */
 extern void umcheckpoint(void);
 /* Flush Umbra's metadata-root cache before copying a database tablespace. */
@@ -142,9 +137,11 @@ extern bool umexists(SMgrRelation reln, ForkNumber forknum);
 extern void umunlink(RelFileLocatorBackend rlocator, ForkNumber forknum,
 					 bool isRedo);
 extern void umextend(SMgrRelation reln, ForkNumber forknum,
-					 BlockNumber blocknum, const void *buffer, bool skipFsync);
+					 BlockNumber blocknum, const void *buffer, bool skipFsync,
+					 BlockNumber *physical_block);
 extern void umzeroextend(SMgrRelation reln, ForkNumber forknum,
-						 BlockNumber blocknum, int nblocks, bool skipFsync);
+						 BlockNumber blocknum, int nblocks, bool skipFsync,
+						 BlockNumber *physical_blocks);
 extern bool umprefetch(SMgrRelation reln, ForkNumber forknum,
 					   BlockNumber blocknum, int nblocks);
 extern uint32 ummaxcombine(SMgrRelation reln, ForkNumber forknum,
@@ -157,10 +154,15 @@ extern void umstartreadv(PgAioHandle *ioh,
 						 void **buffers, BlockNumber nblocks);
 extern void umwritev(SMgrRelation reln, ForkNumber forknum,
 					 BlockNumber blocknum, const void **buffers,
-					 BlockNumber nblocks, bool skipFsync);
+					 BlockNumber nblocks, bool skipFsync,
+					 BlockNumber *physical_blocks);
+/* Mapped logical writeback is deferred until a physical target is known. */
 extern void umwriteback(SMgrRelation reln, ForkNumber forknum,
 						BlockNumber blocknum, BlockNumber nblocks);
-	/* Mapped forks return metadata-root logical EOF rather than physical length. */
+/* This path receives the resolved physical range from the writeback scheduler. */
+extern void umwritebackphysical(SMgrRelation reln, ForkNumber forknum,
+								BlockNumber blocknum, BlockNumber nblocks);
+/* Mapped forks return metadata-root logical EOF rather than physical length. */
 extern BlockNumber umnblocks(SMgrRelation reln, ForkNumber forknum);
 extern void umpreparetruncate(SMgrRelation reln, ForkNumber *forknum,
 						 int nforks, BlockNumber *old_blocks,
@@ -180,20 +182,16 @@ extern bool UmChooseSlotShift(SMgrRelation reln, ForkNumber forknum,
 extern void UmAbortSlotShift(UmbraSlotShift *shift);
 extern void UmReleaseSlotShiftOnExit(UmbraSlotShift *shift);
 extern void UmPublishSlotShift(UmbraSlotShift *shift, XLogRecPtr lsn);
-extern bool UmCheckpointWritePredecessorSlot(SMgrRelation reln,
-										 ForkNumber forknum,
-										 BlockNumber lblkno,
-										 const void *buffer,
-										 uint8 *source_slot);
-extern void UmCheckpointWritebackSourceSlots(SMgrRelation reln,
-											 ForkNumber forknum,
-											 const UmbraCheckpointWritebackRequest *requests,
-											 int nrequests);
 /*
  * During redo, an UNKNOWN policy for a mapped-capable fork is not permission
  * to use the direct physical layout.  Only CREATE redo may resolve it.
  */
 extern bool UmRedoMappingPolicyResolved(SMgrRelation reln, ForkNumber forknum);
+extern bool UmCheckpointWritePredecessorSlot(SMgrRelation reln,
+										 ForkNumber forknum,
+										 BlockNumber lblkno,
+										 const void *buffer,
+										 BlockNumber *physical_block);
 extern bool UmRedoSetActiveSlot(SMgrRelation reln, ForkNumber forknum,
 								 BlockNumber logical_block, uint8 active_slot);
 extern bool UmRedoSlotShift(SMgrRelation reln, ForkNumber forknum,

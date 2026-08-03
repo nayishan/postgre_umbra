@@ -30,9 +30,11 @@ extern void mdcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
 extern bool mdexists(SMgrRelation reln, ForkNumber forknum);
 extern void mdunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo);
 extern void mdextend(SMgrRelation reln, ForkNumber forknum,
-					 BlockNumber blocknum, const void *buffer, bool skipFsync);
+					 BlockNumber blocknum, const void *buffer, bool skipFsync,
+					 BlockNumber *physical_block);
 extern void mdzeroextend(SMgrRelation reln, ForkNumber forknum,
-						 BlockNumber blocknum, int nblocks, bool skipFsync);
+						 BlockNumber blocknum, int nblocks, bool skipFsync,
+						 BlockNumber *physical_blocks);
 extern bool mdprefetch(SMgrRelation reln, ForkNumber forknum,
 					   BlockNumber blocknum, int nblocks);
 extern uint32 mdmaxcombine(SMgrRelation reln, ForkNumber forknum,
@@ -44,9 +46,12 @@ extern void mdstartreadv(PgAioHandle *ioh,
 						 void **buffers, BlockNumber nblocks);
 extern void mdwritev(SMgrRelation reln, ForkNumber forknum,
 					 BlockNumber blocknum,
-					 const void **buffers, BlockNumber nblocks, bool skipFsync);
+					 const void **buffers, BlockNumber nblocks, bool skipFsync,
+					 BlockNumber *physical_blocks);
 extern void mdwriteback(SMgrRelation reln, ForkNumber forknum,
 						BlockNumber blocknum, BlockNumber nblocks);
+extern void mdwritebackphysical(SMgrRelation reln, ForkNumber forknum,
+								BlockNumber blocknum, BlockNumber nblocks);
 extern BlockNumber mdnblocks(SMgrRelation reln, ForkNumber forknum);
 extern void mdtruncate(SMgrRelation reln, ForkNumber forknum,
 					   BlockNumber curnblk, BlockNumber nblocks);

@@ -114,6 +114,12 @@ typedef struct f_smgr
 	 */
 	bool		(*smgr_force_pending_sync) (SMgrRelation reln); /* may be NULL */
 	/*
+	 * Synchronize relation-level SMgr-private metadata after core has synced
+	 * the ordinary forks.  The metadata can then publish state about data that
+	 * is already durable, and is synchronized only once per relation.
+	 */
+	void		(*smgr_sync_relation_metadata) (SMgrRelation reln); /* may be NULL */
+	/*
 	 * The caller establishes checkpoint ordering with ordinary buffer writeback.
 	 */
 	void		(*smgr_checkpoint) (void); /* may be NULL */
@@ -134,9 +140,11 @@ typedef struct f_smgr
 	void		(*smgr_unlink) (RelFileLocatorBackend rlocator, ForkNumber forknum,
 								bool isRedo);
 	void		(*smgr_extend) (SMgrRelation reln, ForkNumber forknum,
-								BlockNumber blocknum, const void *buffer, bool skipFsync);
+								BlockNumber blocknum, const void *buffer,
+								bool skipFsync, BlockNumber *physical_block);
 	void		(*smgr_zeroextend) (SMgrRelation reln, ForkNumber forknum,
-									BlockNumber blocknum, int nblocks, bool skipFsync);
+									BlockNumber blocknum, int nblocks,
+									bool skipFsync, BlockNumber *physical_blocks);
 	bool		(*smgr_prefetch) (SMgrRelation reln, ForkNumber forknum,
 								  BlockNumber blocknum, int nblocks);
 	uint32		(*smgr_maxcombine) (SMgrRelation reln, ForkNumber forknum,
@@ -151,9 +159,13 @@ typedef struct f_smgr
 	void		(*smgr_writev) (SMgrRelation reln, ForkNumber forknum,
 								BlockNumber blocknum,
 								const void **buffers, BlockNumber nblocks,
-								bool skipFsync);
+								bool skipFsync, BlockNumber *physical_blocks);
 	void		(*smgr_writeback) (SMgrRelation reln, ForkNumber forknum,
 								   BlockNumber blocknum, BlockNumber nblocks);
+	void		(*smgr_writeback_physical) (SMgrRelation reln,
+											ForkNumber forknum,
+											BlockNumber physical_blocknum,
+											BlockNumber nblocks);
 	BlockNumber (*smgr_nblocks) (SMgrRelation reln, ForkNumber forknum);
 	/*
 	 * Prepare selected-smgr state before smgrtruncate() enters its critical
@@ -195,6 +207,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_init_new_relation = NULL,
 		.smgr_finish_create = NULL,
 		.smgr_force_pending_sync = NULL,
+		.smgr_sync_relation_metadata = NULL,
 		.smgr_checkpoint = NULL,
 		.smgr_flush_database_tablespace_cache = NULL,
 		.smgr_invalidate_database_cache = NULL,
@@ -209,6 +222,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_startreadv = mdstartreadv,
 		.smgr_writev = mdwritev,
 		.smgr_writeback = mdwriteback,
+		.smgr_writeback_physical = mdwritebackphysical,
 		.smgr_nblocks = mdnblocks,
 		.smgr_prepare_truncate = NULL,
 		.smgr_truncate = mdtruncate,
@@ -228,6 +242,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_init_new_relation = uminitnewrelation,
 		.smgr_finish_create = umfinishcreate,
 		.smgr_force_pending_sync = umforcependingsync,
+		.smgr_sync_relation_metadata = umsyncrelationmetadata,
 		.smgr_checkpoint = umcheckpoint,
 		.smgr_flush_database_tablespace_cache =
 			umflushdatabasetablespacecache,
@@ -244,6 +259,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_startreadv = umstartreadv,
 		.smgr_writev = umwritev,
 		.smgr_writeback = umwriteback,
+		.smgr_writeback_physical = umwritebackphysical,
 		.smgr_nblocks = umnblocks,
 		.smgr_prepare_truncate = umpreparetruncate,
 		.smgr_truncate = umtruncate,
@@ -649,6 +665,17 @@ smgrforcependingsync(SMgrRelation reln)
 	return smgrsw[reln->smgr_which].smgr_force_pending_sync(reln);
 }
 
+/*
+ * Synchronize relation-level selected-smgr metadata after ordinary relation
+ * forks have reached stable storage.
+ */
+void
+smgrsyncrelationmetadata(SMgrRelation reln)
+{
+	if (smgrsw[reln->smgr_which].smgr_sync_relation_metadata != NULL)
+		smgrsw[reln->smgr_which].smgr_sync_relation_metadata(reln);
+}
+
 /* Run selected-smgr checkpoint work at the caller's chosen ordering point. */
 void
 smgrcheckpoint(void)
@@ -700,8 +727,9 @@ smgrinvalidatedatabasetablespacecache(Oid dbid, Oid spcOid)
  * All forks of all given relations are synced out to the store.
  *
  * This is equivalent to FlushRelationBuffers() for each smgr relation,
- * then calling smgrimmedsync() for all forks of each relation, but it's
- * significantly quicker so should be preferred when possible.
+ * then calling smgrimmedsync() for all forks and synchronizing selected-smgr
+ * relation metadata once per relation, but it's significantly quicker so
+ * should be preferred when possible.
  */
 void
 smgrdosyncall(SMgrRelation *rels, int nrels)
@@ -728,6 +756,9 @@ smgrdosyncall(SMgrRelation *rels, int nrels)
 			if (smgrsw[which].smgr_exists(rels[i], forknum))
 				smgrsw[which].smgr_immedsync(rels[i], forknum);
 		}
+
+		/* Publish and sync relation-level private metadata once per relation. */
+		smgrsyncrelationmetadata(rels[i]);
 	}
 
 	RESUME_INTERRUPTS();
@@ -829,10 +860,18 @@ void
 smgrextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		   const void *buffer, bool skipFsync)
 {
+	smgrextend_with_target(reln, forknum, blocknum, buffer, skipFsync, NULL);
+}
+
+void
+smgrextend_with_target(SMgrRelation reln, ForkNumber forknum,
+					   BlockNumber blocknum, const void *buffer,
+					   bool skipFsync, BlockNumber *physical_block)
+{
 	HOLD_INTERRUPTS();
 
 	smgrsw[reln->smgr_which].smgr_extend(reln, forknum, blocknum,
-										 buffer, skipFsync);
+										 buffer, skipFsync, physical_block);
 
 	/*
 	 * Normally we expect this to increase nblocks by one, but if the cached
@@ -858,10 +897,19 @@ void
 smgrzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 			   int nblocks, bool skipFsync)
 {
+	smgrzeroextend_with_targets(reln, forknum, blocknum, nblocks, skipFsync,
+								NULL);
+}
+
+void
+smgrzeroextend_with_targets(SMgrRelation reln, ForkNumber forknum,
+							BlockNumber blocknum, int nblocks,
+							bool skipFsync, BlockNumber *physical_blocks)
+{
 	HOLD_INTERRUPTS();
 
 	smgrsw[reln->smgr_which].smgr_zeroextend(reln, forknum, blocknum,
-											 nblocks, skipFsync);
+											 nblocks, skipFsync, physical_blocks);
 
 	/*
 	 * Normally we expect this to increase the fork size by nblocks, but if
@@ -1000,9 +1048,20 @@ void
 smgrwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		   const void **buffers, BlockNumber nblocks, bool skipFsync)
 {
+	smgrwritev_with_targets(reln, forknum, blocknum, buffers, nblocks,
+							skipFsync, NULL);
+}
+
+void
+smgrwritev_with_targets(SMgrRelation reln, ForkNumber forknum,
+						BlockNumber blocknum, const void **buffers,
+						BlockNumber nblocks, bool skipFsync,
+						BlockNumber *physical_blocks)
+{
 	HOLD_INTERRUPTS();
 	smgrsw[reln->smgr_which].smgr_writev(reln, forknum, blocknum,
-										 buffers, nblocks, skipFsync);
+										 buffers, nblocks, skipFsync,
+										 physical_blocks);
 	RESUME_INTERRUPTS();
 }
 
@@ -1017,6 +1076,20 @@ smgrwriteback(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	HOLD_INTERRUPTS();
 	smgrsw[reln->smgr_which].smgr_writeback(reln, forknum, blocknum,
 											nblocks);
+	RESUME_INTERRUPTS();
+}
+
+/*
+ * smgrwritebackphysical() -- Trigger kernel writeback for an exact physical
+ *                             range returned by the storage manager's write.
+ */
+void
+smgrwritebackphysical(SMgrRelation reln, ForkNumber forknum,
+					  BlockNumber physical_blocknum, BlockNumber nblocks)
+{
+	HOLD_INTERRUPTS();
+	smgrsw[reln->smgr_which].smgr_writeback_physical(reln, forknum,
+												 physical_blocknum, nblocks);
 	RESUME_INTERRUPTS();
 }
 

@@ -109,6 +109,8 @@ extern void smgrfinishcreate(SMgrRelation reln, ForkNumber forknum);
  * durable.
  */
 extern bool smgrforcependingsync(SMgrRelation reln);
+/* Sync relation-level private metadata after ordinary forks are synchronized. */
+extern void smgrsyncrelationmetadata(SMgrRelation reln);
 /* Complete selected-smgr checkpoint work at the caller's ordering point. */
 extern void smgrcheckpoint(void);
 /*
@@ -132,8 +134,15 @@ extern void smgrdosyncall(SMgrRelation *rels, int nrels);
 extern void smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo);
 extern void smgrextend(SMgrRelation reln, ForkNumber forknum,
 					   BlockNumber blocknum, const void *buffer, bool skipFsync);
+extern void smgrextend_with_target(SMgrRelation reln, ForkNumber forknum,
+								   BlockNumber blocknum, const void *buffer,
+								   bool skipFsync, BlockNumber *physical_block);
 extern void smgrzeroextend(SMgrRelation reln, ForkNumber forknum,
 						   BlockNumber blocknum, int nblocks, bool skipFsync);
+extern void smgrzeroextend_with_targets(SMgrRelation reln, ForkNumber forknum,
+										BlockNumber blocknum, int nblocks,
+										bool skipFsync,
+										BlockNumber *physical_blocks);
 extern bool smgrprefetch(SMgrRelation reln, ForkNumber forknum,
 						 BlockNumber blocknum, int nblocks);
 extern uint32 smgrmaxcombine(SMgrRelation reln, ForkNumber forknum,
@@ -149,8 +158,15 @@ extern void smgrwritev(SMgrRelation reln, ForkNumber forknum,
 					   BlockNumber blocknum,
 					   const void **buffers, BlockNumber nblocks,
 					   bool skipFsync);
+extern void smgrwritev_with_targets(SMgrRelation reln, ForkNumber forknum,
+									BlockNumber blocknum,
+									const void **buffers, BlockNumber nblocks,
+									bool skipFsync, BlockNumber *physical_blocks);
 extern void smgrwriteback(SMgrRelation reln, ForkNumber forknum,
 						  BlockNumber blocknum, BlockNumber nblocks);
+extern void smgrwritebackphysical(SMgrRelation reln, ForkNumber forknum,
+								  BlockNumber physical_blocknum,
+								  BlockNumber nblocks);
 extern BlockNumber smgrnblocks(SMgrRelation reln, ForkNumber forknum);
 extern BlockNumber smgrnblocks_cached(SMgrRelation reln, ForkNumber forknum);
 /*
@@ -180,6 +196,15 @@ smgrwrite(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		  const void *buffer, bool skipFsync)
 {
 	smgrwritev(reln, forknum, blocknum, &buffer, 1, skipFsync);
+}
+
+static inline void
+smgrwrite_with_target(SMgrRelation reln, ForkNumber forknum,
+					  BlockNumber blocknum, const void *buffer,
+					  bool skipFsync, BlockNumber *physical_block)
+{
+	smgrwritev_with_targets(reln, forknum, blocknum, &buffer, 1, skipFsync,
+							physical_block);
 }
 
 extern void pgaio_io_set_target_smgr(PgAioHandle *ioh,

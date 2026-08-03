@@ -135,11 +135,7 @@ static void ummap_root_cache_load_locked(UmbraFileContext *ctx,
 	UmbraMapRootEntry *entry);
 static void ummap_root_cache_flush_locked(UmbraMapRootEntry *entry,
 	UmbraFileContext *ctx);
-static void ummap_root_cache_flush_prepared_locked(UmbraMapRootEntry *entry,
-	UmbraFileContext *ctx);
-static void ummap_root_cache_flush_internal_locked(UmbraMapRootEntry *entry,
-	UmbraFileContext *ctx, bool prepared);
-static void ummap_prepare_root_flush(UmbraFileContext *ctx, uint32 flags);
+static void ummap_prepare_root_flush(UmbraFileContext *ctx);
 static int ummap_root_cache_collect_tags(Oid dbid, Oid spcOid,
 	UmbraMapRootTag **tags);
 static void ummap_root_cache_flush_matching(Oid dbid, Oid spcOid);
@@ -259,8 +255,6 @@ ummap_prepare_main_frontier(UmbraFileContext *ctx,
 								RelFileLocatorBackend rlocator)
 {
 	UmbraMapRootEntry *entry;
-	UmbraMapRootData *root;
-	uint32		flags;
 
 	Assert(ctx != NULL);
 	/*
@@ -269,11 +263,9 @@ ummap_prepare_main_frontier(UmbraFileContext *ctx,
 	 * without a cache insertion or descriptor allocation.
 	 */
 	entry = ummap_root_cache_get(ctx, rlocator, LW_SHARED);
-	root = (UmbraMapRootData *) entry->image;
-	flags = root->flags;
 	LWLockRelease(&entry->content_lock);
 
-	ummap_prepare_root_flush(ctx, flags);
+	ummap_prepare_root_flush(ctx);
 }
 
 void
@@ -305,7 +297,9 @@ ummap_publish_prepared_main_frontier(UmbraFileContext *ctx,
 		entry->wal_flush_lsn = InRecovery ? InvalidXLogRecPtr :
 			Max(entry->wal_flush_lsn, GetXLogWriteRecPtr());
 	}
-	ummap_root_cache_flush_prepared_locked(entry, ctx);
+	/* The selected data fork was opened before this critical section. */
+	umfile_immedsync_prepared(ctx, MAIN_FORKNUM);
+	ummap_root_cache_flush_locked(entry, ctx);
 	LWLockRelease(&entry->content_lock);
 
 	/* The prepared metadata fork is one short segment and needs no allocation. */
@@ -370,9 +364,7 @@ ummap_activate_aux_slot0(UmbraFileContext *ctx, ForkNumber forknum,
 	}
 	LWLockRelease(&entry->content_lock);
 
-	/* Auxiliary redo can immediately issue page I/O through the new root. */
-	if (InRecovery)
-		ummap_immedsync_if_exists(ctx, rlocator);
+	/* Activation joins normal checkpoint or explicit metadata synchronization. */
 }
 
 BlockNumber
@@ -438,7 +430,6 @@ ummap_prepare_aux_frontier(UmbraFileContext *ctx, ForkNumber forknum,
 {
 	UmbraMapRootEntry *entry;
 	UmbraMapRootData *root;
-	uint32		flags;
 
 	Assert(ctx != NULL);
 	Assert(UmbraIsMappedAuxiliaryFork(forknum));
@@ -449,10 +440,9 @@ ummap_prepare_aux_frontier(UmbraFileContext *ctx, ForkNumber forknum,
 		LWLockRelease(&entry->content_lock);
 		elog(PANIC, "Umbra auxiliary frontier requires slot-0 activation");
 	}
-	flags = root->flags;
 	LWLockRelease(&entry->content_lock);
 
-	ummap_prepare_root_flush(ctx, flags);
+	ummap_prepare_root_flush(ctx);
 }
 
 void
@@ -492,7 +482,9 @@ ummap_publish_prepared_aux_frontier(UmbraFileContext *ctx,
 		entry->wal_flush_lsn = InRecovery ? InvalidXLogRecPtr :
 			Max(entry->wal_flush_lsn, GetXLogWriteRecPtr());
 	}
-	ummap_root_cache_flush_prepared_locked(entry, ctx);
+	/* The selected data fork was opened before this critical section. */
+	umfile_immedsync_prepared(ctx, forknum);
+	ummap_root_cache_flush_locked(entry, ctx);
 	LWLockRelease(&entry->content_lock);
 
 	/* The metadata fork is one short segment and needs no allocation. */
@@ -573,27 +565,17 @@ ummap_checkpoint(void)
 }
 
 void
-ummap_immedsync_if_exists(UmbraFileContext *ctx,
-					  RelFileLocatorBackend rlocator)
+ummap_sync_relation_metadata(UmbraFileContext *ctx,
+							 RelFileLocatorBackend rlocator)
 {
 	Assert(ctx != NULL);
-	if (ummap_exists(ctx))
-	{
-		ummap_flush_relation(ctx, rlocator);
-		umfile_immedsync(ctx, UMBRA_METADATA_FORKNUM);
-	}
-}
-
-void
-ummap_registersync_if_exists(UmbraFileContext *ctx,
-					   RelFileLocatorBackend rlocator)
-{
-	Assert(ctx != NULL);
-	if (ummap_exists(ctx))
-	{
-		ummap_flush_relation(ctx, rlocator);
-		umfile_registersync(ctx, UMBRA_METADATA_FORKNUM);
-	}
+	/* The caller has already synchronized the standard data forks. */
+	if (!ummap_exists(ctx))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("Umbra mapped relation metadata root is missing")));
+	ummap_flush_relation(ctx, rlocator);
+	umfile_immedsync(ctx, UMBRA_METADATA_FORKNUM);
 }
 
 void
@@ -1026,26 +1008,6 @@ static void
 ummap_root_cache_flush_locked(UmbraMapRootEntry *entry,
 						  UmbraFileContext *ctx)
 {
-	ummap_root_cache_flush_internal_locked(entry, ctx, false);
-}
-
-/*
- * Truncate prepares all active data and metadata descriptors before entering
- * its critical section.  Do not open transient inactive segments while the
- * prepared root publication is in progress.
- */
-static void
-ummap_root_cache_flush_prepared_locked(UmbraMapRootEntry *entry,
-									   UmbraFileContext *ctx)
-{
-	Assert(ctx != NULL);
-	ummap_root_cache_flush_internal_locked(entry, ctx, true);
-}
-
-static void
-ummap_root_cache_flush_internal_locked(UmbraMapRootEntry *entry,
-									  UmbraFileContext *ctx, bool prepared)
-{
 	UmbraFileContext *volatile temporary_ctx = NULL;
 	UmbraFileContext *write_ctx;
 
@@ -1074,37 +1036,10 @@ ummap_root_cache_flush_internal_locked(UmbraMapRootEntry *entry,
 		if (XLogRecPtrIsValid(entry->wal_flush_lsn))
 			XLogFlush(entry->wal_flush_lsn);
 		/*
-		 * The valid root's MAIN EOF and each activated auxiliary EOF determine
-		 * their physical capacities.  Sync every described data fork before
-		 * publishing the root.
+		 * Data-before-root ordering belongs to the caller.  Checkpoint and the
+		 * relation-level pending-sync path synchronize selector pages and data
+		 * forks before asking this cache to publish the root image.
 		 */
-		if (prepared)
-			umfile_immedsync_prepared(write_ctx, MAIN_FORKNUM);
-		else
-			umfile_immedsync(write_ctx, MAIN_FORKNUM);
-		if ((((UmbraMapRootData *) entry->image)->flags &
-			 UMMAP_ROOT_FLAG_FSM_SLOT0) != 0)
-		{
-			if (prepared)
-				umfile_immedsync_prepared(write_ctx, FSM_FORKNUM);
-			else
-				umfile_immedsync(write_ctx, FSM_FORKNUM);
-		}
-		if ((((UmbraMapRootData *) entry->image)->flags &
-			 UMMAP_ROOT_FLAG_VM_SLOT0) != 0)
-		{
-			if (prepared)
-				umfile_immedsync_prepared(write_ctx, VISIBILITYMAP_FORKNUM);
-			else
-				umfile_immedsync(write_ctx, VISIBILITYMAP_FORKNUM);
-		}
-		/*
-		 * Selector pages share the metadata file with the root.  Make their
-		 * WAL-protected contents durable before a root write can make this
-		 * metadata state authoritative.
-		 */
-		MapFlushRelation(write_ctx, entry->tag.rlocator);
-		umfile_immedsync(write_ctx, UMBRA_METADATA_FORKNUM);
 		ummap_root_write_image(write_ctx, entry->image, !entry->needs_fsync);
 		if (temporary_ctx != NULL)
 		{
@@ -1125,16 +1060,11 @@ ummap_root_cache_flush_internal_locked(UmbraMapRootEntry *entry,
 	PG_END_TRY();
 }
 
-/* Open every file the prepared root publication may need to sync or write. */
+/* The truncate caller separately opens the selected physical fork. */
 static void
-ummap_prepare_root_flush(UmbraFileContext *ctx, uint32 flags)
+ummap_prepare_root_flush(UmbraFileContext *ctx)
 {
 	Assert(ctx != NULL);
-	(void) umfile_nblocks(ctx, MAIN_FORKNUM);
-	if ((flags & UMMAP_ROOT_FLAG_FSM_SLOT0) != 0)
-		(void) umfile_nblocks(ctx, FSM_FORKNUM);
-	if ((flags & UMMAP_ROOT_FLAG_VM_SLOT0) != 0)
-		(void) umfile_nblocks(ctx, VISIBILITYMAP_FORKNUM);
 	(void) umfile_nblocks(ctx, UMBRA_METADATA_FORKNUM);
 }
 

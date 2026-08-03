@@ -70,17 +70,19 @@ static BlockNumber um_active_pblk(SMgrRelation reln, ForkNumber forknum,
 static BlockNumber um_mapped_range_end(SMgrRelation reln, ForkNumber forknum,
 									  BlockNumber blocknum, BlockNumber nblocks);
 static BlockNumber um_get_mapped_frontier(SMgrRelation reln,
-									  ForkNumber forknum);
+										  ForkNumber forknum);
 static BlockNumber um_mapped_capacity(SMgrRelation reln, ForkNumber forknum,
 									 BlockNumber logical_eof);
 static void um_ensure_mapped_capacity(SMgrRelation reln, ForkNumber forknum,
 									  BlockNumber physical_capacity,
 									  bool skipFsync);
 static void um_ensure_aux_recovery_capacity(SMgrRelation reln,
-												 ForkNumber forknum);
+											ForkNumber forknum);
 static void um_zero_active_range(SMgrRelation reln, ForkNumber forknum,
 								 BlockNumber first_block, BlockNumber end_block,
-								 bool skipFsync);
+								 bool skipFsync,
+								 BlockNumber output_first_block,
+								 BlockNumber *physical_blocks);
 static void um_publish_mapped_after_data(SMgrRelation reln, ForkNumber forknum,
 									BlockNumber logical_eof);
 static void um_publish_mapped_before_truncate(SMgrRelation reln,
@@ -382,24 +384,24 @@ UmPublishSlotShift(UmbraSlotShift *shift, XLogRecPtr lsn)
 bool
 UmCheckpointWritePredecessorSlot(SMgrRelation reln, ForkNumber forknum,
 								 BlockNumber logical_block,
-								 const void *buffer, uint8 *source_slot)
+								 const void *buffer, BlockNumber *physical_block)
 {
 	const void *buffers[1] = {buffer};
-	BlockNumber	physical_block;
 	uint8		active_slot;
+	uint8		source_slot;
 
-	if (source_slot != NULL)
-		*source_slot = UINT8_MAX;
-	if (reln == NULL || buffer == NULL || source_slot == NULL)
+	if (physical_block != NULL)
+		*physical_block = InvalidBlockNumber;
+	if (reln == NULL || buffer == NULL || physical_block == NULL)
 		return false;
 	um_refresh_mapping_policy(reln, forknum);
 	if (!um_fork_uses_mapped_slots(reln, forknum))
 		return false;
 	active_slot = MapGetActiveSlot(um_get_filectx(reln),
-							   reln->smgr_rlocator, forknum, logical_block);
-	*source_slot = UmbraPreviousActiveSlot(active_slot);
-	if (!UmbraActiveSlotPhysicalBlock(logical_block, *source_slot,
-								  &physical_block))
+								   reln->smgr_rlocator, forknum, logical_block);
+	source_slot = UmbraPreviousActiveSlot(active_slot);
+	if (!UmbraActiveSlotPhysicalBlock(logical_block, source_slot,
+									 physical_block))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("Umbra source-slot block mapping overflow for relation %u/%u/%u fork %d",
@@ -407,108 +409,9 @@ UmCheckpointWritePredecessorSlot(SMgrRelation reln, ForkNumber forknum,
 						reln->smgr_rlocator.locator.dbOid,
 						reln->smgr_rlocator.locator.relNumber, (int) forknum)));
 
-	umfile_writev(um_get_filectx(reln), forknum, physical_block,
+	umfile_writev(um_get_filectx(reln), forknum, *physical_block,
 				  buffers, 1, false);
 	return true;
-}
-
-static int
-um_checkpoint_pblk_comparator(const void *a, const void *b)
-{
-	BlockNumber pblk_a = *(const BlockNumber *) a;
-	BlockNumber pblk_b = *(const BlockNumber *) b;
-
-	if (pblk_a < pblk_b)
-		return -1;
-	if (pblk_a > pblk_b)
-		return 1;
-	return 0;
-}
-
-/*
- * Convert a relation/fork batch of checkpoint source slots to physical
- * blocks, then sort, deduplicate, and coalesce adjacent blocks into
- * segment-local writeback ranges.
- */
-void
-UmCheckpointWritebackSourceSlots(SMgrRelation reln, ForkNumber forknum,
-								 const UmbraCheckpointWritebackRequest *requests,
-								 int nrequests)
-{
-	UmbraFileContext *ctx;
-	BlockNumber pblks[WRITEBACK_MAX_PENDING_FLUSHES];
-	BlockNumber run_start_pblk = InvalidBlockNumber;
-	BlockNumber run_blocks = 0;
-	int			npblks = 0;
-
-	if (reln == NULL || requests == NULL || nrequests <= 0)
-		return;
-	if (nrequests > lengthof(pblks))
-		elog(ERROR, "too many Umbra checkpoint writeback requests: %d",
-			 nrequests);
-
-	um_refresh_mapping_policy(reln, forknum);
-	if (!um_fork_uses_mapped_slots(reln, forknum))
-		return;
-
-	ctx = um_get_filectx(reln);
-	for (int i = 0; i < nrequests; i++)
-	{
-		BlockNumber physical_block;
-
-		if (!UmbraActiveSlotIsValid(requests[i].checkpoint_slot))
-		{
-			Assert(false);
-			continue;
-		}
-		if (!UmbraActiveSlotPhysicalBlock(requests[i].lblkno,
-										  requests[i].checkpoint_slot,
-										  &physical_block))
-			ereport(ERROR,
-					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("Umbra source-slot block mapping overflow for relation %u/%u/%u fork %d",
-							reln->smgr_rlocator.locator.spcOid,
-							reln->smgr_rlocator.locator.dbOid,
-							reln->smgr_rlocator.locator.relNumber, (int) forknum)));
-
-		pblks[npblks++] = physical_block;
-	}
-
-	if (npblks == 0)
-		return;
-
-	qsort(pblks, npblks, sizeof(BlockNumber),
-		  um_checkpoint_pblk_comparator);
-
-	for (int i = 0; i < npblks; i++)
-	{
-		BlockNumber pblk = pblks[i];
-		bool		same_segment;
-
-		if (i > 0 && pblk == pblks[i - 1])
-			continue;
-
-		same_segment =
-			run_blocks > 0 &&
-			run_start_pblk / ((BlockNumber) RELSEG_SIZE) ==
-			pblk / ((BlockNumber) RELSEG_SIZE);
-
-		if (run_blocks == 0)
-		{
-			run_start_pblk = pblk;
-			run_blocks = 1;
-		}
-		else if (same_segment && pblk == run_start_pblk + run_blocks)
-			run_blocks++;
-		else
-		{
-			umfile_writeback(ctx, forknum, run_start_pblk, run_blocks);
-			run_start_pblk = pblk;
-			run_blocks = 1;
-		}
-	}
-
-	umfile_writeback(ctx, forknum, run_start_pblk, run_blocks);
 }
 
 bool
@@ -694,19 +597,25 @@ umunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 
 void
 umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
-		 const void *buffer, bool skipFsync)
+		 const void *buffer, bool skipFsync, BlockNumber *writeback_target)
 {
 	UmbraFileContext *ctx;
 	BlockNumber	logical_eof;
 	BlockNumber	physical_capacity;
 	BlockNumber	physical_block;
 	BlockNumber	logical_end;
+	const void *buffers[1];
+
+	if (writeback_target != NULL)
+		*writeback_target = InvalidBlockNumber;
 
 	um_refresh_mapping_policy(reln, forknum);
 	if (!um_fork_uses_mapped_slots(reln, forknum))
 	{
 		umfile_extend(um_get_filectx(reln), forknum, blocknum, buffer,
 					  skipFsync);
+		if (writeback_target != NULL)
+			*writeback_target = blocknum;
 		return;
 	}
 
@@ -716,6 +625,7 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 				(errmsg("cannot extend mapped Umbra fork below logical EOF")));
 	Assert(blocknum >= logical_eof);
 	physical_block = um_active_pblk(reln, forknum, blocknum);
+	buffers[0] = buffer;
 
 	logical_end = um_mapped_range_end(reln, forknum, blocknum, 1);
 	physical_capacity = um_mapped_capacity(reln, forknum, logical_end);
@@ -723,8 +633,11 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	ctx = um_get_filectx(reln);
 	um_ensure_mapped_capacity(reln, forknum, physical_capacity, skipFsync);
 	if (blocknum > logical_eof)
-		um_zero_active_range(reln, forknum, logical_eof, blocknum, skipFsync);
-	umfile_writev(ctx, forknum, physical_block, &buffer, 1, skipFsync);
+		um_zero_active_range(reln, forknum, logical_eof, blocknum, skipFsync,
+							 InvalidBlockNumber, NULL);
+	umfile_writev(ctx, forknum, physical_block, buffers, 1, skipFsync);
+	if (writeback_target != NULL)
+		*writeback_target = physical_block;
 	um_publish_mapped_after_data(reln, forknum, logical_end);
 	um_ensure_selector_pages(reln, forknum, logical_eof,
 						 logical_end - logical_eof, skipFsync);
@@ -732,17 +645,28 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 void
 umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
-			 int nblocks, bool skipFsync)
+			 int nblocks, bool skipFsync, BlockNumber *physical_blocks)
 {
 	BlockNumber	logical_eof;
 	BlockNumber	physical_capacity;
 	BlockNumber	logical_end;
+
+	if (physical_blocks != NULL)
+	{
+		for (int i = 0; i < nblocks; i++)
+			physical_blocks[i] = InvalidBlockNumber;
+	}
 
 	um_refresh_mapping_policy(reln, forknum);
 	if (!um_fork_uses_mapped_slots(reln, forknum))
 	{
 		umfile_zeroextend(um_get_filectx(reln), forknum, blocknum, nblocks,
 						  skipFsync);
+		if (physical_blocks != NULL)
+		{
+			for (int i = 0; i < nblocks; i++)
+				physical_blocks[i] = blocknum + i;
+		}
 		return;
 	}
 	if (nblocks <= 0)
@@ -761,7 +685,8 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	 * selector for slot 1 or 2, so initialize that selected physical page
 	 * before publishing the larger EOF.  No selector-reset protocol is needed.
 	 */
-	um_zero_active_range(reln, forknum, logical_eof, logical_end, skipFsync);
+	um_zero_active_range(reln, forknum, logical_eof, logical_end, skipFsync,
+						 blocknum, physical_blocks);
 	um_publish_mapped_after_data(reln, forknum, logical_end);
 	um_ensure_selector_pages(reln, forknum, logical_eof,
 						 logical_end - logical_eof, skipFsync);
@@ -854,7 +779,8 @@ umstartreadv(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknum,
 
 void
 umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
-		 const void **buffers, BlockNumber nblocks, bool skipFsync)
+		 const void **buffers, BlockNumber nblocks, bool skipFsync,
+		 BlockNumber *physical_blocks)
 {
 	UmbraFileContext *ctx;
 
@@ -863,6 +789,11 @@ umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	{
 		umfile_writev(um_get_filectx(reln), forknum, blocknum, buffers, nblocks,
 					  skipFsync);
+		if (physical_blocks != NULL)
+		{
+			for (BlockNumber i = 0; i < nblocks; i++)
+				physical_blocks[i] = blocknum + i;
+		}
 		return;
 	}
 	if (nblocks == 0)
@@ -876,6 +807,8 @@ umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 		umfile_writev(ctx, forknum, physical_block, &buffers[i], 1,
 					  skipFsync);
+		if (physical_blocks != NULL)
+			physical_blocks[i] = physical_block;
 	}
 }
 
@@ -883,9 +816,22 @@ void
 umwriteback(SMgrRelation reln, ForkNumber forknum,
 			BlockNumber blocknum, BlockNumber nblocks)
 {
+	/*
+	 * A mapped logical range is not a physical writeback range.  Do not pass it
+	 * to umfile; a caller with resolved physical targets must schedule those
+	 * separately.
+	 */
 	um_refresh_mapping_policy(reln, forknum);
 	if (um_fork_uses_mapped_slots(reln, forknum))
 		return;
+	umfile_writeback(um_get_filectx(reln), forknum, blocknum, nblocks);
+}
+
+void
+umwritebackphysical(SMgrRelation reln, ForkNumber forknum,
+					BlockNumber blocknum, BlockNumber nblocks)
+{
+	um_refresh_mapping_policy(reln, forknum);
 	umfile_writeback(um_get_filectx(reln), forknum, blocknum, nblocks);
 }
 
@@ -1005,25 +951,28 @@ umpreparetruncate(SMgrRelation reln, ForkNumber *forknum, int nforks,
 void
 umimmedsync(SMgrRelation reln, ForkNumber forknum)
 {
-	UmbraFileContext *ctx;
-
 	um_refresh_mapping_policy(reln, forknum);
-	ctx = um_get_filectx(reln);
-	umfile_immedsync(ctx, forknum);
-	if (um_fork_uses_mapped_slots(reln, forknum))
-		ummap_immedsync_if_exists(ctx, reln->smgr_rlocator);
+	umfile_immedsync(um_get_filectx(reln), forknum);
 }
 
 void
 umregistersync(SMgrRelation reln, ForkNumber forknum)
 {
-	UmbraFileContext *ctx;
-
 	um_refresh_mapping_policy(reln, forknum);
-	ctx = um_get_filectx(reln);
-	umfile_registersync(ctx, forknum);
-	if (um_fork_uses_mapped_slots(reln, forknum))
-		ummap_registersync_if_exists(ctx, reln->smgr_rlocator);
+	umfile_registersync(um_get_filectx(reln), forknum);
+}
+
+void
+umsyncrelationmetadata(SMgrRelation reln)
+{
+	um_refresh_mapping_policy(reln, MAIN_FORKNUM);
+	if (!um_fork_uses_mapped_slots(reln, MAIN_FORKNUM))
+		return;
+	/*
+	 * smgrdosyncall() reaches this only after all ordinary forks are durable.
+	 * Flush the MAP root and its private metadata fork once for the relation.
+	 */
+	ummap_sync_relation_metadata(um_get_filectx(reln), reln->smgr_rlocator);
 }
 
 bool
@@ -1262,10 +1211,12 @@ um_ensure_aux_recovery_capacity(SMgrRelation reln, ForkNumber forknum)
 
 static void
 um_zero_active_range(SMgrRelation reln, ForkNumber forknum,
-					 BlockNumber first_block, BlockNumber end_block, bool skipFsync)
+					 BlockNumber first_block, BlockNumber end_block,
+					 bool skipFsync, BlockNumber output_first_block,
+					 BlockNumber *physical_blocks)
 {
 	UmbraFileContext *ctx = um_get_filectx(reln);
-	PGIOAlignedBlock zero_page = {0};
+	PGIOAlignedBlock zero_page = {{0}};
 	const void *buffers[1] = {zero_page.data};
 
 	for (BlockNumber logical_block = first_block;
@@ -1277,6 +1228,8 @@ um_zero_active_range(SMgrRelation reln, ForkNumber forknum,
 
 		umfile_writev(ctx, forknum, physical_block, buffers, 1,
 					  skipFsync);
+		if (physical_blocks != NULL && logical_block >= output_first_block)
+			physical_blocks[logical_block - output_first_block] = physical_block;
 	}
 }
 
@@ -1286,9 +1239,9 @@ um_publish_mapped_after_data(SMgrRelation reln, ForkNumber forknum,
 							BlockNumber logical_eof)
 {
 	/*
-	 * Root writeback flushes its WAL dependency and syncs each activated fork
-	 * before the root. The skip-WAL pending-sync path also calls umimmedsync(),
-	 * which preserves the same order. Avoid an immediate fsync per extension.
+	 * Checkpoint and pending-sync callers own data-before-metadata ordering.
+	 * This path only records the new frontier after its selected data range has
+	 * been materialized; it does not synchronously flush data or metadata.
 	 */
 	if (forknum == MAIN_FORKNUM)
 		ummap_set_main_frontier(um_get_filectx(reln), reln->smgr_rlocator,
