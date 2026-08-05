@@ -37,6 +37,13 @@ typedef struct UmbraSlot0TruncateState
 	BlockNumber	current_physical;
 } UmbraSlot0TruncateState;
 
+typedef enum UmbraMapPolicy
+{
+	UMBRA_MAP_POLICY_UNKNOWN,
+	UMBRA_MAP_POLICY_PLAIN,
+	UMBRA_MAP_POLICY_MAPPED
+} UmbraMapPolicy;
+
 typedef struct UmbraSmgrRelationState
 {
 	/*
@@ -46,13 +53,16 @@ typedef struct UmbraSmgrRelationState
 	 * umfile.c owns the physical segment descriptors below this context.
 	 */
 	UmbraFileContext *filectx;
-	bool		uses_map;
+	UmbraMapPolicy map_policy;
+	bool		map_root_needs_validation;
 	bool		fsm_slot0_active;
 	bool		vm_slot0_active;
 	UmbraSlot0TruncateState slot0_truncate[MAX_FORKNUM + 1];
 } UmbraSmgrRelationState;
 
 static UmbraFileContext *um_get_filectx(SMgrRelation reln);
+static void um_refresh_slot0_policy(SMgrRelation reln, ForkNumber forknum);
+static void um_set_map_policy_mapped(SMgrRelation reln);
 static bool um_main_uses_slot0(SMgrRelation reln, ForkNumber forknum);
 static bool um_fork_uses_slot0(SMgrRelation reln, ForkNumber forknum);
 static BlockNumber um_main_active_pblk(SMgrRelation reln,
@@ -112,51 +122,11 @@ umopen(SMgrRelation reln)
 	if (state->filectx == NULL)
 	{
 		state->filectx = umfile_open(reln->smgr_rlocator);
-		state->uses_map = false;
+		state->map_policy = UMBRA_MAP_POLICY_UNKNOWN;
+		state->map_root_needs_validation = false;
 		state->fsm_slot0_active = false;
 		state->vm_slot0_active = false;
-		/*
-		 * A valid root is the physical-layout authority.  Bootstrap and init
-		 * can create permanent relations that normal backends must later open
-		 * with the same mapping.
-		 */
-		if (!RelFileLocatorBackendIsTemp(reln->smgr_rlocator) &&
-			ummap_exists(state->filectx))
-		{
-			if (InRecovery)
-				state->uses_map = ummap_try_validate(state->filectx);
-			else
-			{
-				ummap_validate_if_exists(state->filectx,
-									 reln->smgr_rlocator);
-				state->uses_map = true;
-			}
-		}
-
-		if (state->uses_map)
-		{
-			if (InRecovery)
-			{
-				(void) ummap_try_aux_slot0_active(state->filectx,
-											   FSM_FORKNUM,
-											   reln->smgr_rlocator,
-											   &state->fsm_slot0_active);
-				(void) ummap_try_aux_slot0_active(state->filectx,
-											   VISIBILITYMAP_FORKNUM,
-											   reln->smgr_rlocator,
-											   &state->vm_slot0_active);
-			}
-			else
-			{
-				state->fsm_slot0_active =
-					ummap_aux_slot0_active(state->filectx, FSM_FORKNUM,
-										  reln->smgr_rlocator);
-				state->vm_slot0_active =
-					ummap_aux_slot0_active(state->filectx,
-										  VISIBILITYMAP_FORKNUM,
-										  reln->smgr_rlocator);
-			}
-		}
+		um_refresh_slot0_policy(reln, MAIN_FORKNUM);
 	}
 }
 
@@ -168,7 +138,14 @@ umclose(SMgrRelation reln, ForkNumber forknum)
 	if (state != NULL && state->filectx != NULL)
 	{
 		if (forknum == MAIN_FORKNUM)
+		{
 			umfile_close(state->filectx, UMBRA_METADATA_FORKNUM);
+			/* Reopen the root, but do not change an established layout. */
+			if (state->map_policy == UMBRA_MAP_POLICY_MAPPED)
+				state->map_root_needs_validation = true;
+			for (int forkidx = 0; forkidx <= MAX_FORKNUM; forkidx++)
+				state->slot0_truncate[forkidx].prepared = false;
+		}
 		umfile_close(state->filectx, forknum);
 	}
 }
@@ -203,8 +180,9 @@ umcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 	 * but only XLOG_SMGR_CREATE redo may create one through
 	 * smgrfinishcreate().
 	 */
+	um_refresh_slot0_policy(reln, forknum);
 	/* A valid root makes MAIN mapped and permits auxiliary activation. */
-	map_auxiliary = state->uses_map &&
+	map_auxiliary = state->map_policy == UMBRA_MAP_POLICY_MAPPED &&
 		UmbraAuxiliaryForkUsesSlot0(forknum);
 	if (map_auxiliary)
 	{
@@ -215,8 +193,9 @@ umcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 	umfile_create(ctx, forknum, isRedo);
 	if (isRedo && forknum == MAIN_FORKNUM &&
 		!RelFileLocatorBackendIsTemp(reln->smgr_rlocator) &&
-		!state->uses_map)
-		state->uses_map = ummap_try_validate(ctx);
+		state->map_policy == UMBRA_MAP_POLICY_UNKNOWN &&
+		ummap_try_validate(ctx))
+		um_set_map_policy_mapped(reln);
 	if (map_auxiliary)
 	{
 		bool		active = ummap_aux_slot0_active(ctx, forknum,
@@ -248,7 +227,8 @@ uminitnewrelation(SMgrRelation reln, bool needs_wal)
 	UmbraSmgrRelationState *state = reln->smgr_private;
 
 	Assert(state != NULL);
-	state->uses_map = false;
+	state->map_policy = UMBRA_MAP_POLICY_PLAIN;
+	state->map_root_needs_validation = false;
 	state->fsm_slot0_active = false;
 	state->vm_slot0_active = false;
 	/*
@@ -258,7 +238,7 @@ uminitnewrelation(SMgrRelation reln, bool needs_wal)
 	if (needs_wal)
 	{
 		ummap_create(um_get_filectx(reln), reln->smgr_rlocator, false);
-		state->uses_map = true;
+		um_set_map_policy_mapped(reln);
 	}
 }
 
@@ -285,12 +265,7 @@ umfinishcreate(SMgrRelation reln, ForkNumber forknum)
 	 * no separate immediate sync is needed here.
 	 */
 	ummap_create(ctx, reln->smgr_rlocator, true);
-	state->uses_map = true;
-	state->fsm_slot0_active =
-		ummap_aux_slot0_active(ctx, FSM_FORKNUM, reln->smgr_rlocator);
-	state->vm_slot0_active =
-		ummap_aux_slot0_active(ctx, VISIBILITYMAP_FORKNUM,
-							  reln->smgr_rlocator);
+	um_set_map_policy_mapped(reln);
 }
 
 /* Flush Umbra's private metadata-root cache at the checkpoint boundary. */
@@ -384,8 +359,10 @@ UmCheckpointWriteSourceSlot(SMgrRelation reln, ForkNumber forknum,
 	BlockNumber	physical_block;
 
 	if (reln == NULL || buffer == NULL ||
-		!UmbraMainActiveSlotIsValid(source_slot) ||
-		!um_main_uses_slot0(reln, forknum))
+		!UmbraMainActiveSlotIsValid(source_slot))
+		return false;
+	um_refresh_slot0_policy(reln, MAIN_FORKNUM);
+	if (!um_main_uses_slot0(reln, forknum))
 		return false;
 	if (!UmbraMainActiveSlotPhysicalBlock(logical_block, source_slot,
 										 &physical_block))
@@ -407,8 +384,10 @@ UmCheckpointWritebackSourceSlot(SMgrRelation reln, ForkNumber forknum,
 {
 	BlockNumber	physical_block;
 
-	if (reln == NULL || !UmbraMainActiveSlotIsValid(source_slot) ||
-		!um_main_uses_slot0(reln, forknum))
+	if (reln == NULL || !UmbraMainActiveSlotIsValid(source_slot))
+		return;
+	um_refresh_slot0_policy(reln, MAIN_FORKNUM);
+	if (!um_main_uses_slot0(reln, forknum))
 		return;
 	if (!UmbraMainActiveSlotPhysicalBlock(logical_block, source_slot,
 										 &physical_block))
@@ -436,6 +415,7 @@ UmRedoSetActiveSlot(SMgrRelation reln, ForkNumber forknum,
 		!UmbraMainActiveSlotIsValid(active_slot))
 		elog(PANIC, "Umbra redo targets an invalid MAIN mapping");
 
+	um_refresh_slot0_policy(reln, MAIN_FORKNUM);
 	state = reln->smgr_private;
 	ctx = um_get_filectx(reln);
 	Assert(state != NULL);
@@ -443,8 +423,7 @@ UmRedoSetActiveSlot(SMgrRelation reln, ForkNumber forknum,
 	/* Image-free redo must never create or repair missing mapping authority. */
 	if (!ummap_try_validate(ctx))
 		return false;
-	state->uses_map = true;
-	reln->smgr_cached_nblocks[MAIN_FORKNUM] = InvalidBlockNumber;
+	um_set_map_policy_mapped(reln);
 	um_get_slot0_frontiers(reln, MAIN_FORKNUM, &logical_eof,
 						   &physical_capacity);
 	if (logical_block >= logical_eof ||
@@ -468,6 +447,7 @@ UmRedoSlotShift(SMgrRelation reln, ForkNumber forknum,
 		RelFileLocatorBackendIsTemp(reln->smgr_rlocator) ||
 		!XLogRecPtrIsValid(shift_lsn))
 		elog(PANIC, "Umbra slot-shift WAL targets an inactive MAIN mapping");
+	um_refresh_slot0_policy(reln, MAIN_FORKNUM);
 	state = reln->smgr_private;
 	ctx = um_get_filectx(reln);
 	Assert(state != NULL);
@@ -481,8 +461,7 @@ UmRedoSlotShift(SMgrRelation reln, ForkNumber forknum,
 	 */
 	if (!ummap_try_validate(ctx))
 		return false;
-	state->uses_map = true;
-	reln->smgr_cached_nblocks[MAIN_FORKNUM] = InvalidBlockNumber;
+	um_set_map_policy_mapped(reln);
 
 	/* With mapping authority established, the FPI may recreate MAIN. */
 	umfile_create(ctx, MAIN_FORKNUM, true);
@@ -516,7 +495,10 @@ uminvalidatedatabasetablespacecache(Oid dbid, Oid spcOid)
 bool
 umexists(SMgrRelation reln, ForkNumber forknum)
 {
-	UmbraFileContext *ctx = um_get_filectx(reln);
+	UmbraFileContext *ctx;
+
+	um_refresh_slot0_policy(reln, forknum);
+	ctx = um_get_filectx(reln);
 
 	/*
 	 * A durable auxiliary root declares a logical fork even if crash recovery
@@ -553,6 +535,7 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	BlockNumber	logical_end;
 	const void *buffers[1];
 
+	um_refresh_slot0_policy(reln, forknum);
 	if (!um_fork_uses_slot0(reln, forknum))
 	{
 		umfile_extend(um_get_filectx(reln), forknum, blocknum, buffer,
@@ -598,6 +581,7 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	BlockNumber	physical_capacity;
 	BlockNumber	logical_end;
 
+	um_refresh_slot0_policy(reln, forknum);
 	if (!um_fork_uses_slot0(reln, forknum))
 	{
 		umfile_zeroextend(um_get_filectx(reln), forknum, blocknum, nblocks,
@@ -639,6 +623,7 @@ umprefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	 * leaves prefetch unimplemented; a later patch can translate logical blocks
 	 * before submitting physical prefetch advice.
 	 */
+	um_refresh_slot0_policy(reln, forknum);
 	if (um_fork_uses_slot0(reln, forknum))
 		return true;
 	return umfile_prefetch(um_get_filectx(reln), forknum, blocknum, nblocks);
@@ -647,6 +632,7 @@ umprefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 uint32
 ummaxcombine(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
 {
+	um_refresh_slot0_policy(reln, forknum);
 	if (um_fork_uses_slot0(reln, forknum))
 		return 1;
 	return umfile_maxcombine(um_get_filectx(reln), forknum, blocknum);
@@ -658,6 +644,7 @@ umreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 {
 	UmbraFileContext *ctx;
 
+	um_refresh_slot0_policy(reln, forknum);
 	if (!um_fork_uses_slot0(reln, forknum))
 	{
 		umfile_readv(um_get_filectx(reln), forknum, blocknum, buffers, nblocks);
@@ -686,6 +673,7 @@ umstartreadv(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknum,
 	PgAioTargetData *target;
 	BlockNumber	physical_block;
 
+	um_refresh_slot0_policy(reln, forknum);
 	if (!um_fork_uses_slot0(reln, forknum))
 	{
 		pgaio_io_set_target_smgr(ioh, reln, forknum, blocknum, nblocks, false);
@@ -718,6 +706,7 @@ umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 {
 	UmbraFileContext *ctx;
 
+	um_refresh_slot0_policy(reln, forknum);
 	if (!um_fork_uses_slot0(reln, forknum))
 	{
 		umfile_writev(um_get_filectx(reln), forknum, blocknum, buffers, nblocks,
@@ -743,6 +732,7 @@ void
 umwriteback(SMgrRelation reln, ForkNumber forknum,
 			BlockNumber blocknum, BlockNumber nblocks)
 {
+	um_refresh_slot0_policy(reln, forknum);
 	if (um_fork_uses_slot0(reln, forknum))
 		return;
 	umfile_writeback(um_get_filectx(reln), forknum, blocknum, nblocks);
@@ -754,6 +744,7 @@ umnblocks(SMgrRelation reln, ForkNumber forknum)
 	BlockNumber	logical_eof;
 	BlockNumber	physical_capacity;
 
+	um_refresh_slot0_policy(reln, forknum);
 	if (um_fork_uses_slot0(reln, forknum))
 	{
 		um_get_slot0_frontiers(reln, forknum, &logical_eof,
@@ -815,6 +806,9 @@ umpreparetruncate(SMgrRelation reln, ForkNumber *forknum, int nforks,
 
 	Assert(state != NULL);
 	Assert(old_blocks != NULL);
+	um_refresh_slot0_policy(reln, MAIN_FORKNUM);
+	um_refresh_slot0_policy(reln, FSM_FORKNUM);
+	um_refresh_slot0_policy(reln, VISIBILITYMAP_FORKNUM);
 	for (int forkidx = 0; forkidx <= MAX_FORKNUM; forkidx++)
 		state->slot0_truncate[forkidx].prepared = false;
 	/*
@@ -872,8 +866,10 @@ umpreparetruncate(SMgrRelation reln, ForkNumber *forknum, int nforks,
 void
 umimmedsync(SMgrRelation reln, ForkNumber forknum)
 {
-	UmbraFileContext *ctx = um_get_filectx(reln);
+	UmbraFileContext *ctx;
 
+	um_refresh_slot0_policy(reln, forknum);
+	ctx = um_get_filectx(reln);
 	umfile_immedsync(ctx, forknum);
 	if (um_fork_uses_slot0(reln, forknum))
 		ummap_immedsync_if_exists(ctx, reln->smgr_rlocator);
@@ -882,8 +878,10 @@ umimmedsync(SMgrRelation reln, ForkNumber forknum)
 void
 umregistersync(SMgrRelation reln, ForkNumber forknum)
 {
-	UmbraFileContext *ctx = um_get_filectx(reln);
+	UmbraFileContext *ctx;
 
+	um_refresh_slot0_policy(reln, forknum);
+	ctx = um_get_filectx(reln);
 	umfile_registersync(ctx, forknum);
 	if (um_fork_uses_slot0(reln, forknum))
 		ummap_registersync_if_exists(ctx, reln->smgr_rlocator);
@@ -892,6 +890,9 @@ umregistersync(SMgrRelation reln, ForkNumber forknum)
 bool
 umpreparependingsync(SMgrRelation reln)
 {
+	um_refresh_slot0_policy(reln, MAIN_FORKNUM);
+	um_refresh_slot0_policy(reln, FSM_FORKNUM);
+	um_refresh_slot0_policy(reln, VISIBILITYMAP_FORKNUM);
 	return um_fork_uses_slot0(reln, MAIN_FORKNUM) ||
 		um_fork_uses_slot0(reln, FSM_FORKNUM) ||
 		um_fork_uses_slot0(reln, VISIBILITYMAP_FORKNUM);
@@ -910,7 +911,108 @@ um_main_uses_slot0(SMgrRelation reln, ForkNumber forknum)
 	UmbraSmgrRelationState *state = reln->smgr_private;
 
 	return forknum == MAIN_FORKNUM && state != NULL &&
-		state->uses_map;
+		state->map_policy == UMBRA_MAP_POLICY_MAPPED;
+}
+
+/*
+ * A mapped layout is established by a valid root or authoritative CREATE
+ * redo.  It remains mapped across SMGRRELEASE: a later metadata-root failure
+ * must not select direct I/O for the same physical data file.
+ */
+static void
+um_refresh_slot0_policy(SMgrRelation reln, ForkNumber forknum)
+{
+	UmbraSmgrRelationState *state;
+
+	if (reln == NULL ||
+		(forknum != MAIN_FORKNUM && forknum != FSM_FORKNUM &&
+		 forknum != VISIBILITYMAP_FORKNUM))
+		return;
+	Assert(CritSectionCount == 0);
+	state = reln->smgr_private;
+	if (state == NULL || state->filectx == NULL)
+		return;
+	if (RelFileLocatorBackendIsTemp(reln->smgr_rlocator))
+	{
+		if (state->map_policy == UMBRA_MAP_POLICY_UNKNOWN)
+			state->map_policy = UMBRA_MAP_POLICY_PLAIN;
+		return;
+	}
+
+	if (state->map_policy == UMBRA_MAP_POLICY_MAPPED)
+	{
+		if (!state->map_root_needs_validation)
+			return;
+		if (!ummap_exists(state->filectx) ||
+			!ummap_try_validate(state->filectx))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("Umbra mapped relation metadata root is missing or corrupted")));
+		if (!InRecovery)
+			ummap_validate_if_exists(state->filectx, reln->smgr_rlocator);
+		um_set_map_policy_mapped(reln);
+		return;
+	}
+
+	if (state->map_policy == UMBRA_MAP_POLICY_PLAIN)
+		return;
+
+	Assert(state->map_policy == UMBRA_MAP_POLICY_UNKNOWN);
+	if (!ummap_exists(state->filectx))
+	{
+		/* Recovery can still encounter authoritative CREATE redo later. */
+		if (!InRecovery)
+			state->map_policy = UMBRA_MAP_POLICY_PLAIN;
+		return;
+	}
+	if (InRecovery)
+	{
+		/* CREATE redo is allowed to repair this otherwise unclaimed root. */
+		if (!ummap_try_validate(state->filectx))
+			return;
+	}
+	else
+		ummap_validate_if_exists(state->filectx, reln->smgr_rlocator);
+	um_set_map_policy_mapped(reln);
+}
+
+static void
+um_set_map_policy_mapped(SMgrRelation reln)
+{
+	UmbraSmgrRelationState *state = reln->smgr_private;
+	bool		fsm_active;
+	bool		vm_active;
+
+	Assert(state != NULL);
+	Assert(state->filectx != NULL);
+	Assert(!RelFileLocatorBackendIsTemp(reln->smgr_rlocator));
+	if (InRecovery)
+	{
+		if (!ummap_try_aux_slot0_active(state->filectx, FSM_FORKNUM,
+										reln->smgr_rlocator, &fsm_active) ||
+			!ummap_try_aux_slot0_active(state->filectx,
+										 VISIBILITYMAP_FORKNUM,
+										 reln->smgr_rlocator, &vm_active))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("Umbra mapped relation metadata root is missing or corrupted")));
+	}
+	else
+	{
+		fsm_active = ummap_aux_slot0_active(state->filectx, FSM_FORKNUM,
+										reln->smgr_rlocator);
+		vm_active = ummap_aux_slot0_active(state->filectx,
+										VISIBILITYMAP_FORKNUM,
+										reln->smgr_rlocator);
+	}
+
+	state->map_policy = UMBRA_MAP_POLICY_MAPPED;
+	state->map_root_needs_validation = false;
+	state->fsm_slot0_active = fsm_active;
+	state->vm_slot0_active = vm_active;
+	reln->smgr_cached_nblocks[MAIN_FORKNUM] = InvalidBlockNumber;
+	reln->smgr_cached_nblocks[FSM_FORKNUM] = InvalidBlockNumber;
+	reln->smgr_cached_nblocks[VISIBILITYMAP_FORKNUM] = InvalidBlockNumber;
 }
 
 static bool
@@ -921,7 +1023,7 @@ um_fork_uses_slot0(SMgrRelation reln, ForkNumber forknum)
 	if (state == NULL)
 		return false;
 	if (forknum == MAIN_FORKNUM)
-		return state->uses_map;
+		return state->map_policy == UMBRA_MAP_POLICY_MAPPED;
 	if (forknum == FSM_FORKNUM)
 		return state->fsm_slot0_active;
 	if (forknum == VISIBILITYMAP_FORKNUM)
