@@ -44,6 +44,14 @@ typedef enum UmbraMapPolicy
 	UMBRA_MAP_POLICY_MAPPED
 } UmbraMapPolicy;
 
+typedef struct UmbraMappedReadRun
+{
+	BlockNumber	physical_block;
+	BlockNumber	nblocks;
+	uint8		active_slot;
+	bool		selector_page_present;
+} UmbraMappedReadRun;
+
 typedef struct UmbraSmgrRelationState
 {
 	/*
@@ -67,12 +75,18 @@ static void um_set_map_policy_mapped(SMgrRelation reln);
 static bool um_fork_uses_mapped_slots(SMgrRelation reln, ForkNumber forknum);
 static BlockNumber um_active_pblk(SMgrRelation reln, ForkNumber forknum,
 								  BlockNumber logical_block);
+static void um_get_mapped_read_run(SMgrRelation reln, ForkNumber forknum,
+								   BlockNumber logical_block,
+								   BlockNumber max_nblocks,
+								   UmbraMappedReadRun *run);
 static BlockNumber um_mapped_range_end(SMgrRelation reln, ForkNumber forknum,
 									  BlockNumber blocknum, BlockNumber nblocks);
 static BlockNumber um_get_mapped_frontier(SMgrRelation reln,
 										  ForkNumber forknum);
 static BlockNumber um_mapped_capacity(SMgrRelation reln, ForkNumber forknum,
 									 BlockNumber logical_eof);
+static void um_require_mapped_range(SMgrRelation reln, ForkNumber forknum,
+								  BlockNumber blocknum, BlockNumber nblocks);
 static bool um_resolve_slot_physical_block(SMgrRelation reln,
 										   ForkNumber forknum,
 										   BlockNumber logical_block,
@@ -718,24 +732,65 @@ bool
 umprefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		   int nblocks)
 {
-	/*
-	 * A mapped logical range cannot be passed directly to umfile_prefetch():
-	 * active-slot layout can make it physically noncontiguous.  This mapping path
-	 * leaves prefetch unimplemented; a later patch can translate logical blocks
-	 * before submitting physical prefetch advice.
-	 */
+#ifdef USE_PREFETCH
+	UmbraFileContext *ctx;
+	int			remaining;
+#endif
+
 	um_refresh_mapping_policy(reln, forknum);
-	if (um_fork_uses_mapped_slots(reln, forknum))
+	if (!um_fork_uses_mapped_slots(reln, forknum))
+		return umfile_prefetch(um_get_filectx(reln), forknum, blocknum,
+							   nblocks);
+#ifdef USE_PREFETCH
+	if (nblocks <= 0)
 		return true;
-	return umfile_prefetch(um_get_filectx(reln), forknum, blocknum, nblocks);
+	if ((uint64) blocknum + (uint64) nblocks >
+		(uint64) MaxBlockNumber + 1)
+		return false;
+
+	if (InRecovery && UmbraIsMappedAuxiliaryFork(forknum))
+		um_ensure_aux_recovery_capacity(reln, forknum);
+	um_require_mapped_range(reln, forknum, blocknum, (BlockNumber) nblocks);
+	ctx = um_get_filectx(reln);
+	/*
+	 * Logical adjacency alone is insufficient.  Each run must retain its active
+	 * slot and selector-page representation, stay in one logical chunk and
+	 * physical segment, and map to consecutive physical blocks.  A true return
+	 * means every translated physical run was submitted to the kernel.
+	 */
+	remaining = nblocks;
+	while (remaining > 0)
+	{
+		UmbraMappedReadRun run;
+		int			nblocks_this_run;
+
+		um_get_mapped_read_run(reln, forknum, blocknum,
+							   (BlockNumber) remaining, &run);
+		nblocks_this_run = Min(remaining, (int) run.nblocks);
+		if (!umfile_prefetch(ctx, forknum, run.physical_block,
+							 nblocks_this_run))
+			return false;
+		blocknum += nblocks_this_run;
+		remaining -= nblocks_this_run;
+	}
+#endif
+
+	return true;
 }
 
 uint32
 ummaxcombine(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
 {
+	UmbraMappedReadRun run;
+
 	um_refresh_mapping_policy(reln, forknum);
+	/* Only a run that satisfies the physical-layout checks below may combine. */
 	if (um_fork_uses_mapped_slots(reln, forknum))
-		return 1;
+	{
+		um_get_mapped_read_run(reln, forknum, blocknum,
+							   UMBRA_CHUNK_PAIRED_PAGES, &run);
+		return run.nblocks;
+	}
 	return umfile_maxcombine(um_get_filectx(reln), forknum, blocknum);
 }
 
@@ -744,6 +799,7 @@ umreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		void **buffers, BlockNumber nblocks)
 {
 	UmbraFileContext *ctx;
+	UmbraMappedReadRun run;
 
 	um_refresh_mapping_policy(reln, forknum);
 	if (!um_fork_uses_mapped_slots(reln, forknum))
@@ -757,13 +813,11 @@ umreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	if (InRecovery && UmbraIsMappedAuxiliaryFork(forknum))
 		um_ensure_aux_recovery_capacity(reln, forknum);
 	ctx = um_get_filectx(reln);
-	for (BlockNumber i = 0; i < nblocks; i++)
-	{
-		BlockNumber physical_block =
-			um_active_pblk(reln, forknum, blocknum + i);
 
-		umfile_readv(ctx, forknum, physical_block, &buffers[i], 1);
-	}
+	um_get_mapped_read_run(reln, forknum, blocknum, nblocks, &run);
+	if (nblocks > run.nblocks)
+		elog(ERROR, "Umbra mapped read crosses a physical run");
+	umfile_readv(ctx, forknum, run.physical_block, buffers, nblocks);
 }
 
 void
@@ -771,9 +825,7 @@ umstartreadv(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknum,
 			 BlockNumber blocknum, void **buffers, BlockNumber nblocks)
 {
 	PgAioTargetData *target;
-	BlockNumber	physical_block;
-	uint8		active_slot;
-	bool		selector_page_present;
+	UmbraMappedReadRun run;
 
 	um_refresh_mapping_policy(reln, forknum);
 	if (!um_fork_uses_mapped_slots(reln, forknum))
@@ -784,30 +836,21 @@ umstartreadv(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknum,
 						  buffers, nblocks);
 		return;
 	}
-	if (nblocks != 1)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("Umbra active-slot AIO requires a single logical block")));
+	if (nblocks == 0)
+		elog(ERROR, "Umbra active-slot AIO requires at least one logical block");
 
 	if (InRecovery && UmbraIsMappedAuxiliaryFork(forknum))
 		um_ensure_aux_recovery_capacity(reln, forknum);
-	active_slot = MapGetActiveSlotWithPresence(um_get_filectx(reln),
-											   reln->smgr_rlocator, forknum,
-											   blocknum, &selector_page_present);
-	if (!UmbraActiveSlotPhysicalBlock(blocknum, active_slot, &physical_block))
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("Umbra active-slot block mapping overflow for relation %u/%u/%u fork %d",
-						reln->smgr_rlocator.locator.spcOid,
-						reln->smgr_rlocator.locator.dbOid,
-						reln->smgr_rlocator.locator.relNumber, (int) forknum)));
+	um_get_mapped_read_run(reln, forknum, blocknum, nblocks, &run);
+	if (nblocks > run.nblocks)
+		elog(ERROR, "Umbra active-slot AIO crosses a physical run");
 	pgaio_io_set_target_smgr(ioh, reln, forknum, blocknum, nblocks, false);
 	target = pgaio_io_get_target_data(ioh);
-	target->smgr.physicalBlockNum = physical_block;
-	target->smgr.umbraActiveSlot = active_slot;
-	target->smgr.umbraSelectorPagePresent = selector_page_present;
+	target->smgr.physicalBlockNum = run.physical_block;
+	target->smgr.umbraActiveSlot = run.active_slot;
+	target->smgr.umbraSelectorPagePresent = run.selector_page_present;
 	pgaio_io_register_callbacks(ioh, PGAIO_HCB_MD_READV, 0);
-	umfile_startreadv(ioh, um_get_filectx(reln), forknum, physical_block,
+	umfile_startreadv(ioh, um_get_filectx(reln), forknum, run.physical_block,
 						  buffers,
 						  nblocks);
 }
@@ -1166,6 +1209,76 @@ um_active_pblk(SMgrRelation reln, ForkNumber forknum,
 	return physical_block;
 }
 
+/*
+ * Resolve one safe mapped read run.  A run may combine only pages with the
+ * same active slot and selector-page presence whose physical blocks are
+ * consecutive; its limit also prevents crossing a logical chunk or physical
+ * segment boundary.
+ */
+static void
+um_get_mapped_read_run(SMgrRelation reln, ForkNumber forknum,
+					   BlockNumber logical_block, BlockNumber max_nblocks,
+					   UmbraMappedReadRun *run)
+{
+	UmbraFileContext *ctx;
+	BlockNumber	run_limit;
+
+	Assert(run != NULL);
+	Assert(max_nblocks > 0);
+	Assert(um_fork_uses_mapped_slots(reln, forknum));
+	ctx = um_get_filectx(reln);
+	run->active_slot =
+		MapGetActiveSlotWithPresence(ctx, reln->smgr_rlocator, forknum,
+								 logical_block, &run->selector_page_present);
+	if (!UmbraActiveSlotPhysicalBlock(logical_block, run->active_slot,
+									 &run->physical_block))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("Umbra active-slot block mapping overflow for relation %u/%u/%u fork %d",
+						reln->smgr_rlocator.locator.spcOid,
+						reln->smgr_rlocator.locator.dbOid,
+						reln->smgr_rlocator.locator.relNumber, (int) forknum)));
+
+	run_limit = UMBRA_CHUNK_PAIRED_PAGES -
+		(logical_block % UMBRA_CHUNK_PAIRED_PAGES);
+	run_limit = Min(run_limit, max_nblocks);
+	run_limit = Min(run_limit,
+					umfile_maxcombine(ctx, forknum, run->physical_block));
+	run->nblocks = 1;
+	for (BlockNumber offset = 1; offset < run_limit; offset++)
+	{
+		BlockNumber	next_logical_block;
+		BlockNumber	next_physical_block;
+		uint8		next_active_slot;
+		bool		next_selector_page_present;
+
+		if ((uint64) logical_block + offset > (uint64) MaxBlockNumber)
+			break;
+		next_logical_block = logical_block + offset;
+		next_active_slot =
+			MapGetActiveSlotWithPresence(ctx, reln->smgr_rlocator, forknum,
+									 next_logical_block,
+									 &next_selector_page_present);
+		if (next_active_slot != run->active_slot ||
+			next_selector_page_present != run->selector_page_present)
+			break;
+		if (!UmbraActiveSlotPhysicalBlock(next_logical_block,
+										  next_active_slot,
+										  &next_physical_block))
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("Umbra active-slot block mapping overflow for relation %u/%u/%u fork %d",
+							reln->smgr_rlocator.locator.spcOid,
+							reln->smgr_rlocator.locator.dbOid,
+							reln->smgr_rlocator.locator.relNumber,
+							(int) forknum)));
+		if ((uint64) next_physical_block !=
+			(uint64) run->physical_block + offset)
+			break;
+		run->nblocks++;
+	}
+}
+
 static BlockNumber
 um_mapped_range_end(SMgrRelation reln, ForkNumber forknum,
 				   BlockNumber blocknum, BlockNumber nblocks)
@@ -1206,6 +1319,22 @@ um_mapped_capacity(SMgrRelation reln, ForkNumber forknum,
 						reln->smgr_rlocator.locator.dbOid,
 						reln->smgr_rlocator.locator.relNumber, (int) forknum)));
 	return physical_capacity;
+}
+
+static void
+um_require_mapped_range(SMgrRelation reln, ForkNumber forknum,
+						BlockNumber blocknum, BlockNumber nblocks)
+{
+	BlockNumber logical_eof;
+	BlockNumber logical_end;
+
+	logical_end = um_mapped_range_end(reln, forknum, blocknum, nblocks);
+	logical_eof = um_get_mapped_frontier(reln, forknum);
+	if (logical_end > logical_eof)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("could not access logical block %u beyond Umbra mapped EOF %u for fork %d",
+						blocknum, logical_eof, (int) forknum)));
 }
 
 static void

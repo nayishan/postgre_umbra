@@ -9809,8 +9809,7 @@ buffer_readv_complete_one(PgAioTargetData *td, uint8 buf_off, Buffer buffer,
 	if (!failed && !is_temp &&
 		UmbraActiveSlotIsValid(td->smgr.umbraActiveSlot))
 	{
-		Assert(td->smgr.nblocks == 1);
-		Assert(buf_off == 0);
+		/* Umbra only assigns this selector to one physically contiguous run. */
 		active_slot = td->smgr.umbraActiveSlot;
 		selector_page_present = td->smgr.umbraSelectorPagePresent;
 	}
