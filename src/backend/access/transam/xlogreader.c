@@ -89,7 +89,7 @@ report_invalid_record(XLogReaderState *state, const char *fmt, ...)
 }
 
 #ifdef USE_UMBRA
-/* Validate byte ranges before redo can materialize the recorded source slot. */
+/* Validate byte ranges before redo can materialize the derived source slot. */
 static bool
 ValidateHintDeltaRecord(XLogReaderState *state, DecodedXLogRecord *decoded)
 {
@@ -104,11 +104,8 @@ ValidateHintDeltaRecord(XLogReaderState *state, DecodedXLogRecord *decoded)
 	block = &decoded->blocks[0];
 	if (!block->in_use || block->forknum != MAIN_FORKNUM ||
 		(block->flags & BKPBLOCK_WILL_INIT) != 0 ||
-		!block->has_slot_shift || block->source_slot_captured ||
-		block->target_slot >= 3 ||
-		(block->has_image &&
-		 (block->apply_image ||
-		  (decoded->header.xl_info & XLR_CHECK_CONSISTENCY) == 0)) ||
+		!block->has_slot_shift || block->target_slot >= 3 ||
+		block->has_image ||
 		!block->has_data || block->data_len == 0 || block->data_len >= BLCKSZ)
 		goto invalid;
 
@@ -1870,7 +1867,6 @@ DecodeXLogRecord(XLogReaderState *state,
 			blk->apply_image = false;
 #ifdef USE_UMBRA
 			blk->has_slot_shift = false;
-			blk->source_slot_captured = false;
 			blk->source_slot = 0;
 			blk->target_slot = 0;
 #endif
@@ -1908,19 +1904,7 @@ DecodeXLogRecord(XLogReaderState *state,
 			if (blk->has_slot_shift)
 			{
 				COPY_HEADER_FIELD(&raw_target_slot, sizeof(uint8));
-				if ((raw_target_slot &
-					 ~(XLR_SLOT_SHIFT_TARGET_SLOT_MASK |
-					   XLR_SLOT_SHIFT_CAPTURED_SOURCE)) != 0)
-				{
-					report_invalid_record(state,
-								  "invalid Umbra target-slot flags at %X/%08X",
-								  LSN_FORMAT_ARGS(state->ReadRecPtr));
-					goto err;
-				}
-				blk->source_slot_captured =
-					(raw_target_slot & XLR_SLOT_SHIFT_CAPTURED_SOURCE) != 0;
-				blk->target_slot = raw_target_slot &
-					XLR_SLOT_SHIFT_TARGET_SLOT_MASK;
+				blk->target_slot = raw_target_slot;
 				if (blk->target_slot < 3)
 					blk->source_slot = blk->target_slot == 0 ? 2 :
 						blk->target_slot - 1;
@@ -2032,11 +2016,8 @@ DecodeXLogRecord(XLogReaderState *state,
 				  blk->forknum != VISIBILITYMAP_FORKNUM) ||
 				 blk->target_slot >= 3 ||
 				 (blk->flags & BKPBLOCK_WILL_INIT) != 0 ||
-				 (blk->has_image && !blk->apply_image && !hint_delta) ||
-				 (!blk->has_image &&
-				  (!blk->has_data ||
-				   (!blk->source_slot_captured && !hint_delta))) ||
-				 (blk->has_image && blk->source_slot_captured)))
+				 (blk->has_image && !blk->apply_image &&
+				  (decoded->header.xl_info & XLR_CHECK_CONSISTENCY) == 0)))
 			{
 				report_invalid_record(state,
 							  "invalid Umbra slot shift for block %u at %X/%08X",

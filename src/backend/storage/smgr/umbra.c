@@ -272,6 +272,26 @@ umcheckpoint(void)
 	ummap_checkpoint();
 }
 
+/*
+ * During redo, an UNKNOWN policy for a mapped-capable fork is not permission
+ * to use the direct physical layout.  Only CREATE redo may resolve it.
+ */
+bool
+UmRedoMappingPolicyResolved(SMgrRelation reln, ForkNumber forknum)
+{
+	UmbraSmgrRelationState *state;
+
+	if (reln == NULL || !UmbraForkUsesActiveSlots(forknum) ||
+		RelFileLocatorBackendIsTemp(reln->smgr_rlocator))
+		return true;
+
+	Assert(InRecovery);
+	um_refresh_mapping_policy(reln, forknum);
+	state = reln->smgr_private;
+	return state != NULL && state->filectx != NULL &&
+		state->map_policy != UMBRA_MAP_POLICY_UNKNOWN;
+}
+
 bool
 UmWalOwnedSlotShiftAvailable(SMgrRelation reln, ForkNumber forknum)
 {
@@ -280,9 +300,13 @@ UmWalOwnedSlotShiftAvailable(SMgrRelation reln, ForkNumber forknum)
 		um_fork_uses_mapped_slots(reln, forknum);
 }
 
+/*
+ * Select a source and target slot before WAL insertion and retain a raw pin
+ * on its selector until the WAL record publishes the target.
+ */
 bool
-UmPrepareSlotShift(SMgrRelation reln, ForkNumber forknum,
-				   BlockNumber logical_block, UmbraSlotShift *shift)
+UmChooseSlotShift(SMgrRelation reln, ForkNumber forknum,
+				  BlockNumber logical_block, UmbraSlotShift *shift)
 {
 	MapSlotShift map_shift;
 
@@ -294,13 +318,14 @@ UmPrepareSlotShift(SMgrRelation reln, ForkNumber forknum,
 						 forknum, logical_block, &map_shift))
 		return false;
 
-	shift->rlocator = map_shift.rlocator;
+	shift->reln = reln;
 	shift->forknum = map_shift.forknum;
 	shift->logical_block = map_shift.logical_block;
 	shift->source_slot = map_shift.source_slot;
 	shift->target_slot = map_shift.target_slot;
 	shift->map_slot_id = map_shift.map_slot_id;
 	shift->prepared = map_shift.prepared;
+	shift->selected = true;
 	return true;
 }
 
@@ -312,7 +337,8 @@ UmAbortSlotShift(UmbraSlotShift *shift)
 	Assert(shift != NULL);
 	if (!shift->prepared)
 		return;
-	map_shift.rlocator = shift->rlocator;
+	Assert(shift->reln != NULL);
+	map_shift.rlocator = shift->reln->smgr_rlocator;
 	map_shift.forknum = shift->forknum;
 	map_shift.logical_block = shift->logical_block;
 	map_shift.source_slot = shift->source_slot;
@@ -321,7 +347,9 @@ UmAbortSlotShift(UmbraSlotShift *shift)
 	map_shift.prepared = shift->prepared;
 	MapAbortSlotShift(&map_shift);
 	shift->prepared = false;
+	shift->selected = false;
 	shift->map_slot_id = -1;
+	shift->reln = NULL;
 }
 
 void
@@ -337,8 +365,10 @@ UmPublishSlotShift(UmbraSlotShift *shift, XLogRecPtr lsn)
 	MapSlotShift map_shift;
 
 	Assert(shift != NULL);
+	Assert(shift->selected);
 	Assert(shift->prepared);
-	map_shift.rlocator = shift->rlocator;
+	Assert(shift->reln != NULL);
+	map_shift.rlocator = shift->reln->smgr_rlocator;
 	map_shift.forknum = shift->forknum;
 	map_shift.logical_block = shift->logical_block;
 	map_shift.source_slot = shift->source_slot;
@@ -348,24 +378,31 @@ UmPublishSlotShift(UmbraSlotShift *shift, XLogRecPtr lsn)
 	MapPublishSlotShift(&map_shift, lsn);
 	shift->prepared = false;
 	shift->map_slot_id = -1;
+	shift->selected = false;
+	shift->reln = NULL;
 }
 
 bool
-UmCheckpointWriteSourceSlot(SMgrRelation reln, ForkNumber forknum,
-							BlockNumber logical_block, uint8 source_slot,
-							const void *buffer)
+UmCheckpointWritePredecessorSlot(SMgrRelation reln, ForkNumber forknum,
+								 BlockNumber logical_block,
+								 const void *buffer, uint8 *source_slot)
 {
 	const void *buffers[1] = {buffer};
 	BlockNumber	physical_block;
+	uint8		active_slot;
 
-	if (reln == NULL || buffer == NULL ||
-		!UmbraActiveSlotIsValid(source_slot))
+	if (source_slot != NULL)
+		*source_slot = UINT8_MAX;
+	if (reln == NULL || buffer == NULL || source_slot == NULL)
 		return false;
 	um_refresh_mapping_policy(reln, forknum);
 	if (!um_fork_uses_mapped_slots(reln, forknum))
 		return false;
-	if (!UmbraActiveSlotPhysicalBlock(logical_block, source_slot,
-									 &physical_block))
+	active_slot = MapGetActiveSlot(um_get_filectx(reln),
+							   reln->smgr_rlocator, forknum, logical_block);
+	*source_slot = UmbraPreviousActiveSlot(active_slot);
+	if (!UmbraActiveSlotPhysicalBlock(logical_block, *source_slot,
+								  &physical_block))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("Umbra source-slot block mapping overflow for relation %u/%u/%u fork %d",
@@ -946,7 +983,6 @@ um_refresh_mapping_policy(SMgrRelation reln, ForkNumber forknum)
 		(forknum != MAIN_FORKNUM && forknum != FSM_FORKNUM &&
 		 forknum != VISIBILITYMAP_FORKNUM))
 		return;
-	Assert(CritSectionCount == 0);
 	state = reln->smgr_private;
 	if (state == NULL || state->filectx == NULL)
 		return;

@@ -1,7 +1,7 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
 # Verify that an update shifted after checkpoint selection is image-free and
-# crash redo materializes its captured source slot before publishing target.
+# crash redo materializes its recorded source before publishing the target.
 
 use strict;
 use warnings FATAL => 'all';
@@ -91,8 +91,8 @@ sub assert_image_free_shift_wal
 	unlike($records[0], qr/\bFPW\b/,
 		'checkpoint-overlap shift is image-free');
 	like($records[0],
-		qr/slot shift: source_slot 1 target_slot 2 captured_source/,
-		'checkpoint-overlap shift records its captured source');
+		qr/slot shift: source_slot 1 target_slot 2\b/,
+		'checkpoint-overlap shift records its source and target');
 }
 
 my $node = PostgreSQL::Test::Cluster->new(
@@ -189,10 +189,10 @@ $node->safe_psql(
 SELECT injection_points_detach('umbra-checkpoint-after-map')]);
 
 is(read_active_slot($map_path, $block_size, $target_block), 1,
-	'C1 leaves the durable selector at its captured source slot');
+	'C1 leaves the durable selector at the current predecessor slot');
 ok(index(read_physical_block($main_path, $block_size,
 			source_slot_block($target_block, 1)), $image_free_marker) >= 0,
-	'C1 writes the overlap page image to captured slot 1');
+	'C1 writes the overlap page image to predecessor slot 1');
 
 $node->stop('immediate');
 $node->start;

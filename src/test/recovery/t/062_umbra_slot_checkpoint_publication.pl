@@ -43,11 +43,40 @@ sub read_active_slot
 	return (unpack('C', $byte) >> (($entry_index % 4) * 2)) & 0x03;
 }
 
+sub source_slot_block
+{
+	my ($logical_block, $slot) = @_;
+	my $chunk = int($logical_block / 32);
+
+	return $chunk * (3 * 32) + $slot * 32 + $logical_block % 32;
+}
+
+sub read_physical_block
+{
+	my ($path, $block_size, $physical_block) = @_;
+	my $offset = $physical_block * $block_size;
+	my $page;
+
+	open(my $fh, '<', $path) or BAIL_OUT("could not open \"$path\": $!");
+	binmode($fh);
+	my $position = sysseek($fh, $offset, SEEK_SET);
+	defined($position) && $position == $offset
+	  or BAIL_OUT("could not seek in \"$path\": $!");
+	my $nread = sysread($fh, $page, $block_size);
+	defined($nread) && $nread == $block_size
+	  or BAIL_OUT("could not read block $physical_block from \"$path\"");
+	close($fh) or BAIL_OUT("could not close \"$path\": $!");
+
+	return $page;
+}
+
 my $node = PostgreSQL::Test::Cluster->new('umbra_slot_checkpoint_publication');
 $node->init;
 $node->append_conf(
 	'postgresql.conf', q[
 autovacuum = off
+bgwriter_lru_maxpages = 0
+checkpoint_flush_after = 1
 mapwriter_lru_maxpages = 0
 checkpoint_timeout = '1h'
 full_page_writes = on
@@ -71,13 +100,14 @@ my $block_size = 0 + $node->safe_psql('postgres', 'SHOW block_size');
 my $relpath = $node->safe_psql(
 	'postgres',
 	q[SELECT pg_relation_filepath('umbra_slot_checkpoint_publication'::regclass);]);
+my $main_path = $node->data_dir . "/$relpath";
 my $map_path = $node->data_dir . "/${relpath}_map";
 my $target_block = 0 + $node->safe_psql(
 	'postgres', q[
 SELECT (ctid::text::point)[0]::integer
 FROM umbra_slot_checkpoint_publication WHERE id = 1;]);
 
-# Avoid consuming the first post-checkpoint FPI with a visibility hint read.
+# Keep the first post-checkpoint slot transition for the update under test.
 $node->safe_psql('postgres', 'CHECKPOINT');
 $node->safe_psql(
 	'postgres', q[
@@ -102,11 +132,12 @@ SELECT injection_points_wakeup(
          'umbra-mapping-after-wal-before-publish')]);
 $update->query_until(qr/preload_done/, '');
 
+my $marker = 'pre-redo-publication-marker';
 $update->query_until(
 	qr/update_started/,
-	q(\echo update_started
-UPDATE umbra_slot_checkpoint_publication SET payload = 'shifted' WHERE id = 1;
-\echo update_done
+	qq(\\echo update_started
+UPDATE umbra_slot_checkpoint_publication SET payload = '$marker' WHERE id = 1;
+\\echo update_done
 ));
 $node->wait_for_event('client backend',
 	'umbra-mapping-after-wal-before-publish');
@@ -131,9 +162,15 @@ $checkpoint->query_until(qr/checkpoint_done/, '');
 
 is($node->safe_psql('postgres',
 		q[SELECT payload FROM umbra_slot_checkpoint_publication WHERE id = 1;]),
-	'shifted', 'update and checkpoint complete after selector publication');
+	$marker, 'update and checkpoint complete after selector publication');
 is(read_active_slot($map_path, $block_size, $target_block), 1,
 	'checkpoint persists the selector target after publication');
+ok(index(read_physical_block($main_path, $block_size,
+			source_slot_block($target_block, 1)), $marker) >= 0,
+	'pre-redo publication is checkpointed to its active target');
+ok(index(read_physical_block($main_path, $block_size,
+			source_slot_block($target_block, 0)), $marker) < 0,
+	'pre-redo publication is not charged to the new shift epoch');
 
 $node->safe_psql(
 	'postgres', q[

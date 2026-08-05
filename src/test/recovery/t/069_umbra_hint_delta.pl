@@ -1,7 +1,6 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# Verify MAIN-fork hint delta WAL, crash redo, and the auxiliary-FSM FPI
-# fallback.
+# Verify MAIN-fork hint delta WAL, crash redo, and the auxiliary-FSM FPI path.
 
 use strict;
 use warnings FATAL => 'all';
@@ -150,10 +149,8 @@ ok(defined($source_slot) && defined($target_slot),
 	'HINT_DELTA records a source and target slot');
 is($source_slot, $initial_slot,
 	'HINT_DELTA names the checkpointed selector as its source');
-isnt($target_slot, $source_slot,
-	'HINT_DELTA reserves a distinct selector target');
-unlike($hint_record, qr/\bcaptured_source\b/,
-	'HINT_DELTA materializes its source during redo instead of capturing it');
+is($target_slot, 1,
+	'HINT_DELTA advances the selector from slot zero to slot one');
 
 my @main_hint_fpi = grep {
 	/desc: FPI_FOR_HINT/ &&
@@ -245,9 +242,9 @@ is($node->safe_psql(
 		'postgres', q[SELECT payload FROM umbra_hint_delta_replaced WHERE id = 2;]),
 	'replacement storage', 'replacement storage remains writable after crash redo');
 
-# A consistency-checking FPI is non-applying: Hint Delta still materializes
-# the old slot and applies its byte range, then recovery compares that result
-# against the recorded full page.
+# HINT_DELTA remains image-free even when xlog2 consistency checking is
+# enabled.  Its source/target transition and final-byte ranges are the complete
+# recovery contract.
 $node->safe_psql(
 	'postgres', q[
 CREATE TABLE umbra_hint_delta_consistency(id integer, payload text)
@@ -273,16 +270,18 @@ my $consistency_wal_end = $node->safe_psql(
 my @consistency_wal = dump_wal(
 	$node, $consistency_wal_start, $consistency_wal_end, 'xlog2 consistency');
 my @consistency_hints = grep {
-	/rmgr: XLOG2/ && /desc: HINT_DELTA/ && /\bFPW\b/ &&
+	/rmgr: XLOG2/ && /desc: HINT_DELTA/ &&
 	/rel \d+\/\d+\/$consistency_filenode fork main blk 0\b/ &&
-	/slot shift: source_slot [0-2] target_slot [0-2]\b/
+	/slot shift: source_slot 0 target_slot 1\b/
 } @consistency_wal;
 is(scalar(@consistency_hints), 1,
-	'xlog2 consistency checking records one FPI-backed HINT_DELTA');
+	'xlog2 consistency checking records one HINT_DELTA');
+unlike($consistency_hints[0] // '', qr/\bFPW\b/,
+	'xlog2 consistency checking does not add a full-page image');
 $node->stop('immediate');
 $node->start;
 is(xmin_is_committed($node, 'umbra_hint_delta_consistency'), 't',
-	'xlog2 consistency HINT_DELTA passes crash redo verification');
+	'xlog2 consistency HINT_DELTA survives crash redo');
 is($node->safe_psql(
 		'postgres', q[SELECT payload FROM umbra_hint_delta_consistency WHERE id = 1;]),
 	'consistency', 'consistency-checked HINT_DELTA retains tuple data');
@@ -301,7 +300,7 @@ my $fsm_filenode = $node->safe_psql(
 	'postgres', q[SELECT pg_relation_filenode('umbra_hint_delta_fsm'::regclass);]);
 cmp_ok($node->safe_psql(
 		'postgres', q[SELECT pg_relation_size('umbra_hint_delta_fsm', 'fsm');]),
-	'>', 0, 'FSM fork exists before fallback coverage');
+	'>', 0, 'FSM fork exists before FPI-path coverage');
 $node->safe_psql(
 	'postgres', q[
 DELETE FROM umbra_hint_delta_fsm;
@@ -319,7 +318,7 @@ VACUUM (DISABLE_PAGE_SKIPPING, TRUNCATE FALSE) umbra_hint_delta_fsm;
 $node->safe_psql('postgres', 'SELECT pg_switch_wal();');
 my $fsm_wal_end = $node->safe_psql(
 	'postgres', 'SELECT pg_current_wal_flush_lsn();');
-my @fsm_wal = dump_wal($node, $fsm_wal_start, $fsm_wal_end, 'FSM fallback');
+my @fsm_wal = dump_wal($node, $fsm_wal_start, $fsm_wal_end, 'FSM FPI path');
 my @fsm_hint_fpi = grep {
 	/desc: FPI_FOR_HINT/ &&
 	/rel \d+\/\d+\/$fsm_filenode fork fsm blk \d+\b/

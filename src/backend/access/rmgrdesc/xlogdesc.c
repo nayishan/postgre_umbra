@@ -435,11 +435,9 @@ XLogRecGetBlockRefInfo(XLogReaderState *record, bool pretty,
 			}
 #ifdef USE_UMBRA
 			if (XLogRecGetBlock(record, block_id)->has_slot_shift)
-				appendStringInfo(buf, "; slot shift: source_slot %u target_slot %u%s",
+				appendStringInfo(buf, "; slot shift: source_slot %u target_slot %u",
 								XLogRecGetBlock(record, block_id)->source_slot,
-								XLogRecGetBlock(record, block_id)->target_slot,
-								XLogRecGetBlock(record, block_id)->source_slot_captured ?
-								" captured_source" : "");
+								XLogRecGetBlock(record, block_id)->target_slot);
 #endif
 
 			if (pretty)

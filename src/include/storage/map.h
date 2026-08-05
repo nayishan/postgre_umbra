@@ -64,7 +64,8 @@ extern void MapEnsureActiveSlotPages(UmbraFileContext *ctx,
 extern bool MapPrepareSlotShift(UmbraFileContext *ctx,
 								 RelFileLocatorBackend rlocator,
 								 ForkNumber forknum,
-								 BlockNumber logical_block, MapSlotShift *shift);
+								 BlockNumber logical_block,
+								 MapSlotShift *shift);
 extern void MapAbortSlotShift(MapSlotShift *shift);
 extern void MapPublishSlotShift(MapSlotShift *shift, XLogRecPtr lsn);
 extern void MapRedoSetActiveSlot(UmbraFileContext *ctx,

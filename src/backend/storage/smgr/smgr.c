@@ -389,8 +389,7 @@ smgropen(RelFileLocator rlocator, ProcNumber backend)
 #ifdef USE_UMBRA
 /*
  * Find an already-open relation handle without allocating.  WAL insertion can
- * use this from a critical section to decide whether an Umbra slot shift is
- * available; a miss simply keeps the ordinary full-page image.
+ * use this while preparing a raw selector pin; a miss retains the FPI.
  */
 SMgrRelation
 smgrlookup(RelFileLocator rlocator, ProcNumber backend)

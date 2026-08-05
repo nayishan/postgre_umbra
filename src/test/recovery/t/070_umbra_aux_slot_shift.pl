@@ -50,17 +50,18 @@ sub read_active_slot
 
 sub update_round
 {
-	my ($node, $marker, $label) = @_;
+	my ($node, $marker, $label, $relation) = @_;
+	$relation //= 'umbra_aux_slot_shift';
 	my $start_lsn = $node->safe_psql(
 		'postgres', 'SELECT pg_current_wal_insert_lsn();');
 
 	$node->safe_psql(
 		'postgres',
-		"UPDATE umbra_aux_slot_shift SET payload = repeat('$marker', 500);");
+		"UPDATE $relation SET payload = repeat('$marker', 500);");
 	$node->safe_psql(
 		'postgres',
 		'VACUUM (FREEZE, ANALYZE, DISABLE_PAGE_SKIPPING) '
-		  . 'umbra_aux_slot_shift;');
+		  . "$relation;");
 	$node->safe_psql('postgres', 'SELECT pg_switch_wal();');
 	my $end_lsn = $node->safe_psql(
 		'postgres', 'SELECT pg_current_wal_flush_lsn();');
@@ -90,10 +91,16 @@ sub transition_blocks
 		{
 			my ($line, $block) = ($1, $2);
 
-			next unless $line =~ /\bFPW\b/;
+			if ($fork eq 'fsm')
+			{
+				next unless $line =~ /\bFPW\b/;
+			}
+			else
+			{
+				next if $line =~ /\bFPW\b/;
+			}
 			next unless $line =~
 			  /slot shift: source_slot $source_slot target_slot $target_slot\b/;
-			next if $line =~ /captured_source/;
 			$blocks{$block} = 1;
 		}
 	}
@@ -130,8 +137,9 @@ autovacuum = off
 bgwriter_lru_maxpages = 0
 mapwriter_lru_maxpages = 0
 checkpoint_timeout = '1h'
-full_page_writes = on
+full_page_writes = off
 wal_log_hints = on
+log_min_messages = debug1
 max_wal_size = '4GB'
 ]);
 $node->start;
@@ -147,6 +155,12 @@ SELECT g, repeat('x', 500) FROM generate_series(1, 500) AS g;
 ]);
 $node->safe_psql(
 	'postgres', 'VACUUM (FREEZE, ANALYZE) umbra_aux_slot_shift;');
+$node->safe_psql('postgres', 'CHECKPOINT;');
+$node->append_conf('postgresql.conf', "full_page_writes = on\n");
+$node->stop;
+$node->start;
+is($node->safe_psql('postgres', 'SHOW full_page_writes'), 'on',
+	'auxiliary rotation runs with full-page writes enabled');
 $node->safe_psql('postgres', 'CHECKPOINT;');
 
 my $filenode = $node->safe_psql(
@@ -176,12 +190,13 @@ for my $round (0 .. 2)
 
 	for my $fork ('fsm', 'vm')
 	{
+		my $wal_shape = $fork eq 'fsm' ? 'FPI-backed' : 'image-free';
 		my $found = transition_blocks(
 			$records, $filenode, $fork, $source_slot, $target_slot);
 
 		ok(keys(%$found) > 0,
 			"$fork round " . ($round + 1)
-			  . " records FPI-backed slot $source_slot to $target_slot");
+			  . " records $wal_shape slot $source_slot to $target_slot");
 		if ($round == 0)
 		{
 			($tracked_block{$fork}) = sort { $a <=> $b } keys(%$found);
@@ -242,8 +257,8 @@ ok(length($fsm_before_crash) > 0,
 ok(length($vm_before_crash) > 0,
 	'VM snapshot is nonempty before crash recovery');
 
-# The third target has not been checkpointed.  Redo must restore the FPI into
-# slot 0 and publish that selector before later auxiliary access.
+# The third target has not been checkpointed.  Redo must reconstruct slot 0
+# through each fork's recorded transition before later auxiliary access.
 $node->stop('immediate');
 $node->start;
 for my $fork ('fsm', 'vm')
@@ -271,9 +286,60 @@ ok(exists $fsm_after->{ $tracked_block{fsm} },
 ok(exists $vm_after->{ $tracked_block{vm} },
 	'VM crash redo leaves the rotated selector at slot 0');
 
+# Applying-FPI redo must not treat a missing MAP root as lifecycle authority.
+# An FSM FPI_FOR_HINT records the dependency, and the later DROP clears it.
+$node->safe_psql(
+	'postgres', q[
+CREATE TABLE umbra_aux_slot_shift_drop(id integer, payload text)
+  WITH (autovacuum_enabled = false, fillfactor = 50);
+INSERT INTO umbra_aux_slot_shift_drop
+SELECT g, repeat('x', 500) FROM generate_series(1, 500) AS g;
+VACUUM (FREEZE, ANALYZE) umbra_aux_slot_shift_drop;
+CHECKPOINT;
+]);
+my $drop_filenode = $node->safe_psql(
+	'postgres',
+	q[SELECT pg_relation_filenode('umbra_aux_slot_shift_drop'::regclass);]);
+my $drop_relpath = $node->safe_psql(
+	'postgres',
+	q[SELECT pg_relation_filepath('umbra_aux_slot_shift_drop'::regclass);]);
+my $drop_map_path = $node->data_dir . "/${drop_relpath}_map";
+my $drop_records = update_round(
+	$node, 'm', 'auxiliary missing-root round',
+	'umbra_aux_slot_shift_drop');
+my $drop_fsm_block;
+for my $transition (@transitions)
+{
+	my ($source_slot, $target_slot) = @$transition;
+	my $found = transition_blocks(
+		$drop_records, $drop_filenode, 'fsm', $source_slot, $target_slot);
+
+	if (keys(%$found) > 0)
+	{
+		($drop_fsm_block) = sort { $a <=> $b } keys(%$found);
+		last;
+	}
+}
+ok(defined($drop_fsm_block),
+	'missing-root relation emits an FSM applying-FPI shift')
+  or BAIL_OUT('could not identify the applying-FPI FSM block');
+$node->safe_psql('postgres', 'DROP TABLE umbra_aux_slot_shift_drop;');
+ok(!-e $drop_map_path,
+	'later DROP removes the applying-FPI shift mapping before crash');
+my $drop_recovery_log_offset = -s $node->logfile;
+$node->stop('immediate');
+$node->start;
+ok($node->log_contains(
+		qr/page $drop_fsm_block of relation .*\/${drop_filenode}_fsm does not exist/,
+		$drop_recovery_log_offset),
+	'missing MAP root records the FSM FPI shift as a dependency');
+is($node->safe_psql(
+		'postgres', q[SELECT to_regclass('umbra_aux_slot_shift_drop') IS NULL;]),
+	't', 'later DROP clears the FSM missing-root dependency');
+
 # Truncate must preserve a nonzero selector without exposing old auxiliary
 # bytes when the same logical page is regrown.  Disable FPWs for the regrow so
-# a fresh FPI-backed shift cannot hide an incorrect active-slot initialization.
+# a fresh selector shift cannot hide an incorrect active-slot initialization.
 $node->safe_psql('postgres', 'CHECKPOINT');
 for my $fork ('fsm', 'vm')
 {
@@ -302,7 +368,7 @@ $node->append_conf('postgresql.conf', "full_page_writes = off\n");
 $node->stop;
 $node->start;
 is($node->safe_psql('postgres', 'SHOW full_page_writes'), 'off',
-	'regrow runs without FPI-backed selector shifts');
+	'regrow runs without redo-boundary selector shifts');
 $node->safe_psql(
 	'postgres', q[
 INSERT INTO umbra_aux_slot_shift

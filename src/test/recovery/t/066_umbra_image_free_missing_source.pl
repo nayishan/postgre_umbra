@@ -152,7 +152,7 @@ is($node->safe_psql(
 		"SELECT redo_lsn >= '$first_updates_end'::pg_lsn "
 		  . "AND redo_lsn <= '$image_free_start'::pg_lsn "
 		  . 'FROM pg_control_checkpoint();'),
-	't', 'crash redo excludes the first FPI shifts but includes image-free WAL');
+	't', 'crash redo excludes the first shifts but includes the later shifts');
 
 $node->stop('immediate');
 

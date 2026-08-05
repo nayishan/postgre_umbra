@@ -289,4 +289,80 @@ check_layout($minimal, 'umbra_slot0_minimal', $minimal_path,
 	$minimal_block_size, 'minimal-WAL restart');
 
 $minimal->stop;
+
+# A consistency FPI cannot carry a slot shift.  If its relation root has been
+# removed by a later DROP, redo must record an invalid-page dependency rather
+# than recreate and access the MAIN fork through the direct physical layout.
+my $redo_policy = PostgreSQL::Test::Cluster->new('slot0_unknown_redo');
+$redo_policy->init(no_data_checksums => 1);
+$redo_policy->append_conf(
+	'postgresql.conf', qq(
+autovacuum = off
+checkpoint_timeout = '1h'
+log_min_messages = debug2
+max_wal_size = '4GB'
+wal_consistency_checking = heap
+));
+$redo_policy->start;
+$redo_policy->safe_psql(
+	'postgres', q{
+CREATE TABLE umbra_unknown_redo (id integer PRIMARY KEY, payload text)
+  WITH (autovacuum_enabled = false);
+INSERT INTO umbra_unknown_redo VALUES (1, repeat('a', 700));
+CHECKPOINT;
+});
+
+my $redo_filenode = 0 + $redo_policy->safe_psql(
+	'postgres',
+	q{SELECT pg_relation_filenode('umbra_unknown_redo'::regclass)});
+my $redo_block = 0 + $redo_policy->safe_psql(
+	'postgres', q{
+SELECT (ctid::text::point)[0]::integer
+FROM umbra_unknown_redo
+WHERE id = 1;
+});
+my $redo_wal_start = $redo_policy->safe_psql(
+	'postgres', 'SELECT pg_current_wal_insert_lsn();');
+$redo_policy->safe_psql(
+	'postgres', q{
+UPDATE umbra_unknown_redo
+SET payload = repeat('b', 700)
+WHERE id = 1;
+});
+my $redo_wal_end = $redo_policy->safe_psql(
+	'postgres', 'SELECT pg_current_wal_insert_lsn();');
+my ($redo_wal, $redo_stderr) = run_command(
+	[
+		'pg_waldump', '--bkp-details',
+		'--path' => $redo_policy->data_dir . '/pg_wal',
+		'--start' => $redo_wal_start,
+		'--end' => $redo_wal_end,
+	]);
+$redo_stderr =~ s/^pg_waldump: first record is after [0-9A-F]+\/[0-9A-F]+, at [0-9A-F]+\/[0-9A-F]+, skipping over \d+ bytes?\n?//;
+is($redo_stderr, '', 'pg_waldump reads ordinary consistency-FPI WAL');
+my @redo_records = grep {
+	/rel \d+\/\d+\/$redo_filenode fork main blk $redo_block\b/
+} split(/\n/, $redo_wal);
+is(scalar(@redo_records), 1,
+	'ordinary update emits one target-block WAL record');
+like($redo_records[0] // '', qr/\bFPW\b/,
+	'consistency checking emits a full-page image');
+unlike($redo_records[0] // '', qr/slot shift:/,
+	'ordinary consistency FPI has no slot shift');
+
+$redo_policy->safe_psql('postgres', 'DROP TABLE umbra_unknown_redo');
+my $redo_log_start = -s $redo_policy->logfile;
+$redo_policy->stop('immediate');
+ok($redo_policy->start,
+	'recovery accepts an ordinary FPI with unresolved mapping authority');
+ok($redo_policy->log_contains(
+	qr/page $redo_block of relation .* does not exist/,
+	$redo_log_start),
+	'ordinary FPI records its unresolved mapping as an invalid-page dependency');
+ok($redo_policy->log_contains(
+	qr/page $redo_block of relation .* has been dropped/,
+	$redo_log_start),
+	'later DROP clears the ordinary-FPI invalid-page dependency');
+$redo_policy->stop;
+
 done_testing();

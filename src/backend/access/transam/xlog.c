@@ -943,6 +943,16 @@ XLogInsertRecord(XLogRecData *rdata,
 		ReserveXLogInsertLocation(rechdr->xl_tot_len, &StartPos, &EndPos,
 								  &rechdr->xl_prev);
 		RedoRecPtr = Insert->RedoRecPtr = StartPos;
+#ifdef USE_UMBRA
+		/*
+		 * Publish the exact redo boundary and start its shift epoch before
+		 * another inserter can pass this checkpoint record.
+		 */
+		SpinLockAcquire(&XLogCtl->info_lck);
+		XLogCtl->RedoRecPtr = StartPos;
+		SpinLockRelease(&XLogCtl->info_lck);
+		CheckPointBuffersShiftEpochBegin();
+#endif
 		inserted = true;
 	}
 
@@ -7449,11 +7459,6 @@ CreateCheckPoint(int flags)
 	/* Run these points outside the critical section. */
 	INJECTION_POINT("create-checkpoint-initial", NULL);
 	INJECTION_POINT_LOAD("create-checkpoint-run");
-#ifdef USE_UMBRA
-	INJECTION_POINT_LOAD("umbra-checkpoint-after-capture-before-redo");
-	CheckPointBuffersCaptureBegin();
-	INJECTION_POINT_CACHED("umbra-checkpoint-after-capture-before-redo", NULL);
-#endif
 
 	/*
 	 * Use a critical section to force system panic if we have trouble.
@@ -7571,6 +7576,12 @@ CreateCheckPoint(int flags)
 		 * the checkpoint.
 		 */
 		RedoRecPtr = XLogCtl->Insert.RedoRecPtr = checkPoint.redo;
+#ifdef USE_UMBRA
+		SpinLockAcquire(&XLogCtl->info_lck);
+		XLogCtl->RedoRecPtr = checkPoint.redo;
+		SpinLockRelease(&XLogCtl->info_lck);
+		CheckPointBuffersShiftEpochBegin();
+#endif
 	}
 
 	/*
@@ -8083,9 +8094,9 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 #ifdef USE_UMBRA
 	PG_TRY();
 	{
-		/* Capture is already visible; now take a fresh delay snapshot. */
-		INJECTION_POINT_LOAD("umbra-checkpoint-after-capture");
-		INJECTION_POINT_CACHED("umbra-checkpoint-after-capture", NULL);
+		/* The shift epoch is visible; now take a fresh delay snapshot. */
+		INJECTION_POINT_LOAD("umbra-checkpoint-after-shift-epoch");
+		INJECTION_POINT_CACHED("umbra-checkpoint-after-shift-epoch", NULL);
 		umbra_vxids = GetVirtualXIDsDelayingChkpt(&umbra_nvxids,
 											 DELAY_CHKPT_START);
 		while (umbra_nvxids > 0 &&
@@ -8256,17 +8267,15 @@ CreateRestartPoint(int flags)
 	 * during recovery this is just pro forma, because no WAL insertions are
 	 * happening.
 	 */
-#ifdef USE_UMBRA
-	CheckPointBuffersCaptureBegin();
-#endif
 	WALInsertLockAcquireExclusive();
 	RedoRecPtr = XLogCtl->Insert.RedoRecPtr = lastCheckPoint.redo;
-	WALInsertLockRelease();
-
-	/* Also update the info_lck-protected copy */
 	SpinLockAcquire(&XLogCtl->info_lck);
 	XLogCtl->RedoRecPtr = lastCheckPoint.redo;
 	SpinLockRelease(&XLogCtl->info_lck);
+#ifdef USE_UMBRA
+	CheckPointBuffersShiftEpochBegin();
+#endif
+	WALInsertLockRelease();
 
 	/*
 	 * Prepare to accumulate statistics.
@@ -9149,13 +9158,21 @@ xlog_redo(XLogReaderState *record)
 			action = XLogReadBufferForRedo(record, block_id, &buffer);
 #ifdef USE_UMBRA
 			/*
-			 * A slot-shift FPI cannot reconstruct missing MAP lifecycle
-			 * authority.  The reader has recorded that dependency for a later
-			 * DROP or covering TRUNCATE.
+			 * Neither a slot-shift FPI nor an ordinary FPI can reconstruct
+			 * missing MAP lifecycle authority.  The reader records that
+			 * dependency for a later DROP or covering TRUNCATE.  Do not accept
+			 * arbitrary BLK_NOTFOUND results from a full-page-image redo.
 			 */
-			if (action == BLK_NOTFOUND &&
-				XLogRecGetBlock(record, block_id)->has_slot_shift)
-				continue;
+			if (action == BLK_NOTFOUND)
+			{
+				DecodedBkpBlock *block = XLogRecGetBlock(record, block_id);
+
+				if (block->has_slot_shift ||
+					!UmRedoMappingPolicyResolved(
+						smgropen(block->rlocator, INVALID_PROC_NUMBER),
+						block->forknum))
+					continue;
+			}
 #endif
 			if (action != BLK_RESTORED)
 				elog(ERROR, "unexpected XLogReadBufferForRedo result when restoring backup block");
@@ -9351,10 +9368,7 @@ xlog2_redo(XLogReaderState *record)
 
 		block = XLogRecGetBlock(record, 0);
 		if (block->forknum != MAIN_FORKNUM || !block->has_slot_shift ||
-			block->source_slot_captured || block->target_slot >= 3 ||
-			(block->has_image &&
-			 (block->apply_image ||
-			  (XLogRecGetInfo(record) & XLR_CHECK_CONSISTENCY) == 0)) ||
+			block->target_slot >= 3 || block->has_image ||
 			!block->has_data || block->data_len == 0 || block->data_len >= BLCKSZ)
 			elog(PANIC, "invalid Umbra hint delta block reference");
 

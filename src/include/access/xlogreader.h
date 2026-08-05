@@ -135,7 +135,6 @@ typedef struct
 #ifdef USE_UMBRA
 	/* Umbra mapped-fork source/target slot transition, if one is attached. */
 	bool		has_slot_shift;
-	bool		source_slot_captured;
 	uint8		source_slot;
 	uint8		target_slot;
 #endif

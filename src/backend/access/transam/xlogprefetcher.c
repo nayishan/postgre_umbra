@@ -40,6 +40,9 @@
 #include "storage/shmem.h"
 #include "storage/smgr.h"
 #include "storage/subsystems.h"
+#ifdef USE_UMBRA
+#include "storage/umbra.h"
+#endif
 #include "utils/fmgrprotos.h"
 #include "utils/guc_hooks.h"
 #include "utils/hsearch.h"
@@ -673,7 +676,7 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 			}
 
 #ifdef USE_UMBRA
-			/* Redo selects the target slot before it can safely read this page. */
+			/* Redo restores the source slot before it can safely read this page. */
 			if (block->has_slot_shift)
 			{
 				XLogPrefetcherAddFilter(prefetcher, block->rlocator,
@@ -733,6 +736,17 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 			 * safely), but for now we'll call smgropen() every time.
 			 */
 			reln = smgropen(block->rlocator, INVALID_PROC_NUMBER);
+
+#ifdef USE_UMBRA
+			/* A physical prefetch is unsafe until CREATE redo resolves the root. */
+			if (!UmRedoMappingPolicyResolved(reln, block->forknum))
+			{
+				XLogPrefetcherAddFilter(prefetcher, block->rlocator, 0,
+									record->lsn);
+				XLogPrefetchIncrement(&SharedStats->skip_new);
+				return LRQ_NEXT_NO_IO;
+			}
+#endif
 
 			/*
 			 * If the relation file doesn't exist on disk, for example because

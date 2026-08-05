@@ -98,8 +98,6 @@ typedef struct
 	bool		from_shared_buffer;
 	bool		hint_delta_slot_shift;
 	bool		slot_shift_in_record;
-	bool		source_slot_capture_possible;
-	bool		source_slot_captured;
 	UmbraSlotShift slot_shift;
 #endif
 } registered_buffer;
@@ -175,10 +173,8 @@ static bool XLogCompressBackupBlock(const PageData *page, uint16 hole_offset,
 									uint16 hole_length, void *dest, uint16 *dlen);
 #ifdef USE_UMBRA
 static bool XLogBlockSlotShiftEligible(registered_buffer *regbuf,
-									   RmgrId rmid, uint8 info,
-									   SMgrRelation *reln);
-static bool XLogPrepareSlotShifts(RmgrId rmid, uint8 info,
-								  XLogRecPtr RedoRecPtr, bool doPageWrites);
+								   RmgrId rmid, uint8 info,
+								   SMgrRelation *reln);
 static void XLogPublishSlotShifts(XLogRecPtr record_endptr);
 static void XLogAbortSlotShifts(void);
 static void XLogReleaseSlotShiftsAtExit(int code, Datum arg);
@@ -271,6 +267,7 @@ XLogResetInsertion(void)
 	if (curinsert_slot_shift_delay_started && MyProc != NULL)
 		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 	curinsert_slot_shift_delay_started = false;
+	curinsert_has_slot_shift = false;
 #endif
 	for (i = 0; i < max_registered_block_id; i++)
 	{
@@ -280,8 +277,6 @@ XLogResetInsertion(void)
 		registered_buffers[i].from_shared_buffer = false;
 		registered_buffers[i].hint_delta_slot_shift = false;
 		registered_buffers[i].slot_shift_in_record = false;
-		registered_buffers[i].source_slot_capture_possible = false;
-		registered_buffers[i].source_slot_captured = false;
 		MemSet(&registered_buffers[i].slot_shift, 0,
 				   sizeof(registered_buffers[i].slot_shift));
 		registered_buffers[i].slot_shift.map_slot_id = -1;
@@ -346,8 +341,6 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
 	regbuf->from_shared_buffer = true;
 	regbuf->hint_delta_slot_shift = false;
 	regbuf->slot_shift_in_record = false;
-	regbuf->source_slot_capture_possible = false;
-	regbuf->source_slot_captured = false;
 	MemSet(&regbuf->slot_shift, 0, sizeof(regbuf->slot_shift));
 	regbuf->slot_shift.map_slot_id = -1;
 #endif
@@ -391,11 +384,15 @@ XLogPrepareBufferHintDelta(Buffer buffer)
 	XLogRegisterBuffer(0, buffer, REGBUF_NO_IMAGE | REGBUF_NO_CHANGE);
 	regbuf = &registered_buffers[0];
 
-	if (regbuf->forkno != MAIN_FORKNUM || MyProc == NULL ||
-		!LocalTransactionIdIsValid(MyProc->vxid.lxid))
+	if (regbuf->forkno != MAIN_FORKNUM)
 	{
 		XLogResetInsertion();
 		return false;
+	}
+	if (MyProc == NULL || !LocalTransactionIdIsValid(MyProc->vxid.lxid))
+	{
+		XLogResetInsertion();
+		elog(ERROR, "cannot prepare an Umbra hint delta outside a transaction");
 	}
 
 	/* Keep the redo point stable until the clean page becomes dirty. */
@@ -414,9 +411,8 @@ XLogPrepareBufferHintDelta(Buffer buffer)
 	PG_TRY();
 	{
 		reln = smgrlookup(regbuf->rlocator, INVALID_PROC_NUMBER);
-		prepared = reln != NULL &&
-			UmPrepareSlotShift(reln, regbuf->forkno, regbuf->block,
-							   &regbuf->slot_shift);
+		prepared = UmChooseSlotShift(reln, regbuf->forkno, regbuf->block,
+							 &regbuf->slot_shift);
 	}
 	PG_CATCH();
 	{
@@ -427,7 +423,6 @@ XLogPrepareBufferHintDelta(Buffer buffer)
 
 	if (!prepared)
 	{
-		/* A relation or selector cache miss retains the ordinary FPI hint path. */
 		XLogResetInsertion();
 		return false;
 	}
@@ -478,8 +473,6 @@ XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator, ForkNumber forknum,
 	regbuf->from_shared_buffer = false;
 	regbuf->hint_delta_slot_shift = false;
 	regbuf->slot_shift_in_record = false;
-	regbuf->source_slot_capture_possible = false;
-	regbuf->source_slot_captured = false;
 	MemSet(&regbuf->slot_shift, 0, sizeof(regbuf->slot_shift));
 	regbuf->slot_shift.map_slot_id = -1;
 #endif
@@ -680,15 +673,20 @@ XLogInsert(RmgrId rmid, uint8 info)
 #ifdef USE_UMBRA
 		PG_TRY();
 		{
-			if (XLogPrepareSlotShifts(rmid, info, RedoRecPtr, doPageWrites) &&
-				(MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0)
-			{
-				MyProc->delayChkptFlags |= DELAY_CHKPT_START;
-				curinsert_slot_shift_delay_started = true;
-			}
 			rdt = XLogRecordAssembleUmbra(rmid, info, RedoRecPtr,
 									  doPageWrites, &fpw_lsn, &num_fpi,
 									  &fpi_bytes, &topxid_included);
+			if (curinsert_has_slot_shift)
+			{
+				if (MyProc == NULL ||
+					!LocalTransactionIdIsValid(MyProc->vxid.lxid))
+					elog(ERROR, "cannot shift an Umbra page outside a transaction");
+				if ((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0)
+				{
+					MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+					curinsert_slot_shift_delay_started = true;
+				}
+			}
 		}
 		PG_CATCH();
 		{
@@ -1216,15 +1214,10 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 	XLogRecData *rdt_datas_last;
 	XLogRecord *rechdr;
 	char	   *scratch = hdr_scratch;
-
-#ifdef USE_UMBRA
 	bool		hint_delta = rmid == RM_XLOG2_ID &&
 		(info & XLR_RMGR_INFO_MASK) == XLOG2_HINT_DELTA;
-#endif
 
-#ifdef USE_UMBRA
 	curinsert_has_slot_shift = false;
-#endif
 
 	/*
 	 * Note: this function can be called multiple times for the same record.
@@ -1245,7 +1238,9 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 	 * for callers of XLogInsert() to pass XLR_CHECK_CONSISTENCY directly for
 	 * a record.
 	 */
-	if (wal_consistency_checking[rmid])
+	if (hint_delta)
+		info &= ~XLR_CHECK_CONSISTENCY;
+	else if (wal_consistency_checking[rmid])
 		info |= XLR_CHECK_CONSISTENCY;
 
 	/*
@@ -1265,18 +1260,16 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 		bool		samerel;
 		bool		is_compressed = false;
 		bool		include_image;
-#ifdef USE_UMBRA
 		bool		include_slot_shift = false;
-		bool		image_free_slot_shift = false;
+		bool		hint_fpi;
 		XLogRecordBlockSlotShiftHeader slot_shift_header;
-#endif
+		SMgrRelation shift_reln = NULL;
 
 		if (!regbuf->in_use)
 			continue;
-#ifdef USE_UMBRA
 		regbuf->slot_shift_in_record = false;
-		regbuf->source_slot_captured = false;
-#endif
+		hint_fpi = rmid == RM_XLOG_ID &&
+			(info & XLR_RMGR_INFO_MASK) == XLOG_FPI_FOR_HINT;
 
 		/* Determine if this block needs to be backed up */
 		if (regbuf->flags & REGBUF_FORCE_IMAGE)
@@ -1302,39 +1295,32 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 			}
 		}
 
-#ifdef USE_UMBRA
 		if (hint_delta && regbuf->hint_delta_slot_shift)
 		{
+			Assert(regbuf->slot_shift.selected);
 			Assert(regbuf->slot_shift.prepared);
 			Assert(regbuf->rdata_len != 0);
+			needs_backup = false;
 			include_slot_shift = true;
 		}
-		else
+		else if (needs_backup &&
+				 XLogBlockSlotShiftEligible(regbuf, rmid, info, &shift_reln))
 		{
-			/*
-			 * A selected checkpoint writes the retained source slot.  Its exact
-			 * source baseline can replace the FPI, but only when ordinary redo has
-			 * page data to apply after it reaches the target slot.
-			 */
-			image_free_slot_shift = needs_backup &&
-				regbuf->slot_shift.prepared &&
-				regbuf->source_slot_capture_possible &&
-				regbuf->rdata_len != 0;
-			if (image_free_slot_shift)
+			if (!regbuf->slot_shift.selected)
+				(void) UmChooseSlotShift(shift_reln, regbuf->forkno, regbuf->block,
+									 &regbuf->slot_shift);
+			if (regbuf->slot_shift.selected)
 			{
-				needs_backup = false;
-				regbuf->source_slot_captured = true;
-			}
-			include_slot_shift = (needs_backup || image_free_slot_shift) &&
-				regbuf->slot_shift.prepared;
-			if (!include_slot_shift && regbuf->slot_shift.prepared)
-			{
-				UmAbortSlotShift(&regbuf->slot_shift);
-				regbuf->source_slot_capture_possible = false;
-				regbuf->source_slot_captured = false;
+				Assert(regbuf->slot_shift.prepared);
+				if (hint_fpi && regbuf->forkno == MAIN_FORKNUM)
+					elog(ERROR, "Umbra MAIN-fork hint WAL did not use a hint delta");
+				include_slot_shift = true;
+				if (!hint_fpi)
+					needs_backup = false;
 			}
 		}
-#endif
+		else if (regbuf->slot_shift.selected)
+			UmAbortSlotShift(&regbuf->slot_shift);
 
 		/* Determine if the buffer data needs to included */
 		if (regbuf->rdata_len == 0)
@@ -1351,18 +1337,13 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 		if ((regbuf->flags & REGBUF_WILL_INIT) == REGBUF_WILL_INIT)
 			bkpb.fork_flags |= BKPBLOCK_WILL_INIT;
 
-#ifdef USE_UMBRA
 		if (include_slot_shift)
 		{
 			slot_shift_header.target_slot = regbuf->slot_shift.target_slot;
-			if (image_free_slot_shift)
-				slot_shift_header.target_slot |=
-					XLR_SLOT_SHIFT_CAPTURED_SOURCE;
 			bkpb.fork_flags |= BKPBLOCK_HAS_SLOT_SHIFT;
 			regbuf->slot_shift_in_record = true;
 			curinsert_has_slot_shift = true;
 		}
-#endif
 
 		/*
 		 * If needs_backup is true or WAL checking is enabled for current
@@ -1673,7 +1654,7 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 #ifdef USE_UMBRA
 static bool
 XLogBlockSlotShiftEligible(registered_buffer *regbuf, RmgrId rmid,
-					   uint8 info, SMgrRelation *reln)
+						   uint8 info, SMgrRelation *reln)
 {
 	Assert(regbuf != NULL);
 	Assert(reln != NULL);
@@ -1686,60 +1667,14 @@ XLogBlockSlotShiftEligible(registered_buffer *regbuf, RmgrId rmid,
 		(rmid == RM_XLOG_ID &&
 		 (info & XLR_RMGR_INFO_MASK) == XLOG_FPI_FOR_HINT &&
 		 regbuf->forkno == MAIN_FORKNUM) ||
-		MyProc == NULL || !LocalTransactionIdIsValid(MyProc->vxid.lxid))
+		MyProc == NULL || !LocalTransactionIdIsValid(MyProc->vxid.lxid) ||
+		IsBootstrapProcessingMode() || IsInitProcessingMode())
 		return false;
 
-	/* This is a pure lookup: WAL preparation must not allocate or open files. */
+	/* Do not create an smgr entry while preparing a raw selector pin. */
 	*reln = smgrlookup(regbuf->rlocator, INVALID_PROC_NUMBER);
 	return *reln != NULL &&
 		UmWalOwnedSlotShiftAvailable(*reln, regbuf->forkno);
-}
-
-static bool
-XLogPrepareSlotShifts(RmgrId rmid, uint8 info, XLogRecPtr RedoRecPtr,
-				  bool doPageWrites)
-{
-	bool		prepared = false;
-
-	if (!doPageWrites || IsBootstrapProcessingMode() ||
-		IsInitProcessingMode())
-		return false;
-
-	/*
-	 * This can run inside the caller's critical section.  A selector cache miss
-	 * deliberately retains the ordinary FPI; no allocation or metadata I/O is
-	 * allowed here.
-	 */
-	for (int block_id = 0; block_id < max_registered_block_id; block_id++)
-	{
-		registered_buffer *regbuf = &registered_buffers[block_id];
-		SMgrRelation reln;
-		XLogRecPtr	page_lsn;
-
-		if (!regbuf->in_use)
-			continue;
-		if (regbuf->slot_shift.prepared)
-		{
-			regbuf->source_slot_capture_possible =
-				BufferCheckpointSourceSlotCaptureIsPossible(regbuf->buffer,
-												  regbuf->slot_shift.source_slot);
-			prepared = true;
-			continue;
-		}
-		if (!XLogBlockSlotShiftEligible(regbuf, rmid, info, &reln))
-			continue;
-		page_lsn = PageGetLSN(regbuf->page);
-		if (XLogRecPtrIsValid(page_lsn) && page_lsn <= RedoRecPtr &&
-			UmPrepareSlotShift(reln, regbuf->forkno, regbuf->block,
-						   &regbuf->slot_shift))
-		{
-			regbuf->source_slot_capture_possible =
-				BufferCheckpointSourceSlotCaptureIsPossible(regbuf->buffer,
-												  regbuf->slot_shift.source_slot);
-			prepared = true;
-		}
-	}
-	return prepared;
 }
 
 static void
@@ -1751,17 +1686,13 @@ XLogPublishSlotShifts(XLogRecPtr record_endptr)
 
 		if (!regbuf->in_use || !regbuf->slot_shift_in_record)
 			continue;
+		Assert(regbuf->slot_shift.selected);
 		Assert(regbuf->slot_shift.prepared);
-		if (!regbuf->hint_delta_slot_shift &&
-			!BufferSaveCheckpointSourceSlot(regbuf->buffer,
-									  regbuf->slot_shift.source_slot) &&
-			regbuf->source_slot_captured)
-			elog(PANIC, "Umbra image-free slot shift lost its checkpoint source slot");
 		UmPublishSlotShift(&regbuf->slot_shift, record_endptr);
+		if (!regbuf->hint_delta_slot_shift)
+			BufferSaveCheckpointShiftEpoch(regbuf->buffer, record_endptr);
 		regbuf->hint_delta_slot_shift = false;
 		regbuf->slot_shift_in_record = false;
-		regbuf->source_slot_capture_possible = false;
-		regbuf->source_slot_captured = false;
 	}
 	curinsert_has_slot_shift = false;
 }
@@ -1777,8 +1708,6 @@ XLogAbortSlotShifts(void)
 			UmAbortSlotShift(&regbuf->slot_shift);
 		regbuf->hint_delta_slot_shift = false;
 		regbuf->slot_shift_in_record = false;
-		regbuf->source_slot_capture_possible = false;
-		regbuf->source_slot_captured = false;
 	}
 	curinsert_has_slot_shift = false;
 }
@@ -1798,8 +1727,6 @@ XLogReleaseSlotShiftsAtExit(int code, Datum arg)
 				UmReleaseSlotShiftOnExit(&regbuf->slot_shift);
 			regbuf->hint_delta_slot_shift = false;
 			regbuf->slot_shift_in_record = false;
-			regbuf->source_slot_capture_possible = false;
-			regbuf->source_slot_captured = false;
 		}
 	}
 	curinsert_has_slot_shift = false;
@@ -2236,7 +2163,7 @@ InitXLogInsert(void)
 	 */
 	if (hdr_scratch == NULL)
 		hdr_scratch = MemoryContextAllocZero(xloginsert_cxt,
-											 HEADER_SCRATCH_SIZE);
+										 HEADER_SCRATCH_SIZE);
 #ifdef USE_UMBRA
 	if (!xloginsert_exit_hook_registered)
 	{
