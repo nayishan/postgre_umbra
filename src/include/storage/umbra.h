@@ -21,11 +21,21 @@
 #include "storage/relfilelocator.h"
 #include "storage/smgr.h"
 
+/* Stored in every Umbra metadata root before formula mapping is activated. */
+#ifndef UMBRA_CHUNK_PAIRED_PAGES
+#define UMBRA_CHUNK_PAIRED_PAGES 32U
+#endif
+#if UMBRA_CHUNK_PAIRED_PAGES <= 0
+#error "UMBRA_CHUNK_PAIRED_PAGES must be greater than zero"
+#endif
+
 extern void uminit(void);
 extern void umopen(SMgrRelation reln);
 extern void umclose(SMgrRelation reln, ForkNumber forknum);
 extern void umdestroy(SMgrRelation reln);
 extern void umcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
+extern void uminitnewrelation(SMgrRelation reln, bool needs_wal);
+extern void umfinishcreate(SMgrRelation reln, ForkNumber forknum);
 extern bool umexists(SMgrRelation reln, ForkNumber forknum);
 extern void umunlink(RelFileLocatorBackend rlocator, ForkNumber forknum,
 					 bool isRedo);

@@ -40,6 +40,10 @@ The files in this directory, and their contents, are
 		uses ordinary relation fork paths in this patch, while keeping
 		open segment descriptors below Umbra's implementation boundary.
 
+    ummap.c	Umbra's private relation metadata root.  The _map file records
+		format identity and future mapping frontiers without yet changing
+		ordinary relation I/O.
+
 Note that md.c in turn relies on src/backend/storage/file/fd.c.
 
 
