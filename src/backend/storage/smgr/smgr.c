@@ -99,9 +99,14 @@ typedef struct f_smgr
 	void		(*smgr_create) (SMgrRelation reln, ForkNumber forknum,
 								bool isRedo);
 	void		(*smgr_init_new_relation) (SMgrRelation reln, bool needs_wal);
-	/* Complete authoritative CREATE redo after the physical fork exists. */
+	/*
+	 * Complete authoritative CREATE redo after smgrcreate() has created the
+	 * physical fork.  This lets an SMgr establish relation-wide metadata that
+	 * defensive page redo must not create.
+	 */
 	void		(*smgr_finish_create) (SMgrRelation reln,
-								 ForkNumber forknum); /* may be NULL */
+									 ForkNumber forknum); /* may be NULL */
+	bool		(*smgr_prepare_pending_sync) (SMgrRelation reln); /* may be NULL */
 	/*
 	 * The caller establishes checkpoint ordering with ordinary buffer writeback.
 	 */
@@ -144,6 +149,19 @@ typedef struct f_smgr
 	void		(*smgr_writeback) (SMgrRelation reln, ForkNumber forknum,
 								   BlockNumber blocknum, BlockNumber nblocks);
 	BlockNumber (*smgr_nblocks) (SMgrRelation reln, ForkNumber forknum);
+	/*
+	 * Prepare selected-smgr state before smgrtruncate() enters its critical
+	 * section.  A logical nblocks lookup need not create the file contexts,
+	 * descriptor arrays, or metadata cache entries physical truncate needs.
+	 * This callback performs those allocation-capable first uses;
+	 * smgrtruncate() must use only prepared state.
+	 * I/O is permitted in the critical section; ordinary memory allocation is
+	 * not.
+	 */
+	void		(*smgr_prepare_truncate) (SMgrRelation reln,
+									 ForkNumber *forknum, int nforks,
+									 BlockNumber *old_nblocks,
+									 BlockNumber *nblocks); /* may be NULL */
 	void		(*smgr_truncate) (SMgrRelation reln, ForkNumber forknum,
 								  BlockNumber old_blocks, BlockNumber nblocks);
 	void		(*smgr_immedsync) (SMgrRelation reln, ForkNumber forknum);
@@ -170,6 +188,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_create = mdcreate,
 		.smgr_init_new_relation = NULL,
 		.smgr_finish_create = NULL,
+		.smgr_prepare_pending_sync = NULL,
 		.smgr_checkpoint = NULL,
 		.smgr_flush_database_tablespace_cache = NULL,
 		.smgr_invalidate_database_cache = NULL,
@@ -185,6 +204,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_writev = mdwritev,
 		.smgr_writeback = mdwriteback,
 		.smgr_nblocks = mdnblocks,
+		.smgr_prepare_truncate = NULL,
 		.smgr_truncate = mdtruncate,
 		.smgr_immedsync = mdimmedsync,
 		.smgr_registersync = mdregistersync,
@@ -201,6 +221,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_create = umcreate,
 		.smgr_init_new_relation = uminitnewrelation,
 		.smgr_finish_create = umfinishcreate,
+		.smgr_prepare_pending_sync = umpreparependingsync,
 		.smgr_checkpoint = umcheckpoint,
 		.smgr_flush_database_tablespace_cache =
 			umflushdatabasetablespacecache,
@@ -218,6 +239,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_writev = umwritev,
 		.smgr_writeback = umwriteback,
 		.smgr_nblocks = umnblocks,
+		.smgr_prepare_truncate = umpreparetruncate,
 		.smgr_truncate = umtruncate,
 		.smgr_immedsync = umimmedsync,
 		.smgr_registersync = umregistersync,
@@ -587,6 +609,15 @@ smgrfinishcreate(SMgrRelation reln, ForkNumber forknum)
 	if (smgrsw[reln->smgr_which].smgr_finish_create != NULL)
 		smgrsw[reln->smgr_which].smgr_finish_create(reln, forknum);
 	RESUME_INTERRUPTS();
+}
+
+/* Ask the selected smgr whether pending-sync WAL emission is unsafe. */
+bool
+smgrpreparependingsync(SMgrRelation reln)
+{
+	if (smgrsw[reln->smgr_which].smgr_prepare_pending_sync == NULL)
+		return false;
+	return smgrsw[reln->smgr_which].smgr_prepare_pending_sync(reln);
 }
 
 /* Run selected-smgr checkpoint work at the caller's chosen ordering point. */
@@ -1007,6 +1038,24 @@ smgrnblocks_cached(SMgrRelation reln, ForkNumber forknum)
 }
 
 /*
+ * Prepare selected-smgr state before a critical-section truncate.  A logical
+ * size lookup need not have created the file contexts, descriptor arrays, or
+ * metadata cache entries physical truncate needs.  The callback performs
+ * those allocation-capable first uses so smgrtruncate() can use prepared
+ * state only.
+ */
+void
+smgrpreparetruncate(SMgrRelation reln, ForkNumber *forknum, int nforks,
+					BlockNumber *old_nblocks, BlockNumber *nblocks)
+{
+	HOLD_INTERRUPTS();
+	if (smgrsw[reln->smgr_which].smgr_prepare_truncate != NULL)
+		smgrsw[reln->smgr_which].smgr_prepare_truncate(reln, forknum,
+													  nforks, old_nblocks, nblocks);
+	RESUME_INTERRUPTS();
+}
+
+/*
  * smgrtruncate() -- Truncate the given forks of supplied relation to
  *					 each specified numbers of blocks
  *
@@ -1199,6 +1248,7 @@ pgaio_io_set_target_smgr(PgAioHandle *ioh,
 	sd->smgr.rlocator = smgr->smgr_rlocator.locator;
 	sd->smgr.forkNum = forknum;
 	sd->smgr.blockNum = blocknum;
+	sd->smgr.physicalBlockNum = blocknum;
 	sd->smgr.nblocks = nblocks;
 	sd->smgr.is_temp = SmgrIsTemp(smgr);
 	/* Temp relations should never be fsync'd */
@@ -1236,11 +1286,13 @@ smgr_aio_reopen(PgAioHandle *ioh)
 			pg_unreachable();
 			break;
 		case PGAIO_OP_READV:
-			od->read.fd = smgrfd(reln, sd->smgr.forkNum, sd->smgr.blockNum, &off);
+			od->read.fd = smgrfd(reln, sd->smgr.forkNum,
+							 sd->smgr.physicalBlockNum, &off);
 			Assert(off == od->read.offset);
 			break;
 		case PGAIO_OP_WRITEV:
-			od->write.fd = smgrfd(reln, sd->smgr.forkNum, sd->smgr.blockNum, &off);
+			od->write.fd = smgrfd(reln, sd->smgr.forkNum,
+							  sd->smgr.physicalBlockNum, &off);
 			Assert(off == od->write.offset);
 			break;
 	}

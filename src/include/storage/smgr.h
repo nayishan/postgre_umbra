@@ -14,6 +14,7 @@
 #ifndef SMGR_H
 #define SMGR_H
 
+#include "access/xlogdefs.h"
 #include "lib/ilist.h"
 #include "storage/aio_types.h"
 #include "storage/block.h"
@@ -99,6 +100,7 @@ extern void smgrcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
 extern void smgrinitnewrelation(SMgrRelation reln, bool needs_wal);
 /* Complete authoritative CREATE redo after the physical fork exists. */
 extern void smgrfinishcreate(SMgrRelation reln, ForkNumber forknum);
+extern bool smgrpreparependingsync(SMgrRelation reln);
 /* Complete selected-smgr checkpoint work at the caller's ordering point. */
 extern void smgrcheckpoint(void);
 /*
@@ -143,6 +145,13 @@ extern void smgrwriteback(SMgrRelation reln, ForkNumber forknum,
 						  BlockNumber blocknum, BlockNumber nblocks);
 extern BlockNumber smgrnblocks(SMgrRelation reln, ForkNumber forknum);
 extern BlockNumber smgrnblocks_cached(SMgrRelation reln, ForkNumber forknum);
+/*
+ * Prepare allocation-capable selected-smgr state before a truncate critical
+ * section.
+ */
+extern void smgrpreparetruncate(SMgrRelation reln, ForkNumber *forknum,
+						 int nforks, BlockNumber *old_nblocks,
+						 BlockNumber *nblocks);
 extern void smgrtruncate(SMgrRelation reln, ForkNumber *forknum, int nforks,
 						 BlockNumber *old_nblocks,
 						 BlockNumber *nblocks);

@@ -21,6 +21,22 @@ extern void ummap_root_cache_backend_init(void);
 extern bool ummap_exists(UmbraFileContext *ctx);
 extern void ummap_create(UmbraFileContext *ctx,
 					 RelFileLocatorBackend rlocator, bool isRedo);
+/* Nonfatal on-disk root probe used by recovery and layout discovery. */
+extern bool ummap_try_validate(UmbraFileContext *ctx);
+extern void ummap_get_main_frontiers(UmbraFileContext *ctx,
+							 RelFileLocatorBackend rlocator,
+							 BlockNumber *logical_eof,
+							 BlockNumber *physical_capacity);
+extern void ummap_set_main_frontiers(UmbraFileContext *ctx,
+							 RelFileLocatorBackend rlocator,
+							 BlockNumber logical_eof,
+							 BlockNumber physical_capacity);
+extern void ummap_prepare_main_frontiers(UmbraFileContext *ctx,
+								 RelFileLocatorBackend rlocator);
+extern void ummap_publish_prepared_main_frontiers(UmbraFileContext *ctx,
+									  RelFileLocatorBackend rlocator,
+									  BlockNumber logical_eof,
+									  BlockNumber physical_capacity);
 extern void ummap_validate_if_exists(UmbraFileContext *ctx,
 							 RelFileLocatorBackend rlocator);
 extern void ummap_immedsync_if_exists(UmbraFileContext *ctx,

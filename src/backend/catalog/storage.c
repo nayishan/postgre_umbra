@@ -342,6 +342,13 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 		}
 	}
 
+	/*
+	 * This may create selected-smgr file and metadata state.  Do it before the
+	 * truncation critical section below, where ordinary memory allocation is
+	 * not allowed.
+	 */
+	smgrpreparetruncate(reln, forks, nforks, old_blocks, blocks);
+
 	RelationPreTruncate(rel);
 
 	/*
@@ -784,8 +791,10 @@ smgrDoPendingSyncs(bool isCommit, bool isParallelWorker)
 		BlockNumber nblocks[MAX_FORKNUM + 1];
 		uint64		total_blocks = 0;
 		SMgrRelation srel;
+		bool		force_sync;
 
 		srel = smgropen(pendingsync->rlocator, INVALID_PROC_NUMBER);
+		force_sync = smgrpreparependingsync(srel);
 
 		/*
 		 * We emit newpage WAL records for smaller relations.
@@ -825,7 +834,7 @@ smgrDoPendingSyncs(bool isCommit, bool isParallelWorker)
 		 * the current main fork is longer than ever, but there's a case where
 		 * main fork is longer than ever but FSM fork gets shorter.
 		 */
-		if (pendingsync->is_truncated ||
+		if (pendingsync->is_truncated || force_sync ||
 			total_blocks >= wal_skip_threshold * (uint64) 1024 / BLCKSZ)
 		{
 			/* allocate the initial array, or extend it, if needed */
@@ -1078,6 +1087,8 @@ smgr_redo(XLogReaderState *record)
 		/* Do the real work to truncate relation forks */
 		if (nforks > 0)
 		{
+			/* This may allocate selected-smgr state; the critical section may not. */
+			smgrpreparetruncate(reln, forks, nforks, old_blocks, blocks);
 			START_CRIT_SECTION();
 			smgrtruncate(reln, forks, nforks, old_blocks, blocks);
 			END_CRIT_SECTION();

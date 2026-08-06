@@ -14,6 +14,7 @@
 
 #include "access/xlog.h"
 #include "access/xlogdefs.h"
+#include "access/xlogutils.h"
 #include "lib/dshash.h"
 #include "miscadmin.h"
 #include "port/pg_crc32c.h"
@@ -28,6 +29,7 @@
 #define UMMAP_ROOT_MAGIC		0x554D4252U	/* "UMBR" */
 #define UMMAP_ROOT_VERSION		1U
 #define UMMAP_ROOT_FLAGS_V1	0x00000001U
+#define UMMAP_ROOT_FLAGS_KNOWN UMMAP_ROOT_FLAGS_V1
 #define UMMAP_ROOT_IMAGE_SIZE	64
 #define UMMAP_ROOT_SECTOR_SIZE	512
 
@@ -85,6 +87,8 @@ typedef struct UmbraMapRootCacheCtl
 
 StaticAssertDecl(sizeof(UmbraMapRootData) == UMMAP_ROOT_IMAGE_SIZE,
 				 "Umbra MAP root payload size is wrong");
+StaticAssertDecl(offsetof(UmbraMapRootData, reserved_before_capacity) == 32,
+				 "Umbra MAP root reserved payload offset is wrong");
 StaticAssertDecl(offsetof(UmbraMapRootData, crc) == 60,
 				 "Umbra MAP root CRC offset is wrong");
 StaticAssertDecl(BLCKSZ >= UMMAP_ROOT_SECTOR_SIZE,
@@ -110,6 +114,7 @@ static void ummap_root_init(char *image);
 static void ummap_root_refresh_crc(UmbraMapRootData *root);
 static bool ummap_root_is_valid(const UmbraMapRootData *root);
 static void ummap_root_load_image(UmbraFileContext *ctx, char *image);
+static bool ummap_root_read_valid_image(UmbraFileContext *ctx, char *image);
 static void ummap_root_write_image(UmbraFileContext *ctx, const char *image,
 							 bool skipFsync);
 static Size ummap_root_cache_shmem_size(void);
@@ -160,11 +165,11 @@ ummap_create(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 	nblocks = umfile_nblocks(ctx, UMBRA_METADATA_FORKNUM);
 
 	/*
-	 * MAIN CREATE redo deterministically reconstructs this bootstrap root.
-	 * It must repair a zero-length or torn prior write before normal opens
-	 * validate the format.
+	 * Only an actual CREATE finish path calls this during redo.  Preserve an
+	 * existing valid root: it can belong to later lifecycle WAL at the same
+	 * locator and must not be reset by an old CREATE record.
 	 */
-	if (isRedo || nblocks == 0)
+	if (nblocks == 0 || (isRedo && !ummap_root_read_valid_image(ctx, image)))
 	{
 		ummap_root_init(image);
 		ummap_root_write_image(ctx, image, false);
@@ -178,12 +183,137 @@ ummap_create(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 	LWLockRelease(&entry->content_lock);
 }
 
+bool
+ummap_try_validate(UmbraFileContext *ctx)
+{
+	char		image[UMMAP_ROOT_IMAGE_SIZE];
+
+	/*
+	 * Nonfatal probe used when recovery can defer a missing or invalid root.
+	 */
+	Assert(ctx != NULL);
+	return ummap_root_read_valid_image(ctx, image);
+}
+
+void
+ummap_get_main_frontiers(UmbraFileContext *ctx,
+						 RelFileLocatorBackend rlocator,
+						 BlockNumber *logical_eof,
+						 BlockNumber *physical_capacity)
+{
+	UmbraMapRootEntry *entry;
+	UmbraMapRootData *root;
+
+	Assert(ctx != NULL);
+	Assert(logical_eof != NULL);
+	Assert(physical_capacity != NULL);
+	entry = ummap_root_cache_get(ctx, rlocator, LW_SHARED);
+	root = (UmbraMapRootData *) entry->image;
+	*logical_eof = root->logical_eof_main;
+	*physical_capacity = root->physical_capacity_main;
+	LWLockRelease(&entry->content_lock);
+}
+
+void
+ummap_set_main_frontiers(UmbraFileContext *ctx,
+						 RelFileLocatorBackend rlocator,
+						 BlockNumber logical_eof,
+						 BlockNumber physical_capacity)
+{
+	UmbraMapRootEntry *entry;
+	UmbraMapRootData *root;
+	BlockNumber	expected_capacity;
+
+	Assert(ctx != NULL);
+	if (!UmbraMainSlot0PhysicalCapacity(logical_eof, &expected_capacity) ||
+		physical_capacity != expected_capacity)
+		elog(PANIC, "invalid Umbra MAIN slot-0 frontiers");
+
+	entry = ummap_root_cache_get(ctx, rlocator, LW_EXCLUSIVE);
+	root = (UmbraMapRootData *) entry->image;
+	if (root->logical_eof_main != logical_eof ||
+		root->physical_capacity_main != physical_capacity)
+	{
+		root->logical_eof_main = logical_eof;
+		root->physical_capacity_main = physical_capacity;
+		ummap_root_refresh_crc(root);
+		entry->dirty = true;
+		entry->needs_fsync = true;
+		entry->wal_flush_lsn = InRecovery ? InvalidXLogRecPtr :
+			Max(entry->wal_flush_lsn, GetXLogWriteRecPtr());
+	}
+	LWLockRelease(&entry->content_lock);
+}
+
+void
+ummap_prepare_main_frontiers(UmbraFileContext *ctx,
+								 RelFileLocatorBackend rlocator)
+{
+	UmbraMapRootEntry *entry;
+
+	Assert(ctx != NULL);
+	/*
+	 * Load the root cache entry and open the metadata descriptor before the
+	 * truncation critical section.  The publish path later finds this entry
+	 * without a cache insertion or descriptor allocation.
+	 */
+	entry = ummap_root_cache_get(ctx, rlocator, LW_SHARED);
+	LWLockRelease(&entry->content_lock);
+
+	(void) umfile_nblocks(ctx, UMBRA_METADATA_FORKNUM);
+}
+
+void
+ummap_publish_prepared_main_frontiers(UmbraFileContext *ctx,
+								  RelFileLocatorBackend rlocator,
+								  BlockNumber logical_eof,
+								  BlockNumber physical_capacity)
+{
+	UmbraMapRootTag tag = {0};
+	UmbraMapRootEntry *entry;
+	UmbraMapRootData *root;
+	BlockNumber	expected_capacity;
+
+	Assert(ctx != NULL);
+	if (!UmbraMainSlot0PhysicalCapacity(logical_eof, &expected_capacity) ||
+		physical_capacity != expected_capacity)
+		elog(PANIC, "invalid Umbra MAIN slot-0 frontiers");
+
+	/* Preparation has made this lookup allocation-free for critical sections. */
+	tag.rlocator = rlocator;
+	if (!ummap_root_cache_find_locked(&tag, LW_EXCLUSIVE, &entry) ||
+		!entry->valid)
+		elog(PANIC, "Umbra MAIN slot-0 frontiers were not prepared");
+	root = (UmbraMapRootData *) entry->image;
+	if (root->logical_eof_main != logical_eof ||
+		root->physical_capacity_main != physical_capacity)
+	{
+		root->logical_eof_main = logical_eof;
+		root->physical_capacity_main = physical_capacity;
+		ummap_root_refresh_crc(root);
+		entry->dirty = true;
+		entry->needs_fsync = true;
+		entry->wal_flush_lsn = InRecovery ? InvalidXLogRecPtr :
+			Max(entry->wal_flush_lsn, GetXLogWriteRecPtr());
+	}
+	ummap_root_cache_flush_locked(entry, ctx);
+	LWLockRelease(&entry->content_lock);
+
+	/* The metadata fork is one short segment and needs no allocation. */
+	umfile_immedsync(ctx, UMBRA_METADATA_FORKNUM);
+}
+
 void
 ummap_validate_if_exists(UmbraFileContext *ctx, RelFileLocatorBackend rlocator)
 {
 	UmbraMapRootEntry *entry;
 
 	Assert(ctx != NULL);
+	/*
+	 * A missing private root is allowed here.  When it exists, enter through
+	 * the resident cache so its strict loader reports an invalid disk image as
+	 * corruption.
+	 */
 	if (!ummap_exists(ctx))
 		return;
 
@@ -312,12 +442,15 @@ static bool
 ummap_root_is_valid(const UmbraMapRootData *root)
 {
 	pg_crc32c	crc;
+	BlockNumber	expected_capacity;
 
+	/* Validate the decoded in-memory payload without performing I/O. */
 	if (root->magic != UMMAP_ROOT_MAGIC ||
 		root->version != UMMAP_ROOT_VERSION ||
 		root->blcksz != BLCKSZ ||
 		root->chunk_pages != UMBRA_CHUNK_PAIRED_PAGES ||
-		root->flags != UMMAP_ROOT_FLAGS_V1 ||
+		(root->flags & UMMAP_ROOT_FLAGS_V1) == 0 ||
+		(root->flags & ~UMMAP_ROOT_FLAGS_KNOWN) != 0 ||
 		!BlockNumberIsValid(root->logical_eof_main) ||
 		!BlockNumberIsValid(root->physical_capacity_main) ||
 		BlockNumberIsValid(root->logical_eof_fsm) ||
@@ -327,6 +460,10 @@ ummap_root_is_valid(const UmbraMapRootData *root)
 		!pg_memory_is_all_zeros(root->reserved_before_capacity,
 								 sizeof(root->reserved_before_capacity)) ||
 		!pg_memory_is_all_zeros(root->reserved, sizeof(root->reserved)))
+		return false;
+	if (!UmbraMainSlot0PhysicalCapacity(root->logical_eof_main,
+										 &expected_capacity) ||
+		root->physical_capacity_main != expected_capacity)
 		return false;
 
 	INIT_CRC32C(crc);
@@ -338,14 +475,29 @@ ummap_root_is_valid(const UmbraMapRootData *root)
 static void
 ummap_root_load_image(UmbraFileContext *ctx, char *image)
 {
-	char		sector[UMMAP_ROOT_SECTOR_SIZE];
-
-	Assert(ctx != NULL);
-	Assert(image != NULL);
-	if (umfile_nblocks(ctx, UMBRA_METADATA_FORKNUM) < 1)
+	/*
+	 * Strict callers convert a missing or invalid image into a corruption ERROR.
+	 */
+	if (!ummap_root_read_valid_image(ctx, image))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("Umbra metadata root has an invalid length")));
+				 errmsg("Umbra metadata root is corrupted or incompatible")));
+}
+
+static bool
+ummap_root_read_valid_image(UmbraFileContext *ctx, char *image)
+{
+	char		sector[UMMAP_ROOT_SECTOR_SIZE];
+
+	/*
+	 * Nonfatal raw reader for probes and redo decisions.  Missing, short or
+	 * malformed roots return false; underlying file I/O errors still propagate.
+	 */
+	Assert(ctx != NULL);
+	Assert(image != NULL);
+	if (!ummap_exists(ctx) ||
+		umfile_nblocks(ctx, UMBRA_METADATA_FORKNUM) < 1)
+		return false;
 
 	umfile_read_bytes(ctx, UMBRA_METADATA_FORKNUM, 0, sector,
 					  UMMAP_ROOT_SECTOR_SIZE);
@@ -353,10 +505,9 @@ ummap_root_load_image(UmbraFileContext *ctx, char *image)
 							  UMMAP_ROOT_SECTOR_SIZE -
 							  UMMAP_ROOT_IMAGE_SIZE) ||
 		!ummap_root_is_valid((UmbraMapRootData *) sector))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("Umbra metadata root is corrupted or incompatible")));
+		return false;
 	memcpy(image, sector, UMMAP_ROOT_IMAGE_SIZE);
+	return true;
 }
 
 static void
@@ -632,6 +783,8 @@ ummap_root_cache_flush_locked(UmbraMapRootEntry *entry,
 
 		if (XLogRecPtrIsValid(entry->wal_flush_lsn))
 			XLogFlush(entry->wal_flush_lsn);
+		/* A valid root always makes its MAIN capacity authoritative. */
+		umfile_immedsync(write_ctx, MAIN_FORKNUM);
 		ummap_root_write_image(write_ctx, entry->image, !entry->needs_fsync);
 		if (temporary_ctx != NULL)
 		{
