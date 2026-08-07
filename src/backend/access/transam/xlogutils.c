@@ -417,6 +417,7 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 									  prefetch_buffer);
 			if (BufferIsValid(*buf))
 			{
+				BufferRememberUmbraActiveSlot(*buf, blkref->source_slot, true);
 				if (mode != RBM_ZERO_AND_LOCK &&
 					mode != RBM_ZERO_AND_CLEANUP_LOCK)
 				{
@@ -432,6 +433,7 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 									  blkref->target_slot,
 									  record->EndRecPtr))
 					elog(PANIC, "Umbra mapping authority disappeared during slot-shift redo");
+				BufferRememberUmbraActiveSlot(*buf, blkref->target_slot, true);
 				MarkBufferDirty(*buf);
 				if (lsn <= PageGetLSN(BufferGetPage(*buf)))
 					return BLK_DONE;
@@ -461,6 +463,10 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 									  prefetch_buffer);
 		if (!BufferIsValid(*buf))
 			return BLK_NOTFOUND;
+#ifdef USE_UMBRA
+		if (blkref->has_slot_shift)
+			BufferRememberUmbraActiveSlot(*buf, blkref->target_slot, true);
+#endif
 		page = BufferGetPage(*buf);
 		if (!RestoreBlockImage(record, block_id, page))
 			ereport(ERROR,

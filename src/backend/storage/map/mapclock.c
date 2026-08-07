@@ -36,6 +36,7 @@ static LWLockPadded *MapPageExtensionLocks = NULL;
 static void MapPageRefreshBufferCount(void);
 static uint32 MapPageRelationHash(RelFileLocatorBackend rlocator);
 static int MapPageClockTick(void);
+static int MapPageClockGetBufferInternal(bool owner_pin);
 
 void
 MapPagePoolShmemRequest(void)
@@ -210,6 +211,19 @@ MapPageExtensionLock(RelFileLocatorBackend rlocator)
 int
 MapPageClockGetBuffer(void)
 {
+	return MapPageClockGetBufferInternal(true);
+}
+
+/* Critical-section callers explicitly own the reference count pin. */
+int
+MapPageClockGetBufferRaw(void)
+{
+	return MapPageClockGetBufferInternal(false);
+}
+
+static int
+MapPageClockGetBufferInternal(bool owner_pin)
+{
 	int         trycounter;
 
 	MapPageEnsureInitialized();
@@ -232,7 +246,8 @@ MapPageClockGetBuffer(void)
 			break;
 		if (MapPageTryClaimBuffer(slot_id))
 		{
-			MapPageRememberPin(slot_id);
+			if (owner_pin)
+				MapPageRememberPin(slot_id);
 			return slot_id;
 		}
 		/* Invalidation can briefly leave its claimed descriptor on this list. */
@@ -269,7 +284,8 @@ MapPageClockGetBuffer(void)
 				trycounter = MapPagePoolCtlData->nslots;
 				break;
 			}
-			MapPageRememberPin(slot_id);
+			if (owner_pin)
+				MapPageRememberPin(slot_id);
 			return slot_id;
 		}
 		if (--trycounter == 0)

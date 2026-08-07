@@ -164,6 +164,14 @@ umfile_init(void)
 										  "UmbraFile",
 										  ALLOCSET_DEFAULT_SIZES);
 
+	/*
+	 * MAP-cache eviction can write back a dirty relation while WAL holds a
+	 * critical section.  Its temporary file context and segment vector live
+	 * here, so permit those allocations.  An allocation failure still follows
+	 * PostgreSQL's critical-section PANIC semantics.
+	 */
+	MemoryContextAllowInCriticalSection(UmFileCxt, true);
+
 	memset(&ctl, 0, sizeof(ctl));
 	ctl.keysize = sizeof(RelFileLocatorBackend);
 	ctl.entrysize = sizeof(UmbraFileContext);

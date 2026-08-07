@@ -44,6 +44,8 @@ typedef struct MapPageDesc MapPageDesc;
 typedef struct MapPageBuffer
 {
 	MapPageDesc *desc;
+	/* A critical-section caller owns this pin explicitly. */
+	bool		raw_pin;
 } MapPageBuffer;
 
 struct MapPageDesc
@@ -87,6 +89,7 @@ extern void MapPageCacheDelete(const MapPageTag *tag, uint32 hashcode,
 							int slot_id);
 extern LWLock *MapPageExtensionLock(RelFileLocatorBackend rlocator);
 extern int MapPageClockGetBuffer(void);
+extern int MapPageClockGetBufferRaw(void);
 extern void MapPageClockFreeBuffer(int slot_id);
 extern void MapPagePinBuffer(int slot_id, bool adjust_usage);
 extern void MapPageUnpinBuffer(int slot_id);
@@ -106,17 +109,12 @@ extern void MapPageCheckpoint(void);
 extern void MapPageInvalidateRelation(RelFileLocatorBackend rlocator);
 extern void MapPageInvalidateDatabase(Oid dbid, Oid spcOid);
 extern MapPageBuffer MapPageBufferRead(UmbraFileContext *ctx,
-							   RelFileLocatorBackend rlocator,
-							   BlockNumber map_block, bool extend,
-							   bool skipFsync, LWLockMode mode);
-extern bool MapPageBufferReadRaw(RelFileLocatorBackend rlocator,
-							 BlockNumber map_block, LWLockMode mode,
-							 MapPageBuffer *buffer);
+								   RelFileLocatorBackend rlocator,
+								   BlockNumber map_block, bool extend,
+								   bool skipFsync, LWLockMode mode);
 extern char *MapPageBufferGetData(MapPageBuffer buffer);
 extern void MapPageMarkBufferDirty(MapPageBuffer buffer,
-							   XLogRecPtr wal_flush_lsn, bool skipFsync);
+								   XLogRecPtr wal_flush_lsn, bool skipFsync);
 extern void MapPageReleaseBuffer(MapPageBuffer buffer);
-extern void MapPageReleaseBufferNoOwner(MapPageBuffer buffer);
-extern void MapPageUnlockBufferKeepPin(MapPageBuffer buffer);
 
 #endif                          /* UMBRA_MAP_INTERNAL_H */

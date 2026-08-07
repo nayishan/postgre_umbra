@@ -73,6 +73,11 @@ static BlockNumber um_get_mapped_frontier(SMgrRelation reln,
 										  ForkNumber forknum);
 static BlockNumber um_mapped_capacity(SMgrRelation reln, ForkNumber forknum,
 									 BlockNumber logical_eof);
+static bool um_resolve_slot_physical_block(SMgrRelation reln,
+										   ForkNumber forknum,
+										   BlockNumber logical_block,
+										   uint8 slot,
+										   BlockNumber *physical_block);
 static void um_ensure_mapped_capacity(SMgrRelation reln, ForkNumber forknum,
 									  BlockNumber physical_capacity,
 									  bool skipFsync);
@@ -291,126 +296,145 @@ UmRedoMappingPolicyResolved(SMgrRelation reln, ForkNumber forknum)
 		state->map_policy != UMBRA_MAP_POLICY_UNKNOWN;
 }
 
-bool
-UmWalOwnedSlotShiftAvailable(SMgrRelation reln, ForkNumber forknum)
-{
-	return reln != NULL && !InRecovery &&
-		!RelFileLocatorBackendIsTemp(reln->smgr_rlocator) &&
-		um_fork_uses_mapped_slots(reln, forknum);
-}
-
 /*
- * Select a source and target slot before WAL insertion and retain a raw pin
- * on its selector until the WAL record publishes the target.
+ * Select a source and target slot before WAL insertion without changing the
+ * selector.  The selection owns no resource, so an insertion that does not
+ * publish its WAL record can simply discard it.
  */
 bool
 UmChooseSlotShift(SMgrRelation reln, ForkNumber forknum,
-				  BlockNumber logical_block, UmbraSlotShift *shift)
+				  BlockNumber logical_block, uint8 cached_active_slot,
+				  bool selector_page_present,
+				  UmbraSlotShift *shift)
 {
-	MapSlotShift map_shift;
+	UmbraSmgrRelationState *state;
 
 	Assert(shift != NULL);
 	MemSet(shift, 0, sizeof(*shift));
-	shift->map_slot_id = -1;
-	if (!UmWalOwnedSlotShiftAvailable(reln, forknum) ||
-		!MapPrepareSlotShift(um_get_filectx(reln), reln->smgr_rlocator,
-						 forknum, logical_block, &map_shift))
+	if (reln == NULL || InRecovery ||
+		RelFileLocatorBackendIsTemp(reln->smgr_rlocator) ||
+		IsBootstrapProcessingMode() || IsInitProcessingMode() ||
+		!UmbraForkUsesActiveSlots(forknum) ||
+		!UmbraActiveSlotIsValid(cached_active_slot))
 		return false;
 
+	um_refresh_mapping_policy(reln, forknum);
+	state = reln->smgr_private;
+	if (state == NULL || state->filectx == NULL ||
+		!um_fork_uses_mapped_slots(reln, forknum))
+		return false;
+	if (!selector_page_present)
+	{
+		if (cached_active_slot != 0)
+			elog(ERROR, "Umbra nonzero active slot has no selector page");
+	}
+
 	shift->reln = reln;
-	shift->forknum = map_shift.forknum;
-	shift->logical_block = map_shift.logical_block;
-	shift->source_slot = map_shift.source_slot;
-	shift->target_slot = map_shift.target_slot;
-	shift->map_slot_id = map_shift.map_slot_id;
-	shift->prepared = map_shift.prepared;
+	shift->forknum = forknum;
+	shift->logical_block = logical_block;
+	shift->source_slot = cached_active_slot;
+	shift->target_slot = UmbraNextActiveSlot(cached_active_slot);
 	shift->selected = true;
 	return true;
 }
 
-void
-UmAbortSlotShift(UmbraSlotShift *shift)
-{
-	MapSlotShift map_shift;
-
-	Assert(shift != NULL);
-	if (!shift->prepared)
-		return;
-	Assert(shift->reln != NULL);
-	map_shift.rlocator = shift->reln->smgr_rlocator;
-	map_shift.forknum = shift->forknum;
-	map_shift.logical_block = shift->logical_block;
-	map_shift.source_slot = shift->source_slot;
-	map_shift.target_slot = shift->target_slot;
-	map_shift.map_slot_id = shift->map_slot_id;
-	map_shift.prepared = shift->prepared;
-	MapAbortSlotShift(&map_shift);
-	shift->prepared = false;
-	shift->selected = false;
-	shift->map_slot_id = -1;
-	shift->reln = NULL;
-}
-
-void
-UmReleaseSlotShiftOnExit(UmbraSlotShift *shift)
-{
-	if (shift != NULL && shift->prepared)
-		UmAbortSlotShift(shift);
-}
-
+/* Publish the selected target only after WAL insertion has assigned its LSN. */
 void
 UmPublishSlotShift(UmbraSlotShift *shift, XLogRecPtr lsn)
 {
-	MapSlotShift map_shift;
-
 	Assert(shift != NULL);
 	Assert(shift->selected);
-	Assert(shift->prepared);
 	Assert(shift->reln != NULL);
-	map_shift.rlocator = shift->reln->smgr_rlocator;
-	map_shift.forknum = shift->forknum;
-	map_shift.logical_block = shift->logical_block;
-	map_shift.source_slot = shift->source_slot;
-	map_shift.target_slot = shift->target_slot;
-	map_shift.map_slot_id = shift->map_slot_id;
-	map_shift.prepared = shift->prepared;
-	MapPublishSlotShift(&map_shift, lsn);
-	shift->prepared = false;
-	shift->map_slot_id = -1;
+	Assert(XLogRecPtrIsValid(lsn));
+	MapPublishSlotShift(um_get_filectx(shift->reln),
+						shift->reln->smgr_rlocator, shift->forknum,
+						shift->logical_block, shift->source_slot,
+						shift->target_slot, lsn);
 	shift->selected = false;
 	shift->reln = NULL;
 }
 
 bool
-UmCheckpointWritePredecessorSlot(SMgrRelation reln, ForkNumber forknum,
-								 BlockNumber logical_block,
-								 const void *buffer, BlockNumber *physical_block)
+UmUsesMappedSlots(SMgrRelation reln, ForkNumber forknum)
 {
-	const void *buffers[1] = {buffer};
-	uint8		active_slot;
-	uint8		source_slot;
+	if (reln == NULL)
+		return false;
+	um_refresh_mapping_policy(reln, forknum);
+	return um_fork_uses_mapped_slots(reln, forknum);
+}
 
-	if (physical_block != NULL)
-		*physical_block = InvalidBlockNumber;
-	if (reln == NULL || buffer == NULL || physical_block == NULL)
+bool
+UmGetActiveSlot(SMgrRelation reln, ForkNumber forknum,
+				BlockNumber logical_block, uint8 *active_slot,
+				bool *selector_page_present)
+{
+	if (active_slot != NULL)
+		*active_slot = UMBRA_ACTIVE_SLOT_INVALID;
+	if (selector_page_present != NULL)
+		*selector_page_present = false;
+	if (reln == NULL || active_slot == NULL)
 		return false;
 	um_refresh_mapping_policy(reln, forknum);
 	if (!um_fork_uses_mapped_slots(reln, forknum))
 		return false;
-	active_slot = MapGetActiveSlot(um_get_filectx(reln),
-								   reln->smgr_rlocator, forknum, logical_block);
-	source_slot = UmbraPreviousActiveSlot(active_slot);
-	if (!UmbraActiveSlotPhysicalBlock(logical_block, source_slot,
-									 physical_block))
+	*active_slot = MapGetActiveSlotWithPresence(um_get_filectx(reln),
+												reln->smgr_rlocator, forknum,
+												logical_block,
+												selector_page_present);
+	return true;
+}
+
+static bool
+um_resolve_slot_physical_block(SMgrRelation reln, ForkNumber forknum,
+								BlockNumber logical_block, uint8 slot,
+								BlockNumber *physical_block)
+{
+	if (physical_block != NULL)
+		*physical_block = InvalidBlockNumber;
+	if (reln == NULL || physical_block == NULL ||
+		!UmbraActiveSlotIsValid(slot))
+		return false;
+	um_refresh_mapping_policy(reln, forknum);
+	if (!um_fork_uses_mapped_slots(reln, forknum))
+		return false;
+	if (!UmbraActiveSlotPhysicalBlock(logical_block, slot, physical_block))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("Umbra source-slot block mapping overflow for relation %u/%u/%u fork %d",
+				 errmsg("Umbra slot block mapping overflow for relation %u/%u/%u fork %d",
 						reln->smgr_rlocator.locator.spcOid,
 						reln->smgr_rlocator.locator.dbOid,
 						reln->smgr_rlocator.locator.relNumber, (int) forknum)));
+	return true;
+}
 
-	umfile_writev(um_get_filectx(reln), forknum, *physical_block,
+bool
+UmWriteSlot(SMgrRelation reln, ForkNumber forknum,
+			BlockNumber logical_block, const void *buffer,
+			uint8 slot)
+{
+	const void *buffers[1] = {buffer};
+	BlockNumber physical_block;
+
+	if (buffer == NULL)
+		return false;
+
+	/*
+	 * This only writes the supplied existing page to its chosen slot.  It does
+	 * not extend the relation or publish a logical MAP frontier; callers use a
+	 * false result to take the ordinary smgr write path.
+	 */
+	/* Match smgrwritev_with_targets() interrupt semantics. */
+	HOLD_INTERRUPTS();
+	if (!um_resolve_slot_physical_block(reln, forknum, logical_block, slot,
+										 &physical_block))
+	{
+		RESUME_INTERRUPTS();
+		return false;
+	}
+
+	umfile_writev(um_get_filectx(reln), forknum, physical_block,
 				  buffers, 1, false);
+	RESUME_INTERRUPTS();
 	return true;
 }
 
@@ -511,7 +535,7 @@ UmRedoSlotShift(SMgrRelation reln, ForkNumber forknum,
 	um_refresh_mapping_policy(reln, forknum);
 	state = reln->smgr_private;
 	ctx = um_get_filectx(reln);
-	Assert(state != NULL);
+	Assert(reln->smgr_private != NULL);
 
 	/*
 	 * A full-page image proves that one logical page can be reconstructed, but
@@ -604,7 +628,6 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	BlockNumber	physical_capacity;
 	BlockNumber	physical_block;
 	BlockNumber	logical_end;
-	const void *buffers[1];
 
 	if (writeback_target != NULL)
 		*writeback_target = InvalidBlockNumber;
@@ -625,7 +648,6 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 				(errmsg("cannot extend mapped Umbra fork below logical EOF")));
 	Assert(blocknum >= logical_eof);
 	physical_block = um_active_pblk(reln, forknum, blocknum);
-	buffers[0] = buffer;
 
 	logical_end = um_mapped_range_end(reln, forknum, blocknum, 1);
 	physical_capacity = um_mapped_capacity(reln, forknum, logical_end);
@@ -635,7 +657,7 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	if (blocknum > logical_eof)
 		um_zero_active_range(reln, forknum, logical_eof, blocknum, skipFsync,
 							 InvalidBlockNumber, NULL);
-	umfile_writev(ctx, forknum, physical_block, buffers, 1, skipFsync);
+	umfile_writev(ctx, forknum, physical_block, &buffer, 1, skipFsync);
 	if (writeback_target != NULL)
 		*writeback_target = physical_block;
 	um_publish_mapped_after_data(reln, forknum, logical_end);
@@ -750,6 +772,8 @@ umstartreadv(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknum,
 {
 	PgAioTargetData *target;
 	BlockNumber	physical_block;
+	uint8		active_slot;
+	bool		selector_page_present;
 
 	um_refresh_mapping_policy(reln, forknum);
 	if (!um_fork_uses_mapped_slots(reln, forknum))
@@ -767,10 +791,21 @@ umstartreadv(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknum,
 
 	if (InRecovery && UmbraIsMappedAuxiliaryFork(forknum))
 		um_ensure_aux_recovery_capacity(reln, forknum);
-	physical_block = um_active_pblk(reln, forknum, blocknum);
+	active_slot = MapGetActiveSlotWithPresence(um_get_filectx(reln),
+											   reln->smgr_rlocator, forknum,
+											   blocknum, &selector_page_present);
+	if (!UmbraActiveSlotPhysicalBlock(blocknum, active_slot, &physical_block))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("Umbra active-slot block mapping overflow for relation %u/%u/%u fork %d",
+						reln->smgr_rlocator.locator.spcOid,
+						reln->smgr_rlocator.locator.dbOid,
+						reln->smgr_rlocator.locator.relNumber, (int) forknum)));
 	pgaio_io_set_target_smgr(ioh, reln, forknum, blocknum, nblocks, false);
 	target = pgaio_io_get_target_data(ioh);
 	target->smgr.physicalBlockNum = physical_block;
+	target->smgr.umbraActiveSlot = active_slot;
+	target->smgr.umbraSelectorPagePresent = selector_page_present;
 	pgaio_io_register_callbacks(ioh, PGAIO_HCB_MD_READV, 0);
 	umfile_startreadv(ioh, um_get_filectx(reln), forknum, physical_block,
 						  buffers,
@@ -976,9 +1011,15 @@ umsyncrelationmetadata(SMgrRelation reln)
 }
 
 bool
-umpreparependingsync(SMgrRelation reln)
+umforcependingsync(SMgrRelation reln)
 {
 	um_refresh_mapping_policy(reln, MAIN_FORKNUM);
+	/*
+	 * This predicate is used only by commit-time pending-sync finalization of a
+	 * WAL-skipping relation.  A mapped MAIN root is a prerequisite for mapped
+	 * FSM or VM, and generic full-page WAL omits that private authority.  The
+	 * MAIN policy alone therefore selects the real file-sync path.
+	 */
 	return um_fork_uses_mapped_slots(reln, MAIN_FORKNUM);
 }
 
@@ -1063,7 +1104,7 @@ um_set_map_policy_mapped(SMgrRelation reln)
 	if (InRecovery)
 	{
 		if (!ummap_try_aux_slot0_active(state->filectx, FSM_FORKNUM,
-										reln->smgr_rlocator, &fsm_active) ||
+									 reln->smgr_rlocator, &fsm_active) ||
 			!ummap_try_aux_slot0_active(state->filectx,
 										 VISIBILITYMAP_FORKNUM,
 										 reln->smgr_rlocator, &vm_active))
@@ -1074,10 +1115,10 @@ um_set_map_policy_mapped(SMgrRelation reln)
 	else
 	{
 		fsm_active = ummap_aux_slot0_active(state->filectx, FSM_FORKNUM,
-										reln->smgr_rlocator);
+											reln->smgr_rlocator);
 		vm_active = ummap_aux_slot0_active(state->filectx,
-										VISIBILITYMAP_FORKNUM,
-										reln->smgr_rlocator);
+											 VISIBILITYMAP_FORKNUM,
+											 reln->smgr_rlocator);
 	}
 
 	state->map_policy = UMBRA_MAP_POLICY_MAPPED;

@@ -30,6 +30,7 @@
 #endif
 
 #define UMBRA_CHUNK_ACTIVE_SLOTS 3U
+#define UMBRA_ACTIVE_SLOT_INVALID UINT8_MAX
 
 typedef struct UmbraSlotShift
 {
@@ -38,8 +39,6 @@ typedef struct UmbraSlotShift
 	BlockNumber logical_block;
 	uint8		source_slot;
 	uint8		target_slot;
-	int			map_slot_id;
-	bool		prepared;
 	bool		selected;
 } UmbraSlotShift;
 
@@ -55,6 +54,13 @@ UmbraPreviousActiveSlot(uint8 active_slot)
 {
 	Assert(UmbraActiveSlotIsValid(active_slot));
 	return active_slot == 0 ? UMBRA_CHUNK_ACTIVE_SLOTS - 1 : active_slot - 1;
+}
+
+static inline uint8
+UmbraNextActiveSlot(uint8 active_slot)
+{
+	Assert(UmbraActiveSlotIsValid(active_slot));
+	return active_slot == UMBRA_CHUNK_ACTIVE_SLOTS - 1 ? 0 : active_slot + 1;
 }
 
 static inline bool
@@ -76,6 +82,27 @@ UmbraActiveSlotPhysicalBlock(BlockNumber logical_block, uint8 active_slot,
 
 	*physical_block = (BlockNumber) physical;
 	return true;
+}
+
+/* Recover the fixed-layout selector from a logical/physical block pair. */
+static inline bool
+UmbraPhysicalBlockActiveSlot(BlockNumber logical_block,
+							 BlockNumber physical_block, uint8 *active_slot)
+{
+	BlockNumber candidate;
+
+	Assert(active_slot != NULL);
+	*active_slot = UMBRA_ACTIVE_SLOT_INVALID;
+	for (uint8 slot = 0; slot < UMBRA_CHUNK_ACTIVE_SLOTS; slot++)
+	{
+		if (UmbraActiveSlotPhysicalBlock(logical_block, slot, &candidate) &&
+			candidate == physical_block)
+		{
+			*active_slot = slot;
+			return true;
+		}
+	}
+	return false;
 }
 
 /* Reserve all three physical slots for every logical chunk. */
@@ -174,24 +201,35 @@ extern void umregistersync(SMgrRelation reln, ForkNumber forknum);
 extern bool umforcependingsync(SMgrRelation reln);
 extern int	umfd(SMgrRelation reln, ForkNumber forknum,
 					 BlockNumber blocknum, uint32 *off);
-extern bool UmWalOwnedSlotShiftAvailable(SMgrRelation reln,
-									 ForkNumber forknum);
+/*
+ * Select a source/target slot from a shared buffer's cached active slot before
+ * WAL insertion.  This does not access the selector and owns no resource, so
+ * a selection that is not published can be discarded.
+ */
 extern bool UmChooseSlotShift(SMgrRelation reln, ForkNumber forknum,
 								  BlockNumber logical_block,
+								  uint8 cached_active_slot,
+								  bool selector_page_present,
 								  UmbraSlotShift *shift);
-extern void UmAbortSlotShift(UmbraSlotShift *shift);
-extern void UmReleaseSlotShiftOnExit(UmbraSlotShift *shift);
+/* Publish a selected target only after WAL insertion has assigned its LSN. */
 extern void UmPublishSlotShift(UmbraSlotShift *shift, XLogRecPtr lsn);
 /*
  * During redo, an UNKNOWN policy for a mapped-capable fork is not permission
  * to use the direct physical layout.  Only CREATE redo may resolve it.
  */
 extern bool UmRedoMappingPolicyResolved(SMgrRelation reln, ForkNumber forknum);
-extern bool UmCheckpointWritePredecessorSlot(SMgrRelation reln,
-										 ForkNumber forknum,
-										 BlockNumber lblkno,
-										 const void *buffer,
-										 BlockNumber *physical_block);
+extern bool UmUsesMappedSlots(SMgrRelation reln, ForkNumber forknum);
+extern bool UmGetActiveSlot(SMgrRelation reln, ForkNumber forknum,
+								BlockNumber logical_block, uint8 *active_slot,
+							bool *selector_page_present);
+/*
+ * Write an existing logical page to the caller-selected physical slot.  This
+ * neither extends the relation nor publishes a MAP frontier; false lets the
+ * caller use the ordinary smgr write path when mapped slots do not apply.
+ */
+extern bool UmWriteSlot(SMgrRelation reln, ForkNumber forknum,
+						BlockNumber logical_block, const void *buffer,
+						uint8 slot);
 extern bool UmRedoSetActiveSlot(SMgrRelation reln, ForkNumber forknum,
 								 BlockNumber logical_block, uint8 active_slot);
 extern bool UmRedoSlotShift(SMgrRelation reln, ForkNumber forknum,
