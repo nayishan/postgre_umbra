@@ -21,6 +21,7 @@
 
 #include "access/xlogutils.h"
 #include "storage/aio.h"
+#include "storage/map.h"
 #include "storage/smgr.h"
 #include "storage/umfile.h"
 #include "storage/ummap.h"
@@ -45,8 +46,8 @@ typedef struct UmbraSmgrRelationState
 
 static UmbraFileContext *um_get_filectx(SMgrRelation reln);
 static bool um_main_uses_slot0(SMgrRelation reln, ForkNumber forknum);
-static BlockNumber um_main_slot0_pblk(SMgrRelation reln,
-								  BlockNumber logical_block);
+static BlockNumber um_main_active_pblk(SMgrRelation reln,
+							   BlockNumber logical_block);
 static BlockNumber um_main_range_end(SMgrRelation reln,
 							  BlockNumber blocknum, BlockNumber nblocks);
 static void um_get_main_frontiers(SMgrRelation reln, BlockNumber *logical_eof,
@@ -269,7 +270,7 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	}
 
 	um_get_main_frontiers(reln, &logical_eof, &physical_capacity);
-	physical_block = um_main_slot0_pblk(reln, blocknum);
+	physical_block = um_main_active_pblk(reln, blocknum);
 	buffers[0] = buffer;
 	if (blocknum < logical_eof)
 	{
@@ -371,7 +372,8 @@ umreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	ctx = um_get_filectx(reln);
 	for (BlockNumber i = 0; i < nblocks; i++)
 	{
-		BlockNumber	physical_block = um_main_slot0_pblk(reln, blocknum + i);
+		BlockNumber	physical_block =
+			um_main_active_pblk(reln, blocknum + i);
 
 		umfile_readv(ctx, MAIN_FORKNUM, physical_block, &buffers[i], 1);
 	}
@@ -398,7 +400,7 @@ umstartreadv(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknum,
 				 errmsg("Umbra slot-0 AIO requires a single logical block")));
 
 	um_require_main_range(reln, blocknum, nblocks);
-	physical_block = um_main_slot0_pblk(reln, blocknum);
+	physical_block = um_main_active_pblk(reln, blocknum);
 	pgaio_io_set_target_smgr(ioh, reln, forknum, blocknum, nblocks, false);
 	target = pgaio_io_get_target_data(ioh);
 	target->smgr.physicalBlockNum = physical_block;
@@ -426,7 +428,8 @@ umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	ctx = um_get_filectx(reln);
 	for (BlockNumber i = 0; i < nblocks; i++)
 	{
-		BlockNumber	physical_block = um_main_slot0_pblk(reln, blocknum + i);
+		BlockNumber	physical_block =
+			um_main_active_pblk(reln, blocknum + i);
 
 		umfile_writev(ctx, MAIN_FORKNUM, physical_block, &buffers[i], 1,
 					  skipFsync);
@@ -579,14 +582,18 @@ um_main_uses_slot0(SMgrRelation reln, ForkNumber forknum)
 }
 
 static BlockNumber
-um_main_slot0_pblk(SMgrRelation reln, BlockNumber logical_block)
+um_main_active_pblk(SMgrRelation reln, BlockNumber logical_block)
 {
 	BlockNumber	physical_block;
+	uint8		active_slot;
 
-	if (!UmbraMainSlot0PhysicalBlock(logical_block, &physical_block))
+	active_slot = MapGetActiveSlot(um_get_filectx(reln), reln->smgr_rlocator,
+							   logical_block);
+	if (!UmbraMainActiveSlotPhysicalBlock(logical_block, active_slot,
+										 &physical_block))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("Umbra MAIN slot-0 block mapping overflow for relation %u/%u/%u",
+				 errmsg("Umbra MAIN active-slot block mapping overflow for relation %u/%u/%u",
 						reln->smgr_rlocator.locator.spcOid,
 						reln->smgr_rlocator.locator.dbOid,
 						reln->smgr_rlocator.locator.relNumber)));
@@ -666,7 +673,7 @@ um_zero_main_range(SMgrRelation reln, BlockNumber first_block,
 		 logical_block++)
 	{
 		BlockNumber	physical_block =
-			um_main_slot0_pblk(reln, logical_block);
+			um_main_active_pblk(reln, logical_block);
 
 		umfile_writev(ctx, MAIN_FORKNUM, physical_block, buffers, 1,
 					  skipFsync);

@@ -88,6 +88,7 @@ PG_SHMEM_SUBSYSTEM(DataChecksumsShmemCallbacks)
 
 #ifdef USE_UMBRA
 PG_SHMEM_SUBSYSTEM(UmbraMapRootShmemCallbacks)
+PG_SHMEM_SUBSYSTEM(MapShmemCallbacks)
 #endif
 
 /* AIO subsystem. This delegates to the method-specific callbacks */

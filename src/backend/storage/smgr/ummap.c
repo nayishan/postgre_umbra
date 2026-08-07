@@ -20,6 +20,7 @@
 #include "port/pg_crc32c.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
+#include "storage/map.h"
 #include "storage/umfile.h"
 #include "storage/ummap.h"
 #include "storage/umbra.h"
@@ -328,6 +329,7 @@ ummap_flush_relation(UmbraFileContext *ctx, RelFileLocatorBackend rlocator)
 	UmbraMapRootEntry *entry;
 
 	Assert(ctx != NULL);
+	MapFlushRelation(ctx, rlocator);
 	if (UmbraMapRootCacheCtlData == NULL)
 		return;
 	ummap_root_cache_ensure_initialized();
@@ -344,6 +346,7 @@ ummap_flush_database_tablespace_cache(Oid dbid, Oid spcOid)
 {
 	Assert(OidIsValid(dbid));
 	Assert(OidIsValid(spcOid));
+	MapFlushDatabaseTablespace(dbid, spcOid);
 	ummap_root_cache_flush_matching(dbid, spcOid);
 }
 
@@ -352,6 +355,7 @@ void
 ummap_invalidate_database_cache(Oid dbid)
 {
 	Assert(OidIsValid(dbid));
+	MapInvalidateDatabase(dbid);
 	ummap_root_cache_invalidate_matching(dbid, InvalidOid);
 }
 
@@ -361,12 +365,15 @@ ummap_invalidate_database_tablespace_cache(Oid dbid, Oid spcOid)
 {
 	Assert(OidIsValid(dbid));
 	Assert(OidIsValid(spcOid));
+	MapInvalidateDatabaseTablespace(dbid, spcOid);
 	ummap_root_cache_invalidate_matching(dbid, spcOid);
 }
 
 void
 ummap_checkpoint(void)
 {
+	/* Flush the checkpoint-start selector set before publishing dirty roots. */
+	MapCheckpoint();
 	ummap_root_cache_flush_matching(InvalidOid, InvalidOid);
 }
 
@@ -399,6 +406,7 @@ ummap_unlink(RelFileLocatorBackend rlocator, bool isRedo)
 {
 	UmbraMapRootTag tag = {0};
 
+	MapInvalidateRelation(rlocator);
 	tag.rlocator = rlocator;
 	if (UmbraMapRootCacheCtlData != NULL)
 		ummap_root_cache_delete_entry(&tag);
