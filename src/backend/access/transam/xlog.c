@@ -46,6 +46,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include "access/bufmask.h"
 #include "access/clog.h"
 #include "access/commit_ts.h"
 #include "access/heaptoast.h"
@@ -99,6 +100,9 @@
 #include "storage/spin.h"
 #include "storage/subsystems.h"
 #include "storage/sync.h"
+#ifdef USE_UMBRA
+#include "storage/umbra.h"
+#endif
 #include "utils/guc_hooks.h"
 #include "utils/guc_tables.h"
 #include "utils/injection_point.h"
@@ -9327,6 +9331,104 @@ xlog2_redo(XLogReaderState *record)
 		 */
 		EmitAndWaitDataChecksumsBarrier(state.new_checksum_state);
 	}
+#ifdef USE_UMBRA
+	else if (info == XLOG2_HINT_DELTA)
+	{
+		DecodedBkpBlock *block;
+		XLogRedoAction action;
+		Buffer		buffer;
+		char	   *data;
+		char	   *ptr;
+		Size		data_len;
+		Size		remaining;
+		uint32		previous_end = 0;
+		int			fragment_count = 0;
+
+		if (XLogRecGetDataLen(record) != 0 ||
+			XLogRecMaxBlockId(record) != 0 ||
+			!XLogRecHasBlockRef(record, 0))
+			elog(PANIC, "invalid Umbra hint delta WAL record");
+
+		block = XLogRecGetBlock(record, 0);
+		if (block->forknum != MAIN_FORKNUM || !block->has_slot_shift ||
+			block->source_slot_captured || block->target_slot >= 3 ||
+			(block->has_image &&
+			 (block->apply_image ||
+			  (XLogRecGetInfo(record) & XLR_CHECK_CONSISTENCY) == 0)) ||
+			!block->has_data || block->data_len == 0 || block->data_len >= BLCKSZ)
+			elog(PANIC, "invalid Umbra hint delta block reference");
+
+		data = XLogRecGetBlockData(record, 0, &data_len);
+		if (data == NULL || data_len == 0)
+			elog(PANIC, "empty Umbra hint delta WAL record");
+
+		ptr = data;
+		remaining = data_len;
+		while (remaining > 0)
+		{
+			xl_hint_delta_fragment fragment;
+			uint32		fragment_end;
+
+			if (remaining < SizeOfXLogHintDeltaFragment)
+				elog(PANIC, "truncated Umbra hint delta fragment");
+			memcpy(&fragment, ptr, SizeOfXLogHintDeltaFragment);
+			ptr += SizeOfXLogHintDeltaFragment;
+			remaining -= SizeOfXLogHintDeltaFragment;
+			fragment_end = (uint32) fragment.offset + fragment.length;
+			if (fragment.length == 0 ||
+				fragment.offset < offsetof(PageHeaderData, pd_flags) ||
+				fragment.offset < previous_end || fragment_end > BLCKSZ ||
+				remaining < fragment.length)
+				elog(PANIC, "invalid Umbra hint delta fragment");
+
+			ptr += fragment.length;
+			remaining -= fragment.length;
+			previous_end = fragment_end;
+			fragment_count++;
+		}
+
+		if (fragment_count == 0)
+			elog(PANIC, "empty Umbra hint delta WAL record");
+
+		action = XLogReadBufferForRedoExtended(record, 0, RBM_NORMAL,
+										   false, &buffer);
+		if (action == BLK_NOTFOUND)
+			return;
+		if (action == BLK_NEEDS_REDO)
+		{
+			Page		page = BufferGetPage(buffer);
+
+			Assert(!PageIsNew(page));
+			ptr = data;
+			remaining = data_len;
+			while (remaining > 0)
+			{
+				xl_hint_delta_fragment fragment;
+
+				memcpy(&fragment, ptr, SizeOfXLogHintDeltaFragment);
+				ptr += SizeOfXLogHintDeltaFragment;
+				remaining -= SizeOfXLogHintDeltaFragment;
+				memcpy(page + fragment.offset, ptr, fragment.length);
+				ptr += fragment.length;
+				remaining -= fragment.length;
+			}
+			PageSetLSN(page, record->EndRecPtr);
+			MarkBufferDirty(buffer);
+		}
+		else if (action == BLK_RESTORED)
+			elog(PANIC, "unexpected image in Umbra hint delta WAL record");
+
+		if (BufferIsValid(buffer))
+			UnlockReleaseBuffer(buffer);
+	}
+#endif
+}
+
+void
+xlog2_mask(char *pagedata, BlockNumber blkno)
+{
+	mask_page_lsn_and_checksum((Page) pagedata);
+	(void) blkno;
 }
 
 /*

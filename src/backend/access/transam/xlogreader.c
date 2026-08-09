@@ -32,6 +32,7 @@
 #include "catalog/pg_control.h"
 #include "common/pg_lzcompress.h"
 #include "replication/origin.h"
+#include "storage/bufpage.h"
 
 #ifndef FRONTEND
 #include "pgstat.h"
@@ -51,10 +52,14 @@ static XLogPageReadResult XLogDecodeNextRecord(XLogReaderState *state, bool nonb
 static bool ValidXLogRecordHeader(XLogReaderState *state, XLogRecPtr RecPtr,
 								  XLogRecPtr PrevRecPtr, XLogRecord *record, bool randAccess);
 static bool ValidXLogRecord(XLogReaderState *state, XLogRecord *record,
-							XLogRecPtr recptr);
+								XLogRecPtr recptr);
 static void ResetDecoder(XLogReaderState *state);
+#ifdef USE_UMBRA
+static bool ValidateHintDeltaRecord(XLogReaderState *state,
+									DecodedXLogRecord *decoded);
+#endif
 static void WALOpenSegmentInit(WALOpenSegment *seg, WALSegmentContext *segcxt,
-							   int segsize, const char *waldir);
+								   int segsize, const char *waldir);
 
 /* size of the buffer allocated for error message. */
 #define MAX_ERRORMSG_LEN 1000
@@ -82,6 +87,64 @@ report_invalid_record(XLogReaderState *state, const char *fmt, ...)
 
 	state->errormsg_deferred = true;
 }
+
+#ifdef USE_UMBRA
+/* Validate byte ranges before redo can materialize the recorded source slot. */
+static bool
+ValidateHintDeltaRecord(XLogReaderState *state, DecodedXLogRecord *decoded)
+{
+	DecodedBkpBlock *block;
+	const char *ptr;
+	Size		remaining;
+	uint32		previous_end = 0;
+	int			fragments = 0;
+
+	if (decoded->main_data_len != 0 || decoded->max_block_id != 0)
+		goto invalid;
+	block = &decoded->blocks[0];
+	if (!block->in_use || block->forknum != MAIN_FORKNUM ||
+		(block->flags & BKPBLOCK_WILL_INIT) != 0 ||
+		!block->has_slot_shift || block->source_slot_captured ||
+		block->target_slot >= 3 ||
+		(block->has_image &&
+		 (block->apply_image ||
+		  (decoded->header.xl_info & XLR_CHECK_CONSISTENCY) == 0)) ||
+		!block->has_data || block->data_len == 0 || block->data_len >= BLCKSZ)
+		goto invalid;
+
+	ptr = block->data;
+	remaining = block->data_len;
+	while (remaining > 0)
+	{
+		xl_hint_delta_fragment fragment;
+		uint32		fragment_end;
+
+		if (remaining < SizeOfXLogHintDeltaFragment)
+			goto invalid;
+		memcpy(&fragment, ptr, SizeOfXLogHintDeltaFragment);
+		ptr += SizeOfXLogHintDeltaFragment;
+		remaining -= SizeOfXLogHintDeltaFragment;
+		fragment_end = (uint32) fragment.offset + fragment.length;
+		if (fragment.length == 0 ||
+			fragment.offset < offsetof(PageHeaderData, pd_flags) ||
+			fragment.offset < previous_end || fragment_end > BLCKSZ ||
+			remaining < fragment.length)
+			goto invalid;
+		ptr += fragment.length;
+		remaining -= fragment.length;
+		previous_end = fragment_end;
+		fragments++;
+	}
+	if (fragments > 0)
+		return true;
+
+invalid:
+	report_invalid_record(state,
+					  "invalid Umbra hint delta record at %X/%08X",
+					  LSN_FORMAT_ARGS(state->ReadRecPtr));
+	return false;
+}
+#endif
 
 /*
  * Set the size of the decoding buffer.  A pointer to a caller supplied memory
@@ -1722,6 +1785,9 @@ DecodeXLogRecord(XLogReaderState *state,
 	uint32		datatotal;
 	RelFileLocator *rlocator = NULL;
 	uint8		block_id;
+#ifdef USE_UMBRA
+	bool		hint_delta;
+#endif
 
 	decoded->header = *record;
 	decoded->lsn = lsn;
@@ -1731,6 +1797,10 @@ DecodeXLogRecord(XLogReaderState *state,
 	decoded->main_data = NULL;
 	decoded->main_data_len = 0;
 	decoded->max_block_id = -1;
+#ifdef USE_UMBRA
+	hint_delta = record->xl_rmid == RM_XLOG2_ID &&
+		(record->xl_info & ~XLR_INFO_MASK) == XLOG2_HINT_DELTA;
+#endif
 	ptr = (char *) record;
 	ptr += SizeOfXLogRecord;
 	remaining = record->xl_tot_len - SizeOfXLogRecord;
@@ -1960,9 +2030,10 @@ DecodeXLogRecord(XLogReaderState *state,
 				(blk->forknum != MAIN_FORKNUM ||
 				 blk->target_slot >= 3 ||
 				 (blk->flags & BKPBLOCK_WILL_INIT) != 0 ||
-				 (blk->has_image && !blk->apply_image) ||
+				 (blk->has_image && !blk->apply_image && !hint_delta) ||
 				 (!blk->has_image &&
-				  (!blk->source_slot_captured || !blk->has_data)) ||
+				  (!blk->has_data ||
+				   (!blk->source_slot_captured && !hint_delta))) ||
 				 (blk->has_image && blk->source_slot_captured)))
 			{
 				report_invalid_record(state,
@@ -2033,6 +2104,11 @@ DecodeXLogRecord(XLogReaderState *state,
 		ptr += decoded->main_data_len;
 		out += decoded->main_data_len;
 	}
+
+#ifdef USE_UMBRA
+	if (hint_delta && !ValidateHintDeltaRecord(state, decoded))
+		goto err;
+#endif
 
 	/* Report the actual size we used. */
 	decoded->size = MAXALIGN(out - (char *) decoded);

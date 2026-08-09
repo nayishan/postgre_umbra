@@ -192,6 +192,9 @@ _bt_killitems(IndexScanDesc scan)
 {
 	Relation	rel = scan->indexRelation;
 	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+#ifdef USE_UMBRA
+	BufferHintDeltaContext hint_delta;
+#endif
 	Page		page;
 	BTPageOpaque opaque;
 	OffsetNumber minoff;
@@ -353,7 +356,11 @@ _bt_killitems(IndexScanDesc scan)
 					 * update the page while just holding a share lock. If we
 					 * are not allowed, there's no point continuing.
 					 */
+#ifdef USE_UMBRA
+					if (!BufferBeginHintDelta(buf, &hint_delta))
+#else
 					if (!BufferBeginSetHintBits(buf))
+#endif
 						goto unlock_page;
 				}
 
@@ -376,7 +383,11 @@ _bt_killitems(IndexScanDesc scan)
 	if (killedsomething)
 	{
 		opaque->btpo_flags |= BTP_HAS_GARBAGE;
+#ifdef USE_UMBRA
+		BufferFinishHintDelta(&hint_delta, true, true);
+#else
 		BufferFinishSetHintBits(buf, true, true);
+#endif
 	}
 
 unlock_page:

@@ -1190,6 +1190,10 @@ init_sequence(Oid relid, SeqTable *p_elm, Relation *p_rel)
 static Form_pg_sequence_data
 read_seq_tuple(Relation rel, Buffer *buf, HeapTuple seqdatatuple)
 {
+#ifdef USE_UMBRA
+	BufferHintDeltaContext hint_delta;
+	bool		hint_delta_started;
+#endif
 	Page		page;
 	ItemId		lp;
 	sequence_magic *sm;
@@ -1223,10 +1227,20 @@ read_seq_tuple(Relation rel, Buffer *buf, HeapTuple seqdatatuple)
 	Assert(!(seqdatatuple->t_data->t_infomask & HEAP_XMAX_IS_MULTI));
 	if (HeapTupleHeaderGetRawXmax(seqdatatuple->t_data) != InvalidTransactionId)
 	{
+#ifdef USE_UMBRA
+		hint_delta_started = BufferBeginHintDelta(*buf, &hint_delta);
+#endif
 		HeapTupleHeaderSetXmax(seqdatatuple->t_data, InvalidTransactionId);
 		seqdatatuple->t_data->t_infomask &= ~HEAP_XMAX_COMMITTED;
 		seqdatatuple->t_data->t_infomask |= HEAP_XMAX_INVALID;
+#ifdef USE_UMBRA
+		if (hint_delta_started)
+			BufferFinishHintDelta(&hint_delta, true, true);
+		else
+			MarkBufferDirtyHint(*buf, true);
+#else
 		MarkBufferDirtyHint(*buf, true);
+#endif
 	}
 
 	seq = (Form_pg_sequence_data) GETSTRUCT(seqdatatuple);

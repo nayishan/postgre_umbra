@@ -29,6 +29,9 @@ RMGRDESCOBJS = $(patsubst %.c,%.o,$(RMGRDESCSOURCES))
 
 all: pg_waldump
 
+# The WAL decoder and XLOG descriptions change with --with-umbra.
+xlogreader.o xlogdesc.o: $(top_builddir)/src/Makefile.global
+
 pg_waldump: $(OBJS) | submake-libpgport
 	$(CC) $(CFLAGS) $^ $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@$(X)
 
