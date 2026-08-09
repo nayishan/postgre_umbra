@@ -31,8 +31,17 @@
 
 /*
  * Each page of XLOG file has a header like this:
+ *
+ * Umbra extends block-reference headers, so its WAL pages must not be
+ * decoded by a standard reader.
  */
-#define XLOG_PAGE_MAGIC 0xD120	/* can be used as WAL version indicator */
+#define XLOG_PAGE_MAGIC_STANDARD 0xD120
+#define XLOG_PAGE_MAGIC_UMBRA 0xD121
+#ifdef USE_UMBRA
+#define XLOG_PAGE_MAGIC XLOG_PAGE_MAGIC_UMBRA
+#else
+#define XLOG_PAGE_MAGIC XLOG_PAGE_MAGIC_STANDARD
+#endif
 
 typedef struct XLogPageHeaderData
 {

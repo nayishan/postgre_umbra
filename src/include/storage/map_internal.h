@@ -73,6 +73,7 @@ extern int MapPageBufferCount;
 #define MapPageGetBlock(slot_id) (MapPageBlocks[(slot_id)].data)
 
 extern void MapPageEnsureInitialized(void);
+extern bool MapPagePoolIsInitialized(void);
 extern void MapPagePoolShmemRequest(void);
 extern void MapPagePoolShmemInit(void);
 extern void MapPagePoolShmemAttach(void);
@@ -108,9 +109,14 @@ extern MapPageBuffer MapPageBufferRead(UmbraFileContext *ctx,
 							   RelFileLocatorBackend rlocator,
 							   BlockNumber map_block, bool extend,
 							   bool skipFsync, LWLockMode mode);
+extern bool MapPageBufferReadRaw(RelFileLocatorBackend rlocator,
+							 BlockNumber map_block, LWLockMode mode,
+							 MapPageBuffer *buffer);
 extern char *MapPageBufferGetData(MapPageBuffer buffer);
 extern void MapPageMarkBufferDirty(MapPageBuffer buffer,
 							   XLogRecPtr wal_flush_lsn, bool skipFsync);
 extern void MapPageReleaseBuffer(MapPageBuffer buffer);
+extern void MapPageReleaseBufferNoOwner(MapPageBuffer buffer);
+extern void MapPageUnlockBufferKeepPin(MapPageBuffer buffer);
 
 #endif                          /* UMBRA_MAP_INTERNAL_H */
