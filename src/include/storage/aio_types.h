@@ -66,6 +66,7 @@ typedef union PgAioTargetData
 		BlockNumber blockNum;	/* logical blknum relative to begin of reln */
 		BlockNumber physicalBlockNum;	/* blknum used to reopen the file */
 		BlockNumber nblocks;
+		uint8		umbraActiveSlot;	/* active slot used for a mapped read */
 		ForkNumber	forkNum:8;	/* don't waste 4 byte for four values */
 		bool		is_temp:1;	/* proc can be inferred by owning AIO */
 		bool		skip_fsync:1;

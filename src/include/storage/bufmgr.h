@@ -288,6 +288,10 @@ extern void AtEOXact_Buffers(bool isCommit);
 extern void AssertBufferLocksPermitCatalogRead(void);
 #endif
 extern char *DebugPrintBufferRefcount(Buffer buffer);
+#ifdef USE_UMBRA
+extern bool BufferGetUmbraActiveSlot(Buffer buffer, uint8 *active_slot);
+extern void BufferRememberUmbraActiveSlot(Buffer buffer, uint8 active_slot);
+#endif
 extern void CheckPointBuffers(int flags);
 extern BlockNumber BufferGetBlockNumber(Buffer buffer);
 extern BlockNumber RelationGetNumberOfBlocksInFork(Relation relation,

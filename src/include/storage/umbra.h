@@ -30,6 +30,7 @@
 #endif
 
 #define UMBRA_CHUNK_ACTIVE_SLOTS 3U
+#define UMBRA_ACTIVE_SLOT_INVALID UINT8_MAX
 
 /* MAIN pages are born in slot 0; persistent selectors can later choose 1/2. */
 static inline bool
@@ -145,5 +146,7 @@ extern void umregistersync(SMgrRelation reln, ForkNumber forknum);
 extern bool umpreparependingsync(SMgrRelation reln);
 extern int	umfd(SMgrRelation reln, ForkNumber forknum,
 					 BlockNumber blocknum, uint32 *off);
+extern bool UmGetActiveSlot(SMgrRelation reln, ForkNumber forknum,
+						 BlockNumber logical_block, uint8 *active_slot);
 
 #endif							/* UMBRA_H */

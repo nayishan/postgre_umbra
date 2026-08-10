@@ -20,12 +20,18 @@
 #include "storage/proclist.h"
 #include "storage/shmem.h"
 #include "storage/subsystems.h"
+#ifdef USE_UMBRA
+#include "storage/umbra.h"
+#endif
 
 BufferDescPadded *BufferDescriptors;
 char	   *BufferBlocks;
 ConditionVariableMinimallyPadded *BufferIOCVArray;
 WritebackContext BackendWritebackContext;
 CkptSortItem *CkptBufferIds;
+#ifdef USE_UMBRA
+uint8	   *UmbraBufferActiveSlots;
+#endif
 
 static void BufferManagerShmemRequest(void *arg);
 static void BufferManagerShmemInit(void *arg);
@@ -108,6 +114,13 @@ BufferManagerShmemRequest(void *arg)
 					   .size = NBuffers * sizeof(CkptSortItem),
 					   .ptr = (void **) &CkptBufferIds,
 		);
+
+#ifdef USE_UMBRA
+	ShmemRequestStruct(.name = "Umbra Buffer Active Slots",
+					   .size = NBuffers * sizeof(uint8),
+					   .ptr = (void **) &UmbraBufferActiveSlots,
+		);
+#endif
 }
 
 /*
@@ -133,6 +146,9 @@ BufferManagerShmemInit(void *arg)
 
 		buf->buf_id = i;
 
+#ifdef USE_UMBRA
+		UmbraBufferActiveSlots[i] = UMBRA_ACTIVE_SLOT_INVALID;
+#endif
 		pgaio_wref_clear(&buf->io_wref);
 
 		proclist_init(&buf->lock_waiters);
