@@ -38,11 +38,13 @@ extern void ummap_publish_prepared_main_frontiers(UmbraFileContext *ctx,
 									  BlockNumber logical_eof,
 									  BlockNumber physical_capacity);
 extern void ummap_validate_if_exists(UmbraFileContext *ctx,
-							 RelFileLocatorBackend rlocator);
-extern void ummap_immedsync_if_exists(UmbraFileContext *ctx,
-							  RelFileLocatorBackend rlocator);
-extern void ummap_registersync_if_exists(UmbraFileContext *ctx,
-							   RelFileLocatorBackend rlocator);
+								 RelFileLocatorBackend rlocator);
+/*
+ * Write and synchronize only relation-level MAP metadata.  The caller must
+ * already have established ordinary data-fork and selector-page ordering.
+ */
+extern void ummap_sync_relation_metadata(UmbraFileContext *ctx,
+									  RelFileLocatorBackend rlocator);
 extern void ummap_unlink(RelFileLocatorBackend rlocator, bool isRedo);
 
 extern void ummap_flush_relation(UmbraFileContext *ctx,

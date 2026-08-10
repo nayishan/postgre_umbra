@@ -97,6 +97,11 @@ extern void umdestroy(SMgrRelation reln);
 extern void umcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
 extern void uminitnewrelation(SMgrRelation reln, bool needs_wal);
 extern void umfinishcreate(SMgrRelation reln, ForkNumber forknum);
+/*
+ * Publish and synchronize relation-level MAP metadata after core has made
+ * the ordinary forks durable.  This is not a per-fork sync callback.
+ */
+extern void umsyncrelationmetadata(SMgrRelation reln);
 /* Flush Umbra's private metadata-root cache at the checkpoint boundary. */
 extern void umcheckpoint(void);
 /* Flush Umbra's metadata-root cache before copying a database tablespace. */

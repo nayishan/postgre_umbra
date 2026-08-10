@@ -372,33 +372,50 @@ ummap_invalidate_database_tablespace_cache(Oid dbid, Oid spcOid)
 void
 ummap_checkpoint(void)
 {
-	/* Flush the checkpoint-start selector set before publishing dirty roots. */
+	/*
+	 * CheckPointGuts calls smgrcheckpoint() only after CheckPointBuffers().
+	 * Within Umbra's private checkpoint phase, preserve the remaining order:
+	 *
+	 *   ordinary data buffers -> dirty MAP selector pages -> dirty MAP roots
+	 *
+	 * MapCheckpoint() writes the checkpoint-start selector set before a root
+	 * image can be published.  A crash before the root write can retain an
+	 * older root, which is conservative.  Publishing the root ahead of this
+	 * private selector writeback would instead make metadata durable before the
+	 * mapping state on which that publication depends.
+	 *
+	 * Do not fold ordinary data-page synchronization into root-cache writeback.
+	 * The caller owns the first phase; this function owns only the MAP phases.
+	 */
 	MapCheckpoint();
 	ummap_root_cache_flush_matching(InvalidOid, InvalidOid);
 }
 
+/*
+ * Finish the metadata phase of a full relation sync.  smgrdosyncall() has
+ * already established this order before reaching Umbra:
+ *
+ *   ordinary buffer writeback -> ordinary fork fsync -> this root write
+ *   -> metadata-fork fsync
+ *
+ * The root is the durable authority for the relation's mapped layout.  A
+ * missing root for a relation selected as mapped is therefore corruption, not
+ * a reason to create an empty one during a sync path.  This routine flushes
+ * and synchronizes only the metadata fork; it must not scan, open, flush, or
+ * synchronize MAIN on its own.
+ */
 void
-ummap_immedsync_if_exists(UmbraFileContext *ctx,
-					  RelFileLocatorBackend rlocator)
+ummap_sync_relation_metadata(UmbraFileContext *ctx,
+							 RelFileLocatorBackend rlocator)
 {
 	Assert(ctx != NULL);
-	if (ummap_exists(ctx))
-	{
-		ummap_flush_relation(ctx, rlocator);
-		umfile_immedsync(ctx, UMBRA_METADATA_FORKNUM);
-	}
-}
+	if (!ummap_exists(ctx))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("Umbra mapped relation metadata root is missing")));
 
-void
-ummap_registersync_if_exists(UmbraFileContext *ctx,
-					   RelFileLocatorBackend rlocator)
-{
-	Assert(ctx != NULL);
-	if (ummap_exists(ctx))
-	{
-		ummap_flush_relation(ctx, rlocator);
-		umfile_registersync(ctx, UMBRA_METADATA_FORKNUM);
-	}
+	ummap_flush_relation(ctx, rlocator);
+	umfile_immedsync(ctx, UMBRA_METADATA_FORKNUM);
 }
 
 void
@@ -791,8 +808,27 @@ ummap_root_cache_flush_locked(UmbraMapRootEntry *entry,
 
 		if (XLogRecPtrIsValid(entry->wal_flush_lsn))
 			XLogFlush(entry->wal_flush_lsn);
-		/* A valid root always makes its MAIN capacity authoritative. */
-		umfile_immedsync(write_ctx, MAIN_FORKNUM);
+		/*
+		 * This is deliberately a root-image writeback primitive, not a general
+		 * relation flush.  Its complete responsibility is:
+		 *
+		 *   make the root's recorded WAL dependency durable;
+		 *   write this one cached root image; and
+		 *   clear this entry's dirty bookkeeping.
+		 *
+		 * It must not synchronize MAIN or another ordinary fork, look up relation
+		 * buffers, or flush selector pages.  The caller chooses the ordering
+		 * point at which the root is allowed to become durable.  Adding those
+		 * actions here would make a root-cache helper silently own relation-wide
+		 * I/O and could publish metadata at the wrong point in a checkpoint or
+		 * pending-sync cycle.
+		 *
+		 * Physical allocation can legitimately precede root publication.  If a
+		 * crash leaves a physical tail beyond the published root frontier, the
+		 * older root remains authoritative and the extra space is harmless.  The
+		 * unsafe direction is the inverse: a durable root must never require data
+		 * or mapping state that its caller has not first made durable.
+		 */
 		ummap_root_write_image(write_ctx, entry->image, !entry->needs_fsync);
 		if (temporary_ctx != NULL)
 		{

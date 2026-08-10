@@ -108,6 +108,18 @@ typedef struct f_smgr
 									 ForkNumber forknum); /* may be NULL */
 	bool		(*smgr_prepare_pending_sync) (SMgrRelation reln); /* may be NULL */
 	/*
+	 * Synchronize relation-level private metadata after the core-owned
+	 * ordinary-fork loop.  Private metadata can describe an entire relation,
+	 * rather than one physical fork, so it must run once and only after every
+	 * ordinary fork required by the caller has reached stable storage.
+	 *
+	 * This is an ordering boundary, not a generic core metadata-fork API.
+	 * Core neither knows the metadata representation nor interprets its
+	 * contents.  The selected smgr owns both the representation and the
+	 * decision whether that relation has metadata to publish.
+	 */
+	void		(*smgr_sync_relation_metadata) (SMgrRelation reln); /* may be NULL */
+	/*
 	 * The caller establishes checkpoint ordering with ordinary buffer writeback.
 	 */
 	void		(*smgr_checkpoint) (void); /* may be NULL */
@@ -189,6 +201,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_init_new_relation = NULL,
 		.smgr_finish_create = NULL,
 		.smgr_prepare_pending_sync = NULL,
+		.smgr_sync_relation_metadata = NULL,
 		.smgr_checkpoint = NULL,
 		.smgr_flush_database_tablespace_cache = NULL,
 		.smgr_invalidate_database_cache = NULL,
@@ -222,6 +235,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_init_new_relation = uminitnewrelation,
 		.smgr_finish_create = umfinishcreate,
 		.smgr_prepare_pending_sync = umpreparependingsync,
+		.smgr_sync_relation_metadata = umsyncrelationmetadata,
 		.smgr_checkpoint = umcheckpoint,
 		.smgr_flush_database_tablespace_cache =
 			umflushdatabasetablespacecache,
@@ -620,7 +634,26 @@ smgrpreparependingsync(SMgrRelation reln)
 	return smgrsw[reln->smgr_which].smgr_prepare_pending_sync(reln);
 }
 
-/* Run selected-smgr checkpoint work at the caller's chosen ordering point. */
+/*
+ * Complete the selected smgr's one relation-level metadata phase.  A NULL
+ * hook deliberately preserves the existing md behavior.  Callers must first
+ * establish the required ordinary-buffer and ordinary-fork durability order;
+ * this function is not a replacement for either per-fork writeback or fsync.
+ */
+void
+smgrsyncrelationmetadata(SMgrRelation reln)
+{
+	if (smgrsw[reln->smgr_which].smgr_sync_relation_metadata != NULL)
+		smgrsw[reln->smgr_which].smgr_sync_relation_metadata(reln);
+}
+
+/*
+ * Run selected-smgr checkpoint work at the caller's chosen ordering point.
+ * The caller owns ordinary shared-buffer writeback.  A private checkpoint
+ * callback may flush implementation-owned state, but it must not silently
+ * take ownership of ordinary relation-fork writeback or choose a different
+ * data-to-metadata ordering.
+ */
 void
 smgrcheckpoint(void)
 {
@@ -671,8 +704,22 @@ smgrinvalidatedatabasetablespacecache(Oid dbid, Oid spcOid)
  * All forks of all given relations are synced out to the store.
  *
  * This is equivalent to FlushRelationBuffers() for each smgr relation,
- * then calling smgrimmedsync() for all forks of each relation, but it's
- * significantly quicker so should be preferred when possible.
+ * then calling smgrimmedsync() for all forks and synchronizing selected-smgr
+ * relation metadata once per relation, but it's significantly quicker so
+ * should be preferred when possible.
+ *
+ * The order below is a durability contract for an smgr that has private
+ * relation metadata:
+ *
+ *   1. write ordinary shared buffers;
+ *   2. synchronize every ordinary fork; and
+ *   3. synchronize private relation metadata once.
+ *
+ * Step 3 may publish metadata that makes a durable set of ordinary pages
+ * reachable.  A crash between steps 2 and 3 leaves an older private metadata
+ * image, which is conservative.  Reversing the last two steps could instead
+ * leave durable metadata that refers to ordinary storage which is not yet
+ * durable.
  */
 void
 smgrdosyncall(SMgrRelation *rels, int nrels)
@@ -683,12 +730,16 @@ smgrdosyncall(SMgrRelation *rels, int nrels)
 	if (nrels == 0)
 		return;
 
+	/* Establish the ordinary-buffer half before any metadata publication. */
 	FlushRelationsAllBuffers(rels, nrels);
 
 	HOLD_INTERRUPTS();
 
 	/*
-	 * Sync the physical file(s).
+	 * Complete all core-visible per-fork work before invoking the private
+	 * relation-level phase.  Do not move that phase into the inner loop: a
+	 * private metadata image can cover more state than the fork currently
+	 * being synchronized.
 	 */
 	for (i = 0; i < nrels; i++)
 	{
@@ -699,6 +750,9 @@ smgrdosyncall(SMgrRelation *rels, int nrels)
 			if (smgrsw[which].smgr_exists(rels[i], forknum))
 				smgrsw[which].smgr_immedsync(rels[i], forknum);
 		}
+
+		/* This is the sole relation-level publication point in this path. */
+		smgrsyncrelationmetadata(rels[i]);
 	}
 
 	RESUME_INTERRUPTS();

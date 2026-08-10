@@ -539,24 +539,59 @@ umpreparetruncate(SMgrRelation reln, ForkNumber *forknum, int nforks,
 	}
 }
 
+/*
+ * Core calls these per-fork callbacks once for every ordinary PostgreSQL
+ * fork.  They intentionally do only that fork's file work.  In particular,
+ * do not flush or register the private metadata fork while handling MAIN:
+ *
+ * - a MAP root is relation-level state, not a MAIN-fork cache entry;
+ * - it can publish logical EOF and mapping authority; and
+ * - core might still have ordinary fork work to finish for this relation.
+ *
+ * smgrdosyncall() invokes umsyncrelationmetadata() only after its complete
+ * ordinary-fork loop.  Keeping the two responsibilities separate makes that
+ * order explicit and prevents an accidental MAP publication from a generic
+ * per-fork callback.
+ */
 void
 umimmedsync(SMgrRelation reln, ForkNumber forknum)
 {
-	UmbraFileContext *ctx = um_get_filectx(reln);
-
-	umfile_immedsync(ctx, forknum);
-	if (forknum == MAIN_FORKNUM)
-		ummap_immedsync_if_exists(ctx, reln->smgr_rlocator);
+	umfile_immedsync(um_get_filectx(reln), forknum);
 }
 
+/*
+ * Deferred sync registration follows the same rule as immediate sync.  The
+ * request carries only the ordinary fork; the later smgrdosyncall() path
+ * flushes relation-level metadata after ordinary buffers and forks have been
+ * made durable.  Registering _map here would reintroduce a per-fork metadata
+ * publication path with no relation-wide ordering guarantee.
+ */
 void
 umregistersync(SMgrRelation reln, ForkNumber forknum)
 {
-	UmbraFileContext *ctx = um_get_filectx(reln);
+	umfile_registersync(um_get_filectx(reln), forknum);
+}
 
-	umfile_registersync(ctx, forknum);
-	if (forknum == MAIN_FORKNUM)
-		ummap_registersync_if_exists(ctx, reln->smgr_rlocator);
+/*
+ * This is Umbra's normal relation-level metadata boundary.  Its caller,
+ * smgrdosyncall(), has already written the relation's ordinary buffers and
+ * synchronized all existing ordinary forks.  Only now may Umbra serialize
+ * a dirty MAP root and synchronize the metadata fork containing it.
+ *
+ * Do not add MAIN synchronization or selector-page discovery here.  Those
+ * are separate caller-owned phases: ordinary fork durability is completed by
+ * core, while checkpoint selector flushing is ordered by ummap_checkpoint().
+ * This function publishes only a root that its caller has made safe to
+ * publish.
+ */
+void
+umsyncrelationmetadata(SMgrRelation reln)
+{
+	if (!um_main_uses_slot0(reln, MAIN_FORKNUM))
+		return;
+
+	ummap_sync_relation_metadata(um_get_filectx(reln),
+							 reln->smgr_rlocator);
 }
 
 bool

@@ -101,6 +101,12 @@ extern void smgrinitnewrelation(SMgrRelation reln, bool needs_wal);
 /* Complete authoritative CREATE redo after the physical fork exists. */
 extern void smgrfinishcreate(SMgrRelation reln, ForkNumber forknum);
 extern bool smgrpreparependingsync(SMgrRelation reln);
+/*
+ * Invoke one selected-smgr relation-metadata phase only after the caller has
+ * completed its ordinary-fork durability work.  Core supplies the ordering
+ * point; the selected smgr owns and interprets the private metadata.
+ */
+extern void smgrsyncrelationmetadata(SMgrRelation reln);
 /* Complete selected-smgr checkpoint work at the caller's ordering point. */
 extern void smgrcheckpoint(void);
 /*

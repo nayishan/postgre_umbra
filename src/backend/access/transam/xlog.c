@@ -8064,9 +8064,15 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 	CheckPointPredicate();
 
 	/*
-	 * Issue buffer writes before checkpointing storage-manager metadata.  The
-	 * hook may synchronize relation data before publishing metadata that makes
-	 * those pages reachable.
+	 * CheckPointBuffers establishes the ordinary data-page half of the
+	 * checkpoint before an smgr can publish implementation-private metadata.
+	 * The required order is:
+	 *
+	 *   ordinary shared buffers -> selected-smgr private checkpoint state
+	 *
+	 * A private callback may flush metadata that identifies or makes a set of
+	 * data pages reachable.  It must therefore stay after CheckPointBuffers;
+	 * it must not take over ordinary buffer writeback or reverse this order.
 	 */
 	CheckPointBuffers(flags);
 	smgrcheckpoint();
