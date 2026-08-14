@@ -50,6 +50,11 @@ extern void MapEnsureActiveSlotPages(UmbraFileContext *ctx,
 							 BlockNumber first_block,
 							 BlockNumber nblocks,
 							 bool skipFsync);
+extern uint8 MapGetActiveSlotWithPresence(UmbraFileContext *ctx,
+								  RelFileLocatorBackend rlocator,
+								  ForkNumber forknum,
+								  BlockNumber logical_block,
+								  bool *selector_page_present);
 extern void MapPublishSlotShift(UmbraFileContext *ctx,
 								RelFileLocatorBackend rlocator,
 								ForkNumber forknum,

@@ -436,6 +436,7 @@ extern PGDLLIMPORT WritebackContext BackendWritebackContext;
 extern PGDLLIMPORT uint8 *UmbraBufferActiveSlots;
 extern PGDLLIMPORT uint64 *CkptBufferShiftEpochs;
 extern PGDLLIMPORT pg_atomic_uint64 *CkptBufferCaptureEpoch;
+extern PGDLLIMPORT bool *UmbraBufferSelectorPagePresent;
 #endif
 
 /* in localbuf.c */

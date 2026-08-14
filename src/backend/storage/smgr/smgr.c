@@ -417,8 +417,8 @@ smgropen(RelFileLocator rlocator, ProcNumber backend)
 #ifdef USE_UMBRA
 /*
  * Find an already-open relation handle without allocating.  WAL insertion can
- * use this from a critical section to decide whether an Umbra slot shift is
- * available; a miss simply keeps the ordinary full-page image.
+ * use this from a critical section before publishing an Umbra slot shift.  A
+ * mapped buffer must retain its relation handle until that publication.
  */
 SMgrRelation
 smgrlookup(RelFileLocator rlocator, ProcNumber backend)
@@ -430,7 +430,7 @@ smgrlookup(RelFileLocator rlocator, ProcNumber backend)
 	brlocator.locator = rlocator;
 	brlocator.backend = backend;
 	return (SMgrRelation) hash_search(SMgrRelationHash, &brlocator,
-								 HASH_FIND, NULL);
+									 HASH_FIND, NULL);
 }
 #endif
 
@@ -1385,6 +1385,7 @@ pgaio_io_set_target_smgr(PgAioHandle *ioh,
 	sd->smgr.physicalBlockNum = blocknum;
 	sd->smgr.nblocks = nblocks;
 	sd->smgr.umbraActiveSlot = UINT8_MAX;
+	sd->smgr.umbraSelectorPagePresent = false;
 	sd->smgr.is_temp = SmgrIsTemp(smgr);
 	/* Temp relations should never be fsync'd */
 	sd->smgr.skip_fsync = skip_fsync && !SmgrIsTemp(smgr);

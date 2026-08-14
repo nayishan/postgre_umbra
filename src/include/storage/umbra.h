@@ -84,6 +84,27 @@ UmbraActiveSlotPhysicalBlock(BlockNumber logical_block, uint8 active_slot,
 	return true;
 }
 
+/* Recover the fixed-layout selector from a logical/physical block pair. */
+static inline bool
+UmbraPhysicalBlockActiveSlot(BlockNumber logical_block,
+							 BlockNumber physical_block, uint8 *active_slot)
+{
+	BlockNumber candidate;
+
+	Assert(active_slot != NULL);
+	*active_slot = UMBRA_ACTIVE_SLOT_INVALID;
+	for (uint8 slot = 0; slot < UMBRA_CHUNK_ACTIVE_SLOTS; slot++)
+	{
+		if (UmbraActiveSlotPhysicalBlock(logical_block, slot, &candidate) &&
+			candidate == physical_block)
+		{
+			*active_slot = slot;
+			return true;
+		}
+	}
+	return false;
+}
+
 /* Reserve all three physical slots for every logical chunk. */
 static inline bool
 UmbraMappedPhysicalCapacity(BlockNumber logical_eof,
@@ -185,11 +206,13 @@ extern bool umforcependingsync(SMgrRelation reln);
 extern int	umfd(SMgrRelation reln, ForkNumber forknum,
 					 BlockNumber blocknum, uint32 *off);
 extern bool UmGetActiveSlot(SMgrRelation reln, ForkNumber forknum,
-						 BlockNumber logical_block, uint8 *active_slot);
+							 BlockNumber logical_block, uint8 *active_slot,
+							 bool *selector_page_present);
 /* Select a shift source from BufferMgr state without reading a selector. */
 extern bool UmChooseSlotShift(SMgrRelation reln, ForkNumber forknum,
 							  BlockNumber logical_block,
 							  uint8 cached_active_slot,
+							  bool selector_page_present,
 							  UmbraSlotShift *shift);
 /* Publish a selected target after WAL insertion has assigned its LSN. */
 extern void UmPublishSlotShift(UmbraSlotShift *shift, XLogRecPtr lsn);
@@ -198,6 +221,11 @@ extern bool UmCheckpointWriteSourceSlot(SMgrRelation reln, ForkNumber forknum,
 										const void *buffer,
 										BlockNumber *physical_block);
 extern bool UmRedoMappingPolicyResolved(SMgrRelation reln, ForkNumber forknum);
+extern bool UmUsesMappedSlots(SMgrRelation reln, ForkNumber forknum);
+/* Write an existing mapped page to a caller-selected slot and report its pblk. */
+extern bool UmWriteSlot(SMgrRelation reln, ForkNumber forknum,
+						BlockNumber logical_block, const void *buffer,
+						uint8 slot, BlockNumber *physical_block);
 extern bool UmRedoSetActiveSlot(SMgrRelation reln, ForkNumber forknum,
 									 BlockNumber logical_block,
 									 uint8 active_slot);

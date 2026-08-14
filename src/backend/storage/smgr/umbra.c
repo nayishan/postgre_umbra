@@ -71,6 +71,11 @@ static BlockNumber um_get_mapped_frontier(SMgrRelation reln,
 									  ForkNumber forknum);
 static BlockNumber um_mapped_capacity(SMgrRelation reln, ForkNumber forknum,
 									 BlockNumber logical_eof);
+static bool um_resolve_slot_physical_block(SMgrRelation reln,
+										   ForkNumber forknum,
+										   BlockNumber logical_block,
+										   uint8 slot,
+										   BlockNumber *physical_block);
 static void um_ensure_mapped_capacity(SMgrRelation reln, ForkNumber forknum,
 									  BlockNumber physical_capacity,
 									  bool skipFsync);
@@ -258,6 +263,7 @@ UmRedoMappingPolicyResolved(SMgrRelation reln, ForkNumber forknum)
 bool
 UmChooseSlotShift(SMgrRelation reln, ForkNumber forknum,
 				  BlockNumber logical_block, uint8 cached_active_slot,
+				  bool selector_page_present,
 				  UmbraSlotShift *shift)
 {
 	UmbraSmgrRelationState *state;
@@ -266,14 +272,18 @@ UmChooseSlotShift(SMgrRelation reln, ForkNumber forknum,
 	MemSet(shift, 0, sizeof(*shift));
 	if (reln == NULL || InRecovery ||
 		RelFileLocatorBackendIsTemp(reln->smgr_rlocator) ||
-		IsBootstrapProcessingMode() || IsInitProcessingMode() ||
-		!UmbraActiveSlotIsValid(cached_active_slot) ||
-		!um_fork_uses_mapped_slots(reln, forknum))
+		IsBootstrapProcessingMode() || IsInitProcessingMode())
 		return false;
 
 	state = reln->smgr_private;
 	if (state == NULL || state->filectx == NULL)
 		return false;
+	if (!um_fork_uses_mapped_slots(reln, forknum))
+		return false;
+	if (!UmbraActiveSlotIsValid(cached_active_slot))
+		elog(PANIC, "Umbra mapped buffer has no cached active slot");
+	if (!selector_page_present && cached_active_slot != 0)
+		elog(PANIC, "Umbra mapped buffer has a nonzero slot without a selector");
 
 	shift->reln = reln;
 	shift->forknum = forknum;
@@ -321,13 +331,77 @@ UmCheckpointWriteSourceSlot(SMgrRelation reln, ForkNumber forknum,
 									 physical_block))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("Umbra source-slot block mapping overflow for relation %u/%u/%u fork %d",
+				 errmsg("Umbra slot block mapping overflow for relation %u/%u/%u fork %d",
 						reln->smgr_rlocator.locator.spcOid,
 							reln->smgr_rlocator.locator.dbOid,
 							reln->smgr_rlocator.locator.relNumber, (int) forknum)));
 
 	umfile_writev(um_get_filectx(reln), forknum, *physical_block,
 				  buffers, 1, false);
+	return true;
+}
+
+bool
+UmUsesMappedSlots(SMgrRelation reln, ForkNumber forknum)
+{
+	if (reln == NULL)
+		return false;
+	um_refresh_mapping_policy(reln, forknum);
+	return um_fork_uses_mapped_slots(reln, forknum);
+}
+
+static bool
+um_resolve_slot_physical_block(SMgrRelation reln, ForkNumber forknum,
+								BlockNumber logical_block, uint8 slot,
+								BlockNumber *physical_block)
+{
+	if (physical_block != NULL)
+		*physical_block = InvalidBlockNumber;
+	if (reln == NULL || physical_block == NULL ||
+		!UmbraActiveSlotIsValid(slot))
+		return false;
+	um_refresh_mapping_policy(reln, forknum);
+	if (!um_fork_uses_mapped_slots(reln, forknum))
+		return false;
+	if (!UmbraActiveSlotPhysicalBlock(logical_block, slot, physical_block))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("Umbra slot block mapping overflow for relation %u/%u/%u fork %d",
+						reln->smgr_rlocator.locator.spcOid,
+						reln->smgr_rlocator.locator.dbOid,
+						reln->smgr_rlocator.locator.relNumber, (int) forknum)));
+	return true;
+}
+
+bool
+UmWriteSlot(SMgrRelation reln, ForkNumber forknum,
+			BlockNumber logical_block, const void *buffer,
+			uint8 slot, BlockNumber *physical_block)
+{
+	const void *buffers[1] = {buffer};
+
+	if (physical_block != NULL)
+		*physical_block = InvalidBlockNumber;
+	if (buffer == NULL || physical_block == NULL)
+		return false;
+
+	/*
+	 * This only writes the supplied existing page to its chosen slot.  It does
+	 * not extend the relation or publish a logical MAP frontier; callers use a
+	 * false result to take the ordinary smgr write path.
+	 */
+	/* Match smgrwritev_with_targets() interrupt semantics. */
+	HOLD_INTERRUPTS();
+	if (!um_resolve_slot_physical_block(reln, forknum, logical_block, slot,
+										 physical_block))
+	{
+		RESUME_INTERRUPTS();
+		return false;
+	}
+
+	umfile_writev(um_get_filectx(reln), forknum, *physical_block,
+				  buffers, 1, false);
+	RESUME_INTERRUPTS();
 	return true;
 }
 
@@ -412,6 +486,7 @@ UmRedoSlotShift(SMgrRelation reln, ForkNumber forknum,
 		elog(PANIC, "Umbra slot-shift WAL targets an inactive mapping");
 	um_refresh_mapping_policy(reln, forknum);
 	ctx = um_get_filectx(reln);
+	Assert(reln->smgr_private != NULL);
 
 	/*
 	 * A full-page image proves that one logical page can be reconstructed, but
@@ -642,6 +717,7 @@ umstartreadv(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknum,
 	PgAioTargetData *target;
 	BlockNumber	physical_block;
 	uint8		active_slot = UMBRA_ACTIVE_SLOT_INVALID;
+	bool		selector_page_present;
 
 	um_refresh_mapping_policy(reln, forknum);
 	if (!um_fork_uses_mapped_slots(reln, forknum))
@@ -659,11 +735,21 @@ umstartreadv(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknum,
 
 	if (InRecovery && UmbraIsMappedAuxiliaryFork(forknum))
 		um_ensure_aux_recovery_capacity(reln, forknum);
-	physical_block = um_active_pblk(reln, forknum, blocknum, &active_slot);
+	active_slot = MapGetActiveSlotWithPresence(um_get_filectx(reln),
+											   reln->smgr_rlocator, forknum,
+											   blocknum, &selector_page_present);
+	if (!UmbraActiveSlotPhysicalBlock(blocknum, active_slot, &physical_block))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("Umbra active-slot block mapping overflow for relation %u/%u/%u fork %d",
+						reln->smgr_rlocator.locator.spcOid,
+						reln->smgr_rlocator.locator.dbOid,
+						reln->smgr_rlocator.locator.relNumber, (int) forknum)));
 	pgaio_io_set_target_smgr(ioh, reln, forknum, blocknum, nblocks, false);
 	target = pgaio_io_get_target_data(ioh);
 	target->smgr.physicalBlockNum = physical_block;
 	target->smgr.umbraActiveSlot = active_slot;
+	target->smgr.umbraSelectorPagePresent = selector_page_present;
 	pgaio_io_register_callbacks(ioh, PGAIO_HCB_MD_READV, 0);
 	umfile_startreadv(ioh, um_get_filectx(reln), forknum, physical_block,
 						  buffers,
@@ -1015,16 +1101,21 @@ um_fork_uses_mapped_slots(SMgrRelation reln, ForkNumber forknum)
 
 bool
 UmGetActiveSlot(SMgrRelation reln, ForkNumber forknum,
-				BlockNumber logical_block, uint8 *active_slot)
+				BlockNumber logical_block, uint8 *active_slot,
+				bool *selector_page_present)
 {
 	if (active_slot != NULL)
 		*active_slot = UMBRA_ACTIVE_SLOT_INVALID;
+	if (selector_page_present != NULL)
+		*selector_page_present = false;
 	if (reln == NULL || active_slot == NULL ||
 		!um_fork_uses_mapped_slots(reln, forknum))
 		return false;
 
-	*active_slot = MapGetActiveSlot(um_get_filectx(reln), reln->smgr_rlocator,
-								  forknum, logical_block);
+	*active_slot = MapGetActiveSlotWithPresence(um_get_filectx(reln),
+											reln->smgr_rlocator, forknum,
+											logical_block,
+											selector_page_present);
 	return true;
 }
 
@@ -1035,7 +1126,7 @@ um_active_pblk(SMgrRelation reln, ForkNumber forknum,
 	BlockNumber	physical_block;
 	uint8		slot;
 
-	if (!UmGetActiveSlot(reln, forknum, logical_block, &slot))
+	if (!UmGetActiveSlot(reln, forknum, logical_block, &slot, NULL))
 		elog(ERROR, "could not resolve Umbra active slot");
 	if (!UmbraActiveSlotPhysicalBlock(logical_block, slot, &physical_block))
 		ereport(ERROR,
