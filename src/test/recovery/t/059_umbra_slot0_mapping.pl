@@ -114,6 +114,52 @@ my $initial_blocks =
 cmp_ok($initial_blocks, '>', CHUNK_PAGES,
 	'initial grow crosses the first slot-0 chunk boundary');
 
+# A global SMGRRELEASE closes descriptors but retains SMgrRelation objects.
+# Leave a pending-unlink gate in an otherwise empty tablespace so that DROP
+# TABLESPACE must issue that barrier.  A mapped handle keeps its layout across
+# the release and revalidates its root before the next mapping-dependent use.
+$node->safe_psql(
+	'postgres', q{
+SET allow_in_place_tablespaces = on;
+CREATE TABLESPACE umbra_policy_ts LOCATION '';
+CREATE TABLE umbra_policy_gate (id integer) TABLESPACE umbra_policy_ts;
+DROP TABLE umbra_policy_gate;
+});
+my $map_file = $node->data_dir . "/${main_path}_map";
+my $policy_session = $node->background_psql('postgres', on_error_stop => 0);
+is(0 + $policy_session->query_safe(q{
+SELECT pg_relation_size('umbra_slot0'::regclass) /
+       current_setting('block_size')::integer;
+}), $initial_blocks, 'retained handle initially observes the mapped logical size');
+$node->safe_psql('postgres', 'DROP TABLESPACE umbra_policy_ts');
+is(0 + $policy_session->query_safe(q{
+SELECT pg_relation_size('umbra_slot0'::regclass) /
+       current_setting('block_size')::integer;
+}), $initial_blocks,
+	'retained MAPPED handle preserves the logical size after SMGRRELEASE');
+
+$node->safe_psql(
+	'postgres', q{
+SET allow_in_place_tablespaces = on;
+CREATE TABLESPACE umbra_policy_missing_ts LOCATION '';
+CREATE TABLE umbra_policy_missing_gate (id integer)
+  TABLESPACE umbra_policy_missing_ts;
+DROP TABLE umbra_policy_missing_gate;
+});
+my $hidden_map_file = "$map_file.policy_hidden";
+rename($map_file, $hidden_map_file)
+  or BAIL_OUT("could not hide mapped root \"$map_file\": $!");
+$node->safe_psql('postgres', 'DROP TABLESPACE umbra_policy_missing_ts');
+my ($ignored, $failed) = $policy_session->query(q{
+SELECT pg_relation_size('umbra_slot0'::regclass) /
+       current_setting('block_size')::integer;
+});
+is($failed, 1,
+	'root missing after SMGRRELEASE fails instead of selecting direct I/O');
+rename($hidden_map_file, $map_file)
+  or BAIL_OUT("could not restore mapped root \"$map_file\": $!");
+$policy_session->quit;
+
 $node->stop;
 $node->start;
 is($node->safe_psql('postgres',

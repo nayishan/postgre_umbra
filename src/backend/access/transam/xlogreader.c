@@ -1944,11 +1944,12 @@ DecodeXLogRecord(XLogReaderState *state,
 			COPY_HEADER_FIELD(&blk->blkno, sizeof(BlockNumber));
 #ifdef USE_UMBRA
 			if (blk->has_slot_shift &&
-				(blk->forknum != MAIN_FORKNUM ||
-				 blk->target_slot >= 3 ||
-				 (blk->flags & BKPBLOCK_WILL_INIT) != 0 ||
-				 (blk->has_image && !blk->apply_image) ||
-				 (blk->has_image && !blk->apply_image)))
+				((blk->forknum != MAIN_FORKNUM &&
+				  blk->forknum != FSM_FORKNUM &&
+				  blk->forknum != VISIBILITYMAP_FORKNUM) ||
+					 blk->target_slot >= 3 ||
+					 (blk->flags & BKPBLOCK_WILL_INIT) != 0 ||
+					 (blk->has_image && !blk->apply_image)))
 			{
 				report_invalid_record(state,
 							  "invalid Umbra slot shift for block %u at %X/%08X",

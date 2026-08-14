@@ -574,8 +574,7 @@ MapRedoSlotShift(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 {
 	Assert(source_slot < 3);
 	Assert(target_slot < 3);
-	Assert(source_slot != target_slot);
-	(void) source_slot;
+	Assert(target_slot == (source_slot + 1) % 3);
 	MapRedoSetActiveSlot(ctx, rlocator, forknum, logical_block, target_slot);
 }
 
@@ -949,12 +948,12 @@ MapPageForgetIO(int slot_id)
 
 static void
 MapSelectorLocation(ForkNumber forknum, BlockNumber logical_block,
-					BlockNumber *map_block,
-					int *byte_offset, int *bit_offset)
+					BlockNumber *map_block, int *byte_offset,
+					int *bit_offset)
 {
-	uint64      page_index;
-	uint64      entry_index;
-	uint64      bit_index;
+	uint64		page_index;
+	uint64		entry_index;
+	uint64		bit_index;
 
 	Assert(map_block != NULL);
 	page_index = (uint64) logical_block / UMBRA_MAP_SELECTOR_ENTRIES_PER_PAGE;

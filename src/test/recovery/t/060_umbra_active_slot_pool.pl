@@ -131,7 +131,7 @@ $node->stop;
 for my $map_path (@map_paths)
 {
 	truncate($map_path, $block_size)
-  or BAIL_OUT("could not remove selector group from \"$map_path\": $!");
+	  or BAIL_OUT("could not remove selector group from \"$map_path\": $!");
 	append_zero_block($map_path, $block_size) for 1 .. 3;
 }
 $node->start;

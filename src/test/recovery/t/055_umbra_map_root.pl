@@ -31,10 +31,10 @@ my $root = slurp_file($map_path);
 my ($magic, $version, $blcksz, $chunk_pages) =
   unpack('L4', substr($root, 0, 16));
 
-is(length($root), 2 * $block_size,
-	'metadata file contains the root and first selector page');
+is(length($root), 4 * $block_size,
+	'metadata file contains the root and first selector group');
 is($magic, 0x554d4252, 'metadata root magic is present');
-is($version, 1, 'metadata root format version is present');
+is($version, 2, 'metadata root format version is present');
 is($blcksz, $block_size, 'metadata root records BLCKSZ');
 is($chunk_pages, 32, 'metadata root records the fixed chunk size');
 is(substr($root, 32, 8), "\0" x 8,

@@ -42,36 +42,36 @@ typedef struct UmbraSlotShift
 	bool		selected;
 } UmbraSlotShift;
 
-/* MAIN pages are born in slot 0; persistent selectors can later choose 1/2. */
+/* A zero selector chooses slot 0; WAL-backed shifts can choose slots 1 or 2. */
 static inline bool
-UmbraMainActiveSlotIsValid(uint8 active_slot)
+UmbraActiveSlotIsValid(uint8 active_slot)
 {
 	return active_slot < UMBRA_CHUNK_ACTIVE_SLOTS;
 }
 
 static inline uint8
-UmbraMainNextActiveSlot(uint8 active_slot)
+UmbraNextActiveSlot(uint8 active_slot)
 {
-	Assert(UmbraMainActiveSlotIsValid(active_slot));
+	Assert(UmbraActiveSlotIsValid(active_slot));
 	return active_slot == UMBRA_CHUNK_ACTIVE_SLOTS - 1 ? 0 : active_slot + 1;
 }
 
 static inline uint8
-UmbraMainPreviousActiveSlot(uint8 active_slot)
+UmbraPreviousActiveSlot(uint8 active_slot)
 {
-	Assert(UmbraMainActiveSlotIsValid(active_slot));
+	Assert(UmbraActiveSlotIsValid(active_slot));
 	return active_slot == 0 ? UMBRA_CHUNK_ACTIVE_SLOTS - 1 : active_slot - 1;
 }
 
 static inline bool
-UmbraMainActiveSlotPhysicalBlock(BlockNumber logical_block, uint8 active_slot,
-								 BlockNumber *physical_block)
+UmbraActiveSlotPhysicalBlock(BlockNumber logical_block, uint8 active_slot,
+							BlockNumber *physical_block)
 {
 	uint64		chunk;
 	uint64		offset;
 	uint64		physical;
 
-	Assert(UmbraMainActiveSlotIsValid(active_slot));
+	Assert(UmbraActiveSlotIsValid(active_slot));
 	chunk = (uint64) logical_block / UMBRA_CHUNK_PAIRED_PAGES;
 	offset = (uint64) logical_block % UMBRA_CHUNK_PAIRED_PAGES;
 	physical = chunk *
@@ -84,16 +84,10 @@ UmbraMainActiveSlotPhysicalBlock(BlockNumber logical_block, uint8 active_slot,
 	return true;
 }
 
+/* Reserve all three physical slots for every logical chunk. */
 static inline bool
-UmbraSlot0PhysicalBlock(BlockNumber logical_block,
-					 BlockNumber *physical_block)
-{
-	return UmbraMainActiveSlotPhysicalBlock(logical_block, 0, physical_block);
-}
-
-static inline bool
-UmbraSlot0PhysicalCapacity(BlockNumber logical_eof,
-					  BlockNumber *physical_capacity)
+UmbraMappedPhysicalCapacity(BlockNumber logical_eof,
+						BlockNumber *physical_capacity)
 {
 	uint64		chunks;
 	uint64		capacity;
@@ -115,25 +109,16 @@ UmbraSlot0PhysicalCapacity(BlockNumber logical_eof,
 	return true;
 }
 
-/* MAIN/FSM/VM share the slot-0 formula; only MAIN later selects other slots. */
 static inline bool
-UmbraMainSlot0PhysicalBlock(BlockNumber logical_block,
-						BlockNumber *physical_block)
-{
-	return UmbraSlot0PhysicalBlock(logical_block, physical_block);
-}
-
-static inline bool
-UmbraMainSlot0PhysicalCapacity(BlockNumber logical_eof,
-						   BlockNumber *physical_capacity)
-{
-	return UmbraSlot0PhysicalCapacity(logical_eof, physical_capacity);
-}
-
-static inline bool
-UmbraAuxiliaryForkUsesSlot0(ForkNumber forknum)
+UmbraIsMappedAuxiliaryFork(ForkNumber forknum)
 {
 	return forknum == FSM_FORKNUM || forknum == VISIBILITYMAP_FORKNUM;
+}
+
+static inline bool
+UmbraForkUsesActiveSlots(ForkNumber forknum)
+{
+	return forknum == MAIN_FORKNUM || UmbraIsMappedAuxiliaryFork(forknum);
 }
 
 extern void uminit(void);

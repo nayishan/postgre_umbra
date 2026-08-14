@@ -60,9 +60,9 @@ extern void MapRedoSetActiveSlot(UmbraFileContext *ctx,
 								 ForkNumber forknum,
 								 BlockNumber logical_block, uint8 active_slot);
 extern void MapRedoSlotShift(UmbraFileContext *ctx,
-						 RelFileLocatorBackend rlocator,
-						 ForkNumber forknum,
-						 BlockNumber logical_block, uint8 source_slot,
-						 uint8 target_slot);
+					 RelFileLocatorBackend rlocator,
+					 ForkNumber forknum,
+					 BlockNumber logical_block, uint8 source_slot,
+					 uint8 target_slot);
 
 #endif                          /* UMBRA_MAP_H */

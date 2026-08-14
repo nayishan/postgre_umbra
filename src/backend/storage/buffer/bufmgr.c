@@ -3990,10 +3990,10 @@ BufferPublishUmbraSlotShift(Buffer buffer, XLogRecPtr shift_end_lsn,
 
 	if (!BufferIsValid(buffer) || BufferIsLocal(buffer) ||
 		!XLogRecPtrIsValid(shift_end_lsn) ||
-		!UmbraMainActiveSlotIsValid(source_slot) ||
-		!UmbraMainActiveSlotIsValid(target_slot))
+		!UmbraActiveSlotIsValid(source_slot) ||
+		!UmbraActiveSlotIsValid(target_slot))
 		return;
-	Assert(UmbraMainNextActiveSlot(source_slot) == target_slot);
+	Assert(UmbraNextActiveSlot(source_slot) == target_slot);
 	Assert(BufferIsPinned(buffer));
 
 	epoch = CheckpointBufferActiveEpoch();
@@ -4001,7 +4001,7 @@ BufferPublishUmbraSlotShift(Buffer buffer, XLogRecPtr shift_end_lsn,
 
 	buf = GetBufferDescriptor(buffer - 1);
 	(void) LockBufHdr(buf);
-	Assert(!UmbraMainActiveSlotIsValid(UmbraBufferActiveSlots[buf->buf_id]) ||
+	Assert(!UmbraActiveSlotIsValid(UmbraBufferActiveSlots[buf->buf_id]) ||
 		   UmbraBufferActiveSlots[buf->buf_id] == source_slot ||
 		   UmbraBufferActiveSlots[buf->buf_id] == target_slot);
 	UmbraBufferActiveSlots[buf->buf_id] = target_slot;
@@ -4749,8 +4749,8 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 		active_slot = UmbraBufferActiveSlots[buf->buf_id];
 		if (epoch != 0 && (buf_state & BM_CHECKPOINT_NEEDED) != 0 &&
 			CkptBufferShiftEpochs[buf->buf_id] == epoch &&
-			UmbraMainActiveSlotIsValid(active_slot))
-			checkpoint_source_slot = UmbraMainPreviousActiveSlot(active_slot);
+			UmbraActiveSlotIsValid(active_slot))
+			checkpoint_source_slot = UmbraPreviousActiveSlot(active_slot);
 		UnlockBufHdr(buf);
 	}
 #endif
@@ -4811,7 +4811,7 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	io_start = pgstat_prepare_io_time(track_io_timing);
 
 #ifdef USE_UMBRA
-	if (UmbraMainActiveSlotIsValid(checkpoint_source_slot))
+	if (UmbraActiveSlotIsValid(checkpoint_source_slot))
 		checkpoint_directed = UmCheckpointWriteSourceSlot(reln,
 											  BufTagGetForkNum(&buf->tag),
 											  buf->tag.blockNum,
@@ -7639,7 +7639,7 @@ TerminateBufferIOWithActiveSlot(BufferDesc *buf, bool clear_dirty,
 
 	Assert(buf_state & BM_IO_IN_PROGRESS);
 #ifdef USE_UMBRA
-	if (UmbraMainActiveSlotIsValid(active_slot))
+	if (UmbraActiveSlotIsValid(active_slot))
 	{
 		Assert(set_flag_bits & BM_VALID);
 		UmbraBufferActiveSlots[buf->buf_id] = active_slot;
@@ -7716,7 +7716,7 @@ BufferGetUmbraActiveSlot(Buffer buffer, uint8 *active_slot)
 	buf_state = LockBufHdr(buf);
 	slot = UmbraBufferActiveSlots[buf->buf_id];
 	UnlockBufHdr(buf);
-	if ((buf_state & BM_VALID) == 0 || !UmbraMainActiveSlotIsValid(slot))
+	if ((buf_state & BM_VALID) == 0 || !UmbraActiveSlotIsValid(slot))
 		return false;
 	*active_slot = slot;
 	return true;
@@ -7729,7 +7729,7 @@ BufferRememberUmbraActiveSlot(Buffer buffer, uint8 active_slot)
 	uint64		buf_state;
 
 	if (!BufferIsValid(buffer) || BufferIsLocal(buffer) ||
-		!UmbraMainActiveSlotIsValid(active_slot))
+		!UmbraActiveSlotIsValid(active_slot))
 		return;
 	Assert(BufferIsPinned(buffer));
 
@@ -8142,7 +8142,7 @@ IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
 		currlocator = BufTagGetRelFileLocator(&tag);
 
 #ifdef USE_UMBRA
-		if (UmbraMainActiveSlotIsValid(cur->checkpoint_source_slot))
+		if (UmbraActiveSlotIsValid(cur->checkpoint_source_slot))
 		{
 			reln = smgropen(currlocator, INVALID_PROC_NUMBER);
 			UmCheckpointWritebackSourceSlot(reln, BufTagGetForkNum(&tag),
@@ -8162,7 +8162,7 @@ IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
 			next = &wb_context->pending_writebacks[i + ahead + 1];
 
 #ifdef USE_UMBRA
-			if (UmbraMainActiveSlotIsValid(next->checkpoint_source_slot))
+			if (UmbraActiveSlotIsValid(next->checkpoint_source_slot))
 				break;
 #endif
 
@@ -9033,7 +9033,7 @@ buffer_readv_complete_one(PgAioTargetData *td, uint8 buf_off, Buffer buffer,
 	set_flag_bits = failed ? BM_IO_ERROR : BM_VALID;
 #ifdef USE_UMBRA
 	if (!failed && !is_temp && td->smgr.nblocks == 1 &&
-		UmbraMainActiveSlotIsValid(td->smgr.umbraActiveSlot))
+		UmbraActiveSlotIsValid(td->smgr.umbraActiveSlot))
 	{
 		Assert(buf_off == 0);
 		active_slot = td->smgr.umbraActiveSlot;

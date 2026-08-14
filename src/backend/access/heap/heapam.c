@@ -2575,7 +2575,14 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			XLogRegisterData(xlrec, tupledata - scratch.data);
 			XLogRegisterBuffer(0, buffer, REGBUF_STANDARD | bufflags);
 			if (all_frozen_set)
-				XLogRegisterBuffer(1, vmbuffer, 0);
+			{
+				uint8		vm_regbuf_flags = 0;
+
+				/* VM redo can initialize a new page from the record's vmflags. */
+				if (!XLogRecPtrIsValid(PageGetLSN(BufferGetPage(vmbuffer))))
+					vm_regbuf_flags |= REGBUF_NO_IMAGE;
+				XLogRegisterBuffer(1, vmbuffer, vm_regbuf_flags);
+			}
 
 			XLogRegisterBufData(0, tupledata, totaldatalen);
 

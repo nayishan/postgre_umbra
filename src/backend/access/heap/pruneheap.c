@@ -2572,6 +2572,7 @@ log_heap_prune_and_freeze(Relation relation, Buffer buffer,
 	XLogRecPtr	recptr;
 	uint8		info;
 	uint8		regbuf_flags_heap;
+	uint8		regbuf_flags_vm = 0;
 
 	Page		heap_page = BufferGetPage(buffer);
 
@@ -2620,7 +2621,12 @@ log_heap_prune_and_freeze(Relation relation, Buffer buffer,
 	XLogRegisterBuffer(0, buffer, regbuf_flags_heap);
 
 	if (do_set_vm)
-		XLogRegisterBuffer(1, vmbuffer, 0);
+	{
+		/* VM redo can initialize a new page from the record's vmflags. */
+		if (!XLogRecPtrIsValid(PageGetLSN(BufferGetPage(vmbuffer))))
+			regbuf_flags_vm |= REGBUF_NO_IMAGE;
+		XLogRegisterBuffer(1, vmbuffer, regbuf_flags_vm);
+	}
 
 	if (nfrozen > 0)
 	{

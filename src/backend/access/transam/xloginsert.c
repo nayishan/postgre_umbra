@@ -1576,7 +1576,8 @@ static bool
 XLogBlockSlotShiftEligible(registered_buffer *regbuf, RmgrId rmid, uint8 info)
 {
 	Assert(regbuf != NULL);
-	return regbuf->from_shared_buffer && regbuf->forkno == MAIN_FORKNUM &&
+	return regbuf->from_shared_buffer &&
+		UmbraForkUsesActiveSlots(regbuf->forkno) &&
 		(regbuf->flags & (REGBUF_FORCE_IMAGE | REGBUF_NO_IMAGE |
 						  REGBUF_NO_CHANGE | REGBUF_WILL_INIT)) == 0 &&
 		(info & XLR_CHECK_CONSISTENCY) == 0 &&
