@@ -710,7 +710,8 @@ static void FlushBuffer(BufferDesc *buf, SMgrRelation reln,
 						BufferWritebackTargets *writeback_targets);
 #ifdef USE_UMBRA
 #define CKPT_BUFFER_EPOCH_ACTIVE	(UINT64CONST(1) << 63)
-#define CKPT_BUFFER_EPOCH_MASK	(~CKPT_BUFFER_EPOCH_ACTIVE)
+#define CKPT_BUFFER_EPOCH_MASK \
+	(UMBRA_BUFFER_STATE_EPOCH_MASK >> UMBRA_BUFFER_STATE_EPOCH_SHIFT)
 static bool CkptBufferIdsPrepared = false;
 static int	CkptBufferIdsPreparedCount = 0;
 static uint64 CheckpointBufferActiveEpoch(void);
@@ -718,6 +719,43 @@ static void CheckpointBufferCaptureBegin(void);
 static void CheckpointBufferCaptureEnd(void);
 static void ClearCheckpointBufferShiftEpoch(BufferDesc *buf);
 static void TerminateCheckpointBufferIO(BufferDesc *buf);
+
+static inline uint8
+BufferDescGetUmbraActiveSlot(const BufferDesc *buf)
+{
+	return (uint8) (buf->umbra_state & UMBRA_BUFFER_STATE_SLOT_MASK);
+}
+
+static inline bool
+BufferDescSelectorPagePresent(const BufferDesc *buf)
+{
+	return (buf->umbra_state & UMBRA_BUFFER_STATE_SELECTOR_PRESENT) != 0;
+}
+
+static inline uint64
+BufferDescGetCheckpointShiftEpoch(const BufferDesc *buf)
+{
+	return buf->umbra_state >> UMBRA_BUFFER_STATE_EPOCH_SHIFT;
+}
+
+static inline void
+BufferDescSetUmbraActiveSlot(BufferDesc *buf, uint8 active_slot,
+							 bool selector_page_present)
+{
+	Assert(active_slot <= UMBRA_BUFFER_STATE_SLOT_MASK);
+	buf->umbra_state &= UMBRA_BUFFER_STATE_EPOCH_MASK;
+	buf->umbra_state |= active_slot;
+	if (selector_page_present)
+		buf->umbra_state |= UMBRA_BUFFER_STATE_SELECTOR_PRESENT;
+}
+
+static inline void
+BufferDescSetCheckpointShiftEpoch(BufferDesc *buf, uint64 epoch)
+{
+	Assert(epoch <= CKPT_BUFFER_EPOCH_MASK);
+	buf->umbra_state &= ~UMBRA_BUFFER_STATE_EPOCH_MASK;
+	buf->umbra_state |= epoch << UMBRA_BUFFER_STATE_EPOCH_SHIFT;
+}
 #endif
 static void FindAndDropRelationBuffers(RelFileLocator rlocator,
 									   ForkNumber forkNum,
@@ -4068,6 +4106,7 @@ BufferPublishUmbraSlotShift(Buffer buffer, XLogRecPtr shift_end_lsn,
 {
 	BufferDesc *buf;
 	uint64		epoch = 0;
+	uint8		active_slot;
 	bool		capture_epoch = false;
 
 	if (!BufferIsValid(buffer) || BufferIsLocal(buffer) ||
@@ -4086,16 +4125,15 @@ BufferPublishUmbraSlotShift(Buffer buffer, XLogRecPtr shift_end_lsn,
 
 	buf = GetBufferDescriptor(buffer - 1);
 	(void) LockBufHdr(buf);
-	Assert(!UmbraActiveSlotIsValid(UmbraBufferActiveSlots[buf->buf_id]) ||
-		   UmbraBufferActiveSlots[buf->buf_id] == source_slot ||
-		   UmbraBufferActiveSlots[buf->buf_id] == target_slot);
-	UmbraBufferActiveSlots[buf->buf_id] = target_slot;
-	UmbraBufferSelectorPagePresent[buf->buf_id] = true;
+	active_slot = BufferDescGetUmbraActiveSlot(buf);
+	Assert(!UmbraActiveSlotIsValid(active_slot) ||
+		   active_slot == source_slot || active_slot == target_slot);
+	BufferDescSetUmbraActiveSlot(buf, target_slot, true);
 	if (capture_epoch && CheckpointBufferActiveEpoch() == epoch)
 	{
 		/* A buffer can shift at most once in one checkpoint epoch. */
-		Assert(CkptBufferShiftEpochs[buf->buf_id] != epoch);
-		CkptBufferShiftEpochs[buf->buf_id] = epoch;
+		Assert(BufferDescGetCheckpointShiftEpoch(buf) != epoch);
+		BufferDescSetCheckpointShiftEpoch(buf, epoch);
 	}
 	UnlockBufHdr(buf);
 }
@@ -4103,7 +4141,7 @@ BufferPublishUmbraSlotShift(Buffer buffer, XLogRecPtr shift_end_lsn,
 static void
 ClearCheckpointBufferShiftEpoch(BufferDesc *buf)
 {
-	CkptBufferShiftEpochs[buf->buf_id] = 0;
+	BufferDescSetCheckpointShiftEpoch(buf, 0);
 }
 #endif
 
@@ -4838,9 +4876,9 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 
 		buf_state = LockBufHdr(buf);
 		epoch = CheckpointBufferActiveEpoch();
-		active_slot = UmbraBufferActiveSlots[buf->buf_id];
+		active_slot = BufferDescGetUmbraActiveSlot(buf);
 		if (epoch != 0 && (buf_state & BM_CHECKPOINT_NEEDED) != 0 &&
-			CkptBufferShiftEpochs[buf->buf_id] == epoch &&
+			BufferDescGetCheckpointShiftEpoch(buf) == epoch &&
 			UmbraActiveSlotIsValid(active_slot))
 			checkpoint_source_slot = UmbraPreviousActiveSlot(active_slot);
 		UnlockBufHdr(buf);
@@ -8162,8 +8200,7 @@ TerminateBufferIOWithActiveSlot(BufferDesc *buf, bool clear_dirty,
 	{
 		Assert(set_flag_bits & BM_VALID);
 		Assert(selector_page_present || active_slot == 0);
-		UmbraBufferActiveSlots[buf->buf_id] = active_slot;
-		UmbraBufferSelectorPagePresent[buf->buf_id] = selector_page_present;
+		BufferDescSetUmbraActiveSlot(buf, active_slot, selector_page_present);
 	}
 #else
 	Assert(active_slot == UINT8_MAX);
@@ -8239,9 +8276,9 @@ BufferGetUmbraActiveSlot(Buffer buffer, uint8 *active_slot,
 
 	buf = GetBufferDescriptor(buffer - 1);
 	buf_state = LockBufHdr(buf);
-	slot = UmbraBufferActiveSlots[buf->buf_id];
+	slot = BufferDescGetUmbraActiveSlot(buf);
 	if (selector_page_present != NULL)
-		*selector_page_present = UmbraBufferSelectorPagePresent[buf->buf_id];
+		*selector_page_present = BufferDescSelectorPagePresent(buf);
 	UnlockBufHdr(buf);
 	if ((buf_state & BM_VALID) == 0 || !UmbraActiveSlotIsValid(slot))
 		return false;
@@ -8265,8 +8302,7 @@ BufferRememberUmbraActiveSlot(Buffer buffer, uint8 active_slot,
 	buf = GetBufferDescriptor(buffer - 1);
 	buf_state = LockBufHdr(buf);
 	Assert(buf_state & BM_VALID);
-	UmbraBufferActiveSlots[buf->buf_id] = active_slot;
-	UmbraBufferSelectorPagePresent[buf->buf_id] = selector_page_present;
+	BufferDescSetUmbraActiveSlot(buf, active_slot, selector_page_present);
 	UnlockBufHdr(buf);
 }
 
@@ -8274,8 +8310,7 @@ static void
 InvalidateUmbraBufferActiveSlot(BufferDesc *buf)
 {
 	Assert(pg_atomic_read_u64(&buf->state) & BM_LOCKED);
-	UmbraBufferActiveSlots[buf->buf_id] = UMBRA_ACTIVE_SLOT_INVALID;
-	UmbraBufferSelectorPagePresent[buf->buf_id] = false;
+	BufferDescSetUmbraActiveSlot(buf, UMBRA_BUFFER_STATE_SLOT_MASK, false);
 }
 
 /* A source-slot write satisfies this checkpoint, not the current selector. */

@@ -356,6 +356,14 @@ typedef struct BufferDesc
 	 * buffer header spinlock.
 	 */
 	proclist_head lock_waiters;
+
+#ifdef USE_UMBRA
+	/*
+	 * Active slot, selector-page presence, and checkpoint shift epoch.
+	 * Protected by the buffer header spinlock.
+	 */
+	uint64		umbra_state;
+#endif
 } BufferDesc;
 
 /*
@@ -380,11 +388,25 @@ typedef struct BufferDesc
  */
 #define BUFFERDESC_PAD_TO_SIZE	(SIZEOF_VOID_P == 8 ? 64 : 1)
 
+#ifdef USE_UMBRA
+/* Low three bits describe the mapping; upper bits hold the shift epoch. */
+#define UMBRA_BUFFER_STATE_SLOT_MASK			UINT64CONST(0x3)
+#define UMBRA_BUFFER_STATE_SELECTOR_PRESENT	(UINT64CONST(1) << 2)
+#define UMBRA_BUFFER_STATE_EPOCH_SHIFT		3
+#define UMBRA_BUFFER_STATE_EPOCH_MASK			(~UINT64CONST(0x7))
+#define UMBRA_BUFFER_STATE_INITIAL				UMBRA_BUFFER_STATE_SLOT_MASK
+#endif
+
 typedef union BufferDescPadded
 {
 	BufferDesc	bufferdesc;
 	char		pad[BUFFERDESC_PAD_TO_SIZE];
 } BufferDescPadded;
+
+#if defined(USE_UMBRA) && SIZEOF_VOID_P == 8
+StaticAssertDecl(sizeof(BufferDesc) == BUFFERDESC_PAD_TO_SIZE,
+				 "Umbra buffer state must not enlarge BufferDescPadded");
+#endif
 
 /*
  * The PendingWriteback & WritebackContext structure are used to keep
@@ -433,10 +455,7 @@ extern PGDLLIMPORT BufferDescPadded *BufferDescriptors;
 extern PGDLLIMPORT ConditionVariableMinimallyPadded *BufferIOCVArray;
 extern PGDLLIMPORT WritebackContext BackendWritebackContext;
 #ifdef USE_UMBRA
-extern PGDLLIMPORT uint8 *UmbraBufferActiveSlots;
-extern PGDLLIMPORT uint64 *CkptBufferShiftEpochs;
 extern PGDLLIMPORT pg_atomic_uint64 *CkptBufferCaptureEpoch;
-extern PGDLLIMPORT bool *UmbraBufferSelectorPagePresent;
 #endif
 
 /* in localbuf.c */
