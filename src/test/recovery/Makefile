@@ -14,7 +14,8 @@ EXTRA_INSTALL=contrib/pageinspect \
 	contrib/pg_stat_statements \
 	contrib/pg_visibility \
 	contrib/test_decoding \
-	src/test/modules/injection_points
+	src/test/modules/injection_points \
+	src/test/modules/test_aio
 
 subdir = src/test/recovery
 top_builddir = ../../..

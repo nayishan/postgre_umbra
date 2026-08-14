@@ -9638,10 +9638,10 @@ buffer_readv_complete_one(PgAioTargetData *td, uint8 buf_off, Buffer buffer,
 	/* Terminate I/O and set BM_VALID. */
 	set_flag_bits = failed ? BM_IO_ERROR : BM_VALID;
 #ifdef USE_UMBRA
-	if (!failed && !is_temp && td->smgr.nblocks == 1 &&
+	if (!failed && !is_temp &&
 		UmbraActiveSlotIsValid(td->smgr.umbraActiveSlot))
 	{
-		Assert(buf_off == 0);
+		/* Umbra only assigns this selector to one physically contiguous run. */
 		active_slot = td->smgr.umbraActiveSlot;
 		selector_page_present = td->smgr.umbraSelectorPagePresent;
 	}
