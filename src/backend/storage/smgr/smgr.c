@@ -146,9 +146,11 @@ typedef struct f_smgr
 	void		(*smgr_unlink) (RelFileLocatorBackend rlocator, ForkNumber forknum,
 								bool isRedo);
 	void		(*smgr_extend) (SMgrRelation reln, ForkNumber forknum,
-								BlockNumber blocknum, const void *buffer, bool skipFsync);
+								BlockNumber blocknum, const void *buffer,
+								bool skipFsync, BlockNumber *physical_block);
 	void		(*smgr_zeroextend) (SMgrRelation reln, ForkNumber forknum,
-									BlockNumber blocknum, int nblocks, bool skipFsync);
+									BlockNumber blocknum, int nblocks,
+									bool skipFsync, BlockNumber *physical_blocks);
 	bool		(*smgr_prefetch) (SMgrRelation reln, ForkNumber forknum,
 								  BlockNumber blocknum, int nblocks);
 	uint32		(*smgr_maxcombine) (SMgrRelation reln, ForkNumber forknum,
@@ -163,9 +165,13 @@ typedef struct f_smgr
 	void		(*smgr_writev) (SMgrRelation reln, ForkNumber forknum,
 								BlockNumber blocknum,
 								const void **buffers, BlockNumber nblocks,
-								bool skipFsync);
+								bool skipFsync, BlockNumber *physical_blocks);
 	void		(*smgr_writeback) (SMgrRelation reln, ForkNumber forknum,
 								   BlockNumber blocknum, BlockNumber nblocks);
+	void		(*smgr_writeback_physical) (SMgrRelation reln,
+											ForkNumber forknum,
+											BlockNumber physical_blocknum,
+											BlockNumber nblocks);
 	BlockNumber (*smgr_nblocks) (SMgrRelation reln, ForkNumber forknum);
 	/*
 	 * Prepare selected-smgr state before smgrtruncate() enters its critical
@@ -222,6 +228,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_startreadv = mdstartreadv,
 		.smgr_writev = mdwritev,
 		.smgr_writeback = mdwriteback,
+		.smgr_writeback_physical = mdwritebackphysical,
 		.smgr_nblocks = mdnblocks,
 		.smgr_prepare_truncate = NULL,
 		.smgr_truncate = mdtruncate,
@@ -258,6 +265,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_startreadv = umstartreadv,
 		.smgr_writev = umwritev,
 		.smgr_writeback = umwriteback,
+		.smgr_writeback_physical = umwritebackphysical,
 		.smgr_nblocks = umnblocks,
 		.smgr_prepare_truncate = umpreparetruncate,
 		.smgr_truncate = umtruncate,
@@ -884,10 +892,18 @@ void
 smgrextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		   const void *buffer, bool skipFsync)
 {
+	smgrextend_with_target(reln, forknum, blocknum, buffer, skipFsync, NULL);
+}
+
+void
+smgrextend_with_target(SMgrRelation reln, ForkNumber forknum,
+					   BlockNumber blocknum, const void *buffer,
+					   bool skipFsync, BlockNumber *physical_block)
+{
 	HOLD_INTERRUPTS();
 
 	smgrsw[reln->smgr_which].smgr_extend(reln, forknum, blocknum,
-										 buffer, skipFsync);
+										 buffer, skipFsync, physical_block);
 
 	/*
 	 * Normally we expect this to increase nblocks by one, but if the cached
@@ -913,10 +929,19 @@ void
 smgrzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 			   int nblocks, bool skipFsync)
 {
+	smgrzeroextend_with_targets(reln, forknum, blocknum, nblocks, skipFsync,
+								NULL);
+}
+
+void
+smgrzeroextend_with_targets(SMgrRelation reln, ForkNumber forknum,
+							BlockNumber blocknum, int nblocks,
+							bool skipFsync, BlockNumber *physical_blocks)
+{
 	HOLD_INTERRUPTS();
 
 	smgrsw[reln->smgr_which].smgr_zeroextend(reln, forknum, blocknum,
-											 nblocks, skipFsync);
+											 nblocks, skipFsync, physical_blocks);
 
 	/*
 	 * Normally we expect this to increase the fork size by nblocks, but if
@@ -1055,9 +1080,20 @@ void
 smgrwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		   const void **buffers, BlockNumber nblocks, bool skipFsync)
 {
+	smgrwritev_with_targets(reln, forknum, blocknum, buffers, nblocks,
+							skipFsync, NULL);
+}
+
+void
+smgrwritev_with_targets(SMgrRelation reln, ForkNumber forknum,
+						BlockNumber blocknum, const void **buffers,
+						BlockNumber nblocks, bool skipFsync,
+						BlockNumber *physical_blocks)
+{
 	HOLD_INTERRUPTS();
 	smgrsw[reln->smgr_which].smgr_writev(reln, forknum, blocknum,
-										 buffers, nblocks, skipFsync);
+										 buffers, nblocks, skipFsync,
+										 physical_blocks);
 	RESUME_INTERRUPTS();
 }
 
@@ -1072,6 +1108,20 @@ smgrwriteback(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	HOLD_INTERRUPTS();
 	smgrsw[reln->smgr_which].smgr_writeback(reln, forknum, blocknum,
 											nblocks);
+	RESUME_INTERRUPTS();
+}
+
+/*
+ * smgrwritebackphysical() -- Trigger kernel writeback for an exact physical
+ *                             range returned by the storage manager's write.
+ */
+void
+smgrwritebackphysical(SMgrRelation reln, ForkNumber forknum,
+					  BlockNumber physical_blocknum, BlockNumber nblocks)
+{
+	HOLD_INTERRUPTS();
+	smgrsw[reln->smgr_which].smgr_writeback_physical(reln, forknum,
+												 physical_blocknum, nblocks);
 	RESUME_INTERRUPTS();
 }
 

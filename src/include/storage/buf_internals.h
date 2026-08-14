@@ -390,11 +390,20 @@ typedef union BufferDescPadded
  * The PendingWriteback & WritebackContext structure are used to keep
  * information about pending flush requests to be issued to the OS.
  */
+typedef enum PendingWritebackKind
+{
+	PENDING_WB_REGULAR,
+	PENDING_WB_CHECKPOINT_SOURCE,
+	PENDING_WB_CHECKPOINT_FALLBACK,
+	PENDING_WB_EXTENSION,
+	PENDING_WB_KIND_COUNT
+} PendingWritebackKind;
+
 typedef struct PendingWriteback
 {
-	/* could store different types of pending flushes here */
 	BufferTag	tag;
-	uint8		checkpoint_source_slot;
+	BlockNumber physical_block;
+	uint8		kind;
 } PendingWriteback;
 
 /* struct forward declared in bufmgr.h */
@@ -405,6 +414,15 @@ typedef struct WritebackContext
 
 	/* current number of pending writeback requests */
 	int			nr_pending;
+
+	/* Optional aggregate diagnostics for this context's lifetime. */
+	bool		collect_stats;
+	uint64		input_blocks[PENDING_WB_KIND_COUNT];
+	uint64		unique_blocks;
+	uint64		issued_runs;
+	uint64		issued_blocks;
+	uint64		max_run_blocks;
+	uint64		run_length_counts[WRITEBACK_MAX_PENDING_FLUSHES + 1];
 
 	/* pending requests */
 	PendingWriteback pending_writebacks[WRITEBACK_MAX_PENDING_FLUSHES];
@@ -557,7 +575,8 @@ extern void WritebackContextInit(WritebackContext *context, int *max_pending);
 extern void IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context);
 extern void ScheduleBufferTagForWriteback(WritebackContext *wb_context,
 										  IOContext io_context, BufferTag *tag,
-										  uint8 checkpoint_source_slot);
+										  BlockNumber physical_block,
+										  PendingWritebackKind kind);
 
 extern void TrackNewBufferPin(Buffer buf);
 
