@@ -38,6 +38,9 @@
 #include <unistd.h>
 
 #include "access/tableam.h"
+#ifdef USE_UMBRA
+#include "access/xlog_internal.h"
+#endif
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
 #ifdef USE_ASSERT_CHECKING
@@ -49,6 +52,9 @@
 #include "executor/instrument.h"
 #include "lib/binaryheap.h"
 #include "miscadmin.h"
+#ifdef USE_UMBRA
+#include "port/pg_bitutils.h"
+#endif
 #include "pg_trace.h"
 #include "pgstat.h"
 #include "postmaster/bgwriter.h"
@@ -68,6 +74,9 @@
 #include "storage/umbra.h"
 #endif
 #include "utils/memdebug.h"
+#ifdef USE_UMBRA
+#include "utils/memutils.h"
+#endif
 #include "utils/ps_status.h"
 #include "utils/rel.h"
 #include "utils/resowner.h"
@@ -4055,7 +4064,7 @@ CheckpointBufferActiveEpoch(void)
 void
 BufferPublishUmbraSlotShift(Buffer buffer, XLogRecPtr shift_end_lsn,
 							uint8 source_slot,
-							uint8 target_slot)
+							uint8 target_slot, bool capture_checkpoint_shift)
 {
 	BufferDesc *buf;
 	uint64		epoch = 0;
@@ -4069,8 +4078,11 @@ BufferPublishUmbraSlotShift(Buffer buffer, XLogRecPtr shift_end_lsn,
 	Assert(UmbraNextActiveSlot(source_slot) == target_slot);
 	Assert(BufferIsPinned(buffer));
 
-	epoch = CheckpointBufferActiveEpoch();
-	capture_epoch = epoch != 0 && shift_end_lsn > GetRedoRecPtr();
+	if (capture_checkpoint_shift)
+	{
+		epoch = CheckpointBufferActiveEpoch();
+		capture_epoch = epoch != 0 && shift_end_lsn > GetRedoRecPtr();
+	}
 
 	buf = GetBufferDescriptor(buffer - 1);
 	(void) LockBufHdr(buf);
@@ -6076,9 +6088,299 @@ IncrBufferRefCount(Buffer buffer)
  * local buffers, repeated GetBufferDescriptor() and repeated reading of the
  * buffer's state sufficiently hurts the performance of BufferSetHintBits16().
  */
+#ifdef USE_UMBRA
+#define HINT_DELTA_MAX_SIZE (BLCKSZ + SizeOfXLogHintDeltaFragment)
+#define HINT_DELTA_MERGE_GAP SizeOfXLogHintDeltaFragment
+#define HINT_DELTA_BITMAP_WORDS (BLCKSZ / 64)
+#define HINT_DELTA_BITMAP_BYTES (HINT_DELTA_BITMAP_WORDS * sizeof(uint64))
+
+/* One reusable pair of scratch areas per single-threaded backend process. */
+static char *HintDeltaDataScratch = NULL;
+static uint64 *HintDeltaBitmapScratch = NULL;
+
+static inline void
+BufferHintDeltaSetBitmapRange(uint64 *bitmap, uint32 start, uint32 end)
+{
+	while (start < end)
+	{
+		uint32		wordno = start / 64;
+		uint32		bitno = start % 64;
+		uint32		nbits = Min(64 - bitno, end - start);
+		uint64		mask;
+
+		if (nbits == 64)
+			mask = UINT64_MAX;
+		else
+			mask = ((UINT64CONST(1) << nbits) - 1) << bitno;
+		bitmap[wordno] |= mask;
+		start += nbits;
+	}
+}
+
+static pg_noinline void
+BufferHintDeltaSwitchToBitmap(BufferHintDeltaContext *context,
+							  uint32 start, uint32 end)
+{
+	Assert(context->prepared);
+	Assert(context->bitmap == NULL);
+	Assert(HintDeltaBitmapScratch != NULL);
+	MemSet(HintDeltaBitmapScratch, 0, HINT_DELTA_BITMAP_BYTES);
+	context->bitmap = HintDeltaBitmapScratch;
+
+	for (int i = 0; i < context->nranges; i++)
+	{
+		BufferHintDeltaRange *range = &context->inline_ranges[i];
+
+		BufferHintDeltaSetBitmapRange(context->bitmap, range->offset,
+									  (uint32) range->offset + range->length);
+	}
+	BufferHintDeltaSetBitmapRange(context->bitmap, start, end);
+	context->nranges = 0;
+}
+
+void
+BufferRegisterHintDeltaRangeImpl(BufferHintDeltaContext *context,
+								 const void *ptr, Size length)
+{
+	Page		page;
+	uint32		start;
+	uint32		end;
+	BufferHintDeltaRange *ranges;
+
+	Assert(context != NULL);
+	Assert(context->prepared);
+	Assert(BufferIsValid(context->buffer));
+	Assert(length > 0 && length <= BLCKSZ);
+
+	page = BufferGetPage(context->buffer);
+	Assert((const char *) ptr >= page + offsetof(PageHeaderData, pd_flags));
+	Assert((const char *) ptr + length <= page + BLCKSZ);
+	start = (const char *) ptr - page;
+	end = start + length;
+
+	if (context->bitmap != NULL)
+	{
+		BufferHintDeltaSetBitmapRange(context->bitmap, start, end);
+		return;
+	}
+
+	ranges = context->inline_ranges;
+	if (context->nranges == 0)
+	{
+		ranges[0].offset = start;
+		ranges[0].length = end - start;
+		context->nranges = 1;
+		return;
+	}
+
+	/* Ordered page walks normally merge with, or append after, the last range. */
+	{
+		BufferHintDeltaRange *last = &ranges[context->nranges - 1];
+		uint32		last_end = (uint32) last->offset + last->length;
+
+		if (start >= last->offset)
+		{
+			if (start <= last_end + HINT_DELTA_MERGE_GAP)
+			{
+				if (end > last_end)
+					last->length = end - last->offset;
+				return;
+			}
+			if (context->nranges < BUFFER_HINT_DELTA_INLINE_RANGES)
+			{
+				last++;
+				last->offset = start;
+				last->length = end - start;
+				context->nranges++;
+				return;
+			}
+
+			BufferHintDeltaSwitchToBitmap(context, start, end);
+			return;
+		}
+	}
+
+	/* Rare out-of-order registrations use insertion/merge in the 16 slots. */
+	{
+		int			first = 0;
+		int			past = 0;
+		uint32		merged_start = start;
+		uint32		merged_end = end;
+		int			new_count;
+
+		while (first < context->nranges)
+		{
+			uint32		range_end = (uint32) ranges[first].offset +
+				ranges[first].length;
+
+			if (range_end + HINT_DELTA_MERGE_GAP >= merged_start)
+				break;
+			first++;
+		}
+
+		past = first;
+		while (past < context->nranges &&
+			   ranges[past].offset <= merged_end + HINT_DELTA_MERGE_GAP)
+		{
+			uint32		range_end = (uint32) ranges[past].offset +
+				ranges[past].length;
+
+			merged_start = Min(merged_start, (uint32) ranges[past].offset);
+			merged_end = Max(merged_end, range_end);
+			past++;
+		}
+
+		new_count = context->nranges - (past - first) + 1;
+		if (new_count > BUFFER_HINT_DELTA_INLINE_RANGES)
+		{
+			BufferHintDeltaSwitchToBitmap(context, start, end);
+			return;
+		}
+
+		memmove(&ranges[first + 1], &ranges[past],
+				(context->nranges - past) * sizeof(BufferHintDeltaRange));
+		ranges[first].offset = merged_start;
+		ranges[first].length = merged_end - merged_start;
+		context->nranges = new_count;
+	}
+}
+
+static inline char *
+BufferHintDeltaAppendFragment(char *ptr, const char *page,
+							  uint32 start, uint32 end)
+{
+	xl_hint_delta_fragment fragment;
+
+	fragment.offset = start;
+	fragment.length = end - start;
+	memcpy(ptr, &fragment, SizeOfXLogHintDeltaFragment);
+	ptr += SizeOfXLogHintDeltaFragment;
+	memcpy(ptr, page + start, fragment.length);
+	return ptr + fragment.length;
+}
+
+/* Build sorted final-byte ranges from inline ranges or the overflow bitmap. */
+uint32
+BufferBuildHintDelta(const BufferHintDeltaContext *context, char **data)
+{
+	const char *page;
+	char	   *delta;
+	char	   *ptr;
+
+	Assert(context != NULL);
+	Assert(data != NULL);
+	Assert(HintDeltaDataScratch != NULL);
+	page = BufferGetPage(context->buffer);
+	delta = HintDeltaDataScratch;
+	Assert(page != NULL);
+
+	ptr = delta;
+	if (context->bitmap == NULL)
+	{
+		for (int i = 0; i < context->nranges; i++)
+		{
+			const BufferHintDeltaRange *range = &context->inline_ranges[i];
+			uint32		end = (uint32) range->offset + range->length;
+
+			ptr = BufferHintDeltaAppendFragment(ptr, page, range->offset, end);
+		}
+	}
+	else
+	{
+		bool		have_range = false;
+		uint32		range_start = 0;
+		uint32		range_end = 0;
+
+		for (int wordno = 0; wordno < HINT_DELTA_BITMAP_WORDS; wordno++)
+		{
+			uint64		word = context->bitmap[wordno];
+
+			while (word != 0)
+			{
+				uint32		pos = wordno * 64 + pg_rightmost_one_pos64(word);
+
+				word &= word - 1;
+				if (!have_range)
+				{
+					range_start = pos;
+					range_end = pos + 1;
+					have_range = true;
+				}
+				else if (pos <= range_end + HINT_DELTA_MERGE_GAP)
+					range_end = pos + 1;
+				else
+				{
+					ptr = BufferHintDeltaAppendFragment(ptr, page,
+													  range_start, range_end);
+					range_start = pos;
+					range_end = pos + 1;
+				}
+			}
+		}
+
+		if (have_range)
+			ptr = BufferHintDeltaAppendFragment(ptr, page,
+										  range_start, range_end);
+	}
+
+	Assert(ptr <= delta + HINT_DELTA_MAX_SIZE);
+	*data = delta;
+	return ptr - delta;
+}
+
+static bool
+BufferHintDeltaCaptureNeeded(BufferDesc *bufHdr, uint64 lockstate)
+{
+	if ((lockstate & BM_DIRTY) != 0 ||
+		(lockstate & BM_PERMANENT) == 0 ||
+		BufTagGetForkNum(&bufHdr->tag) != MAIN_FORKNUM ||
+		!XLogHintBitIsNeeded() || RecoveryInProgress() ||
+		RelFileLocatorSkippingWAL(BufTagGetRelFileLocator(&bufHdr->tag)))
+		return false;
+	return true;
+}
+
+static bool
+PrepareBufferHintDelta(BufferDesc *bufHdr, uint64 lockstate)
+{
+	if (!BufferHintDeltaCaptureNeeded(bufHdr, lockstate))
+		return false;
+
+	Assert(CritSectionCount == 0);
+
+	if (HintDeltaDataScratch == NULL || HintDeltaBitmapScratch == NULL)
+	{
+		PG_TRY();
+		{
+			if (HintDeltaDataScratch == NULL)
+				HintDeltaDataScratch =
+					MemoryContextAlloc(TopMemoryContext, HINT_DELTA_MAX_SIZE);
+			if (HintDeltaBitmapScratch == NULL)
+				HintDeltaBitmapScratch =
+					MemoryContextAlloc(TopMemoryContext,
+								   HINT_DELTA_BITMAP_BYTES);
+		}
+		PG_CATCH();
+		{
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+	}
+
+	return true;
+}
+#endif
+
+#ifdef USE_UMBRA
+static inline void
+MarkSharedBufferDirtyHint(Buffer buffer, BufferDesc *bufHdr, uint64 lockstate,
+						  bool buffer_std,
+						  const BufferHintDeltaContext *hint_delta_context)
+#else
 static inline void
 MarkSharedBufferDirtyHint(Buffer buffer, BufferDesc *bufHdr, uint64 lockstate,
 						  bool buffer_std)
+#endif
 {
 	Page		page = BufferGetPage(buffer);
 
@@ -6104,10 +6406,8 @@ MarkSharedBufferDirtyHint(Buffer buffer, BufferDesc *bufHdr, uint64 lockstate,
 		uint64		buf_state;
 
 		/*
-		 * If we need to protect hint bit updates from torn writes, WAL-log a
-		 * full page image of the page. This full page image is only necessary
-		 * if the hint bit update is the first change to the page since the
-		 * last checkpoint.
+		 * If we need to protect hint bit updates from torn writes, WAL-log the
+		 * first change to a clean page.
 		 *
 		 * We don't check full_page_writes here because that logic is included
 		 * when we call XLogInsert() since the value changes dynamically.
@@ -6124,7 +6424,9 @@ MarkSharedBufferDirtyHint(Buffer buffer, BufferDesc *bufHdr, uint64 lockstate,
 			 */
 			if (RecoveryInProgress() ||
 				RelFileLocatorSkippingWAL(BufTagGetRelFileLocator(&bufHdr->tag)))
+			{
 				return;
+			}
 
 			wal_log = true;
 		}
@@ -6158,7 +6460,15 @@ MarkSharedBufferDirtyHint(Buffer buffer, BufferDesc *bufHdr, uint64 lockstate,
 		 * reduce the call rate...
 		 */
 		if (wal_log)
-			lsn = XLogSaveBufferForHint(buffer, buffer_std);
+		{
+#ifdef USE_UMBRA
+			if (hint_delta_context != NULL)
+				lsn = XLogSaveBufferForHintDelta(buffer, buffer_std,
+											 hint_delta_context);
+			else
+#endif
+				lsn = XLogSaveBufferForHint(buffer, buffer_std);
+		}
 
 		if (XLogRecPtrIsValid(lsn))
 		{
@@ -6217,9 +6527,14 @@ MarkBufferDirtyHint(Buffer buffer, bool buffer_std)
 		return;
 	}
 
+#ifdef USE_UMBRA
 	MarkSharedBufferDirtyHint(buffer, bufHdr,
 							  pg_atomic_read_u64(&bufHdr->state),
-							  buffer_std);
+							  buffer_std, NULL);
+#else
+	MarkSharedBufferDirtyHint(buffer, bufHdr,
+							  pg_atomic_read_u64(&bufHdr->state), buffer_std);
+#endif
 }
 
 /*
@@ -7442,6 +7757,32 @@ BufferBeginSetHintBits(Buffer buffer)
 	return SharedBufferBeginSetHintBits(buffer, buf_hdr, &lockstate);
 }
 
+#ifdef USE_UMBRA
+/* Begin a hint update whose changed ranges can be WAL-logged by Umbra. */
+bool
+BufferBeginHintDelta(Buffer buffer, BufferHintDeltaContext *context)
+{
+	BufferDesc *buf_hdr;
+	uint64		lockstate;
+
+	Assert(context != NULL);
+	context->buffer = buffer;
+	context->bitmap = NULL;
+	context->nranges = 0;
+	context->prepared = false;
+
+	if (BufferIsLocal(buffer))
+		return true;
+
+	buf_hdr = GetBufferDescriptor(buffer - 1);
+	if (!SharedBufferBeginSetHintBits(buffer, buf_hdr, &lockstate))
+		return false;
+
+	context->prepared = PrepareBufferHintDelta(buf_hdr, lockstate);
+	return true;
+}
+#endif
+
 /*
  * End a phase of setting hint bits on this buffer, started with
  * BufferBeginSetHintBits().
@@ -7461,6 +7802,52 @@ BufferFinishSetHintBits(Buffer buffer, bool mark_dirty, bool buffer_std)
 		MarkBufferDirtyHint(buffer, buffer_std);
 }
 
+#ifdef USE_UMBRA
+void
+BufferFinishHintDelta(BufferHintDeltaContext *context, bool mark_dirty,
+					  bool buffer_std)
+{
+	Buffer		buffer;
+
+	Assert(context != NULL);
+	buffer = context->buffer;
+	Assert(BufferIsValid(buffer));
+
+	if (mark_dirty)
+	{
+		if (BufferIsLocal(buffer))
+			MarkLocalBufferDirty(buffer);
+		else
+		{
+			BufferDesc *buf_hdr = GetBufferDescriptor(buffer - 1);
+			uint64		lockstate;
+
+			Assert(BufferIsLockedByMeInMode(buffer,
+								  BUFFER_LOCK_SHARE_EXCLUSIVE) ||
+				   BufferIsLockedByMeInMode(buffer, BUFFER_LOCK_EXCLUSIVE));
+			lockstate = pg_atomic_read_u64(&buf_hdr->state);
+			if (context->prepared && !(lockstate & BM_DIRTY))
+			{
+				if (context->bitmap == NULL && context->nranges == 0)
+				{
+					elog(ERROR, "Umbra hint delta has no registered byte ranges");
+				}
+			}
+			MarkSharedBufferDirtyHint(buffer, buf_hdr,
+								  lockstate,
+								  buffer_std,
+								  context->prepared && !(lockstate & BM_DIRTY) ?
+								  context : NULL);
+		}
+	}
+
+	context->buffer = InvalidBuffer;
+	context->bitmap = NULL;
+	context->nranges = 0;
+	context->prepared = false;
+}
+#endif
+
 /*
  * Try to set hint bits on a single 16bit value in a buffer.
  *
@@ -7478,12 +7865,20 @@ BufferSetHintBits16(uint16 *ptr, uint16 val, Buffer buffer)
 {
 	BufferDesc *buf_hdr;
 	uint64		lockstate;
+#ifdef USE_UMBRA
+	BufferHintDeltaContext hint_delta;
+#endif
 #ifdef USE_ASSERT_CHECKING
 	char	   *page;
 
 	/* verify that the address is on the page */
 	page = BufferGetPage(buffer);
 	Assert((char *) ptr >= page && (char *) ptr < (page + BLCKSZ));
+#endif
+
+#ifdef USE_UMBRA
+	if (*ptr == val)
+		return true;
 #endif
 
 	if (BufferIsLocal(buffer))
@@ -7499,9 +7894,20 @@ BufferSetHintBits16(uint16 *ptr, uint16 val, Buffer buffer)
 
 	if (SharedBufferBeginSetHintBits(buffer, buf_hdr, &lockstate))
 	{
+#ifdef USE_UMBRA
+		MemSet(&hint_delta, 0, sizeof(hint_delta));
+		hint_delta.buffer = buffer;
+		hint_delta.prepared = PrepareBufferHintDelta(buf_hdr, lockstate);
+		BufferRegisterHintDeltaRange(&hint_delta, ptr, sizeof(uint16));
+#endif
 		*ptr = val;
 
+#ifdef USE_UMBRA
+		MarkSharedBufferDirtyHint(buffer, buf_hdr, lockstate, true,
+							  hint_delta.prepared ? &hint_delta : NULL);
+#else
 		MarkSharedBufferDirtyHint(buffer, buf_hdr, lockstate, true);
+#endif
 
 		return true;
 	}

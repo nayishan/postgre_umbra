@@ -405,7 +405,7 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 		}
 		else
 		{
-			/* Materialize the old baseline before publishing the target. */
+			/* Materialize the recorded source before publishing the target. */
 			if (!UmRedoSetActiveSlot(reln, forknum, blkno,
 								 blkref->source_slot))
 			{

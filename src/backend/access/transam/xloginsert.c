@@ -95,6 +95,8 @@ typedef struct
 #ifdef USE_UMBRA
 	Buffer		buffer;
 	bool		from_shared_buffer;
+	const void *hint_delta_context;
+	XLogRecData hint_delta_rdata;
 	bool		slot_shift_in_record;
 	UmbraSlotShift slot_shift;
 #endif
@@ -170,7 +172,7 @@ static bool XLogCompressBackupBlock(const PageData *page, uint16 hole_offset,
 									uint16 hole_length, void *dest, uint16 *dlen);
 #ifdef USE_UMBRA
 static bool XLogBlockSlotShiftEligible(registered_buffer *regbuf,
-									   RmgrId rmid, uint8 info);
+										   RmgrId rmid, uint8 info);
 static void XLogPublishSlotShifts(XLogRecPtr record_endptr);
 #endif
 
@@ -267,6 +269,9 @@ XLogResetInsertion(void)
 #ifdef USE_UMBRA
 		registered_buffers[i].buffer = InvalidBuffer;
 		registered_buffers[i].from_shared_buffer = false;
+		registered_buffers[i].hint_delta_context = NULL;
+		MemSet(&registered_buffers[i].hint_delta_rdata, 0,
+			   sizeof(registered_buffers[i].hint_delta_rdata));
 		registered_buffers[i].slot_shift_in_record = false;
 		MemSet(&registered_buffers[i].slot_shift, 0,
 				   sizeof(registered_buffers[i].slot_shift));
@@ -329,6 +334,8 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
 #ifdef USE_UMBRA
 	regbuf->buffer = buffer;
 	regbuf->from_shared_buffer = true;
+	regbuf->hint_delta_context = NULL;
+	MemSet(&regbuf->hint_delta_rdata, 0, sizeof(regbuf->hint_delta_rdata));
 	regbuf->slot_shift_in_record = false;
 	MemSet(&regbuf->slot_shift, 0, sizeof(regbuf->slot_shift));
 #endif
@@ -357,6 +364,9 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
 
 	regbuf->in_use = true;
 }
+
+#ifdef USE_UMBRA
+#endif
 
 /*
  * Like XLogRegisterBuffer, but for registering a block that's not in the
@@ -388,6 +398,8 @@ XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator, ForkNumber forknum,
 #ifdef USE_UMBRA
 	regbuf->buffer = InvalidBuffer;
 	regbuf->from_shared_buffer = false;
+	regbuf->hint_delta_context = NULL;
+	MemSet(&regbuf->hint_delta_rdata, 0, sizeof(regbuf->hint_delta_rdata));
 	regbuf->slot_shift_in_record = false;
 	MemSet(&regbuf->slot_shift, 0, sizeof(regbuf->slot_shift));
 #endif
@@ -1131,6 +1143,10 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 	char	   *scratch = hdr_scratch;
 
 #ifdef USE_UMBRA
+	bool		hint_delta_selected = false;
+#endif
+
+#ifdef USE_UMBRA
 	curinsert_has_slot_shift = false;
 #endif
 
@@ -1182,6 +1198,16 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 			continue;
 #ifdef USE_UMBRA
 		regbuf->slot_shift_in_record = false;
+		if (regbuf->hint_delta_context != NULL)
+		{
+			Assert(regbuf->rdata_len == 0 ||
+				   regbuf->rdata_head == &regbuf->hint_delta_rdata);
+			regbuf->rdata_head = NULL;
+			regbuf->rdata_tail = (XLogRecData *) &regbuf->rdata_head;
+			regbuf->rdata_len = 0;
+			MemSet(&regbuf->hint_delta_rdata, 0,
+				   sizeof(regbuf->hint_delta_rdata));
+		}
 #endif
 
 		/* Determine if this block needs to be backed up */
@@ -1209,10 +1235,6 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 		}
 
 #ifdef USE_UMBRA
-		/*
-		 * Choose the source from the populated shared buffer, not from a MAP
-		 * page.  Publication below will reread that canonical selector.
-		 */
 		if (needs_backup && XLogBlockSlotShiftEligible(regbuf, rmid, info))
 		{
 			if (!regbuf->slot_shift.selected)
@@ -1235,7 +1257,31 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 			}
 			include_slot_shift = regbuf->slot_shift.selected;
 			if (include_slot_shift)
+			{
+				if (regbuf->hint_delta_context != NULL)
+				{
+					char	   *data;
+					uint32		len;
+
+					Assert(rmid == RM_XLOG_ID);
+					Assert((info & XLR_RMGR_INFO_MASK) == XLOG_FPI_FOR_HINT);
+					Assert(regbuf->rdata_len == 0);
+					len = BufferBuildHintDelta(regbuf->hint_delta_context,
+												   &data);
+					if (len == 0 || len >= BLCKSZ)
+						elog(PANIC, "invalid Umbra hint delta WAL data");
+					regbuf->hint_delta_rdata.data = data;
+					regbuf->hint_delta_rdata.len = len;
+					regbuf->hint_delta_rdata.next = NULL;
+					regbuf->rdata_head = &regbuf->hint_delta_rdata;
+					regbuf->rdata_tail = &regbuf->hint_delta_rdata;
+					regbuf->rdata_len = len;
+					hint_delta_selected = true;
+					if (wal_consistency_checking[RM_XLOG2_ID])
+						info |= XLR_CHECK_CONSISTENCY;
+				}
 				needs_backup = false;
+			}
 		}
 		else if (regbuf->slot_shift.selected)
 		{
@@ -1555,8 +1601,17 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 	if (total_len > XLogRecordMaxSize)
 		ereport(ERROR,
 				(errmsg_internal("oversized WAL record"),
-				 errdetail_internal("WAL record would be %" PRIu64 " bytes (of maximum %u bytes); rmid %u flags %u.",
+					 errdetail_internal("WAL record would be %" PRIu64 " bytes (of maximum %u bytes); rmid %u flags %u.",
 									total_len, XLogRecordMaxSize, rmid, info)));
+
+	if (hint_delta_selected)
+	{
+		Assert(rmid == RM_XLOG_ID);
+		Assert((info & XLR_RMGR_INFO_MASK) == XLOG_FPI_FOR_HINT);
+		rmid = RM_XLOG2_ID;
+		info = (info & (XLR_INFO_MASK | XLR_CHECK_CONSISTENCY)) |
+			XLOG2_HINT_DELTA;
+	}
 
 	/*
 	 * Fill in the fields in the record header. Prev-link is filled in later,
@@ -1584,10 +1639,9 @@ XLogBlockSlotShiftEligible(registered_buffer *regbuf, RmgrId rmid, uint8 info)
 		UmbraForkUsesActiveSlots(regbuf->forkno) &&
 		(regbuf->flags & (REGBUF_FORCE_IMAGE | REGBUF_NO_IMAGE |
 						  REGBUF_NO_CHANGE | REGBUF_WILL_INIT)) == 0 &&
-		(info & XLR_CHECK_CONSISTENCY) == 0 &&
-		!wal_consistency_checking[rmid] &&
 		!(rmid == RM_XLOG_ID &&
-		  (info & XLR_RMGR_INFO_MASK) == XLOG_FPI_FOR_HINT) &&
+		  (info & XLR_RMGR_INFO_MASK) == XLOG_FPI_FOR_HINT &&
+		  regbuf->hint_delta_context == NULL) &&
 		MyProc != NULL && LocalTransactionIdIsValid(MyProc->vxid.lxid) &&
 		!IsBootstrapProcessingMode() && !IsInitProcessingMode();
 }
@@ -1605,8 +1659,10 @@ XLogPublishSlotShifts(XLogRecPtr record_endptr)
 		BufferPublishUmbraSlotShift(regbuf->buffer,
 								record_endptr,
 								regbuf->slot_shift.source_slot,
-								regbuf->slot_shift.target_slot);
+								regbuf->slot_shift.target_slot,
+								regbuf->hint_delta_context == NULL);
 		UmPublishSlotShift(&regbuf->slot_shift, record_endptr);
+		regbuf->hint_delta_context = NULL;
 		regbuf->slot_shift_in_record = false;
 	}
 	curinsert_has_slot_shift = false;
@@ -1733,8 +1789,9 @@ XLogCheckBufferNeedsBackup(Buffer buffer)
  * this checkpoint round. The LSN of the inserted wal record is returned if we
  * had to write, InvalidXLogRecPtr otherwise.
  */
-XLogRecPtr
-XLogSaveBufferForHint(Buffer buffer, bool buffer_std)
+static XLogRecPtr
+XLogSaveBufferForHintInternal(Buffer buffer, bool buffer_std,
+							  const void *hint_delta_context)
 {
 	XLogRecPtr	recptr = InvalidXLogRecPtr;
 	XLogRecPtr	lsn;
@@ -1742,6 +1799,9 @@ XLogSaveBufferForHint(Buffer buffer, bool buffer_std)
 
 	/* this also verifies that we hold an appropriate lock */
 	Assert(BufferIsDirty(buffer));
+#ifndef USE_UMBRA
+	(void) hint_delta_context;
+#endif
 
 	/*
 	 * Update RedoRecPtr so that we can make the right decision. It's possible
@@ -1771,12 +1831,38 @@ XLogSaveBufferForHint(Buffer buffer, bool buffer_std)
 			flags |= REGBUF_STANDARD;
 
 		XLogRegisterBuffer(0, buffer, flags);
+#ifdef USE_UMBRA
+		if (hint_delta_context != NULL)
+		{
+			uint8			info = XLOG_FPI_FOR_HINT;
 
-		recptr = XLogInsert(RM_XLOG_ID, XLOG_FPI_FOR_HINT);
+			registered_buffers[0].hint_delta_context = hint_delta_context;
+			recptr = XLogInsert(RM_XLOG_ID, info);
+		}
+		else
+#endif
+			recptr = XLogInsert(RM_XLOG_ID, XLOG_FPI_FOR_HINT);
 	}
 
 	return recptr;
 }
+
+XLogRecPtr
+XLogSaveBufferForHint(Buffer buffer, bool buffer_std)
+{
+	return XLogSaveBufferForHintInternal(buffer, buffer_std, NULL);
+}
+
+#ifdef USE_UMBRA
+XLogRecPtr
+XLogSaveBufferForHintDelta(Buffer buffer, bool buffer_std,
+							 const void *hint_delta_context)
+{
+	Assert(hint_delta_context != NULL);
+	return XLogSaveBufferForHintInternal(buffer, buffer_std,
+									 hint_delta_context);
+}
+#endif
 
 /*
  * Write a WAL record containing a full image of a page. Caller is responsible

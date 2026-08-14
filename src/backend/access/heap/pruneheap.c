@@ -920,9 +920,29 @@ heap_page_fix_vm_corruption(PruneState *prstate, OffsetNumber offnum,
 	/* Avoid marking the buffer dirty if PD_ALL_VISIBLE is already clear */
 	if (do_clear_heap)
 	{
+#ifdef USE_UMBRA
+		BufferHintDeltaContext hint_delta;
+		bool		hint_delta_started;
+#endif
+
 		Assert(PageIsAllVisible(prstate->page));
+#ifdef USE_UMBRA
+		hint_delta_started =
+			BufferBeginHintDelta(prstate->buffer, &hint_delta);
+		if (hint_delta_started)
+			BufferRegisterHintDeltaRange(&hint_delta,
+									 &((PageHeader) prstate->page)->pd_flags,
+									 sizeof(((PageHeader) prstate->page)->pd_flags));
+#endif
 		PageClearAllVisible(prstate->page);
+#ifdef USE_UMBRA
+		if (hint_delta_started)
+			BufferFinishHintDelta(&hint_delta, true, true);
+		else
+			MarkBufferDirtyHint(prstate->buffer, true);
+#else
 		MarkBufferDirtyHint(prstate->buffer, true);
+#endif
 	}
 
 	if (do_clear_vm)
@@ -1019,8 +1039,28 @@ prune_freeze_fast_path(PruneState *prstate, PruneFreezeResult *presult)
 	/* Clear any stale prune hint */
 	if (TransactionIdIsValid(PageGetPruneXid(page)))
 	{
+#ifdef USE_UMBRA
+		BufferHintDeltaContext hint_delta;
+		bool		hint_delta_started;
+#endif
+
+#ifdef USE_UMBRA
+		hint_delta_started =
+			BufferBeginHintDelta(prstate->buffer, &hint_delta);
+		if (hint_delta_started)
+			BufferRegisterHintDeltaRange(&hint_delta,
+									 &((PageHeader) page)->pd_prune_xid,
+									 sizeof(((PageHeader) page)->pd_prune_xid));
+#endif
 		PageClearPrunable(page);
+#ifdef USE_UMBRA
+		if (hint_delta_started)
+			BufferFinishHintDelta(&hint_delta, true, true);
+		else
+			MarkBufferDirtyHint(prstate->buffer, true);
+#else
 		MarkBufferDirtyHint(prstate->buffer, true);
+#endif
 	}
 
 	if (PageIsEmpty(page))
@@ -1099,6 +1139,10 @@ heap_page_prune_and_freeze(PruneFreezeParams *params,
 	bool		do_hint_prune;
 	bool		do_set_vm;
 	bool		did_tuple_hint_fpi;
+#ifdef USE_UMBRA
+	bool		hint_delta_started = false;
+	BufferHintDeltaContext hint_delta;
+#endif
 	int64		fpi_before = pgWalUsage.wal_fpi;
 	TransactionId conflict_xid;
 
@@ -1226,6 +1270,23 @@ heap_page_prune_and_freeze(PruneFreezeParams *params,
 	if (do_set_vm)
 		LockBuffer(prstate.vmbuffer, BUFFER_LOCK_EXCLUSIVE);
 
+	/* Capture before the critical section can apply the hint-only change. */
+#ifdef USE_UMBRA
+	if (do_hint_prune && !do_freeze && !do_prune && !do_set_vm)
+	{
+		hint_delta_started = BufferBeginHintDelta(prstate.buffer, &hint_delta);
+		if (hint_delta_started)
+		{
+			BufferRegisterHintDeltaRange(&hint_delta,
+									 &((PageHeader) prstate.page)->pd_prune_xid,
+									 sizeof(((PageHeader) prstate.page)->pd_prune_xid));
+			BufferRegisterHintDeltaRange(&hint_delta,
+									 &((PageHeader) prstate.page)->pd_flags,
+									 sizeof(((PageHeader) prstate.page)->pd_flags));
+		}
+	}
+#endif
+
 	/* Any error while applying the changes is critical */
 	START_CRIT_SECTION();
 
@@ -1253,7 +1314,16 @@ heap_page_prune_and_freeze(PruneFreezeParams *params,
 		 * for the VM to be set and PD_ALL_VISIBLE to be clear.
 		 */
 		if (!do_freeze && !do_prune && !do_set_vm)
+		{
+#ifdef USE_UMBRA
+			if (hint_delta_started)
+				BufferFinishHintDelta(&hint_delta, true, true);
+			else
+				MarkBufferDirtyHint(prstate.buffer, true);
+#else
 			MarkBufferDirtyHint(prstate.buffer, true);
+#endif
+		}
 	}
 
 	if (do_prune || do_freeze || do_set_vm)

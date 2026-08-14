@@ -285,9 +285,10 @@ check_layout($minimal, 'umbra_slot0_minimal', $minimal_path,
 
 $minimal->stop;
 
-# A consistency FPI cannot carry a slot shift.  If its relation root has been
-# removed by a later DROP, redo must record an invalid-page dependency rather
-# than recreate and access the MAIN fork through the direct physical layout.
+# A checkpoint-first consistency-checked update retains its slot shift.  If
+# its relation root has been removed by a later DROP, redo must record an
+# invalid-page dependency rather than recreate and access the MAIN fork through
+# the direct physical layout.
 my $redo_policy = PostgreSQL::Test::Cluster->new('slot0_unknown_redo');
 $redo_policy->init(no_data_checksums => 1);
 $redo_policy->append_conf(
@@ -342,8 +343,9 @@ is(scalar(@redo_records), 1,
 	'ordinary update emits one target-block WAL record');
 like($redo_records[0] // '', qr/\bFPW\b/,
 	'consistency checking emits a full-page image');
-unlike($redo_records[0] // '', qr/slot shift:/,
-	'ordinary consistency FPI has no slot shift');
+like($redo_records[0] // '',
+	qr/slot shift: source_slot [0-2] target_slot [0-2]\b/,
+	'ordinary consistency FPI retains its slot shift');
 
 $redo_policy->safe_psql('postgres', 'DROP TABLE umbra_unknown_redo');
 my $redo_log_start = -s $redo_policy->logfile;

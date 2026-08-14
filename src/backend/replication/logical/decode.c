@@ -200,6 +200,9 @@ xlog2_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	switch (info)
 	{
 		case XLOG2_CHECKSUMS:
+#ifdef USE_UMBRA
+		case XLOG2_HINT_DELTA:
+#endif
 			break;
 		default:
 			elog(ERROR, "unexpected RM_XLOG2_ID record type: %u", info);

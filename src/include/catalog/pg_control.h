@@ -88,6 +88,9 @@ typedef struct CheckPoint
 
 /* XLOG info values for XLOG2 rmgr */
 #define XLOG2_CHECKSUMS					0x00
+#ifdef USE_UMBRA
+#define XLOG2_HINT_DELTA				0x10
+#endif
 
 
 /*
