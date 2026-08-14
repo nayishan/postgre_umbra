@@ -60,13 +60,15 @@ rightneighbor(int x)
  * The caller must hold an exclusive lock on the page.
  */
 bool
-fsm_set_avail(Page page, int slot, uint8 value)
+fsm_set_avail(Page page, int slot, uint8 value, bool *rebuilt)
 {
 	int			nodeno = NonLeafNodesPerPage + slot;
 	FSMPage		fsmpage = (FSMPage) PageGetContents(page);
 	uint8		oldvalue;
 
 	Assert(slot < LeafNodesPerPage);
+	if (rebuilt != NULL)
+		*rebuilt = false;
 
 	oldvalue = fsmpage->fp_nodes[nodeno];
 
@@ -107,7 +109,11 @@ fsm_set_avail(Page page, int slot, uint8 value)
 	 * top, the tree is corrupt.  If so, rebuild.
 	 */
 	if (value > fsmpage->fp_nodes[0])
+	{
 		fsm_rebuild_page(page);
+		if (rebuilt != NULL)
+			*rebuilt = true;
+	}
 
 	return true;
 }

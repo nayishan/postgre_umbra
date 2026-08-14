@@ -25,14 +25,29 @@ sub normalize_waldump_stderr
 
 sub read_active_slot
 {
-	my ($path, $block_size, $logical_block) = @_;
+	my ($path, $block_size, $fork, $logical_block) = @_;
 	my $entries_per_page = $block_size * 4;
 	my $page_index = int($logical_block / $entries_per_page);
 	my $entry_index = $logical_block % $entries_per_page;
-	my $group = int($page_index / 256);
-	my $map_block = 1 + $group * 258 + 2 + ($page_index % 256);
-	my $offset = $map_block * $block_size + int($entry_index / 4);
+	my $map_block;
+	my $offset;
 	my $byte;
+
+	if ($fork eq 'fsm')
+	{
+		$map_block = 1 + $page_index * 258;
+	}
+	elsif ($fork eq 'main')
+	{
+		my $group = int($page_index / 256);
+
+		$map_block = 1 + $group * 258 + 2 + ($page_index % 256);
+	}
+	else
+	{
+		BAIL_OUT("unsupported fork \"$fork\"");
+	}
+	$offset = $map_block * $block_size + int($entry_index / 4);
 
 	open(my $fh, '<', $path) or BAIL_OUT("could not open \"$path\": $!");
 	binmode($fh);
@@ -117,7 +132,8 @@ my $target_block = 0;
 
 is(xmin_is_committed($node, 'umbra_hint_delta'), 'f',
 	'checkpointed tuple has no committed hint bit');
-my $initial_slot = read_active_slot($map_path, $block_size, $target_block);
+my $initial_slot = read_active_slot(
+	$map_path, $block_size, 'main', $target_block);
 is($initial_slot, 0, 'checkpointed tuple starts at slot zero');
 
 my $wal_start = $node->safe_psql(
@@ -174,13 +190,13 @@ ok(!grep(/slot shift:/, @ordinary_updates),
 
 # mapwriter is disabled, so the selector on disk remains the old baseline
 # until crash redo publishes the durable HINT_DELTA target.
-is(read_active_slot($map_path, $block_size, $target_block), $source_slot,
+is(read_active_slot($map_path, $block_size, 'main', $target_block), $source_slot,
 	'selector target is not checkpointed before the immediate stop');
 $node->stop('immediate');
 $node->start;
 is(xmin_is_committed($node, 'umbra_hint_delta'), 't',
 	'crash redo restores the committed hint bit');
-is(read_active_slot($map_path, $block_size, $target_block), $target_slot,
+is(read_active_slot($map_path, $block_size, 'main', $target_block), $target_slot,
 	'crash redo publishes the HINT_DELTA selector target');
 is($node->safe_psql(
 		'postgres', q[SELECT payload FROM umbra_hint_delta WHERE id = 1;]),
@@ -289,8 +305,8 @@ is($node->safe_psql(
 		'postgres', q[SELECT payload FROM umbra_hint_delta_consistency WHERE id = 1;]),
 	'consistency', 'consistency-checked HINT_DELTA retains tuple data');
 
-# FSM uses MarkBufferDirtyHint() directly.  With full_page_writes enabled,
-# the generic hint record retains its full-page image and does not rotate.
+# Normal FSM maintenance changes one leaf and its ancestor chain.  It records
+# those bytes as a delta and rotates the mapped FSM block exactly once.
 $node->safe_psql(
 	'postgres', q[
 CREATE TABLE umbra_hint_delta_fsm(id integer, payload text)
@@ -301,9 +317,12 @@ VACUUM (ANALYZE) umbra_hint_delta_fsm;
 ]);
 my $fsm_filenode = $node->safe_psql(
 	'postgres', q[SELECT pg_relation_filenode('umbra_hint_delta_fsm'::regclass);]);
+my $fsm_relpath = $node->safe_psql(
+	'postgres', q[SELECT pg_relation_filepath('umbra_hint_delta_fsm'::regclass);]);
+my $fsm_map_path = $node->data_dir . "/${fsm_relpath}_map";
 cmp_ok($node->safe_psql(
 		'postgres', q[SELECT pg_relation_size('umbra_hint_delta_fsm', 'fsm');]),
-	'>', 0, 'FSM fork exists before hint FPI coverage');
+	'>', 0, 'FSM fork exists before hint delta coverage');
 $node->safe_psql(
 	'postgres', q[
 DELETE FROM umbra_hint_delta_fsm;
@@ -321,23 +340,43 @@ VACUUM (DISABLE_PAGE_SKIPPING, TRUNCATE FALSE) umbra_hint_delta_fsm;
 $node->safe_psql('postgres', 'SELECT pg_switch_wal();');
 my $fsm_wal_end = $node->safe_psql(
 	'postgres', 'SELECT pg_current_wal_flush_lsn();');
-my @fsm_wal = dump_wal($node, $fsm_wal_start, $fsm_wal_end, 'FSM hint FPI');
+my @fsm_wal = dump_wal($node, $fsm_wal_start, $fsm_wal_end, 'FSM hint delta');
 my @fsm_hint_fpi = grep {
 	/desc: FPI_FOR_HINT/ &&
 	/rel \d+\/\d+\/$fsm_filenode fork fsm blk \d+\b/
 } @fsm_wal;
-cmp_ok(scalar(@fsm_hint_fpi), '>=', 1,
-	'FSM maintenance emits at least one FPI_FOR_HINT record');
-ok(!grep(!/\bFPW\b/, @fsm_hint_fpi),
-	'FSM FPI_FOR_HINT retains a full-page image');
 my @fsm_hint_delta = grep {
 	/rmgr: XLOG2/ && /desc: HINT_DELTA/ &&
 	/rel \d+\/\d+\/$fsm_filenode fork fsm blk \d+\b/
 } @fsm_wal;
-is(scalar(@fsm_hint_delta), 0,
-	'FSM maintenance never emits HINT_DELTA');
-ok(!grep(/slot shift: source_slot [0-2] target_slot [0-2]/, @fsm_hint_fpi),
-	'FSM FPI_FOR_HINT does not carry an active-slot transition');
+cmp_ok(scalar(@fsm_hint_delta), '>=', 1,
+	'FSM maintenance emits HINT_DELTA records');
+ok(!grep(/\bFPW\b/, @fsm_hint_delta),
+	'FSM HINT_DELTA records do not carry full-page images');
+is(scalar(@fsm_hint_fpi), 0,
+	'normal FSM maintenance emits no FPI_FOR_HINT record');
+my $fsm_hint_record = $fsm_hint_delta[0] // '';
+my ($fsm_block) = $fsm_hint_record =~ /fork fsm blk (\d+)\b/;
+my ($fsm_source_slot, $fsm_target_slot) =
+	$fsm_hint_record =~ /slot shift: source_slot ([0-2]) target_slot ([0-2])\b/;
+ok(defined($fsm_block),
+	'FSM HINT_DELTA identifies its logical block');
+ok(defined($fsm_source_slot) && defined($fsm_target_slot),
+	'FSM HINT_DELTA records a source and target slot');
+SKIP:
+{
+	skip 'FSM HINT_DELTA lacks a selector transition', 2
+	  unless defined($fsm_block) && defined($fsm_source_slot) &&
+	  defined($fsm_target_slot);
+	is(read_active_slot($fsm_map_path, $block_size, 'fsm', $fsm_block),
+		$fsm_source_slot,
+		'FSM selector target is not checkpointed before the immediate stop');
+	$node->stop('immediate');
+	$node->start;
+	is(read_active_slot($fsm_map_path, $block_size, 'fsm', $fsm_block),
+		$fsm_target_slot,
+		'crash redo publishes the FSM HINT_DELTA selector target');
+}
 
 # A clean MAIN hint still uses the generic hint record when it does not need
 # an FPI.  HINT_DELTA is the slot-shift payload, not a replacement for every

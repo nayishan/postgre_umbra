@@ -110,9 +110,13 @@ static int	fsm_set_and_search(Relation rel, FSMAddress addr, uint16 slot,
 							   uint8 newValue, uint8 minValue);
 static BlockNumber fsm_search(Relation rel, uint8 min_cat);
 static uint8 fsm_vacuum_page(Relation rel, FSMAddress addr,
-							 BlockNumber start, BlockNumber end,
-							 bool *eof_p);
+								BlockNumber start, BlockNumber end,
+								bool *eof_p);
 static bool fsm_does_block_exist(Relation rel, BlockNumber blknumber);
+#ifdef USE_UMBRA
+static void fsm_set_avail_with_hint_delta(Buffer buffer, Page page,
+										  int slot, uint8 value);
+#endif
 
 
 /******** Public API ********/
@@ -243,7 +247,7 @@ XLogRecordPageWithFreeSpace(RelFileLocator rlocator, BlockNumber heapBlk,
 	 * need to use regular MarkBufferDirty here to mark the FSM block as
 	 * modified during recovery, otherwise changes to the FSM may be lost.
 	 */
-	if (fsm_set_avail(page, slot, new_cat))
+	if (fsm_set_avail(page, slot, new_cat, NULL))
 		MarkBufferDirty(buf);
 	UnlockReleaseBuffer(buf);
 }
@@ -647,6 +651,61 @@ fsm_extend(Relation rel, BlockNumber fsm_nblocks)
 							   RBM_ZERO_ON_ERROR);
 }
 
+#ifdef USE_UMBRA
+/* Register the leaf and every ancestor that fsm_set_avail() can update. */
+static void
+fsm_register_hint_delta_ranges(BufferHintDeltaContext *context, Page page,
+							   int slot)
+{
+	FSMPage		fsmpage = (FSMPage) PageGetContents(page);
+	int			nodeno = NonLeafNodesPerPage + slot;
+
+	for (;;)
+	{
+		BufferRegisterHintDeltaRange(context, &fsmpage->fp_nodes[nodeno],
+									 sizeof(fsmpage->fp_nodes[nodeno]));
+		if (nodeno == 0)
+			break;
+		nodeno = (nodeno - 1) / 2;
+	}
+}
+
+/*
+ * Normal FSM node updates change a leaf and its ancestor chain.  A rebuild
+ * can rewrite the entire non-leaf tree, so retain the generic FPI path there.
+ */
+static void
+fsm_set_avail_with_hint_delta(Buffer buffer, Page page, int slot, uint8 value)
+{
+	BufferHintDeltaContext context;
+	bool		changed;
+	bool		rebuilt;
+
+	if (!BufferBeginHintDelta(buffer, &context))
+		return;
+	fsm_register_hint_delta_ranges(&context, page, slot);
+	changed = fsm_set_avail(page, slot, value, &rebuilt);
+	if (rebuilt)
+	{
+		BufferFinishHintDelta(&context, false, false);
+		MarkBufferDirtyHint(buffer, false);
+	}
+	else
+		BufferFinishHintDelta(&context, changed, false);
+}
+#endif
+
+static void
+fsm_set_avail_and_mark_hint(Buffer buffer, Page page, int slot, uint8 value)
+{
+#ifdef USE_UMBRA
+	fsm_set_avail_with_hint_delta(buffer, page, slot, value);
+#else
+	if (fsm_set_avail(page, slot, value, NULL))
+		MarkBufferDirtyHint(buffer, false);
+#endif
+}
+
 /*
  * Set value in given FSM page and slot.
  *
@@ -667,8 +726,7 @@ fsm_set_and_search(Relation rel, FSMAddress addr, uint16 slot,
 
 	page = BufferGetPage(buf);
 
-	if (fsm_set_avail(page, slot, newValue))
-		MarkBufferDirtyHint(buf, false);
+	fsm_set_avail_and_mark_hint(buf, page, slot, newValue);
 
 	if (minValue != 0)
 	{
@@ -749,8 +807,7 @@ fsm_search(Relation rel, uint8 min_cat)
 				 */
 				page = BufferGetPage(buf);
 				LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-				fsm_set_avail(page, slot, 0);
-				MarkBufferDirtyHint(buf, false);
+				fsm_set_avail_and_mark_hint(buf, page, slot, 0);
 				UnlockReleaseBuffer(buf);
 				if (restarts++ > 10000) /* same rationale as below */
 					return InvalidBlockNumber;
@@ -905,8 +962,7 @@ fsm_vacuum_page(Relation rel, FSMAddress addr,
 			if (fsm_get_avail(page, slot) != child_avail)
 			{
 				LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-				fsm_set_avail(page, slot, child_avail);
-				MarkBufferDirtyHint(buf, false);
+				fsm_set_avail_and_mark_hint(buf, page, slot, child_avail);
 				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 			}
 		}

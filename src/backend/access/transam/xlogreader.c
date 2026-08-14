@@ -102,7 +102,10 @@ ValidateHintDeltaRecord(XLogReaderState *state, DecodedXLogRecord *decoded)
 	if (decoded->main_data_len != 0 || decoded->max_block_id != 0)
 		goto invalid;
 	block = &decoded->blocks[0];
-	if (!block->in_use || block->forknum != MAIN_FORKNUM ||
+	if (!block->in_use ||
+		(block->forknum != MAIN_FORKNUM &&
+		 block->forknum != FSM_FORKNUM &&
+		 block->forknum != VISIBILITYMAP_FORKNUM) ||
 		(block->flags & BKPBLOCK_WILL_INIT) != 0 ||
 		!block->has_slot_shift ||
 		block->target_slot >= 3 ||

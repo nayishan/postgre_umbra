@@ -9340,6 +9340,7 @@ xlog2_redo(XLogReaderState *record)
 	{
 		DecodedBkpBlock *block;
 		XLogRedoAction action;
+		ReadBufferMode mode;
 		Buffer		buffer;
 		char	   *data;
 		char	   *ptr;
@@ -9354,7 +9355,8 @@ xlog2_redo(XLogReaderState *record)
 			elog(PANIC, "invalid Umbra hint delta WAL record");
 
 		block = XLogRecGetBlock(record, 0);
-		if (block->forknum != MAIN_FORKNUM || !block->has_slot_shift ||
+		if (!UmbraForkUsesActiveSlots(block->forknum) ||
+			!block->has_slot_shift ||
 			block->target_slot >= 3 ||
 			(block->has_image &&
 			 (block->apply_image ||
@@ -9394,15 +9396,21 @@ xlog2_redo(XLogReaderState *record)
 		if (fragment_count == 0)
 			elog(PANIC, "empty Umbra hint delta WAL record");
 
-		action = XLogReadBufferForRedoExtended(record, 0, RBM_NORMAL,
-										   false, &buffer);
+		/* Auxiliary hint pages can be initialized from their all-zero state. */
+		mode = block->forknum == MAIN_FORKNUM ? RBM_NORMAL : RBM_ZERO_ON_ERROR;
+		action = XLogReadBufferForRedoExtended(record, 0, mode,
+									   false, &buffer);
 		if (action == BLK_NOTFOUND)
 			return;
 		if (action == BLK_NEEDS_REDO)
 		{
 			Page		page = BufferGetPage(buffer);
 
-			Assert(!PageIsNew(page));
+			if (PageIsNew(page))
+			{
+				Assert(block->forknum != MAIN_FORKNUM);
+				PageInit(page, BLCKSZ, 0);
+			}
 			ptr = data;
 			remaining = data_len;
 			while (remaining > 0)

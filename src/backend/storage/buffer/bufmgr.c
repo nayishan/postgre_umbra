@@ -6333,7 +6333,7 @@ BufferHintDeltaCaptureNeeded(BufferDesc *bufHdr, uint64 lockstate)
 {
 	if ((lockstate & BM_DIRTY) != 0 ||
 		(lockstate & BM_PERMANENT) == 0 ||
-		BufTagGetForkNum(&bufHdr->tag) != MAIN_FORKNUM ||
+		!UmbraForkUsesActiveSlots(BufTagGetForkNum(&bufHdr->tag)) ||
 		!XLogHintBitIsNeeded() || RecoveryInProgress() ||
 		RelFileLocatorSkippingWAL(BufTagGetRelFileLocator(&bufHdr->tag)))
 		return false;
