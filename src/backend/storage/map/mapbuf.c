@@ -33,7 +33,9 @@ static bool MapPageDiscardFailedLoad(MapPageDesc *desc,
 								 const MapPageTag *tag, uint32 hashcode);
 static void MapPageRememberIO(int slot_id);
 static void MapPageForgetIO(int slot_id);
-static void MapSelectorLocation(BlockNumber logical_block,
+static BlockNumber MapSelectorPageBlock(ForkNumber forknum,
+									 uint64 page_index);
+static void MapSelectorLocation(ForkNumber forknum, BlockNumber logical_block,
 							BlockNumber *map_block, int *byte_offset,
 							int *bit_offset);
 static uint8 MapSelectorRead(const char *page, int byte_offset,
@@ -427,7 +429,7 @@ MapPageReleaseBuffer(MapPageBuffer buffer)
 
 uint8
 MapGetActiveSlot(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
-				 BlockNumber logical_block)
+				 ForkNumber forknum, BlockNumber logical_block)
 {
 	MapPageBuffer buffer;
 	BlockNumber map_block;
@@ -436,7 +438,8 @@ MapGetActiveSlot(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 	uint8       active_slot;
 	LWLock     *extension_lock;
 
-	MapSelectorLocation(logical_block, &map_block, &byte_offset, &bit_offset);
+	MapSelectorLocation(forknum, logical_block, &map_block, &byte_offset,
+						&bit_offset);
 
 	/* A missing selector page has the on-disk default: every entry is slot 0. */
 	extension_lock = MapPageExtensionLock(rlocator);
@@ -455,15 +458,16 @@ MapGetActiveSlot(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 	if (active_slot >= 3)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("invalid Umbra active slot %u for logical block %u",
-						active_slot, logical_block)));
+					 errmsg("invalid Umbra active slot %u for fork %d logical block %u",
+						active_slot, (int) forknum, logical_block)));
 	return active_slot;
 }
 
 void
 MapEnsureActiveSlotPages(UmbraFileContext *ctx,
 						 RelFileLocatorBackend rlocator,
-						 BlockNumber first_block, BlockNumber nblocks,
+						 ForkNumber forknum, BlockNumber first_block,
+						 BlockNumber nblocks,
 						 bool skipFsync)
 {
 	uint64		logical_end;
@@ -486,8 +490,7 @@ MapEnsureActiveSlotPages(UmbraFileContext *ctx,
 	for (page_index = first_page_index; page_index <= last_page_index;
 		 page_index++)
 	{
-		BlockNumber	map_block = UMBRA_MAP_SELECTOR_FIRST_BLOCK +
-			(BlockNumber) page_index;
+		BlockNumber	map_block = MapSelectorPageBlock(forknum, page_index);
 		MapPageBuffer buffer;
 
 		buffer = MapPageBufferRead(ctx, rlocator, map_block, true, skipFsync,
@@ -498,7 +501,8 @@ MapEnsureActiveSlotPages(UmbraFileContext *ctx,
 
 void
 MapPublishSlotShift(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
-					BlockNumber logical_block, uint8 source_slot,
+					ForkNumber forknum, BlockNumber logical_block,
+					uint8 source_slot,
 					uint8 target_slot, XLogRecPtr lsn)
 {
 	MapPageBuffer buffer;
@@ -512,7 +516,7 @@ MapPublishSlotShift(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 	Assert(target_slot < 3);
 	Assert(target_slot == (source_slot + 1) % 3);
 	Assert(XLogRecPtrIsValid(lsn));
-	MapSelectorLocation(logical_block, &map_block, &byte_offset,
+	MapSelectorLocation(forknum, logical_block, &map_block, &byte_offset,
 						&bit_offset);
 	/* Publication creates the default-zero selector page when necessary. */
 	Assert(CritSectionCount > 0);
@@ -532,7 +536,8 @@ MapPublishSlotShift(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 
 void
 MapRedoSetActiveSlot(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
-					 BlockNumber logical_block, uint8 active_slot)
+					 ForkNumber forknum, BlockNumber logical_block,
+					 uint8 active_slot)
 {
 	MapPageBuffer buffer;
 	BlockNumber map_block;
@@ -542,7 +547,8 @@ MapRedoSetActiveSlot(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 
 	Assert(ctx != NULL);
 	Assert(active_slot < 3);
-	MapSelectorLocation(logical_block, &map_block, &byte_offset, &bit_offset);
+	MapSelectorLocation(forknum, logical_block, &map_block, &byte_offset,
+						&bit_offset);
 	buffer = MapPageBufferRead(ctx, rlocator, map_block, true, false,
 						   LW_EXCLUSIVE);
 	current_slot = MapSelectorRead(MapPageBufferGetData(buffer), byte_offset,
@@ -562,14 +568,15 @@ MapRedoSetActiveSlot(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 
 void
 MapRedoSlotShift(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
-				 BlockNumber logical_block, uint8 source_slot,
+				 ForkNumber forknum, BlockNumber logical_block,
+				 uint8 source_slot,
 				 uint8 target_slot)
 {
 	Assert(source_slot < 3);
 	Assert(target_slot < 3);
 	Assert(source_slot != target_slot);
 	(void) source_slot;
-	MapRedoSetActiveSlot(ctx, rlocator, logical_block, target_slot);
+	MapRedoSetActiveSlot(ctx, rlocator, forknum, logical_block, target_slot);
 }
 
 void
@@ -941,7 +948,8 @@ MapPageForgetIO(int slot_id)
 }
 
 static void
-MapSelectorLocation(BlockNumber logical_block, BlockNumber *map_block,
+MapSelectorLocation(ForkNumber forknum, BlockNumber logical_block,
+					BlockNumber *map_block,
 					int *byte_offset, int *bit_offset)
 {
 	uint64      page_index;
@@ -951,17 +959,51 @@ MapSelectorLocation(BlockNumber logical_block, BlockNumber *map_block,
 	Assert(map_block != NULL);
 	page_index = (uint64) logical_block / UMBRA_MAP_SELECTOR_ENTRIES_PER_PAGE;
 	entry_index = (uint64) logical_block % UMBRA_MAP_SELECTOR_ENTRIES_PER_PAGE;
-	if (page_index >= (uint64) InvalidBlockNumber -
-		UMBRA_MAP_SELECTOR_FIRST_BLOCK)
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("Umbra active-slot page address overflow")));
 	bit_index = entry_index * UMBRA_MAP_SELECTOR_BITS;
-	*map_block = UMBRA_MAP_SELECTOR_FIRST_BLOCK + (BlockNumber) page_index;
+	*map_block = MapSelectorPageBlock(forknum, page_index);
 	if (byte_offset != NULL)
 		*byte_offset = bit_index / BITS_PER_BYTE;
 	if (bit_offset != NULL)
 		*bit_offset = bit_index % BITS_PER_BYTE;
+}
+
+static BlockNumber
+MapSelectorPageBlock(ForkNumber forknum, uint64 page_index)
+{
+	uint64		group;
+	uint64		within_group;
+	uint64		map_block;
+
+	switch (forknum)
+	{
+		case FSM_FORKNUM:
+			group = page_index;
+			within_group = 0;
+			break;
+		case VISIBILITYMAP_FORKNUM:
+			group = page_index;
+			within_group = UMBRA_MAP_SELECTOR_FSM_PAGES_PER_GROUP;
+			break;
+		case MAIN_FORKNUM:
+			group = page_index / UMBRA_MAP_SELECTOR_MAIN_PAGES_PER_GROUP;
+			within_group = UMBRA_MAP_SELECTOR_FSM_PAGES_PER_GROUP +
+				UMBRA_MAP_SELECTOR_VM_PAGES_PER_GROUP +
+				(page_index % UMBRA_MAP_SELECTOR_MAIN_PAGES_PER_GROUP);
+			break;
+		default:
+			elog(ERROR, "unsupported fork number %d in Umbra selector lookup",
+				 (int) forknum);
+			return InvalidBlockNumber;
+	}
+
+	map_block = UMBRA_MAP_SELECTOR_FIRST_BLOCK +
+		group * UMBRA_MAP_SELECTOR_GROUP_PAGES + within_group;
+	if (map_block > (uint64) MaxBlockNumber)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("Umbra active-slot page address overflow for fork %d",
+						(int) forknum)));
+	return (BlockNumber) map_block;
 }
 
 static uint8

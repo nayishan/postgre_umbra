@@ -794,7 +794,7 @@ smgrDoPendingSyncs(bool isCommit, bool isParallelWorker)
 		bool		force_sync;
 
 		srel = smgropen(pendingsync->rlocator, INVALID_PROC_NUMBER);
-		force_sync = smgrpreparependingsync(srel);
+		force_sync = smgrforcependingsync(srel);
 
 		/*
 		 * We emit newpage WAL records for smaller relations.

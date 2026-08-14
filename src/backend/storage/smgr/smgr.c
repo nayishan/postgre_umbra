@@ -106,7 +106,13 @@ typedef struct f_smgr
 	 */
 	void		(*smgr_finish_create) (SMgrRelation reln,
 									 ForkNumber forknum); /* may be NULL */
-	bool		(*smgr_prepare_pending_sync) (SMgrRelation reln); /* may be NULL */
+	/*
+	 * Return true when a WAL-skipping relation's commit-time pending-sync
+	 * finalization must sync files rather than use generic full-page WAL.  This
+	 * is required when that WAL cannot make SMgr-private metadata or layout
+	 * durable.
+	 */
+	bool		(*smgr_force_pending_sync) (SMgrRelation reln); /* may be NULL */
 	/*
 	 * Synchronize relation-level private metadata after the core-owned
 	 * ordinary-fork loop.  Private metadata can describe an entire relation,
@@ -200,7 +206,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_create = mdcreate,
 		.smgr_init_new_relation = NULL,
 		.smgr_finish_create = NULL,
-		.smgr_prepare_pending_sync = NULL,
+		.smgr_force_pending_sync = NULL,
 		.smgr_sync_relation_metadata = NULL,
 		.smgr_checkpoint = NULL,
 		.smgr_flush_database_tablespace_cache = NULL,
@@ -234,7 +240,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_create = umcreate,
 		.smgr_init_new_relation = uminitnewrelation,
 		.smgr_finish_create = umfinishcreate,
-		.smgr_prepare_pending_sync = umpreparependingsync,
+		.smgr_force_pending_sync = umforcependingsync,
 		.smgr_sync_relation_metadata = umsyncrelationmetadata,
 		.smgr_checkpoint = umcheckpoint,
 		.smgr_flush_database_tablespace_cache =
@@ -645,13 +651,17 @@ smgrfinishcreate(SMgrRelation reln, ForkNumber forknum)
 	RESUME_INTERRUPTS();
 }
 
-/* Ask the selected smgr whether pending-sync WAL emission is unsafe. */
+/*
+ * Ask whether commit-time finalization of this WAL-skipping relation must use
+ * real file synchronization because generic full-page WAL omits private
+ * SMgr metadata.
+ */
 bool
-smgrpreparependingsync(SMgrRelation reln)
+smgrforcependingsync(SMgrRelation reln)
 {
-	if (smgrsw[reln->smgr_which].smgr_prepare_pending_sync == NULL)
+	if (smgrsw[reln->smgr_which].smgr_force_pending_sync == NULL)
 		return false;
-	return smgrsw[reln->smgr_which].smgr_prepare_pending_sync(reln);
+	return smgrsw[reln->smgr_which].smgr_force_pending_sync(reln);
 }
 
 /*

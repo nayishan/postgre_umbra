@@ -15,11 +15,21 @@
 
 typedef struct UmbraFileContext UmbraFileContext;
 
-/* Block zero is the resident root; selector pages begin at block one. */
+/*
+ * Block zero is the resident root. Each following 258-page group contains
+ * one FSM selector, one VM selector, and 256 MAIN selectors.
+ */
 #define UMBRA_MAP_SELECTOR_FIRST_BLOCK 1
 #define UMBRA_MAP_SELECTOR_BITS 2
 #define UMBRA_MAP_SELECTOR_ENTRIES_PER_PAGE \
 	((BLCKSZ * BITS_PER_BYTE) / UMBRA_MAP_SELECTOR_BITS)
+#define UMBRA_MAP_SELECTOR_FSM_PAGES_PER_GROUP 1
+#define UMBRA_MAP_SELECTOR_VM_PAGES_PER_GROUP 1
+#define UMBRA_MAP_SELECTOR_MAIN_PAGES_PER_GROUP 256
+#define UMBRA_MAP_SELECTOR_GROUP_PAGES \
+	(UMBRA_MAP_SELECTOR_FSM_PAGES_PER_GROUP + \
+	 UMBRA_MAP_SELECTOR_VM_PAGES_PER_GROUP + \
+	 UMBRA_MAP_SELECTOR_MAIN_PAGES_PER_GROUP)
 
 extern void MapInvalidateRelation(RelFileLocatorBackend rlocator);
 extern void MapInvalidateDatabase(Oid dbid);
@@ -32,22 +42,27 @@ extern int MapPageBgWriterFlush(int max_pages);
 
 extern uint8 MapGetActiveSlot(UmbraFileContext *ctx,
 						  RelFileLocatorBackend rlocator,
+						  ForkNumber forknum,
 						  BlockNumber logical_block);
 extern void MapEnsureActiveSlotPages(UmbraFileContext *ctx,
 							 RelFileLocatorBackend rlocator,
+							 ForkNumber forknum,
 							 BlockNumber first_block,
 							 BlockNumber nblocks,
 							 bool skipFsync);
 extern void MapPublishSlotShift(UmbraFileContext *ctx,
 								RelFileLocatorBackend rlocator,
+								ForkNumber forknum,
 								BlockNumber logical_block, uint8 source_slot,
 								uint8 target_slot, XLogRecPtr lsn);
 extern void MapRedoSetActiveSlot(UmbraFileContext *ctx,
 								 RelFileLocatorBackend rlocator,
+								 ForkNumber forknum,
 								 BlockNumber logical_block, uint8 active_slot);
 extern void MapRedoSlotShift(UmbraFileContext *ctx,
-					 RelFileLocatorBackend rlocator,
-					 BlockNumber logical_block, uint8 source_slot,
-					 uint8 target_slot);
+						 RelFileLocatorBackend rlocator,
+						 ForkNumber forknum,
+						 BlockNumber logical_block, uint8 source_slot,
+						 uint8 target_slot);
 
 #endif                          /* UMBRA_MAP_H */
