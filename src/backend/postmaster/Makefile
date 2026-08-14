@@ -30,4 +30,12 @@ OBJS = \
 	walsummarizer.o \
 	walwriter.o
 
+ifeq ($(with_umbra), yes)
+OBJS += \
+	mapwriter.o
+endif
+
+# Reconfiguration can change the enabled background worker object list.
+objfiles.txt postmaster.o: $(top_builddir)/src/Makefile.global
+
 include $(top_srcdir)/src/backend/common.mk

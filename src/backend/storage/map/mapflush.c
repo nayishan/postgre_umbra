@@ -23,6 +23,7 @@ static void MapPageInvalidateMatching(const RelFileLocatorBackend *rlocator,
 static void MapPageInvalidateSlot(int slot_id,
 							  const RelFileLocatorBackend *rlocator,
 							  Oid dbid, Oid spcOid);
+static int MapPageBgWriterNextSlot = 0;
 
 void
 MapInvalidateRelation(RelFileLocatorBackend rlocator)
@@ -62,6 +63,39 @@ MapCheckpoint(void)
 {
 	/* Persist the selector snapshot before the root publishes it. */
 	MapPageCheckpoint();
+}
+
+int
+MapPageBgWriterFlush(int max_pages)
+{
+	int			cleaned = 0;
+	int			scanned = 0;
+
+	if (max_pages <= 0)
+		return 0;
+	MapPageEnsureInitialized();
+	if (MapPageBufferCount == 0)
+		return 0;
+
+	while (scanned < MapPageBufferCount && cleaned < max_pages)
+	{
+		MapPageDesc *desc;
+		uint64		state;
+		int			slot_id = MapPageBgWriterNextSlot;
+
+		MapPageBgWriterNextSlot = (MapPageBgWriterNextSlot + 1) %
+			MapPageBufferCount;
+		scanned++;
+		desc = &MapPageDescriptors[slot_id];
+		state = pg_atomic_read_u64(&desc->state);
+		if ((state & MAP_PAGE_DIRTY) == 0)
+			continue;
+		if (MapPageFlushBuffer(slot_id, NULL, NULL, true, false) &&
+			(pg_atomic_read_u64(&desc->state) & MAP_PAGE_DIRTY) == 0)
+			cleaned++;
+	}
+
+	return cleaned;
 }
 
 void
