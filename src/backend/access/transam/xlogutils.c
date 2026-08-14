@@ -447,9 +447,21 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 	if (XLogRecBlockImageApply(record, block_id))
 	{
 		Assert(XLogRecHasBlockImage(record, block_id));
+#ifdef USE_UMBRA
+		/* An FPI cannot establish the root that defines this fork's layout. */
+		if (!UmRedoMappingPolicyResolved(
+				smgropen(rlocator, INVALID_PROC_NUMBER), forknum))
+		{
+			XLogRecordInvalidPage(rlocator, forknum, blkno, false);
+			*buf = InvalidBuffer;
+			return BLK_NOTFOUND;
+		}
+#endif
 		*buf = XLogReadBufferExtended(rlocator, forknum, blkno,
 									  get_cleanup_lock ? RBM_ZERO_AND_CLEANUP_LOCK : RBM_ZERO_AND_LOCK,
 									  prefetch_buffer);
+		if (!BufferIsValid(*buf))
+			return BLK_NOTFOUND;
 		page = BufferGetPage(*buf);
 		if (!RestoreBlockImage(record, block_id, page))
 			ereport(ERROR,
@@ -551,6 +563,22 @@ XLogReadBufferExtended(RelFileLocator rlocator, ForkNumber forknum,
 
 	/* Open the relation at smgr level */
 	smgr = smgropen(rlocator, INVALID_PROC_NUMBER);
+
+#ifdef USE_UMBRA
+	/*
+	 * Page redo reconstructs at most one page, not the private root that
+	 * identifies its physical layout.  Until CREATE redo resolves that root,
+	 * page redo must not create or access a direct-layout file.
+	 */
+	if ((mode == RBM_NORMAL || mode == RBM_NORMAL_NO_LOG ||
+		 mode == RBM_ZERO_ON_ERROR) &&
+		!UmRedoMappingPolicyResolved(smgr, forknum))
+	{
+		if (mode != RBM_NORMAL_NO_LOG)
+			XLogRecordInvalidPage(rlocator, forknum, blkno, false);
+		return InvalidBuffer;
+	}
+#endif
 
 	/*
 	 * Create the target file if it doesn't already exist.  This lets us cope

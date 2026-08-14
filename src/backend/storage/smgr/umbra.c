@@ -233,6 +233,26 @@ umcheckpoint(void)
 }
 
 /*
+ * During redo, an UNKNOWN policy for a mapped-capable fork is not permission
+ * to use the direct physical layout.  Only CREATE redo may resolve it.
+ */
+bool
+UmRedoMappingPolicyResolved(SMgrRelation reln, ForkNumber forknum)
+{
+	UmbraSmgrRelationState *state;
+
+	if (reln == NULL || !UmbraForkUsesActiveSlots(forknum) ||
+		RelFileLocatorBackendIsTemp(reln->smgr_rlocator))
+		return true;
+
+	Assert(InRecovery);
+	um_refresh_mapping_policy(reln, forknum);
+	state = reln->smgr_private;
+	return state != NULL && state->filectx != NULL &&
+		state->map_policy != UMBRA_MAP_POLICY_UNKNOWN;
+}
+
+/*
  * Choose a transition from a buffer's cached slot without consulting MAP.
  * Publication rereads the canonical selector under its own lock.
  */
@@ -901,7 +921,14 @@ umsyncrelationmetadata(SMgrRelation reln)
 bool
 umforcependingsync(SMgrRelation reln)
 {
-	return um_main_uses_slot0(reln, MAIN_FORKNUM);
+	um_refresh_mapping_policy(reln, MAIN_FORKNUM);
+	/*
+	 * This predicate is used only by commit-time pending-sync finalization of a
+	 * WAL-skipping relation.  A mapped MAIN root is a prerequisite for mapped
+	 * FSM or VM, and generic full-page WAL omits that private authority.  The
+	 * MAIN policy alone therefore selects the real file-sync path.
+	 */
+	return um_fork_uses_mapped_slots(reln, MAIN_FORKNUM);
 }
 
 int
