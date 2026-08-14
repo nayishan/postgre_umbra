@@ -8090,9 +8090,57 @@ ScheduleBufferTagForWriteback(WritebackContext *wb_context, IOContext io_context
 		IssuePendingWritebacks(wb_context, io_context);
 }
 
+#ifdef USE_UMBRA
+static inline int
+pending_writeback_comparator(const PendingWriteback *a,
+							 const PendingWriteback *b)
+{
+	int			ret;
+	RelFileLocator rlocatora;
+	RelFileLocator rlocatorb;
+	ForkNumber	forknuma;
+	ForkNumber	forknumb;
+	bool		source_slota;
+	bool		source_slotb;
+
+	rlocatora = BufTagGetRelFileLocator(&a->tag);
+	rlocatorb = BufTagGetRelFileLocator(&b->tag);
+	ret = rlocator_comparator(&rlocatora, &rlocatorb);
+	if (ret != 0)
+		return ret;
+
+	forknuma = BufTagGetForkNum(&a->tag);
+	forknumb = BufTagGetForkNum(&b->tag);
+	if (forknuma < forknumb)
+		return -1;
+	if (forknuma > forknumb)
+		return 1;
+
+	source_slota = UmbraActiveSlotIsValid(a->checkpoint_source_slot);
+	source_slotb = UmbraActiveSlotIsValid(b->checkpoint_source_slot);
+	if (source_slota != source_slotb)
+		return source_slota ? -1 : 1;
+
+	if (a->tag.blockNum < b->tag.blockNum)
+		return -1;
+	if (a->tag.blockNum > b->tag.blockNum)
+		return 1;
+
+	if (source_slota)
+		return (int) a->checkpoint_source_slot -
+			(int) b->checkpoint_source_slot;
+
+	return 0;
+}
+#endif
+
 #define ST_SORT sort_pending_writebacks
 #define ST_ELEMENT_TYPE PendingWriteback
+#ifdef USE_UMBRA
+#define ST_COMPARE(a, b) pending_writeback_comparator(a, b)
+#else
 #define ST_COMPARE(a, b) buffertag_comparator(&a->tag, &b->tag)
+#endif
 #define ST_SCOPE static
 #define ST_DEFINE
 #include "lib/sort_template.h"
@@ -8144,10 +8192,36 @@ IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
 #ifdef USE_UMBRA
 		if (UmbraActiveSlotIsValid(cur->checkpoint_source_slot))
 		{
+			UmbraCheckpointWritebackRequest requests[WRITEBACK_MAX_PENDING_FLUSHES];
+			ForkNumber	forknum = BufTagGetForkNum(&tag);
+			int			nrequests = 0;
+			int			slot_end = i;
+
+			/* The comparator keeps one relation/fork source batch together. */
+			while (slot_end < wb_context->nr_pending)
+			{
+				PendingWriteback *slot_request =
+					&wb_context->pending_writebacks[slot_end];
+
+				if (!UmbraActiveSlotIsValid(
+						slot_request->checkpoint_source_slot) ||
+					!RelFileLocatorEquals(currlocator,
+									  BufTagGetRelFileLocator(
+										  &slot_request->tag)) ||
+					forknum != BufTagGetForkNum(&slot_request->tag))
+					break;
+
+				requests[nrequests].logical_block = slot_request->tag.blockNum;
+				requests[nrequests].source_slot =
+					slot_request->checkpoint_source_slot;
+				nrequests++;
+				slot_end++;
+			}
+
 			reln = smgropen(currlocator, INVALID_PROC_NUMBER);
-			UmCheckpointWritebackSourceSlot(reln, BufTagGetForkNum(&tag),
-											 tag.blockNum,
-											 cur->checkpoint_source_slot);
+			UmCheckpointWritebackSourceSlots(reln, forknum, requests,
+											  nrequests);
+			i = slot_end - 1;
 			continue;
 		}
 #endif
