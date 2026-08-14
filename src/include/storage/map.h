@@ -41,6 +41,9 @@ extern void MapPublishSlotShift(UmbraFileContext *ctx,
 								RelFileLocatorBackend rlocator,
 								BlockNumber logical_block, uint8 source_slot,
 								uint8 target_slot, XLogRecPtr lsn);
+extern void MapRedoSetActiveSlot(UmbraFileContext *ctx,
+								 RelFileLocatorBackend rlocator,
+								 BlockNumber logical_block, uint8 active_slot);
 extern void MapRedoSlotShift(UmbraFileContext *ctx,
 					 RelFileLocatorBackend rlocator,
 					 BlockNumber logical_block, uint8 source_slot,

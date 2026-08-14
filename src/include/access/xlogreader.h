@@ -133,7 +133,7 @@ typedef struct
 	uint8		flags;
 
 #ifdef USE_UMBRA
-	/* Umbra MAIN source/target slot transition, if one is attached. */
+	/* Umbra source/target slot transition, if one is attached. */
 	bool		has_slot_shift;
 	uint8		source_slot;
 	uint8		target_slot;

@@ -1,7 +1,6 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# Verify FPI-backed active-slot shifts, their target-only WAL header, and
-# redo ordering.
+# Verify target-only active-slot shifts, their WAL header, and redo ordering.
 
 use strict;
 use warnings FATAL => 'all';
@@ -55,12 +54,13 @@ sub assert_shift_wal
 	my @records = grep {
 		/rel \d+\/\d+\/$filenode fork main blk $target_block\b/
 	} split(/\n/, $dump);
-	ok(
-		grep(
-			/\bFPW\b/ &&
-			  /slot shift: source_slot $source_slot target_slot $target_slot/,
-			@records),
-		"$label: WAL retains an FPI and decodes the target slot transition");
+	my @selector_shifts = grep {
+		/slot shift: source_slot $source_slot target_slot $target_slot/
+	} @records;
+	is(scalar(@selector_shifts), 1,
+		"$label: WAL records one target-only slot transition");
+	unlike($selector_shifts[0] // '', qr/\bFPW\b/,
+		"$label: normal shift omits the full-page image");
 }
 
 my $node = PostgreSQL::Test::Cluster->new('umbra_slot_shift_wal');
@@ -94,9 +94,9 @@ my $target_block = 0 + $node->safe_psql(
 SELECT (ctid::text::point)[0]::integer
 FROM umbra_slot_shift_wal WHERE id = 1;]);
 
-# Read the tuple before the FPI interval begins.  With checksums enabled, a
-# post-checkpoint visibility hint would otherwise consume that interval in a
-# separate XLOG_FPI_FOR_HINT record.
+# Read the tuple before the first shift interval begins.  With checksums
+# enabled, a post-checkpoint visibility hint would otherwise consume that
+# interval in a separate XLOG_FPI_FOR_HINT record.
 $node->safe_psql('postgres', 'CHECKPOINT');
 
 is(-s $map_path, 2 * $block_size,
@@ -126,7 +126,7 @@ for my $step_index (0 .. $#steps)
 	is($updated_block, $target_block, "$label: update remains on one page");
 	assert_shift_wal($node, $filenode, $target_block, $start_lsn, $end_lsn,
 		$source_slot, $target_slot, $label);
-	# Each following update starts in a fresh full-page-write interval.
+	# Each following update starts in a fresh slot-shift interval.
 	if ($step_index < $#steps)
 	{
 		$node->safe_psql('postgres', 'CHECKPOINT');
@@ -135,7 +135,7 @@ for my $step_index (0 .. $#steps)
 
 		# A fresh backend may set the prior update's commit hint when it next
 		# reads this tuple.  Let that separate FPI_FOR_HINT happen before the
-		# next checkpoint interval, so the next UPDATE owns its ordinary FPI.
+		# next checkpoint interval, so the next UPDATE owns its shift.
 		$node->safe_psql('postgres', q[
 SELECT (ctid::text::point)[0]::integer
 FROM umbra_slot_shift_wal WHERE id = 1;]);
@@ -144,17 +144,17 @@ FROM umbra_slot_shift_wal WHERE id = 1;]);
 }
 
 # The final shift is intentionally not checkpointed.  Recovery must publish
-# its selector target before restoring the FPI into that target slot.
+# its selector target after materializing the preceding source slot.
 $node->stop('immediate');
 $node->start;
 is(read_active_slot($map_path, $block_size, $target_block), 0,
 	'crash redo persists the final selector target');
 is($node->safe_psql('postgres',
 		q[SELECT payload FROM umbra_slot_shift_wal WHERE id = 1;]),
-	'three', 'crash redo restores the FPI through the final target slot');
+	'three', 'crash redo restores the final update through the target slot');
 
 # A later DROP can remove the mapping files before a crash even though the
-# checkpoint redo point still precedes the shift.  The FPI does not identify
+# checkpoint redo point still precedes the shift.  The target-only record does not identify
 # the missing root's lifecycle, so redo must record a dependency and let DROP
 # clear it.
 $node->safe_psql(
@@ -241,11 +241,11 @@ $node->start;
 ok($node->log_contains(
 		qr/page $drop_target_block of relation .*\/$drop_filenode does not exist/,
 		$recovery_log_offset),
-	'missing mapping records the FPI shift as an invalid-page dependency');
+	'missing mapping records the target-only shift as an invalid-page dependency');
 ok($node->log_contains(
 		qr/page $zero_target_block of relation .*\/$zero_filenode does not exist/,
 		$recovery_log_offset),
-	'zero-length mapping records the FPI shift as an invalid-page dependency');
+	'zero-length mapping records the target-only shift as an invalid-page dependency');
 is($node->safe_psql(
 		'postgres', q[SELECT to_regclass('umbra_slot_shift_drop') IS NULL;]),
 	't', 'later DROP clears the missing-mapping dependency');

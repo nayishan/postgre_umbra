@@ -531,9 +531,8 @@ MapPublishSlotShift(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 }
 
 void
-MapRedoSlotShift(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
-				 BlockNumber logical_block, uint8 source_slot,
-				 uint8 target_slot)
+MapRedoSetActiveSlot(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
+					 BlockNumber logical_block, uint8 active_slot)
 {
 	MapPageBuffer buffer;
 	BlockNumber map_block;
@@ -542,26 +541,35 @@ MapRedoSlotShift(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 	uint8		current_slot;
 
 	Assert(ctx != NULL);
-	Assert(source_slot < 3);
-	Assert(target_slot < 3);
-	Assert(source_slot != target_slot);
-	(void) source_slot;
+	Assert(active_slot < 3);
 	MapSelectorLocation(logical_block, &map_block, &byte_offset, &bit_offset);
 	buffer = MapPageBufferRead(ctx, rlocator, map_block, true, false,
 						   LW_EXCLUSIVE);
 	current_slot = MapSelectorRead(MapPageBufferGetData(buffer), byte_offset,
 							 bit_offset);
 	/*
-	 * A prior failed recovery can leave a later selector value on disk.  WAL
-	 * order is authoritative, so replay this record's target unconditionally.
+	 * Recovery order is authoritative, so a replay can restore its source
+	 * selector before materializing that page or publish its target afterward.
 	 */
-	if (current_slot != target_slot)
+	if (current_slot != active_slot)
 	{
 		MapSelectorWrite(MapPageBufferGetData(buffer), byte_offset, bit_offset,
-						 target_slot);
+						 active_slot);
 		MapPageMarkBufferDirty(buffer, InvalidXLogRecPtr, false);
 	}
 	MapPageReleaseBuffer(buffer);
+}
+
+void
+MapRedoSlotShift(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
+				 BlockNumber logical_block, uint8 source_slot,
+				 uint8 target_slot)
+{
+	Assert(source_slot < 3);
+	Assert(target_slot < 3);
+	Assert(source_slot != target_slot);
+	(void) source_slot;
+	MapRedoSetActiveSlot(ctx, rlocator, logical_block, target_slot);
 }
 
 void

@@ -66,11 +66,13 @@ tests += {
       't/055_umbra_map_root.pl',
       't/056_umbra_map_root_redo.pl',
       't/057_umbra_root_cache.pl',
+      't/058_umbra_image_free_recovery.pl',
       't/059_umbra_slot0_mapping.pl',
       't/060_umbra_active_slot_pool.pl',
       't/061_umbra_slot_shift_wal.pl',
       't/062_umbra_slot_checkpoint_publication.pl',
       't/064_umbra_checkpoint_source_slot.pl',
+      't/066_umbra_image_free_missing_source.pl',
     ],
   },
 }

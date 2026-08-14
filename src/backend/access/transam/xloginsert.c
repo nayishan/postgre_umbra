@@ -1230,6 +1230,8 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 											  &regbuf->slot_shift);
 			}
 			include_slot_shift = regbuf->slot_shift.selected;
+			if (include_slot_shift)
+				needs_backup = false;
 		}
 		else if (regbuf->slot_shift.selected)
 		{
