@@ -166,9 +166,9 @@ ummap_create(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 	nblocks = umfile_nblocks(ctx, UMBRA_METADATA_FORKNUM);
 
 	/*
-	 * Only an actual CREATE finish path calls this during redo.  Preserve an
+	 * Redo callers repair only a missing or invalid root.  Preserve an
 	 * existing valid root: it can belong to later lifecycle WAL at the same
-	 * locator and must not be reset by an old CREATE record.
+	 * locator and must not be reset by an older record.
 	 */
 	if (nblocks == 0 || (isRedo && !ummap_root_read_valid_image(ctx, image)))
 	{

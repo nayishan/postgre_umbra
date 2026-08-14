@@ -26,6 +26,9 @@
 #include "miscadmin.h"
 #include "storage/fd.h"
 #include "storage/smgr.h"
+#ifdef USE_UMBRA
+#include "storage/umbra.h"
+#endif
 #include "utils/hsearch.h"
 #include "utils/rel.h"
 
@@ -55,11 +58,11 @@ HotStandbyState standbyState = STANDBY_DISABLED;
 /*
  * During XLOG replay, we may see XLOG records for incremental updates of
  * pages that no longer exist, because their relation was later dropped or
- * truncated.  (Note: this is only possible when full_page_writes = OFF,
- * since when it's ON, the first reference we see to a page should always
- * be a full-page rewrite not an incremental update.)  Rather than simply
- * ignoring such records, we make a note of the referenced page, and then
- * complain if we don't actually see a drop or truncate covering the page
+ * truncated.  This normally requires full_page_writes = OFF.  Umbra can also
+ * decline a slot-shift FPI when its MAP lifecycle authority is missing, since
+ * the page image cannot reconstruct that relation-wide state.  Rather than
+ * simply ignoring such records, we make a note of the referenced page, and
+ * then complain if we don't actually see a drop or truncate covering the page
  * later in replay.
  */
 typedef struct xl_invalid_page_key
@@ -350,6 +353,9 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 	Page		page;
 	bool		zeromode;
 	bool		willinit;
+#ifdef USE_UMBRA
+	DecodedBkpBlock *blkref;
+#endif
 
 	if (!XLogRecGetBlockTagExtended(record, block_id, &rlocator, &forknum, &blkno,
 									&prefetch_buffer))
@@ -369,6 +375,25 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 		elog(PANIC, "block with WILL_INIT flag in WAL record must be zeroed by redo routine");
 	if (!willinit && zeromode)
 		elog(PANIC, "block to be initialized in redo routine must be marked with WILL_INIT flag in the WAL record");
+
+#ifdef USE_UMBRA
+	blkref = XLogRecGetBlock(record, block_id);
+	if (blkref->has_slot_shift)
+	{
+		SMgrRelation reln;
+
+		if (!XLogRecBlockImageApply(record, block_id))
+			elog(PANIC, "Umbra slot-shift WAL record has no applying full-page image");
+		reln = smgropen(rlocator, INVALID_PROC_NUMBER);
+		if (!UmRedoSlotShift(reln, forknum, blkno, blkref->source_slot,
+							 blkref->target_slot, record->EndRecPtr))
+		{
+			log_invalid_page(rlocator, forknum, blkno, false);
+			*buf = InvalidBuffer;
+			return BLK_NOTFOUND;
+		}
+	}
+#endif
 
 	/* If it has a full-page image and it should be restored, do it. */
 	if (XLogRecBlockImageApply(record, block_id))

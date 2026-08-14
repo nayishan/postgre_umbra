@@ -32,11 +32,28 @@
 #define UMBRA_CHUNK_ACTIVE_SLOTS 3U
 #define UMBRA_ACTIVE_SLOT_INVALID UINT8_MAX
 
+typedef struct UmbraSlotShift
+{
+	SMgrRelation reln;
+	ForkNumber	forknum;
+	BlockNumber logical_block;
+	uint8		source_slot;
+	uint8		target_slot;
+	bool		selected;
+} UmbraSlotShift;
+
 /* MAIN pages are born in slot 0; persistent selectors can later choose 1/2. */
 static inline bool
 UmbraMainActiveSlotIsValid(uint8 active_slot)
 {
 	return active_slot < UMBRA_CHUNK_ACTIVE_SLOTS;
+}
+
+static inline uint8
+UmbraMainNextActiveSlot(uint8 active_slot)
+{
+	Assert(UmbraMainActiveSlotIsValid(active_slot));
+	return active_slot == UMBRA_CHUNK_ACTIVE_SLOTS - 1 ? 0 : active_slot + 1;
 }
 
 static inline bool
@@ -148,5 +165,15 @@ extern int	umfd(SMgrRelation reln, ForkNumber forknum,
 					 BlockNumber blocknum, uint32 *off);
 extern bool UmGetActiveSlot(SMgrRelation reln, ForkNumber forknum,
 						 BlockNumber logical_block, uint8 *active_slot);
+/* Select a shift source from BufferMgr state without reading a selector. */
+extern bool UmChooseSlotShift(SMgrRelation reln, ForkNumber forknum,
+							  BlockNumber logical_block,
+							  uint8 cached_active_slot,
+							  UmbraSlotShift *shift);
+/* Publish a selected target after WAL insertion has assigned its LSN. */
+extern void UmPublishSlotShift(UmbraSlotShift *shift, XLogRecPtr lsn);
+extern bool UmRedoSlotShift(SMgrRelation reln, ForkNumber forknum,
+							BlockNumber logical_block, uint8 source_slot,
+							uint8 target_slot, XLogRecPtr shift_lsn);
 
 #endif							/* UMBRA_H */

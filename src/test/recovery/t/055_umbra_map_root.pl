@@ -31,7 +31,8 @@ my $root = slurp_file($map_path);
 my ($magic, $version, $blcksz, $chunk_pages) =
   unpack('L4', substr($root, 0, 16));
 
-is(length($root), $block_size, 'metadata root occupies one regular block');
+is(length($root), 2 * $block_size,
+	'metadata file contains the root and first selector page');
 is($magic, 0x554d4252, 'metadata root magic is present');
 is($version, 1, 'metadata root format version is present');
 is($blcksz, $block_size, 'metadata root records BLCKSZ');

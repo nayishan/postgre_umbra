@@ -20,6 +20,7 @@
 #include <limits.h>
 
 #include "access/xlogutils.h"
+#include "miscadmin.h"
 #include "storage/aio.h"
 #include "storage/map.h"
 #include "storage/smgr.h"
@@ -65,6 +66,9 @@ static void um_publish_main_after_data(SMgrRelation reln,
 static void um_publish_main_before_truncate(SMgrRelation reln,
 									   BlockNumber logical_eof,
 									   BlockNumber physical_capacity);
+static void um_ensure_selector_pages(SMgrRelation reln,
+								 BlockNumber first_block, BlockNumber nblocks,
+								 bool skipFsync);
 
 void
 uminit(void)
@@ -212,6 +216,93 @@ umcheckpoint(void)
 	ummap_checkpoint();
 }
 
+/*
+ * Choose a transition from a buffer's cached slot without consulting MAP.
+ * Publication rereads the canonical selector under its own lock.
+ */
+bool
+UmChooseSlotShift(SMgrRelation reln, ForkNumber forknum,
+				  BlockNumber logical_block, uint8 cached_active_slot,
+				  UmbraSlotShift *shift)
+{
+	UmbraSmgrRelationState *state;
+
+	Assert(shift != NULL);
+	MemSet(shift, 0, sizeof(*shift));
+	if (reln == NULL || InRecovery ||
+		RelFileLocatorBackendIsTemp(reln->smgr_rlocator) ||
+		IsBootstrapProcessingMode() || IsInitProcessingMode() ||
+		!UmbraMainActiveSlotIsValid(cached_active_slot) ||
+		!um_main_uses_slot0(reln, forknum))
+		return false;
+
+	state = reln->smgr_private;
+	if (state == NULL || state->filectx == NULL)
+		return false;
+
+	shift->reln = reln;
+	shift->forknum = forknum;
+	shift->logical_block = logical_block;
+	shift->source_slot = cached_active_slot;
+	shift->target_slot = UmbraMainNextActiveSlot(cached_active_slot);
+	shift->selected = true;
+	return true;
+}
+
+void
+UmPublishSlotShift(UmbraSlotShift *shift, XLogRecPtr lsn)
+{
+	UmbraSmgrRelationState *state;
+
+	Assert(shift != NULL);
+	Assert(shift->selected);
+	Assert(shift->reln != NULL);
+	Assert(XLogRecPtrIsValid(lsn));
+	state = shift->reln->smgr_private;
+	Assert(state != NULL && state->filectx != NULL);
+	MapPublishSlotShift(state->filectx, shift->reln->smgr_rlocator,
+						shift->logical_block, shift->source_slot,
+						shift->target_slot, lsn);
+	shift->selected = false;
+	shift->reln = NULL;
+}
+
+bool
+UmRedoSlotShift(SMgrRelation reln, ForkNumber forknum,
+				BlockNumber logical_block, uint8 source_slot,
+				uint8 target_slot, XLogRecPtr shift_lsn)
+{
+	UmbraSmgrRelationState *state;
+	UmbraFileContext *ctx;
+
+	if (!InRecovery || reln == NULL || forknum != MAIN_FORKNUM ||
+		RelFileLocatorBackendIsTemp(reln->smgr_rlocator) ||
+		!XLogRecPtrIsValid(shift_lsn))
+		elog(PANIC, "Umbra slot-shift WAL targets an inactive MAIN mapping");
+	state = reln->smgr_private;
+	ctx = um_get_filectx(reln);
+	Assert(state != NULL);
+
+	/*
+	 * A full-page image proves that one logical page can be reconstructed, but
+	 * it does not identify the lifecycle that owned a missing metadata root.
+	 * Only CREATE redo may rebuild that relation-wide mapping authority.  A
+	 * later DROP or covering TRUNCATE can clear the dependency recorded by the
+	 * caller.
+	 */
+	if (!ummap_try_validate(ctx))
+		return false;
+	state->uses_map = true;
+	reln->smgr_cached_nblocks[MAIN_FORKNUM] = InvalidBlockNumber;
+
+	/* With mapping authority established, the FPI may recreate MAIN. */
+	umfile_create(ctx, MAIN_FORKNUM, true);
+
+	MapRedoSlotShift(ctx, reln->smgr_rlocator,
+					 logical_block, source_slot, target_slot);
+	return true;
+}
+
 /* Flush Umbra's metadata-root cache before copying a database tablespace. */
 void
 umflushdatabasetablespacecache(Oid dbid, Oid spcOid)
@@ -295,6 +386,8 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		um_zero_main_range(reln, logical_eof, blocknum, skipFsync);
 	umfile_writev(ctx, MAIN_FORKNUM, physical_block, buffers, 1, skipFsync);
 	um_publish_main_after_data(reln, logical_end, physical_capacity);
+	um_ensure_selector_pages(reln, logical_eof, logical_end - logical_eof,
+						 skipFsync);
 }
 
 void
@@ -330,6 +423,8 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	/* A regrown page can retain slot-0 capacity after a prior truncate. */
 	um_zero_main_range(reln, logical_eof, logical_end, skipFsync);
 	um_publish_main_after_data(reln, logical_end, physical_capacity);
+	um_ensure_selector_pages(reln, logical_eof, logical_end - logical_eof,
+						 skipFsync);
 }
 
 bool
@@ -751,8 +846,20 @@ um_publish_main_before_truncate(SMgrRelation reln, BlockNumber logical_eof,
 								BlockNumber physical_capacity)
 {
 	ummap_publish_prepared_main_frontiers(um_get_filectx(reln),
-									reln->smgr_rlocator, logical_eof,
-									physical_capacity);
+							reln->smgr_rlocator, logical_eof,
+							physical_capacity);
+}
+
+/* Extension is the non-critical path that seeds selector pages for WAL shifts. */
+static void
+um_ensure_selector_pages(SMgrRelation reln, BlockNumber first_block,
+						 BlockNumber nblocks, bool skipFsync)
+{
+	if (nblocks == 0 || CritSectionCount != 0 || !IsUnderPostmaster ||
+		IsBootstrapProcessingMode() || IsInitProcessingMode())
+		return;
+	MapEnsureActiveSlotPages(um_get_filectx(reln), reln->smgr_rlocator,
+							 first_block, nblocks, skipFsync);
 }
 
 static UmbraFileContext *

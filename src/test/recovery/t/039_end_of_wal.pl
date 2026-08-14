@@ -21,8 +21,12 @@ use integer;    # causes / operator to use integer math
 my $BIG_ENDIAN = pack("L", 0x12345678) eq pack("N", 0x12345678);
 
 # Fields retrieved from code headers.
+my $xlog_page_magic_name =
+  check_pg_config('^#define USE_UMBRA 1$')
+  ? 'XLOG_PAGE_MAGIC_UMBRA'
+  : 'XLOG_PAGE_MAGIC_STANDARD';
 my @scan_result = scan_server_header('access/xlog_internal.h',
-	'#define\s+XLOG_PAGE_MAGIC\s+(\w+)');
+	'#define\s+' . $xlog_page_magic_name . '\s+(\w+)');
 my $XLP_PAGE_MAGIC = hex($scan_result[0]);
 @scan_result = scan_server_header('access/xlog_internal.h',
 	'#define\s+XLP_FIRST_IS_CONTRECORD\s+(\w+)');
