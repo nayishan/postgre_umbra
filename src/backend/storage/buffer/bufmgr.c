@@ -639,6 +639,7 @@ static void UnpinBufferNoOwner(BufferDesc *buf);
 static int	BufferSyncPrepare(int flags);
 static void BufferSync(int flags);
 static int	SyncOneBuffer(int buf_id, bool skip_recently_used,
+						  bool checkpoint_flush,
 						  WritebackContext *wb_context);
 static void WaitIO(BufferDesc *buf);
 static void AbortBufferIO(Buffer buffer);
@@ -668,9 +669,13 @@ static pg_attribute_always_inline void TrackBufferHit(IOObject io_object,
 													  ForkNumber forknum, BlockNumber blocknum);
 static Buffer GetVictimBuffer(BufferAccessStrategy strategy, IOContext io_context);
 static void FlushUnlockedBuffer(BufferDesc *buf, SMgrRelation reln,
-								IOObject io_object, IOContext io_context);
+								IOObject io_object, IOContext io_context,
+								bool checkpoint_flush,
+								uint8 *writeback_source_slot);
 static void FlushBuffer(BufferDesc *buf, SMgrRelation reln,
-						IOObject io_object, IOContext io_context);
+						IOObject io_object, IOContext io_context,
+						bool checkpoint_flush,
+						uint8 *writeback_source_slot);
 #ifdef USE_UMBRA
 #define CKPT_BUFFER_EPOCH_ACTIVE	(UINT64CONST(1) << 63)
 #define CKPT_BUFFER_EPOCH_MASK	(~CKPT_BUFFER_EPOCH_ACTIVE)
@@ -679,6 +684,8 @@ static int	CkptBufferIdsPreparedCount = 0;
 static uint64 CheckpointBufferActiveEpoch(void);
 static void CheckpointBufferCaptureBegin(void);
 static void CheckpointBufferCaptureEnd(void);
+static void ClearCheckpointBufferShiftEpoch(BufferDesc *buf);
+static void TerminateCheckpointBufferIO(BufferDesc *buf);
 #endif
 static void FindAndDropRelationBuffers(RelFileLocator rlocator,
 									   ForkNumber forkNum,
@@ -2361,6 +2368,7 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 
 #ifdef USE_UMBRA
 	InvalidateUmbraBufferActiveSlot(victim_buf_hdr);
+	ClearCheckpointBufferShiftEpoch(victim_buf_hdr);
 #endif
 	victim_buf_hdr->tag = newTag;
 
@@ -2478,6 +2486,7 @@ retry:
 	oldFlags = buf_state & BUF_FLAG_MASK;
 #ifdef USE_UMBRA
 	InvalidateUmbraBufferActiveSlot(buf);
+	ClearCheckpointBufferShiftEpoch(buf);
 #endif
 	ClearBufferTag(&buf->tag);
 
@@ -2565,6 +2574,7 @@ InvalidateVictimBuffer(BufferDesc *buf_hdr)
 	 */
 #ifdef USE_UMBRA
 	InvalidateUmbraBufferActiveSlot(buf_hdr);
+	ClearCheckpointBufferShiftEpoch(buf_hdr);
 #endif
 	ClearBufferTag(&buf_hdr->tag);
 	UnlockBufHdrExt(buf_hdr, buf_state,
@@ -2674,11 +2684,11 @@ again:
 		}
 
 		/* OK, do the I/O */
-		FlushBuffer(buf_hdr, NULL, IOOBJECT_RELATION, io_context);
+		FlushBuffer(buf_hdr, NULL, IOOBJECT_RELATION, io_context, false, NULL);
 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 
 		ScheduleBufferTagForWriteback(&BackendWritebackContext, io_context,
-									  &buf_hdr->tag);
+									  &buf_hdr->tag, UINT8_MAX);
 	}
 
 
@@ -3031,6 +3041,7 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 
 #ifdef USE_UMBRA
 			InvalidateUmbraBufferActiveSlot(victim_buf_hdr);
+			ClearCheckpointBufferShiftEpoch(victim_buf_hdr);
 #endif
 			victim_buf_hdr->tag = tag;
 
@@ -3600,7 +3611,7 @@ TrackNewBufferPin(Buffer buf)
 #define ST_DEFINE
 #include "lib/sort_template.h"
 
-/* Select this checkpoint's buffers before storage metadata is flushed. */
+/* Select this checkpoint's buffers before checkpoint writeback. */
 static int
 BufferSyncPrepare(int flags)
 {
@@ -3853,7 +3864,7 @@ BufferSync(int flags)
 		 */
 		if (pg_atomic_read_u64(&bufHdr->state) & BM_CHECKPOINT_NEEDED)
 		{
-			if (SyncOneBuffer(buf_id, false, &wb_context) & BUF_WRITTEN)
+			if (SyncOneBuffer(buf_id, false, true, &wb_context) & BUF_WRITTEN)
 			{
 				TRACE_POSTGRESQL_BUFFER_SYNC_WRITTEN(buf_id);
 				PendingCheckpointerStats.buffers_written++;
@@ -3966,6 +3977,47 @@ CheckpointBufferActiveEpoch(void)
 	if ((epoch_state & CKPT_BUFFER_EPOCH_ACTIVE) == 0)
 		return 0;
 	return epoch_state & CKPT_BUFFER_EPOCH_MASK;
+}
+
+void
+BufferPublishUmbraSlotShift(Buffer buffer, XLogRecPtr shift_end_lsn,
+							uint8 source_slot,
+							uint8 target_slot)
+{
+	BufferDesc *buf;
+	uint64		epoch = 0;
+	bool		capture_epoch = false;
+
+	if (!BufferIsValid(buffer) || BufferIsLocal(buffer) ||
+		!XLogRecPtrIsValid(shift_end_lsn) ||
+		!UmbraMainActiveSlotIsValid(source_slot) ||
+		!UmbraMainActiveSlotIsValid(target_slot))
+		return;
+	Assert(UmbraMainNextActiveSlot(source_slot) == target_slot);
+	Assert(BufferIsPinned(buffer));
+
+	epoch = CheckpointBufferActiveEpoch();
+	capture_epoch = epoch != 0 && shift_end_lsn > GetRedoRecPtr();
+
+	buf = GetBufferDescriptor(buffer - 1);
+	(void) LockBufHdr(buf);
+	Assert(!UmbraMainActiveSlotIsValid(UmbraBufferActiveSlots[buf->buf_id]) ||
+		   UmbraBufferActiveSlots[buf->buf_id] == source_slot ||
+		   UmbraBufferActiveSlots[buf->buf_id] == target_slot);
+	UmbraBufferActiveSlots[buf->buf_id] = target_slot;
+	if (capture_epoch && CheckpointBufferActiveEpoch() == epoch)
+	{
+		/* A buffer can shift at most once in one checkpoint epoch. */
+		Assert(CkptBufferShiftEpochs[buf->buf_id] != epoch);
+		CkptBufferShiftEpochs[buf->buf_id] = epoch;
+	}
+	UnlockBufHdr(buf);
+}
+
+static void
+ClearCheckpointBufferShiftEpoch(BufferDesc *buf)
+{
+	CkptBufferShiftEpochs[buf->buf_id] = 0;
 }
 #endif
 
@@ -4203,8 +4255,8 @@ BgBufferSync(WritebackContext *wb_context)
 	/* Execute the LRU scan */
 	while (num_to_scan > 0 && reusable_buffers < upcoming_alloc_est)
 	{
-		int			sync_state = SyncOneBuffer(next_to_clean, true,
-											   wb_context);
+		int			sync_state = SyncOneBuffer(next_to_clean, true, false,
+									   wb_context);
 
 		if (++next_to_clean >= NBuffers)
 		{
@@ -4279,12 +4331,14 @@ BgBufferSync(WritebackContext *wb_context)
  * after locking it, but we don't care all that much.)
  */
 static int
-SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
+SyncOneBuffer(int buf_id, bool skip_recently_used, bool checkpoint_flush,
+			  WritebackContext *wb_context)
 {
 	BufferDesc *bufHdr = GetBufferDescriptor(buf_id);
 	int			result = 0;
 	uint64		buf_state;
 	BufferTag	tag;
+	uint8			writeback_source_slot = UINT8_MAX;
 
 	/* Make sure we can handle the pin */
 	ReservePrivateRefCountEntry();
@@ -4326,7 +4380,8 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
 	 */
 	PinBuffer_Locked(bufHdr);
 
-	FlushUnlockedBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+	FlushUnlockedBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL,
+						checkpoint_flush, &writeback_source_slot);
 
 	tag = bufHdr->tag;
 
@@ -4336,7 +4391,8 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
 	 * SyncOneBuffer() is only called by checkpointer and bgwriter, so
 	 * IOContext will always be IOCONTEXT_NORMAL.
 	 */
-	ScheduleBufferTagForWriteback(wb_context, IOCONTEXT_NORMAL, &tag);
+	ScheduleBufferTagForWriteback(wb_context, IOCONTEXT_NORMAL, &tag,
+							  writeback_source_slot);
 
 	return result | BUF_WRITTEN;
 }
@@ -4654,15 +4710,26 @@ BufferGetTag(Buffer buffer, RelFileLocator *rlocator, ForkNumber *forknum,
  */
 static void
 FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
-			IOContext io_context)
+			IOContext io_context, bool checkpoint_flush,
+			uint8 *writeback_source_slot)
 {
 	XLogRecPtr	recptr;
 	ErrorContextCallback errcallback;
 	instr_time	io_start;
 	Block		bufBlock;
+	uint32		blocks_written = 1;
+#ifdef USE_UMBRA
+	uint8			checkpoint_source_slot = UMBRA_ACTIVE_SLOT_INVALID;
+	uint8			active_slot = UMBRA_ACTIVE_SLOT_INVALID;
+	bool		checkpoint_directed = false;
+#else
+	(void) checkpoint_flush;
+#endif
 
 	Assert(BufferLockHeldByMeInMode(buf, BUFFER_LOCK_EXCLUSIVE) ||
-		   BufferLockHeldByMeInMode(buf, BUFFER_LOCK_SHARE_EXCLUSIVE));
+			BufferLockHeldByMeInMode(buf, BUFFER_LOCK_SHARE_EXCLUSIVE));
+	if (writeback_source_slot != NULL)
+		*writeback_source_slot = UINT8_MAX;
 
 	/*
 	 * Try to start an I/O operation.  If StartBufferIO returns false, then
@@ -4671,6 +4738,22 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	 */
 	if (StartSharedBufferIO(buf, false, true, NULL) == BUFFER_IO_ALREADY_DONE)
 		return;
+
+#ifdef USE_UMBRA
+	{
+		uint64		buf_state;
+		uint64		epoch;
+
+		buf_state = LockBufHdr(buf);
+		epoch = CheckpointBufferActiveEpoch();
+		active_slot = UmbraBufferActiveSlots[buf->buf_id];
+		if (epoch != 0 && (buf_state & BM_CHECKPOINT_NEEDED) != 0 &&
+			CkptBufferShiftEpochs[buf->buf_id] == epoch &&
+			UmbraMainActiveSlotIsValid(active_slot))
+			checkpoint_source_slot = UmbraMainPreviousActiveSlot(active_slot);
+		UnlockBufHdr(buf);
+	}
+#endif
 
 	/* Setup error traceback support for ereport() */
 	errcallback.callback = shared_buffer_write_error_callback;
@@ -4727,11 +4810,32 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 
 	io_start = pgstat_prepare_io_time(track_io_timing);
 
-	smgrwrite(reln,
-			  BufTagGetForkNum(&buf->tag),
-			  buf->tag.blockNum,
-			  bufBlock,
-			  false);
+#ifdef USE_UMBRA
+	if (UmbraMainActiveSlotIsValid(checkpoint_source_slot))
+		checkpoint_directed = UmCheckpointWriteSourceSlot(reln,
+											  BufTagGetForkNum(&buf->tag),
+											  buf->tag.blockNum,
+											  checkpoint_source_slot,
+											  bufBlock);
+	if (checkpoint_directed)
+	{
+		if (!checkpoint_flush)
+		{
+			smgrwrite(reln,
+					  BufTagGetForkNum(&buf->tag),
+					  buf->tag.blockNum,
+					  bufBlock,
+					  false);
+			blocks_written++;
+		}
+	}
+	else
+#endif
+		smgrwrite(reln,
+				  BufTagGetForkNum(&buf->tag),
+				  buf->tag.blockNum,
+				  bufBlock,
+				  false);
 
 	/*
 	 * When a strategy is in use, only flushes of dirty buffers already in the
@@ -4752,14 +4856,24 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	 * of a dirty shared buffer (IOCONTEXT_NORMAL IOOP_WRITE).
 	 */
 	pgstat_count_io_op_time(io_object, io_context,
-							IOOP_WRITE, io_start, 1, BLCKSZ);
+							IOOP_WRITE, io_start, blocks_written,
+							(uint64) blocks_written * BLCKSZ);
 
-	pgBufferUsage.shared_blks_written++;
+	pgBufferUsage.shared_blks_written += blocks_written;
 
 	/*
 	 * Mark the buffer as clean and end the BM_IO_IN_PROGRESS state.
 	 */
-	TerminateBufferIO(buf, true, 0, true, false);
+#ifdef USE_UMBRA
+	if (checkpoint_directed && checkpoint_flush)
+	{
+		if (writeback_source_slot != NULL)
+			*writeback_source_slot = checkpoint_source_slot;
+		TerminateCheckpointBufferIO(buf);
+	}
+	else
+#endif
+		TerminateBufferIO(buf, true, 0, true, false);
 
 	TRACE_POSTGRESQL_BUFFER_FLUSH_DONE(BufTagGetForkNum(&buf->tag),
 									   buf->tag.blockNum,
@@ -4777,12 +4891,14 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
  */
 static void
 FlushUnlockedBuffer(BufferDesc *buf, SMgrRelation reln,
-					IOObject io_object, IOContext io_context)
+					IOObject io_object, IOContext io_context,
+					bool checkpoint_flush, uint8 *writeback_source_slot)
 {
 	Buffer		buffer = BufferDescriptorGetBuffer(buf);
 
 	BufferLockAcquire(buffer, buf, BUFFER_LOCK_SHARE_EXCLUSIVE);
-	FlushBuffer(buf, reln, io_object, io_context);
+	FlushBuffer(buf, reln, io_object, io_context, checkpoint_flush,
+				writeback_source_slot);
 	BufferLockUnlock(buffer, buf);
 }
 
@@ -5382,7 +5498,8 @@ FlushRelationBuffers(Relation rel)
 			(buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
 		{
 			PinBuffer_Locked(bufHdr);
-			FlushUnlockedBuffer(bufHdr, srel, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+			FlushUnlockedBuffer(bufHdr, srel, IOOBJECT_RELATION, IOCONTEXT_NORMAL,
+									false, NULL);
 			UnpinBuffer(bufHdr);
 		}
 		else
@@ -5477,7 +5594,8 @@ FlushRelationsAllBuffers(SMgrRelation *smgrs, int nrels)
 			(buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
 		{
 			PinBuffer_Locked(bufHdr);
-			FlushUnlockedBuffer(bufHdr, srelent->srel, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+			FlushUnlockedBuffer(bufHdr, srelent->srel, IOOBJECT_RELATION,
+									IOCONTEXT_NORMAL, false, NULL);
 			UnpinBuffer(bufHdr);
 		}
 		else
@@ -5703,7 +5821,8 @@ FlushDatabaseBuffers(Oid dbid)
 			(buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
 		{
 			PinBuffer_Locked(bufHdr);
-			FlushUnlockedBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+			FlushUnlockedBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL,
+									false, NULL);
 			UnpinBuffer(bufHdr);
 		}
 		else
@@ -5729,7 +5848,7 @@ FlushOneBuffer(Buffer buffer)
 
 	Assert(BufferIsLockedByMe(buffer));
 
-	FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+	FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL, false, NULL);
 }
 
 /*
@@ -7534,7 +7653,12 @@ TerminateBufferIOWithActiveSlot(BufferDesc *buf, bool clear_dirty,
 	unset_flag_bits |= BM_IO_ERROR;
 
 	if (clear_dirty)
+	{
 		unset_flag_bits |= BM_DIRTY | BM_CHECKPOINT_NEEDED;
+#ifdef USE_UMBRA
+		ClearCheckpointBufferShiftEpoch(buf);
+#endif
+	}
 
 	if (release_aio)
 	{
@@ -7621,6 +7745,27 @@ InvalidateUmbraBufferActiveSlot(BufferDesc *buf)
 {
 	Assert(pg_atomic_read_u64(&buf->state) & BM_LOCKED);
 	UmbraBufferActiveSlots[buf->buf_id] = UMBRA_ACTIVE_SLOT_INVALID;
+}
+
+/* A source-slot write satisfies this checkpoint, not the current selector. */
+static void
+TerminateCheckpointBufferIO(BufferDesc *buf)
+{
+	uint64		buf_state;
+
+	buf_state = LockBufHdr(buf);
+	Assert(buf_state & BM_IO_IN_PROGRESS);
+	Assert(buf_state & BM_DIRTY);
+	ClearCheckpointBufferShiftEpoch(buf);
+	buf_state = UnlockBufHdrExt(buf, buf_state, 0,
+								BM_IO_IN_PROGRESS | BM_IO_ERROR |
+								BM_CHECKPOINT_NEEDED, 0);
+
+	ResourceOwnerForgetBufferIO(CurrentResourceOwner,
+								BufferDescriptorGetBuffer(buf));
+	ConditionVariableBroadcast(BufferDescriptorGetIOCV(buf));
+	if (buf_state & BM_PIN_COUNT_WAITER)
+		WakePinCountWaiter(buf);
 }
 #endif
 
@@ -7909,7 +8054,8 @@ WritebackContextInit(WritebackContext *context, int *max_pending)
  */
 void
 ScheduleBufferTagForWriteback(WritebackContext *wb_context, IOContext io_context,
-							  BufferTag *tag)
+							  BufferTag *tag,
+							  uint8 checkpoint_source_slot)
 {
 	PendingWriteback *pending;
 
@@ -7932,6 +8078,7 @@ ScheduleBufferTagForWriteback(WritebackContext *wb_context, IOContext io_context
 		pending = &wb_context->pending_writebacks[wb_context->nr_pending++];
 
 		pending->tag = *tag;
+		pending->checkpoint_source_slot = checkpoint_source_slot;
 	}
 
 	/*
@@ -7994,6 +8141,17 @@ IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
 		tag = cur->tag;
 		currlocator = BufTagGetRelFileLocator(&tag);
 
+#ifdef USE_UMBRA
+		if (UmbraMainActiveSlotIsValid(cur->checkpoint_source_slot))
+		{
+			reln = smgropen(currlocator, INVALID_PROC_NUMBER);
+			UmCheckpointWritebackSourceSlot(reln, BufTagGetForkNum(&tag),
+											 tag.blockNum,
+											 cur->checkpoint_source_slot);
+			continue;
+		}
+#endif
+
 		/*
 		 * Peek ahead, into following writeback requests, to see if they can
 		 * be combined with the current one.
@@ -8002,6 +8160,11 @@ IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
 		{
 
 			next = &wb_context->pending_writebacks[i + ahead + 1];
+
+#ifdef USE_UMBRA
+			if (UmbraMainActiveSlotIsValid(next->checkpoint_source_slot))
+				break;
+#endif
 
 			/* different file, stop */
 			if (!RelFileLocatorEquals(currlocator,
@@ -8137,7 +8300,8 @@ EvictUnpinnedBufferInternal(BufferDesc *desc, bool *buffer_flushed)
 	/* If it was dirty, try to clean it once. */
 	if (buf_state & BM_DIRTY)
 	{
-		FlushUnlockedBuffer(desc, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+		FlushUnlockedBuffer(desc, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL,
+							false, NULL);
 		*buffer_flushed = true;
 	}
 

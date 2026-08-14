@@ -8098,6 +8098,7 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 
 		/* Capture the selected MAIN buffers before their writeback begins. */
 		CheckPointBuffersPrepare(flags);
+		INJECTION_POINT("umbra-checkpoint-after-buffer-selection", NULL);
 		CheckPointBuffers(flags);
 		smgrcheckpoint();
 	}

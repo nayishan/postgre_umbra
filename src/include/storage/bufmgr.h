@@ -294,6 +294,9 @@ extern void BufferRememberUmbraActiveSlot(Buffer buffer, uint8 active_slot);
 extern void CheckPointBuffersShiftEpochBegin(void);
 extern void CheckPointBuffersPrepare(int flags);
 extern void CheckPointBuffersAbort(void);
+extern void BufferPublishUmbraSlotShift(Buffer buffer, XLogRecPtr shift_end_lsn,
+										uint8 source_slot,
+										uint8 target_slot);
 #endif
 extern void CheckPointBuffers(int flags);
 extern BlockNumber BufferGetBlockNumber(Buffer buffer);

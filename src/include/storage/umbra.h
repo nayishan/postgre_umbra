@@ -56,6 +56,13 @@ UmbraMainNextActiveSlot(uint8 active_slot)
 	return active_slot == UMBRA_CHUNK_ACTIVE_SLOTS - 1 ? 0 : active_slot + 1;
 }
 
+static inline uint8
+UmbraMainPreviousActiveSlot(uint8 active_slot)
+{
+	Assert(UmbraMainActiveSlotIsValid(active_slot));
+	return active_slot == 0 ? UMBRA_CHUNK_ACTIVE_SLOTS - 1 : active_slot - 1;
+}
+
 static inline bool
 UmbraMainActiveSlotPhysicalBlock(BlockNumber logical_block, uint8 active_slot,
 								 BlockNumber *physical_block)
@@ -172,6 +179,13 @@ extern bool UmChooseSlotShift(SMgrRelation reln, ForkNumber forknum,
 							  UmbraSlotShift *shift);
 /* Publish a selected target after WAL insertion has assigned its LSN. */
 extern void UmPublishSlotShift(UmbraSlotShift *shift, XLogRecPtr lsn);
+extern bool UmCheckpointWriteSourceSlot(SMgrRelation reln, ForkNumber forknum,
+										BlockNumber lblkno, uint8 source_slot,
+										const void *buffer);
+extern void UmCheckpointWritebackSourceSlot(SMgrRelation reln,
+											ForkNumber forknum,
+											BlockNumber lblkno,
+											uint8 source_slot);
 extern bool UmRedoSlotShift(SMgrRelation reln, ForkNumber forknum,
 							BlockNumber logical_block, uint8 source_slot,
 							uint8 target_slot, XLogRecPtr shift_lsn);
