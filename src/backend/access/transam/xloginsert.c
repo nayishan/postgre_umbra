@@ -98,6 +98,8 @@ typedef struct
 	const void *hint_delta_context;
 	XLogRecData hint_delta_rdata;
 	bool		slot_shift_in_record;
+	bool		logical_birth_in_record;
+	BlockNumber logical_birth_eof;
 	UmbraSlotShift slot_shift;
 #endif
 } registered_buffer;
@@ -149,6 +151,7 @@ static bool begininsert_called = false;
 
 #ifdef USE_UMBRA
 static bool curinsert_has_slot_shift = false;
+static bool curinsert_has_logical_birth = false;
 static bool curinsert_slot_shift_delay_started = false;
 #endif
 
@@ -174,6 +177,7 @@ static bool XLogCompressBackupBlock(const PageData *page, uint16 hole_offset,
 static bool XLogBlockSlotShiftEligible(registered_buffer *regbuf,
 										   RmgrId rmid, uint8 info);
 static void XLogPublishSlotShifts(XLogRecPtr record_endptr);
+static void XLogPublishLogicalBirths(XLogRecPtr record_endptr);
 #endif
 
 /*
@@ -273,6 +277,8 @@ XLogResetInsertion(void)
 		MemSet(&registered_buffers[i].hint_delta_rdata, 0,
 			   sizeof(registered_buffers[i].hint_delta_rdata));
 		registered_buffers[i].slot_shift_in_record = false;
+		registered_buffers[i].logical_birth_in_record = false;
+		registered_buffers[i].logical_birth_eof = InvalidBlockNumber;
 		MemSet(&registered_buffers[i].slot_shift, 0,
 				   sizeof(registered_buffers[i].slot_shift));
 #endif
@@ -284,6 +290,9 @@ XLogResetInsertion(void)
 	mainrdata_last = (XLogRecData *) &mainrdata_head;
 	curinsert_flags = 0;
 	begininsert_called = false;
+#ifdef USE_UMBRA
+	curinsert_has_logical_birth = false;
+#endif
 }
 
 /*
@@ -586,7 +595,7 @@ XLogInsert(RmgrId rmid, uint8 info)
 		int			num_fpi = 0;
 		uint64		fpi_bytes = 0;
 #ifdef USE_UMBRA
-		bool		slot_shift_critical = false;
+		bool		umbra_publish_critical = false;
 #endif
 
 		/*
@@ -628,10 +637,10 @@ XLogInsert(RmgrId rmid, uint8 info)
 #endif
 
 #ifdef USE_UMBRA
-		if (curinsert_has_slot_shift)
+		if (curinsert_has_slot_shift || curinsert_has_logical_birth)
 		{
 			START_CRIT_SECTION();
-			slot_shift_critical = true;
+			umbra_publish_critical = true;
 		}
 #endif
 		EndPos = XLogInsertRecord(rdt, fpw_lsn, curinsert_flags, num_fpi,
@@ -642,7 +651,9 @@ XLogInsert(RmgrId rmid, uint8 info)
 			INJECTION_POINT_CACHED("umbra-mapping-after-wal-before-publish", NULL);
 			XLogPublishSlotShifts(EndPos);
 		}
-		if (slot_shift_critical)
+		if (XLogRecPtrIsValid(EndPos) && curinsert_has_logical_birth)
+			XLogPublishLogicalBirths(EndPos);
+		if (umbra_publish_critical)
 			END_CRIT_SECTION();
 #endif
 	} while (!XLogRecPtrIsValid(EndPos));
@@ -1148,6 +1159,7 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 
 #ifdef USE_UMBRA
 	curinsert_has_slot_shift = false;
+	curinsert_has_logical_birth = false;
 #endif
 
 	/*
@@ -1191,13 +1203,18 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 		bool		include_image;
 #ifdef USE_UMBRA
 		bool		include_slot_shift = false;
-		XLogRecordBlockSlotShiftHeader slot_shift_header;
+		bool		include_logical_birth = false;
+		bool		include_umbra_info = false;
+		BlockNumber logical_birth_eof = InvalidBlockNumber;
+		XLogRecordBlockUmbraHeader umbra_header = {0};
 #endif
 
 		if (!regbuf->in_use)
 			continue;
 #ifdef USE_UMBRA
 		regbuf->slot_shift_in_record = false;
+		regbuf->logical_birth_in_record = false;
+		regbuf->logical_birth_eof = InvalidBlockNumber;
 		if (regbuf->hint_delta_context != NULL)
 		{
 			Assert(regbuf->rdata_len == 0 ||
@@ -1288,6 +1305,17 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 			regbuf->slot_shift.selected = false;
 			regbuf->slot_shift.reln = NULL;
 		}
+
+		if ((needs_backup ||
+			 (regbuf->flags & REGBUF_WILL_INIT) == REGBUF_WILL_INIT) &&
+			UmGetLogicalBirthForWAL(regbuf->rlocator, regbuf->forkno,
+								  regbuf->block, &logical_birth_eof))
+		{
+			include_logical_birth = true;
+			regbuf->logical_birth_in_record = true;
+			regbuf->logical_birth_eof = logical_birth_eof;
+			curinsert_has_logical_birth = true;
+		}
 #endif
 
 		/* Determine if the buffer data needs to included */
@@ -1306,10 +1334,17 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 			bkpb.fork_flags |= BKPBLOCK_WILL_INIT;
 
 #ifdef USE_UMBRA
+		include_umbra_info = include_slot_shift || include_logical_birth;
+		if (include_umbra_info)
+		{
+			bkpb.fork_flags |= BKPBLOCK_HAS_UMBRA_INFO;
+			if (include_slot_shift)
+				umbra_header.flags |= XLOG_UMBRA_BLOCK_HAS_SLOT_SHIFT;
+			if (include_logical_birth)
+				umbra_header.flags |= XLOG_UMBRA_BLOCK_HAS_LOGICAL_EOF;
+		}
 		if (include_slot_shift)
 		{
-			slot_shift_header.target_slot = regbuf->slot_shift.target_slot;
-			bkpb.fork_flags |= BKPBLOCK_HAS_SLOT_SHIFT;
 			regbuf->slot_shift_in_record = true;
 			curinsert_has_slot_shift = true;
 		}
@@ -1496,11 +1531,20 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 		memcpy(scratch, &bkpb, SizeOfXLogRecordBlockHeader);
 		scratch += SizeOfXLogRecordBlockHeader;
 #ifdef USE_UMBRA
-		if (include_slot_shift)
+		if (include_umbra_info)
 		{
-			memcpy(scratch, &slot_shift_header,
-				   SizeOfXLogRecordBlockSlotShiftHeader);
-			scratch += SizeOfXLogRecordBlockSlotShiftHeader;
+			memcpy(scratch, &umbra_header, SizeOfXLogRecordBlockUmbraHeader);
+			scratch += SizeOfXLogRecordBlockUmbraHeader;
+			if (include_slot_shift)
+			{
+				memcpy(scratch, &regbuf->slot_shift.target_slot, sizeof(uint8));
+				scratch += sizeof(uint8);
+			}
+			if (include_logical_birth)
+			{
+				memcpy(scratch, &logical_birth_eof, sizeof(BlockNumber));
+				scratch += sizeof(BlockNumber);
+			}
 		}
 #endif
 		if (include_image)
@@ -1666,6 +1710,20 @@ XLogPublishSlotShifts(XLogRecPtr record_endptr)
 		regbuf->slot_shift_in_record = false;
 	}
 	curinsert_has_slot_shift = false;
+}
+
+static void
+XLogPublishLogicalBirths(XLogRecPtr record_endptr)
+{
+	for (int block_id = 0; block_id < max_registered_block_id; block_id++)
+	{
+		registered_buffer *regbuf = &registered_buffers[block_id];
+
+		if (!regbuf->in_use || !regbuf->logical_birth_in_record)
+			continue;
+		UmPublishLogicalBirth(regbuf->rlocator, regbuf->forkno,
+						  regbuf->logical_birth_eof, record_endptr);
+	}
 }
 #endif
 
@@ -1883,6 +1941,18 @@ log_newpage(RelFileLocator *rlocator, ForkNumber forknum, BlockNumber blkno,
 	int			flags;
 	XLogRecPtr	recptr;
 
+	/* A buffer-backed caller is already in its critical section. */
+#ifdef USE_UMBRA
+	if (CritSectionCount == 0 && UmbraForkUsesActiveSlots(forknum))
+	{
+		if (blkno == MaxBlockNumber)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("cannot WAL-log an Umbra page beyond the logical block limit")));
+		UmPrepareLogicalBirth(*rlocator, forknum, blkno + 1);
+	}
+#endif
+
 	flags = REGBUF_FORCE_IMAGE;
 	if (page_std)
 		flags |= REGBUF_STANDARD;
@@ -1916,6 +1986,26 @@ log_newpages(RelFileLocator *rlocator, ForkNumber forknum, int num_pages,
 	XLogRecPtr	recptr;
 	int			i;
 	int			j;
+#ifdef USE_UMBRA
+	BlockNumber	logical_eof = 0;
+#endif
+
+#ifdef USE_UMBRA
+	/* Arm the logical birth before these FPIs or their later private writes. */
+	if (CritSectionCount == 0 && UmbraForkUsesActiveSlots(forknum))
+	{
+		for (i = 0; i < num_pages; i++)
+		{
+			if (blknos[i] == MaxBlockNumber)
+				ereport(ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("cannot WAL-log an Umbra page beyond the logical block limit")));
+			logical_eof = Max(logical_eof, blknos[i] + 1);
+		}
+		if (logical_eof != 0)
+			UmPrepareLogicalBirth(*rlocator, forknum, logical_eof);
+	}
+#endif
 
 	flags = REGBUF_FORCE_IMAGE;
 	if (page_std)
@@ -2010,6 +2100,16 @@ log_newpage_range(Relation rel, ForkNumber forknum,
 {
 	int			flags;
 	BlockNumber blkno;
+
+#ifdef USE_UMBRA
+	/*
+	 * This path WAL-logs pages after the private writer has extended them.
+	 * The individual FPI block headers publish this frontier after each page is
+	 * represented in WAL.
+	 */
+	if (startblk < endblk && UmbraForkUsesActiveSlots(forknum))
+		UmPrepareLogicalBirth(rel->rd_locator, forknum, endblk);
+#endif
 
 	flags = REGBUF_FORCE_IMAGE;
 	if (page_std)

@@ -3154,6 +3154,19 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	 * We don't need to set checksum for all-zero pages.
 	 */
 	extension_pblks = palloc_array(BlockNumber, extend_by);
+#ifdef USE_UMBRA
+	/*
+	 * The first ordinary page WAL record follows this extension.  Keep its
+	 * logical frontier private until that record carries it, so a checkpoint
+	 * cannot persist a root ahead of the page WAL.
+	 * Unlogged and minimal-WAL relations deliberately take the normal
+	 * filesystem-durability path and need no redo frontier record.
+	 */
+	if (bmr.rel != NULL &&
+		(RelationNeedsWAL(bmr.rel) || fork == INIT_FORKNUM))
+		UmPrepareLogicalBirth(BMR_GET_SMGR(bmr)->smgr_rlocator.locator,
+							 fork, first_block + extend_by);
+#endif
 	smgrzeroextend_with_targets(BMR_GET_SMGR(bmr), fork, first_block,
 								extend_by, false, extension_pblks);
 #ifdef USE_UMBRA
@@ -5816,6 +5829,11 @@ RelationCopyStorageUsingBuffer(RelFileLocator srclocator,
 	 * relation before starting to copy block by block.
 	 */
 	memset(buf.data, 0, BLCKSZ);
+#ifdef USE_UMBRA
+	/* Each copied page is WAL-logged only after this preallocation. */
+	if (use_wal)
+		UmPrepareLogicalBirth(dstlocator, forkNum, nblocks);
+#endif
 	smgrextend(smgropen(dstlocator, INVALID_PROC_NUMBER), forkNum, nblocks - 1,
 			   buf.data, true);
 

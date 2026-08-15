@@ -72,6 +72,10 @@ typedef struct UmbraMapRootEntry
 	bool        valid;
 	bool        dirty;
 	bool        needs_fsync;
+	/* Runtime EOF can lead this only after physical data exists. */
+	BlockNumber wal_covered_eof_main;
+	BlockNumber wal_covered_eof_fsm;
+	BlockNumber wal_covered_eof_vm;
 	XLogRecPtr  wal_flush_lsn;
 	char        image[UMMAP_ROOT_IMAGE_SIZE];
 } UmbraMapRootEntry;
@@ -144,6 +148,19 @@ static void ummap_root_set_aux_frontier(UmbraMapRootData *root,
 										BlockNumber logical_eof);
 static bool ummap_root_aux_frontier_valid(const UmbraMapRootData *root,
 										 ForkNumber forknum);
+static BlockNumber ummap_root_get_frontier(const UmbraMapRootData *root,
+											ForkNumber forknum);
+static void ummap_root_set_frontier(UmbraMapRootData *root,
+									 ForkNumber forknum,
+									 BlockNumber logical_eof);
+static BlockNumber ummap_entry_get_wal_covered_frontier(
+	const UmbraMapRootEntry *entry, ForkNumber forknum);
+static void ummap_entry_set_wal_covered_frontier(UmbraMapRootEntry *entry,
+												 ForkNumber forknum,
+												 BlockNumber logical_eof);
+static void ummap_root_cache_set_wal_covered_from_image(UmbraMapRootEntry *entry);
+static bool ummap_root_cache_frontier_is_wal_covered(
+	const UmbraMapRootEntry *entry);
 
 const ShmemCallbacks UmbraMapRootShmemCallbacks = {
 	.request_fn = ummap_root_cache_request,
@@ -224,6 +241,8 @@ ummap_set_main_frontier(UmbraFileContext *ctx,
 	UmbraMapRootEntry *entry;
 	UmbraMapRootData *root;
 	BlockNumber	physical_capacity;
+	BlockNumber	current_logical_eof;
+	bool		old_frontier_wal_covered;
 
 	Assert(ctx != NULL);
 	if (!UmbraMappedPhysicalCapacity(logical_eof, &physical_capacity))
@@ -231,15 +250,147 @@ ummap_set_main_frontier(UmbraFileContext *ctx,
 
 	entry = ummap_root_cache_get(ctx, rlocator, LW_EXCLUSIVE);
 	root = (UmbraMapRootData *) entry->image;
-	if (root->logical_eof_main != logical_eof)
+	current_logical_eof = root->logical_eof_main;
+	if (current_logical_eof != logical_eof)
 	{
 		root->logical_eof_main = logical_eof;
+		old_frontier_wal_covered =
+			entry->wal_covered_eof_main >= current_logical_eof;
+		if (old_frontier_wal_covered)
+			entry->wal_covered_eof_main = logical_eof;
+		else if (logical_eof < current_logical_eof)
+			entry->wal_covered_eof_main =
+				Min(entry->wal_covered_eof_main, logical_eof);
 		ummap_root_refresh_crc(root);
 		entry->dirty = true;
 		entry->needs_fsync = true;
 		entry->wal_flush_lsn = InRecovery ? InvalidXLogRecPtr :
 			Max(entry->wal_flush_lsn, GetXLogWriteRecPtr());
 	}
+	LWLockRelease(&entry->content_lock);
+}
+
+/*
+ * Make newly materialized capacity visible to all backends, while keeping the
+ * dirty root out of a checkpoint until page WAL has covered this frontier.
+ * Preparation made this lookup allocation-free for the caller's critical
+ * section.
+ */
+void
+ummap_publish_frontier_after_data(UmbraFileContext *ctx, ForkNumber forknum,
+								  RelFileLocatorBackend rlocator,
+								  BlockNumber logical_eof)
+{
+	UmbraMapRootTag tag = {0};
+	UmbraMapRootEntry *entry;
+	UmbraMapRootData *root;
+	BlockNumber	physical_capacity;
+	BlockNumber	current_logical_eof;
+
+	Assert(ctx != NULL);
+	Assert(UmbraForkUsesActiveSlots(forknum));
+	if (!UmbraMappedPhysicalCapacity(logical_eof, &physical_capacity))
+		elog(PANIC, "invalid Umbra mapped data frontier");
+
+	tag.rlocator = rlocator;
+	if (!ummap_root_cache_find_locked(&tag, LW_EXCLUSIVE, &entry) ||
+		!entry->valid)
+		elog(PANIC, "Umbra mapped data frontier was not prepared");
+	root = (UmbraMapRootData *) entry->image;
+	current_logical_eof = ummap_root_get_frontier(root, forknum);
+	if (current_logical_eof < logical_eof)
+	{
+		ummap_root_set_frontier(root, forknum, logical_eof);
+		ummap_root_refresh_crc(root);
+		entry->dirty = true;
+		entry->needs_fsync = true;
+		entry->wal_flush_lsn = InRecovery ? InvalidXLogRecPtr :
+			Max(entry->wal_flush_lsn, GetXLogWriteRecPtr());
+	}
+	LWLockRelease(&entry->content_lock);
+}
+
+bool
+ummap_frontier_needs_wal(UmbraFileContext *ctx, ForkNumber forknum,
+						 RelFileLocatorBackend rlocator,
+						 BlockNumber logical_eof)
+{
+	UmbraMapRootEntry *entry;
+	UmbraMapRootData *root;
+	BlockNumber	current_logical_eof;
+	bool		needs_wal;
+
+	Assert(ctx != NULL);
+	Assert(UmbraForkUsesActiveSlots(forknum));
+	entry = ummap_root_cache_get(ctx, rlocator, LW_SHARED);
+	root = (UmbraMapRootData *) entry->image;
+	current_logical_eof = ummap_root_get_frontier(root, forknum);
+	needs_wal = logical_eof <= current_logical_eof &&
+		logical_eof > ummap_entry_get_wal_covered_frontier(entry, forknum);
+	LWLockRelease(&entry->content_lock);
+	return needs_wal;
+}
+
+/* Record that a page WAL record can reconstruct its logical EOF. */
+void
+ummap_note_frontier_wal(UmbraFileContext *ctx, ForkNumber forknum,
+						RelFileLocatorBackend rlocator,
+						BlockNumber logical_eof,
+						XLogRecPtr record_endptr)
+{
+	UmbraMapRootTag tag = {0};
+	UmbraMapRootEntry *entry;
+
+	Assert(ctx != NULL);
+	Assert(UmbraForkUsesActiveSlots(forknum));
+	Assert(XLogRecPtrIsValid(record_endptr));
+	tag.rlocator = rlocator;
+	if (!ummap_root_cache_find_locked(&tag, LW_EXCLUSIVE, &entry) ||
+		!entry->valid)
+		elog(PANIC, "Umbra logical EOF WAL root was not prepared");
+	if (ummap_entry_get_wal_covered_frontier(entry, forknum) < logical_eof)
+		ummap_entry_set_wal_covered_frontier(entry, forknum, logical_eof);
+	entry->wal_flush_lsn = InRecovery ? InvalidXLogRecPtr :
+		Max(entry->wal_flush_lsn, record_endptr);
+	LWLockRelease(&entry->content_lock);
+}
+
+/*
+ * A logical-birth record is replayed in WAL order with truncate records.
+ * It can therefore only raise the cached frontier; a later truncate record
+ * remains the sole path that lowers it.  In particular, an older birth record
+ * must not overwrite a frontier that was already made durable past it.
+ */
+void
+ummap_advance_frontier_from_redo(UmbraFileContext *ctx, ForkNumber forknum,
+								RelFileLocatorBackend rlocator,
+								BlockNumber logical_eof)
+{
+	UmbraMapRootEntry *entry;
+	UmbraMapRootData *root;
+	BlockNumber	physical_capacity;
+	BlockNumber	current_logical_eof;
+
+	Assert(ctx != NULL);
+	Assert(InRecovery);
+	Assert(UmbraForkUsesActiveSlots(forknum));
+	if (!UmbraMappedPhysicalCapacity(logical_eof, &physical_capacity))
+		elog(PANIC, "invalid Umbra mapped redo frontier");
+
+	entry = ummap_root_cache_get(ctx, rlocator, LW_EXCLUSIVE);
+	root = (UmbraMapRootData *) entry->image;
+	current_logical_eof = ummap_root_get_frontier(root, forknum);
+
+	if (current_logical_eof < logical_eof)
+	{
+		ummap_root_set_frontier(root, forknum, logical_eof);
+		ummap_root_refresh_crc(root);
+		entry->dirty = true;
+		entry->needs_fsync = true;
+		entry->wal_flush_lsn = InvalidXLogRecPtr;
+	}
+	if (ummap_entry_get_wal_covered_frontier(entry, forknum) < logical_eof)
+		ummap_entry_set_wal_covered_frontier(entry, forknum, logical_eof);
 	LWLockRelease(&entry->content_lock);
 }
 
@@ -290,6 +441,7 @@ ummap_publish_prepared_main_frontier(UmbraFileContext *ctx,
 		entry->wal_flush_lsn = InRecovery ? InvalidXLogRecPtr :
 			Max(entry->wal_flush_lsn, GetXLogWriteRecPtr());
 	}
+	entry->wal_covered_eof_main = logical_eof;
 	ummap_root_cache_flush_locked(entry, ctx);
 	LWLockRelease(&entry->content_lock);
 }
@@ -320,6 +472,7 @@ ummap_set_aux_frontier(UmbraFileContext *ctx, ForkNumber forknum,
 	UmbraMapRootData *root;
 	BlockNumber	physical_capacity;
 	BlockNumber	current_logical_eof;
+	bool		old_frontier_wal_covered;
 
 	Assert(ctx != NULL);
 	Assert(UmbraIsMappedAuxiliaryFork(forknum));
@@ -332,6 +485,17 @@ ummap_set_aux_frontier(UmbraFileContext *ctx, ForkNumber forknum,
 	if (current_logical_eof != logical_eof)
 	{
 		ummap_root_set_aux_frontier(root, forknum, logical_eof);
+		old_frontier_wal_covered =
+			ummap_entry_get_wal_covered_frontier(entry, forknum) >=
+			current_logical_eof;
+		if (old_frontier_wal_covered)
+			ummap_entry_set_wal_covered_frontier(entry, forknum,
+												  logical_eof);
+		else if (logical_eof < current_logical_eof)
+			ummap_entry_set_wal_covered_frontier(entry, forknum,
+												  Min(ummap_entry_get_wal_covered_frontier(entry,
+																		forknum),
+													  logical_eof));
 		ummap_root_refresh_crc(root);
 		entry->dirty = true;
 		entry->needs_fsync = true;
@@ -387,6 +551,7 @@ ummap_publish_prepared_aux_frontier(UmbraFileContext *ctx,
 		entry->wal_flush_lsn = InRecovery ? InvalidXLogRecPtr :
 			Max(entry->wal_flush_lsn, GetXLogWriteRecPtr());
 	}
+	ummap_entry_set_wal_covered_frontier(entry, forknum, logical_eof);
 	ummap_root_cache_flush_locked(entry, ctx);
 	LWLockRelease(&entry->content_lock);
 }
@@ -564,6 +729,91 @@ ummap_root_aux_frontier_valid(const UmbraMapRootData *root,
 	logical_eof = ummap_root_get_aux_frontier(root, forknum);
 	return BlockNumberIsValid(logical_eof) &&
 		UmbraMappedPhysicalCapacity(logical_eof, &physical_capacity);
+}
+
+static BlockNumber
+ummap_root_get_frontier(const UmbraMapRootData *root, ForkNumber forknum)
+{
+	Assert(root != NULL);
+	if (forknum == MAIN_FORKNUM)
+		return root->logical_eof_main;
+	return ummap_root_get_aux_frontier(root, forknum);
+}
+
+static void
+ummap_root_set_frontier(UmbraMapRootData *root, ForkNumber forknum,
+						 BlockNumber logical_eof)
+{
+	Assert(root != NULL);
+	if (forknum == MAIN_FORKNUM)
+		root->logical_eof_main = logical_eof;
+	else
+		ummap_root_set_aux_frontier(root, forknum, logical_eof);
+}
+
+static BlockNumber
+ummap_entry_get_wal_covered_frontier(const UmbraMapRootEntry *entry,
+									 ForkNumber forknum)
+{
+	Assert(entry != NULL);
+	switch (forknum)
+	{
+		case MAIN_FORKNUM:
+			return entry->wal_covered_eof_main;
+		case FSM_FORKNUM:
+			return entry->wal_covered_eof_fsm;
+		case VISIBILITYMAP_FORKNUM:
+			return entry->wal_covered_eof_vm;
+		default:
+			elog(PANIC, "invalid Umbra mapped fork %d", (int) forknum);
+	}
+	return 0;
+}
+
+static void
+ummap_entry_set_wal_covered_frontier(UmbraMapRootEntry *entry,
+									 ForkNumber forknum,
+									 BlockNumber logical_eof)
+{
+	Assert(entry != NULL);
+	switch (forknum)
+	{
+		case MAIN_FORKNUM:
+			entry->wal_covered_eof_main = logical_eof;
+			break;
+		case FSM_FORKNUM:
+			entry->wal_covered_eof_fsm = logical_eof;
+			break;
+		case VISIBILITYMAP_FORKNUM:
+			entry->wal_covered_eof_vm = logical_eof;
+			break;
+		default:
+			elog(PANIC, "invalid Umbra mapped fork %d", (int) forknum);
+	}
+}
+
+static void
+ummap_root_cache_set_wal_covered_from_image(UmbraMapRootEntry *entry)
+{
+	UmbraMapRootData *root;
+
+	Assert(entry != NULL);
+	root = (UmbraMapRootData *) entry->image;
+	entry->wal_covered_eof_main = root->logical_eof_main;
+	entry->wal_covered_eof_fsm = root->logical_eof_fsm;
+	entry->wal_covered_eof_vm = root->logical_eof_vm;
+}
+
+static bool
+ummap_root_cache_frontier_is_wal_covered(const UmbraMapRootEntry *entry)
+{
+	const UmbraMapRootData *root;
+
+	Assert(entry != NULL);
+	root = (const UmbraMapRootData *) entry->image;
+	return entry->wal_covered_eof_main >= root->logical_eof_main &&
+		entry->wal_covered_eof_fsm >= root->logical_eof_fsm &&
+		entry->wal_covered_eof_vm >= root->logical_eof_vm;
 }
 
 static void
@@ -840,6 +1090,9 @@ ummap_root_cache_ensure_entry_locked(const UmbraMapRootTag *tag)
 		entry->valid = false;
 		entry->dirty = false;
 		entry->needs_fsync = false;
+		entry->wal_covered_eof_main = 0;
+		entry->wal_covered_eof_fsm = 0;
+		entry->wal_covered_eof_vm = 0;
 		entry->wal_flush_lsn = InvalidXLogRecPtr;
 		MemSet(entry->image, 0, sizeof(entry->image));
 	}
@@ -872,6 +1125,7 @@ ummap_root_cache_get(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 				entry->valid = true;
 				entry->dirty = false;
 				entry->needs_fsync = false;
+				ummap_root_cache_set_wal_covered_from_image(entry);
 				entry->wal_flush_lsn = InvalidXLogRecPtr;
 				break;
 			}
@@ -888,6 +1142,7 @@ ummap_root_cache_get(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 			entry->valid = true;
 			entry->dirty = false;
 			entry->needs_fsync = false;
+			ummap_root_cache_set_wal_covered_from_image(entry);
 			entry->wal_flush_lsn = InvalidXLogRecPtr;
 		}
 		break;
@@ -915,6 +1170,9 @@ ummap_root_cache_flush_locked(UmbraMapRootEntry *entry,
 	Assert(entry != NULL);
 	Assert(LWLockHeldByMeInMode(&entry->content_lock, LW_EXCLUSIVE));
 	if (!entry->valid || !entry->dirty)
+		return;
+	/* The shared root can lead disk only after a page WAL record covers it. */
+	if (!ummap_root_cache_frontier_is_wal_covered(entry))
 		return;
 
 	PG_TRY();

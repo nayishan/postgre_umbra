@@ -386,6 +386,14 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 
 #ifdef USE_UMBRA
 	blkref = XLogRecGetBlock(record, block_id);
+	/*
+	 * A logical EOF is attached only to a record that can construct this page
+	 * from scratch.  Advance the root before asking smgr to locate the block.
+	 */
+	if (blkref->has_logical_eof &&
+		(willinit || XLogRecBlockImageApply(record, block_id)))
+		UmRedoLogicalBirth(smgropen(rlocator, INVALID_PROC_NUMBER), forknum,
+						   blkref->logical_eof);
 	if (blkref->has_slot_shift)
 	{
 		SMgrRelation reln;

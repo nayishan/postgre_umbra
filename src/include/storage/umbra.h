@@ -16,6 +16,7 @@
 #ifndef UMBRA_H
 #define UMBRA_H
 
+#include "access/xlogdefs.h"
 #include "storage/aio_types.h"
 #include "storage/block.h"
 #include "storage/relfilelocator.h"
@@ -222,6 +223,18 @@ extern bool UmCheckpointWriteSourceSlot(SMgrRelation reln, ForkNumber forknum,
 										BlockNumber *physical_block);
 extern bool UmRedoMappingPolicyResolved(SMgrRelation reln, ForkNumber forknum);
 extern bool UmUsesMappedSlots(SMgrRelation reln, ForkNumber forknum);
+/* Pair physical mapped extension with the page WAL that makes it recoverable. */
+extern void UmPrepareLogicalBirth(RelFileLocator rlocator, ForkNumber forknum,
+							 BlockNumber logical_eof);
+extern bool UmGetLogicalBirthForWAL(RelFileLocator rlocator, ForkNumber forknum,
+								BlockNumber logical_block,
+								BlockNumber *logical_eof);
+extern void UmPublishLogicalBirth(RelFileLocator rlocator, ForkNumber forknum,
+								 BlockNumber logical_eof,
+								 XLogRecPtr record_endptr);
+/* Redo raises a valid mapped root frontier after materializing its capacity. */
+extern void UmRedoLogicalBirth(SMgrRelation reln, ForkNumber forknum,
+							   BlockNumber logical_eof);
 /* Write an existing mapped page to a caller-selected slot and report its pblk. */
 extern bool UmWriteSlot(SMgrRelation reln, ForkNumber forknum,
 						BlockNumber logical_block, const void *buffer,

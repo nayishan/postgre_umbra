@@ -116,18 +116,21 @@ typedef struct XLogRecordBlockHeader
 
 #ifdef USE_UMBRA
 /*
- * A WAL block reference can move an Umbra mapped page to its next active slot.
- * It stores the target slot; the reader derives the preceding source slot.
+ * Umbra-private information attached to a WAL block reference.  The optional
+ * fields immediately following this byte are selected by its flags.
  */
-typedef struct XLogRecordBlockSlotShiftHeader
+typedef struct XLogRecordBlockUmbraHeader
 {
-	uint8		target_slot;
-} XLogRecordBlockSlotShiftHeader;
+	uint8		flags;
+} XLogRecordBlockUmbraHeader;
 
-#define SizeOfXLogRecordBlockSlotShiftHeader \
-	sizeof(XLogRecordBlockSlotShiftHeader)
+#define SizeOfXLogRecordBlockUmbraHeader \
+	(sizeof(XLogRecordBlockUmbraHeader))
+
+#define XLOG_UMBRA_BLOCK_HAS_SLOT_SHIFT	0x01
+#define XLOG_UMBRA_BLOCK_HAS_LOGICAL_EOF	0x02
 #else
-#define SizeOfXLogRecordBlockSlotShiftHeader 0
+#define SizeOfXLogRecordBlockUmbraHeader 0
 #endif
 
 /*
@@ -200,7 +203,8 @@ typedef struct XLogRecordBlockCompressHeader
  */
 #define MaxSizeOfXLogRecordBlockHeader \
 	(SizeOfXLogRecordBlockHeader + \
-	 SizeOfXLogRecordBlockSlotShiftHeader + \
+	 SizeOfXLogRecordBlockUmbraHeader + \
+	 sizeof(uint8) + sizeof(BlockNumber) + \
 	 SizeOfXLogRecordBlockImageHeader + \
 	 SizeOfXLogRecordBlockCompressHeader + \
 	 sizeof(RelFileLocator) + \
@@ -208,11 +212,11 @@ typedef struct XLogRecordBlockCompressHeader
 
 /*
  * The fork number normally fits in the lower 4 bits in fork_flags.  Umbra
- * reserves one of those bits for its private slot-shift marker.
+ * reserves one of those bits for private block-reference metadata.
  */
 #ifdef USE_UMBRA
 #define BKPBLOCK_FORK_MASK	0x07
-#define BKPBLOCK_HAS_SLOT_SHIFT 0x08
+#define BKPBLOCK_HAS_UMBRA_INFO 0x08
 #define BKPBLOCK_FLAG_MASK	0xF8
 #else
 #define BKPBLOCK_FORK_MASK	0x0F

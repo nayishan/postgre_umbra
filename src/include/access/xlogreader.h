@@ -133,10 +133,13 @@ typedef struct
 	uint8		flags;
 
 #ifdef USE_UMBRA
-	/* Umbra mapped-fork source/target slot transition, if one is attached. */
+	/* Umbra-private information attached to this mapped block reference. */
+	bool		has_umbra_info;
 	bool		has_slot_shift;
 	uint8		source_slot;
 	uint8		target_slot;
+	bool		has_logical_eof;
+	BlockNumber logical_eof;
 #endif
 
 	/* Information on full-page image, if any */

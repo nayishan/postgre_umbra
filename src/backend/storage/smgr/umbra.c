@@ -19,10 +19,14 @@
 
 #include <limits.h>
 
+#include "access/xact.h"
+#include "access/xlog.h"
 #include "access/xlogutils.h"
+#include "lib/ilist.h"
 #include "miscadmin.h"
 #include "storage/aio.h"
 #include "storage/map.h"
+#include "storage/proc.h"
 #include "storage/smgr.h"
 #include "storage/umfile.h"
 #include "storage/ummap.h"
@@ -63,8 +67,23 @@ typedef struct UmbraSmgrRelationState
 	UmbraFileContext *filectx;
 	UmbraMapPolicy map_policy;
 	bool		map_root_needs_validation;
+	/* Backend-local checkpoint-delay accounting for pending page births. */
+	BlockNumber	pending_birth_eof[MAX_FORKNUM + 1];
+	BlockNumber	pending_birth_data_eof[MAX_FORKNUM + 1];
+	BlockNumber	pending_birth_wal_eof[MAX_FORKNUM + 1];
+	dlist_node	birth_state_node;
 	UmbraMappedTruncateState mapped_truncate[MAX_FORKNUM + 1];
 } UmbraSmgrRelationState;
+
+/*
+ * Checkpoint delay is a backend property, while pending births belong to
+ * individual SMgrRelation handles.  Count the latter so completing one fork
+ * cannot release the delay while another relation's birth remains pending.
+ */
+static uint32 um_pending_logical_births;
+static bool um_logical_birth_delay_started;
+static dlist_head um_logical_birth_states;
+static bool um_logical_birth_callbacks_registered;
 
 static UmbraFileContext *um_get_filectx(SMgrRelation reln);
 static void um_refresh_mapping_policy(SMgrRelation reln, ForkNumber forknum);
@@ -79,6 +98,8 @@ static void um_get_mapped_read_run(SMgrRelation reln, ForkNumber forknum,
 								   UmbraMappedReadRun *run);
 static BlockNumber um_mapped_range_end(SMgrRelation reln, ForkNumber forknum,
 									  BlockNumber blocknum, BlockNumber nblocks);
+static BlockNumber um_get_shared_mapped_frontier(SMgrRelation reln,
+											ForkNumber forknum);
 static BlockNumber um_get_mapped_frontier(SMgrRelation reln,
 									  ForkNumber forknum);
 static BlockNumber um_mapped_capacity(SMgrRelation reln, ForkNumber forknum,
@@ -102,17 +123,44 @@ static void um_zero_active_range(SMgrRelation reln, ForkNumber forknum,
 								  BlockNumber *physical_blocks);
 static void um_publish_mapped_after_data(SMgrRelation reln, ForkNumber forknum,
 									BlockNumber logical_eof);
+static void um_publish_mapped_after_birth_data(SMgrRelation reln,
+											ForkNumber forknum,
+											BlockNumber logical_eof);
 static void um_publish_mapped_before_truncate(SMgrRelation reln,
 										  ForkNumber forknum,
 										  BlockNumber logical_eof);
 static void um_ensure_selector_pages(SMgrRelation reln, ForkNumber forknum,
 								 BlockNumber first_block, BlockNumber nblocks,
 								 bool skipFsync);
+static void um_prepare_logical_birth(SMgrRelation reln, ForkNumber forknum,
+									 BlockNumber logical_eof);
+static bool um_logical_birth_pending(SMgrRelation reln, ForkNumber forknum);
+static void um_note_logical_birth_data(SMgrRelation reln, ForkNumber forknum,
+									BlockNumber logical_eof);
+static void um_note_logical_birth_wal(SMgrRelation reln, ForkNumber forknum,
+								   BlockNumber logical_eof);
+static void um_publish_logical_birth_if_ready(SMgrRelation reln,
+										 ForkNumber forknum);
+static void um_forget_logical_births(UmbraSmgrRelationState *state);
+static void um_forget_all_logical_births(void);
+static void um_logical_birth_xact_callback(XactEvent event, void *arg);
+static void um_logical_birth_subxact_callback(SubXactEvent event,
+												  SubTransactionId mySubid,
+												  SubTransactionId parentSubid,
+												  void *arg);
+static void um_prepare_mapped_frontier(SMgrRelation reln, ForkNumber forknum);
 
 void
 uminit(void)
 {
 	umfile_init();
+	dlist_init(&um_logical_birth_states);
+	if (!um_logical_birth_callbacks_registered)
+	{
+		RegisterXactCallback(um_logical_birth_xact_callback, NULL);
+		RegisterSubXactCallback(um_logical_birth_subxact_callback, NULL);
+		um_logical_birth_callbacks_registered = true;
+	}
 }
 
 void
@@ -130,6 +178,7 @@ umopen(SMgrRelation reln)
 		state = MemoryContextAllocZero(TopMemoryContext,
 									   sizeof(UmbraSmgrRelationState));
 		reln->smgr_private = state;
+		dlist_push_tail(&um_logical_birth_states, &state->birth_state_node);
 	}
 
 	if (state->filectx == NULL)
@@ -168,6 +217,8 @@ umdestroy(SMgrRelation reln)
 
 	if (state != NULL)
 	{
+		um_forget_logical_births(state);
+		dlist_delete(&state->birth_state_node);
 		if (state->filectx != NULL)
 			umfile_destroy(state->filectx);
 		pfree(state);
@@ -250,6 +301,89 @@ umcheckpoint(void)
 	ummap_checkpoint();
 }
 
+/* Prepare a logical birth before its data page or page WAL is produced. */
+void
+UmPrepareLogicalBirth(RelFileLocator rlocator, ForkNumber forknum,
+				  BlockNumber logical_eof)
+{
+	SMgrRelation reln;
+
+	/*
+	 * The birth protocol coordinates page WAL with postmaster checkpoint
+	 * publication.  initdb's standalone post-bootstrap backend has no such
+	 * concurrent checkpoint, and finishes with its own filesystem sync.
+	 */
+	if (CritSectionCount != 0 || !IsUnderPostmaster)
+		return;
+
+	reln = smgropen(rlocator, INVALID_PROC_NUMBER);
+	um_prepare_logical_birth(reln, forknum, logical_eof);
+}
+
+/*
+ * The generic WAL record already identifies its relation, fork, and logical
+ * block.  Return the only extra birth fact: the logical EOF it can establish.
+ */
+bool
+UmGetLogicalBirthForWAL(RelFileLocator rlocator, ForkNumber forknum,
+						 BlockNumber logical_block,
+						 BlockNumber *logical_eof)
+{
+	SMgrRelation reln;
+	UmbraSmgrRelationState *state;
+	BlockNumber	pending_eof;
+
+	Assert(logical_eof != NULL);
+	*logical_eof = InvalidBlockNumber;
+	if (!IsUnderPostmaster || !UmbraForkUsesActiveSlots(forknum))
+		return false;
+	reln = smgrlookup(rlocator, INVALID_PROC_NUMBER);
+	if (reln == NULL)
+		return false;
+	state = reln->smgr_private;
+	if (state == NULL)
+		return false;
+	pending_eof = state->pending_birth_eof[forknum];
+	if (logical_block == MaxBlockNumber)
+		return false;
+	/* Cover a birth before its physical extension has made root visible. */
+	if (pending_eof != 0 && logical_block < pending_eof)
+	{
+		*logical_eof = logical_block + 1;
+		return true;
+	}
+	/* Also repair an earlier data-first birth left only in the shared cache. */
+	if (!ummap_frontier_needs_wal(state->filectx, forknum,
+								reln->smgr_rlocator, logical_block + 1))
+		return false;
+
+	*logical_eof = logical_block + 1;
+	return true;
+}
+
+/* Publish a birth only after the page record carrying its EOF was inserted. */
+void
+UmPublishLogicalBirth(RelFileLocator rlocator, ForkNumber forknum,
+				  BlockNumber logical_eof, XLogRecPtr record_endptr)
+{
+	SMgrRelation reln;
+	UmbraSmgrRelationState *state;
+
+	if (!IsUnderPostmaster || !UmbraForkUsesActiveSlots(forknum) ||
+		logical_eof == 0 || !BlockNumberIsValid(logical_eof) ||
+		!XLogRecPtrIsValid(record_endptr))
+		return;
+	reln = smgrlookup(rlocator, INVALID_PROC_NUMBER);
+	if (reln == NULL)
+		elog(PANIC, "Umbra logical-birth WAL has no relation handle");
+	state = reln->smgr_private;
+	if (state == NULL)
+		elog(PANIC, "Umbra logical-birth WAL has no relation state");
+	ummap_note_frontier_wal(state->filectx, forknum, reln->smgr_rlocator,
+						logical_eof, record_endptr);
+	um_note_logical_birth_wal(reln, forknum, logical_eof);
+}
+
 /*
  * During redo, an UNKNOWN policy for a mapped-capable fork is not permission
  * to use the direct physical layout.  Only CREATE redo may resolve it.
@@ -268,6 +402,43 @@ UmRedoMappingPolicyResolved(SMgrRelation reln, ForkNumber forknum)
 	state = reln->smgr_private;
 	return state != NULL && state->filectx != NULL &&
 		state->map_policy != UMBRA_MAP_POLICY_UNKNOWN;
+}
+
+/*
+ * A page record's logical EOF is meaningful only after CREATE redo has
+ * established a valid mapped root.  It supplies an upper frontier, not layout
+ * identity or active-slot state: slot 0 remains derivable from the logical
+ * block number.
+ */
+void
+UmRedoLogicalBirth(SMgrRelation reln, ForkNumber forknum,
+				   BlockNumber logical_eof)
+{
+	UmbraFileContext *ctx;
+	BlockNumber	current_logical_eof;
+	BlockNumber	physical_capacity;
+
+	if (!InRecovery || reln == NULL ||
+		!UmbraForkUsesActiveSlots(forknum) ||
+		RelFileLocatorBackendIsTemp(reln->smgr_rlocator) ||
+		logical_eof == 0 || !BlockNumberIsValid(logical_eof))
+		elog(PANIC, "Umbra logical-birth redo has invalid state");
+
+	um_refresh_mapping_policy(reln, forknum);
+	if (!um_fork_uses_mapped_slots(reln, forknum))
+		return;
+
+	ctx = um_get_filectx(reln);
+	current_logical_eof = um_get_mapped_frontier(reln, forknum);
+	physical_capacity = um_mapped_capacity(reln, forknum,
+							  Max(current_logical_eof, logical_eof));
+
+	/* Redo may recreate a missing ordinary fork, but never the MAP root. */
+	umfile_create(ctx, forknum, true);
+	um_ensure_mapped_capacity(reln, forknum, physical_capacity, true);
+	ummap_advance_frontier_from_redo(ctx, forknum, reln->smgr_rlocator,
+								logical_eof);
+	reln->smgr_cached_nblocks[forknum] = InvalidBlockNumber;
 }
 
 /*
@@ -588,6 +759,7 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	BlockNumber	physical_capacity;
 	BlockNumber	physical_target;
 	BlockNumber	logical_end;
+	bool		birth_pending;
 	const void *buffers[1];
 
 	if (physical_block != NULL)
@@ -608,21 +780,39 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		ereport(ERROR,
 				(errmsg("cannot extend mapped Umbra fork below logical EOF")));
 	Assert(blocknum >= logical_eof);
-	physical_target = um_active_pblk(reln, forknum, blocknum, NULL);
 	buffers[0] = buffer;
 
 	logical_end = um_mapped_range_end(reln, forknum, blocknum, 1);
 	physical_capacity = um_mapped_capacity(reln, forknum, logical_end);
 
 	ctx = um_get_filectx(reln);
-	um_ensure_mapped_capacity(reln, forknum, physical_capacity, skipFsync);
-	if (blocknum > logical_eof)
-		um_zero_active_range(reln, forknum, logical_eof, blocknum, skipFsync,
-							 InvalidBlockNumber, NULL);
-	umfile_writev(ctx, forknum, physical_target, buffers, 1, skipFsync);
+	birth_pending = um_logical_birth_pending(reln, forknum);
+	if (birth_pending)
+	{
+		/* The root stays private until both the data and page WAL are present. */
+		START_CRIT_SECTION();
+		physical_target = um_active_pblk(reln, forknum, blocknum, NULL);
+		um_ensure_mapped_capacity(reln, forknum, physical_capacity, skipFsync);
+		if (blocknum > logical_eof)
+			um_zero_active_range(reln, forknum, logical_eof, blocknum,
+							 skipFsync, InvalidBlockNumber, NULL);
+		umfile_writev(ctx, forknum, physical_target, buffers, 1, skipFsync);
+		um_note_logical_birth_data(reln, forknum, logical_end);
+		END_CRIT_SECTION();
+	}
+	else
+	{
+		/* WAL-skipping callers publish after materializing the new slot. */
+		physical_target = um_active_pblk(reln, forknum, blocknum, NULL);
+		um_ensure_mapped_capacity(reln, forknum, physical_capacity, skipFsync);
+		if (blocknum > logical_eof)
+			um_zero_active_range(reln, forknum, logical_eof, blocknum,
+							 skipFsync, InvalidBlockNumber, NULL);
+		umfile_writev(ctx, forknum, physical_target, buffers, 1, skipFsync);
+		um_publish_mapped_after_data(reln, forknum, logical_end);
+	}
 	if (physical_block != NULL)
 		*physical_block = physical_target;
-	um_publish_mapped_after_data(reln, forknum, logical_end);
 	um_ensure_selector_pages(reln, forknum, logical_eof,
 						 logical_end - logical_eof, skipFsync);
 }
@@ -634,6 +824,7 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	BlockNumber	logical_eof;
 	BlockNumber	physical_capacity;
 	BlockNumber	logical_end;
+	bool		birth_pending;
 
 	if (physical_blocks != NULL)
 	{
@@ -663,11 +854,25 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		return;
 	physical_capacity = um_mapped_capacity(reln, forknum, logical_end);
 
-	um_ensure_mapped_capacity(reln, forknum, physical_capacity, skipFsync);
-	/* A regrown page can still occupy retained active-slot capacity after truncate. */
-	um_zero_active_range(reln, forknum, logical_eof, logical_end, skipFsync,
-						 blocknum, physical_blocks);
-	um_publish_mapped_after_data(reln, forknum, logical_end);
+	birth_pending = um_logical_birth_pending(reln, forknum);
+	if (birth_pending)
+	{
+		START_CRIT_SECTION();
+		um_ensure_mapped_capacity(reln, forknum, physical_capacity, skipFsync);
+		/* A regrown page can still occupy retained active-slot capacity after truncate. */
+		um_zero_active_range(reln, forknum, logical_eof, logical_end,
+							 skipFsync, blocknum, physical_blocks);
+		um_note_logical_birth_data(reln, forknum, logical_end);
+		END_CRIT_SECTION();
+	}
+	else
+	{
+		um_ensure_mapped_capacity(reln, forknum, physical_capacity, skipFsync);
+		/* A regrown page can still occupy retained active-slot capacity after truncate. */
+		um_zero_active_range(reln, forknum, logical_eof, logical_end,
+							 skipFsync, blocknum, physical_blocks);
+		um_publish_mapped_after_data(reln, forknum, logical_end);
+	}
 	um_ensure_selector_pages(reln, forknum, logical_eof,
 						 logical_end - logical_eof, skipFsync);
 }
@@ -1270,13 +1475,19 @@ um_mapped_range_end(SMgrRelation reln, ForkNumber forknum,
 }
 
 static BlockNumber
-um_get_mapped_frontier(SMgrRelation reln, ForkNumber forknum)
+um_get_shared_mapped_frontier(SMgrRelation reln, ForkNumber forknum)
 {
 	if (forknum == MAIN_FORKNUM)
 		return ummap_get_main_frontier(um_get_filectx(reln),
-									  reln->smgr_rlocator);
+											  reln->smgr_rlocator);
 	return ummap_get_aux_frontier(um_get_filectx(reln), forknum,
 								   reln->smgr_rlocator);
+}
+
+static BlockNumber
+um_get_mapped_frontier(SMgrRelation reln, ForkNumber forknum)
+{
+	return um_get_shared_mapped_frontier(reln, forknum);
 }
 
 static BlockNumber
@@ -1396,6 +1607,15 @@ um_publish_mapped_after_data(SMgrRelation reln, ForkNumber forknum,
 									reln->smgr_rlocator, logical_eof);
 }
 
+/* Publish runtime capacity while the root cache waits for page WAL coverage. */
+static void
+um_publish_mapped_after_birth_data(SMgrRelation reln, ForkNumber forknum,
+									BlockNumber logical_eof)
+{
+	ummap_publish_frontier_after_data(um_get_filectx(reln), forknum,
+								  reln->smgr_rlocator, logical_eof);
+}
+
 /* A lower root is safe before the physical tail is removed. */
 static void
 um_publish_mapped_before_truncate(SMgrRelation reln, ForkNumber forknum,
@@ -1422,6 +1642,224 @@ um_ensure_selector_pages(SMgrRelation reln, ForkNumber forknum,
 		return;
 	MapEnsureActiveSlotPages(um_get_filectx(reln), reln->smgr_rlocator,
 							 forknum, first_block, nblocks, skipFsync);
+}
+
+/* Load the root cache entry and metadata descriptor before a birth WAL record. */
+static void
+um_prepare_mapped_frontier(SMgrRelation reln, ForkNumber forknum)
+{
+	UmbraFileContext *ctx = um_get_filectx(reln);
+
+	Assert(um_fork_uses_mapped_slots(reln, forknum));
+	if (forknum == MAIN_FORKNUM)
+		ummap_prepare_main_frontier(ctx, reln->smgr_rlocator);
+	else
+		ummap_prepare_aux_frontier(ctx, forknum, reln->smgr_rlocator);
+}
+
+/*
+ * A page birth has two independent prerequisites: its fixed-slot data range
+ * must be materialized, and a FPI or WILL_INIT record must carry the logical
+ * EOF.  The shared root exposes completed data to other backends, while its
+ * cache entry keeps that frontier out of a disk flush until WAL covers it.
+ */
+static void
+um_prepare_logical_birth(SMgrRelation reln, ForkNumber forknum,
+						 BlockNumber logical_eof)
+{
+	UmbraSmgrRelationState *state;
+	BlockNumber	shared_eof;
+	bool		first_pending;
+
+	if (reln == NULL || InRecovery || CritSectionCount != 0 ||
+		!UmbraForkUsesActiveSlots(forknum) ||
+		RelFileLocatorBackendIsTemp(reln->smgr_rlocator) ||
+		!XLogInsertAllowed() || !XLogIsNeeded() || IsBootstrapProcessingMode() ||
+		IsInitProcessingMode())
+		return;
+	if (logical_eof == 0 || !BlockNumberIsValid(logical_eof))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("invalid Umbra logical-birth frontier")));
+
+	um_refresh_mapping_policy(reln, forknum);
+	if (!um_fork_uses_mapped_slots(reln, forknum))
+		return;
+
+	state = reln->smgr_private;
+	Assert(state != NULL);
+	if (logical_eof <= state->pending_birth_eof[forknum])
+		return;
+	shared_eof = um_get_shared_mapped_frontier(reln, forknum);
+	if (MyProc == NULL || !LocalTransactionIdIsValid(MyProc->vxid.lxid))
+		elog(ERROR, "cannot prepare an Umbra logical birth outside a transaction");
+
+	/* Later publication can run inside XLogInsert's critical section. */
+	um_prepare_mapped_frontier(reln, forknum);
+	first_pending = state->pending_birth_eof[forknum] == 0;
+	if (first_pending)
+	{
+		state->pending_birth_data_eof[forknum] =
+			Min(shared_eof, logical_eof);
+		state->pending_birth_wal_eof[forknum] = 0;
+		um_pending_logical_births++;
+	}
+	else
+		state->pending_birth_data_eof[forknum] =
+			Max(state->pending_birth_data_eof[forknum],
+				Min(shared_eof, logical_eof));
+	state->pending_birth_eof[forknum] = logical_eof;
+	if (um_pending_logical_births == 1 &&
+		(MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0)
+	{
+		MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+		um_logical_birth_delay_started = true;
+	}
+}
+
+static bool
+um_logical_birth_pending(SMgrRelation reln, ForkNumber forknum)
+{
+	UmbraSmgrRelationState *state = reln->smgr_private;
+
+	return state != NULL && state->pending_birth_eof[forknum] != 0;
+}
+
+static void
+um_note_logical_birth_data(SMgrRelation reln, ForkNumber forknum,
+						  BlockNumber logical_eof)
+{
+	UmbraSmgrRelationState *state = reln->smgr_private;
+
+	if (state == NULL)
+		return;
+	if (state->pending_birth_eof[forknum] == 0)
+		return;
+	if (logical_eof > state->pending_birth_eof[forknum])
+		elog(PANIC, "Umbra logical-birth data exceeds its pending frontier");
+	/* This makes the new EOF globally visible but leaves its root flush gated. */
+	um_publish_mapped_after_birth_data(reln, forknum, logical_eof);
+	reln->smgr_cached_nblocks[forknum] = InvalidBlockNumber;
+	state->pending_birth_data_eof[forknum] =
+		Max(state->pending_birth_data_eof[forknum], logical_eof);
+	um_publish_logical_birth_if_ready(reln, forknum);
+}
+
+static void
+um_note_logical_birth_wal(SMgrRelation reln, ForkNumber forknum,
+						 BlockNumber logical_eof)
+{
+	UmbraSmgrRelationState *state = reln->smgr_private;
+
+	if (state == NULL || state->pending_birth_eof[forknum] == 0)
+		return;
+	if (logical_eof > state->pending_birth_eof[forknum])
+	{
+		/* Shared root coverage can belong to another local pending range. */
+		return;
+	}
+	state->pending_birth_wal_eof[forknum] =
+		Max(state->pending_birth_wal_eof[forknum], logical_eof);
+	um_publish_logical_birth_if_ready(reln, forknum);
+}
+
+static void
+um_publish_logical_birth_if_ready(SMgrRelation reln, ForkNumber forknum)
+{
+	UmbraSmgrRelationState *state = reln->smgr_private;
+	BlockNumber	pending_eof;
+
+	Assert(state != NULL);
+	pending_eof = state->pending_birth_eof[forknum];
+	if (pending_eof == 0 ||
+		state->pending_birth_data_eof[forknum] < pending_eof ||
+		state->pending_birth_wal_eof[forknum] < pending_eof)
+		return;
+
+	state->pending_birth_eof[forknum] = 0;
+	state->pending_birth_data_eof[forknum] = 0;
+	state->pending_birth_wal_eof[forknum] = 0;
+	Assert(um_pending_logical_births > 0);
+	um_pending_logical_births--;
+	if (um_pending_logical_births == 0 && um_logical_birth_delay_started)
+	{
+		if (MyProc != NULL)
+			MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+		um_logical_birth_delay_started = false;
+	}
+}
+
+static void
+um_forget_logical_births(UmbraSmgrRelationState *state)
+{
+	int			forkidx;
+
+	if (state == NULL)
+		return;
+	for (forkidx = 0; forkidx <= MAX_FORKNUM; forkidx++)
+	{
+		if (state->pending_birth_eof[forkidx] == 0)
+			continue;
+		Assert(um_pending_logical_births > 0);
+		state->pending_birth_eof[forkidx] = 0;
+		state->pending_birth_data_eof[forkidx] = 0;
+		state->pending_birth_wal_eof[forkidx] = 0;
+		um_pending_logical_births--;
+	}
+	if (um_pending_logical_births == 0 && um_logical_birth_delay_started)
+	{
+		if (MyProc != NULL)
+			MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+		um_logical_birth_delay_started = false;
+	}
+}
+
+static void
+um_forget_all_logical_births(void)
+{
+	dlist_iter	iter;
+
+	dlist_foreach(iter, &um_logical_birth_states)
+	{
+		UmbraSmgrRelationState *state =
+			dlist_container(UmbraSmgrRelationState, birth_state_node,
+								iter.cur);
+
+		um_forget_logical_births(state);
+	}
+}
+
+static void
+um_logical_birth_xact_callback(XactEvent event, void *arg)
+{
+	(void) arg;
+
+	switch (event)
+	{
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PARALLEL_ABORT:
+			um_forget_all_logical_births();
+			break;
+		case XACT_EVENT_PRE_COMMIT:
+		case XACT_EVENT_PARALLEL_PRE_COMMIT:
+			um_forget_all_logical_births();
+			break;
+		default:
+			break;
+	}
+}
+
+static void
+um_logical_birth_subxact_callback(SubXactEvent event,
+								  SubTransactionId mySubid,
+								  SubTransactionId parentSubid, void *arg)
+{
+	(void) mySubid;
+	(void) parentSubid;
+	(void) arg;
+
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+		um_forget_all_logical_births();
 }
 
 static UmbraFileContext *

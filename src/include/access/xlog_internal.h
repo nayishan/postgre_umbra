@@ -36,7 +36,7 @@
  * decoded by a standard reader.
  */
 #define XLOG_PAGE_MAGIC_STANDARD 0xD120
-#define XLOG_PAGE_MAGIC_UMBRA 0xD121
+#define XLOG_PAGE_MAGIC_UMBRA 0xD122
 #ifdef USE_UMBRA
 #define XLOG_PAGE_MAGIC XLOG_PAGE_MAGIC_UMBRA
 #else

@@ -11,6 +11,7 @@
 #ifndef UMMAP_H
 #define UMMAP_H
 
+#include "access/xlogdefs.h"
 #include "storage/relfilelocator.h"
 #include "storage/shmem.h"
 
@@ -28,6 +29,25 @@ extern BlockNumber ummap_get_main_frontier(UmbraFileContext *ctx,
 extern void ummap_set_main_frontier(UmbraFileContext *ctx,
 								RelFileLocatorBackend rlocator,
 								BlockNumber logical_eof);
+/* Publish runtime capacity, but keep it out of a root flush until page WAL. */
+extern void ummap_publish_frontier_after_data(UmbraFileContext *ctx,
+										  ForkNumber forknum,
+										  RelFileLocatorBackend rlocator,
+										  BlockNumber logical_eof);
+extern bool ummap_frontier_needs_wal(UmbraFileContext *ctx,
+								 ForkNumber forknum,
+								 RelFileLocatorBackend rlocator,
+								 BlockNumber logical_eof);
+extern void ummap_note_frontier_wal(UmbraFileContext *ctx,
+								ForkNumber forknum,
+								RelFileLocatorBackend rlocator,
+								BlockNumber logical_eof,
+								XLogRecPtr record_endptr);
+/* Redo can only raise a birth frontier; truncate is the lowering path. */
+extern void ummap_advance_frontier_from_redo(UmbraFileContext *ctx,
+										 ForkNumber forknum,
+										 RelFileLocatorBackend rlocator,
+										 BlockNumber logical_eof);
 extern void ummap_prepare_main_frontier(UmbraFileContext *ctx,
 									RelFileLocatorBackend rlocator);
 extern void ummap_publish_prepared_main_frontier(UmbraFileContext *ctx,
