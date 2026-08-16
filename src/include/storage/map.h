@@ -16,10 +16,10 @@
 typedef struct UmbraFileContext UmbraFileContext;
 
 /*
- * Block zero is the resident root. Each following 258-page group contains
- * one FSM selector, one VM selector, and 256 MAIN selectors.
+ * Each 258-page group contains one FSM selector, one VM selector, and 256
+ * MAIN selectors. There is no relation-level root page.
  */
-#define UMBRA_MAP_SELECTOR_FIRST_BLOCK 1
+#define UMBRA_MAP_SELECTOR_FIRST_BLOCK 0
 #define UMBRA_MAP_SELECTOR_BITS 2
 #define UMBRA_MAP_SELECTOR_ENTRIES_PER_PAGE \
 	((BLCKSZ * BITS_PER_BYTE) / UMBRA_MAP_SELECTOR_BITS)
@@ -45,11 +45,18 @@ extern uint8 MapGetActiveSlot(UmbraFileContext *ctx,
 						  ForkNumber forknum,
 						  BlockNumber logical_block);
 extern void MapEnsureActiveSlotPages(UmbraFileContext *ctx,
-							 RelFileLocatorBackend rlocator,
-							 ForkNumber forknum,
-							 BlockNumber first_block,
-							 BlockNumber nblocks,
-							 bool skipFsync);
+									 RelFileLocatorBackend rlocator,
+									 ForkNumber forknum,
+									 BlockNumber first_block,
+									 BlockNumber nblocks,
+									 bool skipFsync);
+/* Restore selector-default slot 0 before a truncated logical range regrows. */
+extern void MapResetActiveSlots(UmbraFileContext *ctx,
+								RelFileLocatorBackend rlocator,
+								ForkNumber forknum,
+								BlockNumber first_block,
+								BlockNumber nblocks,
+								bool skipFsync);
 extern uint8 MapGetActiveSlotWithPresence(UmbraFileContext *ctx,
 								  RelFileLocatorBackend rlocator,
 								  ForkNumber forknum,

@@ -20,7 +20,7 @@ sub read_active_slot
 	my $page_index = int($logical_block / $entries_per_page);
 	my $entry_index = $logical_block % $entries_per_page;
 	my $group = int($page_index / 256);
-	my $map_block = 1 + $group * 258 + 2 + ($page_index % 256);
+	my $map_block = $group * 258 + 2 + ($page_index % 256);
 	my $offset = $map_block * $block_size + int($entry_index / 4);
 	my $byte;
 
@@ -104,8 +104,8 @@ FROM umbra_slot_shift_wal WHERE id = 1;]);
 # first shift interval so each following UPDATE is the operation under test.
 $node->safe_psql('postgres', 'CHECKPOINT');
 
-is(-s $map_path, 4 * $block_size,
-	'initial insert and checkpoint seed the first selector group');
+is(-s $map_path, 3 * $block_size,
+	'initial insert and checkpoint seed the first selector group without a root');
 is(read_active_slot($map_path, $block_size, $target_block), 0,
 	'initial selector is slot 0');
 
@@ -159,8 +159,8 @@ is($node->safe_psql('postgres',
 	'three', 'crash redo restores the final update through the target slot');
 
 # A later DROP can remove the mapping files before a crash even though the
-# checkpoint redo point still precedes the shift.  The target-only record does not identify
-# the missing root's lifecycle, so redo must record a dependency and let DROP
+# checkpoint redo point still precedes the shift.  The target-only record does
+# not identify a later DROP, so redo must record a dependency and let DROP
 # clear it.
 $node->safe_psql(
 	'postgres', q[
@@ -232,8 +232,7 @@ ok(!-e $drop_main_path && !-e $zero_main_path,
 	'repeated recovery starts with both dropped MAIN files absent');
 
 # A crash during metadata unlink can instead leave an existing but zero-length
-# fork.  It is not mapping authority either, so shift redo must account for it
-# without repairing the root.
+# fork.  It is not mapping authority either, so shift redo must account for it.
 open(my $zero_map_fh, '>', $zero_map_path)
   or BAIL_OUT("could not create \"$zero_map_path\": $!");
 close($zero_map_fh)

@@ -138,8 +138,6 @@ typedef struct
 	bool		has_slot_shift;
 	uint8		source_slot;
 	uint8		target_slot;
-	bool		has_logical_eof;
-	BlockNumber logical_eof;
 #endif
 
 	/* Information on full-page image, if any */

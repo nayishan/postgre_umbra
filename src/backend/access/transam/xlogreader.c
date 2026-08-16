@@ -1877,8 +1877,6 @@ DecodeXLogRecord(XLogReaderState *state,
 			blk->has_slot_shift = false;
 			blk->source_slot = 0;
 			blk->target_slot = 0;
-			blk->has_logical_eof = false;
-			blk->logical_eof = InvalidBlockNumber;
 #endif
 
 			COPY_HEADER_FIELD(&fork_flags, sizeof(uint8));
@@ -1917,8 +1915,7 @@ DecodeXLogRecord(XLogReaderState *state,
 								  SizeOfXLogRecordBlockUmbraHeader);
 				if (umbra_header.flags == 0 ||
 					(umbra_header.flags &
-					 ~(XLOG_UMBRA_BLOCK_HAS_SLOT_SHIFT |
-					   XLOG_UMBRA_BLOCK_HAS_LOGICAL_EOF)) != 0)
+						 ~XLOG_UMBRA_BLOCK_HAS_SLOT_SHIFT) != 0)
 				{
 					report_invalid_record(state,
 								  "invalid Umbra block header at %X/%08X",
@@ -1933,11 +1930,6 @@ DecodeXLogRecord(XLogReaderState *state,
 					if (blk->target_slot < 3)
 						blk->source_slot = blk->target_slot == 0 ? 2 :
 							blk->target_slot - 1;
-				}
-				if (umbra_header.flags & XLOG_UMBRA_BLOCK_HAS_LOGICAL_EOF)
-				{
-					COPY_HEADER_FIELD(&blk->logical_eof, sizeof(BlockNumber));
-					blk->has_logical_eof = true;
 				}
 			}
 #endif
@@ -2041,20 +2033,6 @@ DecodeXLogRecord(XLogReaderState *state,
 			}
 			COPY_HEADER_FIELD(&blk->blkno, sizeof(BlockNumber));
 #ifdef USE_UMBRA
-			if (blk->has_logical_eof &&
-				((blk->forknum != MAIN_FORKNUM &&
-				  blk->forknum != FSM_FORKNUM &&
-				  blk->forknum != VISIBILITYMAP_FORKNUM) ||
-				 blk->blkno == MaxBlockNumber ||
-				 !BlockNumberIsValid(blk->logical_eof) ||
-				 blk->logical_eof != blk->blkno + 1))
-			{
-				report_invalid_record(state,
-							  "invalid Umbra logical EOF for block %u at %X/%08X",
-							  blk->blkno,
-							  LSN_FORMAT_ARGS(state->ReadRecPtr));
-				goto err;
-			}
 			if (blk->has_slot_shift &&
 				((blk->forknum != MAIN_FORKNUM &&
 				  blk->forknum != FSM_FORKNUM &&

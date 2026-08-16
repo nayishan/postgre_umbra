@@ -194,7 +194,7 @@ ok($node->log_contains(
 ok(!-e $missing_main_path,
 	'image-free probing does not recreate a missing MAIN file');
 is(file_sha256($missing_map_path), $missing_map_digest,
-	'image-free probing does not repair or reset the retained MAP root');
+	'image-free probing does not repair or reset the retained selector MAP');
 is(file_sha256($old_high_main_path), $future_main_digest,
 	'image-free probing does not truncate or reset newer MAIN storage');
 is(file_sha256($old_high_map_path), $future_map_digest,

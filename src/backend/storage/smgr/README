@@ -42,11 +42,10 @@ The files in this directory, and their contents, are
 		uses ordinary relation fork paths in this patch, while keeping
 		open segment descriptors below Umbra's implementation boundary.
 
-    ummap.c	Umbra's private relation metadata root.  The _map file records
-		format identity and future mapping frontiers without yet changing
-		ordinary relation I/O.  A private shared cache owns root residency,
-		content locking, deferred output, and invalidation; only ummap.c
-		interprets the root bytes.
+    ummap.c	Umbra's selector-MAP lifecycle wrappers.  The relation-local
+		_map file holds only active-slot selectors for MAIN, FSM, and VM;
+		missing selectors mean slot 0.  The data-fork physical length is
+		the logical extent authority, not the MAP file.
 
 Note that md.c in turn relies on src/backend/storage/file/fd.c.
 

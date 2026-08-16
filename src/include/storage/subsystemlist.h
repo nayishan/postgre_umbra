@@ -87,7 +87,6 @@ PG_SHMEM_SUBSYSTEM(LogicalDecodingCtlShmemCallbacks)
 PG_SHMEM_SUBSYSTEM(DataChecksumsShmemCallbacks)
 
 #ifdef USE_UMBRA
-PG_SHMEM_SUBSYSTEM(UmbraMapRootShmemCallbacks)
 PG_SHMEM_SUBSYSTEM(MapShmemCallbacks)
 #endif
 

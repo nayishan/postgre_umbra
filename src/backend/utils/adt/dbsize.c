@@ -23,6 +23,7 @@
 #include "miscadmin.h"
 #include "storage/fd.h"
 #include "storage/smgr.h"
+#include "storage/umbra.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -361,13 +362,22 @@ calculate_relation_size(RelFileLocator *rfn, ProcNumber backend, ForkNumber fork
 	return totalsize;
 }
 
-/* Return a SQL-visible fork size, using Umbra's logical MAIN EOF when active. */
+/* Return a SQL-visible fork size using the selected smgr's logical EOF. */
 static int64
 calculate_relation_fork_size(Relation rel, ForkNumber forknum)
 {
 #ifdef USE_UMBRA
-	if (forknum == MAIN_FORKNUM && RELKIND_HAS_STORAGE(rel->rd_rel->relkind))
-		return (int64) smgrnblocks(RelationGetSmgr(rel), forknum) * BLCKSZ;
+	/* Every non-temporary three-bucket fork has a logical, not raw, length. */
+	if (RELKIND_HAS_STORAGE(rel->rd_rel->relkind) &&
+		UmbraForkUsesThreeBuckets(forknum))
+	{
+		SMgrRelation smgr = RelationGetSmgr(rel);
+
+		/* FSM and VM are optional; their absent on-disk size is zero. */
+		if (!smgrexists(smgr, forknum))
+			return 0;
+		return (int64) smgrnblocks(smgr, forknum) * BLCKSZ;
+	}
 #endif
 
 	return calculate_relation_size(&(rel->rd_locator), rel->rd_backend, forknum);

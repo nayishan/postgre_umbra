@@ -9143,24 +9143,6 @@ xlog_redo(XLogReaderState *record)
 			}
 
 			action = XLogReadBufferForRedo(record, block_id, &buffer);
-#ifdef USE_UMBRA
-			/*
-			 * Neither a slot-shift FPI nor an ordinary FPI can reconstruct
-			 * missing MAP lifecycle authority.  The reader records that
-			 * dependency for a later DROP or covering TRUNCATE.  Do not accept
-			 * arbitrary BLK_NOTFOUND results from a full-page-image redo.
-			 */
-			if (action == BLK_NOTFOUND)
-			{
-				DecodedBkpBlock *block = XLogRecGetBlock(record, block_id);
-
-				if (block->has_slot_shift ||
-					!UmRedoMappingPolicyResolved(
-						smgropen(block->rlocator, INVALID_PROC_NUMBER),
-						block->forknum))
-					continue;
-			}
-#endif
 			if (action != BLK_RESTORED)
 				elog(ERROR, "unexpected XLogReadBufferForRedo result when restoring backup block");
 			UnlockReleaseBuffer(buffer);

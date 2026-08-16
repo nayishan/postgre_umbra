@@ -1,10 +1,11 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# Verify that a validated Umbra metadata root remains resident until restart.
+# Verify that unlogged reset removes stale selector state before INIT is copied.
 
 use strict;
 use warnings FATAL => 'all';
 
+use Fcntl qw(SEEK_SET);
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -12,50 +13,72 @@ use Test::More;
 plan skip_all => 'requires an Umbra storage manager build'
   unless check_pg_config('^#define USE_UMBRA 1$');
 
-my $node = PostgreSQL::Test::Cluster->new('root_cache');
-$node->init;
+sub read_active_slot
+{
+	my ($path, $block_size, $logical_block) = @_;
+	my $entries_per_page = $block_size * 4;
+	my $page_index = int($logical_block / $entries_per_page);
+	my $entry_index = $logical_block % $entries_per_page;
+	my $group = int($page_index / 256);
+	my $map_block = $group * 258 + 2 + ($page_index % 256);
+	my $offset = $map_block * $block_size + int($entry_index / 4);
+	my $byte;
+
+	open(my $fh, '<', $path) or BAIL_OUT("could not open \"$path\": $!");
+	binmode($fh);
+	defined(sysseek($fh, $offset, SEEK_SET))
+	  or BAIL_OUT("could not seek in \"$path\": $!");
+	sysread($fh, $byte, 1) == 1
+	  or BAIL_OUT("could not read selector from \"$path\": $!");
+	close($fh) or BAIL_OUT("could not close \"$path\": $!");
+
+	return unpack('C', $byte) & 0x03;
+}
+
+my $node = PostgreSQL::Test::Cluster->new('unlogged_selector_reset');
+$node->init(no_data_checksums => 1);
 $node->start;
-
-my $bootstrap_main_path = $node->safe_psql(
-	'postgres', q{SELECT pg_relation_filepath('pg_catalog.pg_class'::regclass);});
-my $bootstrap_map_path = $node->data_dir . "/${bootstrap_main_path}_map";
-ok(-e $bootstrap_map_path,
-	'bootstrap-created pg_class has a metadata root');
-
 $node->safe_psql(
 	'postgres', q{
-CREATE TABLE umbra_root_cache (id integer);
-INSERT INTO umbra_root_cache VALUES (1);
+CREATE UNLOGGED TABLE umbra_unlogged_selector (id integer PRIMARY KEY);
+INSERT INTO umbra_unlogged_selector VALUES (1);
 CHECKPOINT;
 });
 
+my $block_size = 0 + $node->safe_psql('postgres', 'SHOW block_size');
 my $main_path = $node->safe_psql(
-	'postgres', q{SELECT pg_relation_filepath('umbra_root_cache'::regclass);});
+	'postgres',
+	q{SELECT pg_relation_filepath('umbra_unlogged_selector'::regclass);});
 my $map_path = $node->data_dir . "/${main_path}_map";
-my $crc = unpack('L', substr(slurp_file($map_path), 60, 4));
 
+is(-s $map_path, 3 * $block_size,
+	'unlogged MAIN initially has a selector group');
+
+# Leave an impossible old selector behind.  After restart the unlogged MAIN
+# comes from INIT, so this selector must not remain to redirect new pages.
+$node->stop('immediate');
 open(my $map_fh, '+<', $map_path)
-  or die "could not open \"$map_path\": $!";
+  or BAIL_OUT("could not open \"$map_path\": $!");
 binmode($map_fh);
-seek($map_fh, 60, 0)
-  or die "could not seek \"$map_path\": $!";
-print $map_fh pack('L', $crc ^ 1)
-  or die "could not corrupt \"$map_path\": $!";
-close($map_fh)
-  or die "could not close \"$map_path\": $!";
+defined(sysseek($map_fh, 2 * $block_size, SEEK_SET))
+  or BAIL_OUT("could not seek in \"$map_path\": $!");
+print $map_fh pack('C', 1)
+  or BAIL_OUT("could not write stale selector to \"$map_path\": $!");
+close($map_fh) or BAIL_OUT("could not close \"$map_path\": $!");
 
-is($node->safe_psql('postgres', 'SELECT count(*) FROM umbra_root_cache'),
-	'1', 'a new backend uses the resident validated metadata root');
-
-$node->stop;
 $node->start;
+is($node->safe_psql('postgres',
+		'SELECT count(*) FROM umbra_unlogged_selector'), '0',
+	'unlogged contents are restored from INIT after a crash');
+ok(!-e $map_path,
+	'unlogged reset removes the selector-MAP left by the former MAIN');
 
-my ($result, $stdout, $stderr) =
-  $node->psql('postgres', 'SELECT * FROM umbra_root_cache');
-is($result, 3, 'restart reloads rather than trusting the former root cache');
-like($stderr, qr/Umbra metadata root is corrupted or incompatible/,
-	'restart validates the reloaded metadata root');
+$node->safe_psql('postgres',
+	'INSERT INTO umbra_unlogged_selector VALUES (2)');
+is(-s $map_path, 3 * $block_size,
+	'new unlogged MAIN materializes a fresh selector group');
+is(read_active_slot($map_path, $block_size, 0), 0,
+	'fresh unlogged logical block starts in slot 0');
 
 $node->stop;
-
 done_testing();

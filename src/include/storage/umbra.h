@@ -22,15 +22,8 @@
 #include "storage/relfilelocator.h"
 #include "storage/smgr.h"
 
-/* Stored in every Umbra metadata root, including before formula activation. */
-#ifndef UMBRA_CHUNK_PAIRED_PAGES
-#define UMBRA_CHUNK_PAIRED_PAGES 32U
-#endif
-#if UMBRA_CHUNK_PAIRED_PAGES <= 0
-#error "UMBRA_CHUNK_PAIRED_PAGES must be greater than zero"
-#endif
-
-#define UMBRA_CHUNK_ACTIVE_SLOTS 3U
+/* Every logical page owns exactly these physical slots. */
+#define UMBRA_ACTIVE_SLOT_COUNT 3U
 #define UMBRA_ACTIVE_SLOT_INVALID UINT8_MAX
 
 typedef struct UmbraSlotShift
@@ -47,38 +40,33 @@ typedef struct UmbraSlotShift
 static inline bool
 UmbraActiveSlotIsValid(uint8 active_slot)
 {
-	return active_slot < UMBRA_CHUNK_ACTIVE_SLOTS;
+	return active_slot < UMBRA_ACTIVE_SLOT_COUNT;
 }
 
 static inline uint8
 UmbraNextActiveSlot(uint8 active_slot)
 {
 	Assert(UmbraActiveSlotIsValid(active_slot));
-	return active_slot == UMBRA_CHUNK_ACTIVE_SLOTS - 1 ? 0 : active_slot + 1;
+	return active_slot == UMBRA_ACTIVE_SLOT_COUNT - 1 ? 0 : active_slot + 1;
 }
 
 static inline uint8
 UmbraPreviousActiveSlot(uint8 active_slot)
 {
 	Assert(UmbraActiveSlotIsValid(active_slot));
-	return active_slot == 0 ? UMBRA_CHUNK_ACTIVE_SLOTS - 1 : active_slot - 1;
+	return active_slot == 0 ? UMBRA_ACTIVE_SLOT_COUNT - 1 : active_slot - 1;
 }
 
+/* The no-root layout is P = 3 * logical block + active slot. */
 static inline bool
 UmbraActiveSlotPhysicalBlock(BlockNumber logical_block, uint8 active_slot,
 							BlockNumber *physical_block)
 {
-	uint64		chunk;
-	uint64		offset;
 	uint64		physical;
 
 	Assert(UmbraActiveSlotIsValid(active_slot));
-	chunk = (uint64) logical_block / UMBRA_CHUNK_PAIRED_PAGES;
-	offset = (uint64) logical_block % UMBRA_CHUNK_PAIRED_PAGES;
-	physical = chunk *
-		(UMBRA_CHUNK_ACTIVE_SLOTS * (uint64) UMBRA_CHUNK_PAIRED_PAGES) +
-		(uint64) active_slot * UMBRA_CHUNK_PAIRED_PAGES + offset;
-	if (physical > (uint64) MaxBlockNumber)
+	physical = (uint64) logical_block * UMBRA_ACTIVE_SLOT_COUNT + active_slot;
+	if (physical >= (uint64) InvalidBlockNumber)
 		return false;
 
 	*physical_block = (BlockNumber) physical;
@@ -94,7 +82,7 @@ UmbraPhysicalBlockActiveSlot(BlockNumber logical_block,
 
 	Assert(active_slot != NULL);
 	*active_slot = UMBRA_ACTIVE_SLOT_INVALID;
-	for (uint8 slot = 0; slot < UMBRA_CHUNK_ACTIVE_SLOTS; slot++)
+	for (uint8 slot = 0; slot < UMBRA_ACTIVE_SLOT_COUNT; slot++)
 	{
 		if (UmbraActiveSlotPhysicalBlock(logical_block, slot, &candidate) &&
 			candidate == physical_block)
@@ -106,24 +94,14 @@ UmbraPhysicalBlockActiveSlot(BlockNumber logical_block,
 	return false;
 }
 
-/* Reserve all three physical slots for every logical chunk. */
+/* Reserve all three physical slots for every logical page. */
 static inline bool
-UmbraMappedPhysicalCapacity(BlockNumber logical_eof,
-						BlockNumber *physical_capacity)
+UmbraThreeBucketPhysicalCapacity(BlockNumber logical_eof,
+								 BlockNumber *physical_capacity)
 {
-	uint64		chunks;
 	uint64		capacity;
 
-	if (logical_eof == 0)
-	{
-		*physical_capacity = 0;
-		return true;
-	}
-
-	chunks = ((uint64) logical_eof + UMBRA_CHUNK_PAIRED_PAGES - 1) /
-		UMBRA_CHUNK_PAIRED_PAGES;
-	capacity = chunks *
-		(UMBRA_CHUNK_ACTIVE_SLOTS * (uint64) UMBRA_CHUNK_PAIRED_PAGES);
+	capacity = (uint64) logical_eof * UMBRA_ACTIVE_SLOT_COUNT;
 	if (capacity >= (uint64) InvalidBlockNumber)
 		return false;
 
@@ -137,10 +115,18 @@ UmbraIsMappedAuxiliaryFork(ForkNumber forknum)
 	return forknum == FSM_FORKNUM || forknum == VISIBILITYMAP_FORKNUM;
 }
 
+/* These forks have selector MAP pages and can change active slot. */
 static inline bool
 UmbraForkUsesActiveSlots(ForkNumber forknum)
 {
 	return forknum == MAIN_FORKNUM || UmbraIsMappedAuxiliaryFork(forknum);
+}
+
+/* INIT is always slot 0, but still uses the same three-bucket geometry. */
+static inline bool
+UmbraForkUsesThreeBuckets(ForkNumber forknum)
+{
+	return UmbraForkUsesActiveSlots(forknum) || forknum == INIT_FORKNUM;
 }
 
 extern void uminit(void);
@@ -148,21 +134,19 @@ extern void umopen(SMgrRelation reln);
 extern void umclose(SMgrRelation reln, ForkNumber forknum);
 extern void umdestroy(SMgrRelation reln);
 extern void umcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
-extern void uminitnewrelation(SMgrRelation reln, bool needs_wal);
-extern void umfinishcreate(SMgrRelation reln, ForkNumber forknum);
 /*
- * Publish and synchronize relation-level MAP metadata after core has made
- * the ordinary forks durable.  This is not a per-fork sync callback.
+ * Flush and synchronize selector MAP pages after core has made the ordinary
+ * forks durable.  This is not a per-fork sync callback.
  */
 extern void umsyncrelationmetadata(SMgrRelation reln);
-/* Flush Umbra's private metadata-root cache at the checkpoint boundary. */
+/* Flush Umbra's private selector MAP cache at the checkpoint boundary. */
 extern void umcheckpoint(void);
-/* Flush Umbra's metadata-root cache before copying a database tablespace. */
+/* Flush Umbra's selector MAP cache before copying a database tablespace. */
 extern void umflushdatabasetablespacecache(Oid dbid, Oid spcOid);
-/* Forget a database's metadata-root cache entries without touching files. */
+/* Forget a database's selector MAP cache entries without touching files. */
 extern void uminvalidatedatabasecache(Oid dbid);
 /*
- * Forget one tablespace's metadata-root cache entries without touching files.
+ * Forget one tablespace's selector MAP cache entries without touching files.
  */
 extern void uminvalidatedatabasetablespacecache(Oid dbid, Oid spcOid);
 extern bool umexists(SMgrRelation reln, ForkNumber forknum);
@@ -194,16 +178,12 @@ extern void umwriteback(SMgrRelation reln, ForkNumber forknum,
 /* This path receives the resolved physical range from the scheduler. */
 extern void umwritebackphysical(SMgrRelation reln, ForkNumber forknum,
 								BlockNumber blocknum, BlockNumber nblocks);
-/* Mapped forks return metadata-root logical EOF rather than physical length. */
+/* Three-bucket forks return physical length divided by three. */
 extern BlockNumber umnblocks(SMgrRelation reln, ForkNumber forknum);
-extern void umpreparetruncate(SMgrRelation reln, ForkNumber *forknum,
-						 int nforks, BlockNumber *old_blocks,
-						 BlockNumber *nblocks);
 extern void umtruncate(SMgrRelation reln, ForkNumber forknum,
 					   BlockNumber old_blocks, BlockNumber nblocks);
 extern void umimmedsync(SMgrRelation reln, ForkNumber forknum);
 extern void umregistersync(SMgrRelation reln, ForkNumber forknum);
-extern bool umforcependingsync(SMgrRelation reln);
 extern int	umfd(SMgrRelation reln, ForkNumber forknum,
 					 BlockNumber blocknum, uint32 *off);
 extern bool UmGetActiveSlot(SMgrRelation reln, ForkNumber forknum,
@@ -221,20 +201,7 @@ extern bool UmCheckpointWriteSourceSlot(SMgrRelation reln, ForkNumber forknum,
 										BlockNumber lblkno, uint8 source_slot,
 										const void *buffer,
 										BlockNumber *physical_block);
-extern bool UmRedoMappingPolicyResolved(SMgrRelation reln, ForkNumber forknum);
 extern bool UmUsesMappedSlots(SMgrRelation reln, ForkNumber forknum);
-/* Pair physical mapped extension with the page WAL that makes it recoverable. */
-extern void UmPrepareLogicalBirth(RelFileLocator rlocator, ForkNumber forknum,
-							 BlockNumber logical_eof);
-extern bool UmGetLogicalBirthForWAL(RelFileLocator rlocator, ForkNumber forknum,
-								BlockNumber logical_block,
-								BlockNumber *logical_eof);
-extern void UmPublishLogicalBirth(RelFileLocator rlocator, ForkNumber forknum,
-								 BlockNumber logical_eof,
-								 XLogRecPtr record_endptr);
-/* Redo raises a valid mapped root frontier after materializing its capacity. */
-extern void UmRedoLogicalBirth(SMgrRelation reln, ForkNumber forknum,
-							   BlockNumber logical_eof);
 /* Write an existing mapped page to a caller-selected slot and report its pblk. */
 extern bool UmWriteSlot(SMgrRelation reln, ForkNumber forknum,
 						BlockNumber logical_block, const void *buffer,

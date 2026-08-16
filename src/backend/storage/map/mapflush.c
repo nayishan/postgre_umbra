@@ -61,7 +61,7 @@ MapFlushDatabaseTablespace(Oid dbid, Oid spcOid)
 void
 MapCheckpoint(void)
 {
-	/* Persist the selector snapshot before the root publishes it. */
+	/* Persist selector updates that were dirty at checkpoint start. */
 	MapPageCheckpoint();
 }
 

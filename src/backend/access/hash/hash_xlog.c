@@ -730,8 +730,8 @@ hash_xlog_squeeze_page(XLogReaderState *record)
 		}
 	}
 
-	/* replay the record for initializing overflow buffer */
-	if (XLogReadBufferForRedo(record, 2, &ovflbuf) == BLK_NEEDS_REDO)
+	/* Replay this block as a complete reinitialization. */
+	ovflbuf = XLogInitBufferForRedo(record, 2);
 	{
 		Page		ovflpage;
 		HashPageOpaque ovflopaque;

@@ -142,7 +142,7 @@ umfile_open_flags(ForkNumber forknum)
 {
 	int			flags = O_RDWR | PG_BINARY;
 
-	/* The metadata root uses sector I/O and deliberately remains buffered. */
+	/* Selector metadata stays buffered because its entries are bit-packed. */
 	if ((io_direct_flags & IO_DIRECT_DATA) &&
 		forknum != UMBRA_METADATA_FORKNUM)
 		flags |= PG_O_DIRECT;
@@ -579,7 +579,7 @@ umfile_read_bytes(UmbraFileContext *ctx, ForkNumber forknum,
 							FilePathName(v->umfd_vfd))));
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("could not read complete Umbra metadata root from file \"%s\"",
+				 errmsg("could not read complete Umbra selector metadata from file \"%s\"",
 						FilePathName(v->umfd_vfd))));
 	}
 }
@@ -613,7 +613,7 @@ umfile_write_bytes(UmbraFileContext *ctx, ForkNumber forknum,
 							FilePathName(v->umfd_vfd))));
 		ereport(ERROR,
 				(errcode(ERRCODE_DISK_FULL),
-				 errmsg("could not write complete Umbra metadata root to file \"%s\"",
+				 errmsg("could not write complete Umbra selector metadata to file \"%s\"",
 						FilePathName(v->umfd_vfd))));
 	}
 
@@ -683,8 +683,8 @@ umfile_open(RelFileLocatorBackend rlocator)
 }
 
 /*
- * Create an unregistered, backend-local context for one shared-cache
- * writeback.  Shared root-cache entries have no owning relation handle, but
+ * Create an unregistered, backend-local context for one shared selector-cache
+ * writeback.  Shared selector-cache entries have no owning relation handle, but
  * file descriptors remain local to the backend that performs I/O.  Keep this
  * context out of the relation registry so it cannot collide with a normal
  * relation context.  The caller must destroy it when that writeback completes.

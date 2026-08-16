@@ -386,36 +386,25 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 
 #ifdef USE_UMBRA
 	blkref = XLogRecGetBlock(record, block_id);
-	/*
-	 * A logical EOF is attached only to a record that can construct this page
-	 * from scratch.  Advance the root before asking smgr to locate the block.
-	 */
-	if (blkref->has_logical_eof &&
-		(willinit || XLogRecBlockImageApply(record, block_id)))
-		UmRedoLogicalBirth(smgropen(rlocator, INVALID_PROC_NUMBER), forknum,
-						   blkref->logical_eof);
-	if (blkref->has_slot_shift)
+	if (blkref->has_slot_shift &&
+		!XLogRecBlockImageApply(record, block_id))
 	{
 		SMgrRelation reln;
 
 		reln = smgropen(rlocator, INVALID_PROC_NUMBER);
-		if (XLogRecBlockImageApply(record, block_id))
-		{
-			if (!UmRedoSlotShift(reln, forknum, blkno,
-								  blkref->source_slot,
-								  blkref->target_slot,
-								  record->EndRecPtr))
-			{
-				XLogRecordInvalidPage(rlocator, forknum, blkno, false);
-				*buf = InvalidBuffer;
-				return BLK_NOTFOUND;
-			}
-		}
-		else
-		{
-			/* Materialize the recorded source before publishing the target. */
-			if (!UmRedoSetActiveSlot(reln, forknum, blkno,
+		/* Materialize the recorded source before publishing the target. */
+		if (!UmRedoSetActiveSlot(reln, forknum, blkno,
 								 blkref->source_slot))
+		{
+			/*
+			 * An auxiliary HINT_DELTA can reconstruct a missing page from
+			 * its all-zero state.  First extend the three-bucket capacity,
+			 * which initializes the missing page at slot zero.  Restoring the
+			 * WAL-recorded source below then makes FlushOneBuffer() materialize
+			 * that zero baseline in the source slot before publishing target.
+			 * Normal redo still requires the existing source page.
+			 */
+			if (mode != RBM_ZERO_ON_ERROR)
 			{
 				XLogRecordInvalidPage(rlocator, forknum, blkno, false);
 				*buf = InvalidBuffer;
@@ -423,33 +412,42 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 			}
 			*buf = XLogReadBufferExtended(rlocator, forknum, blkno, mode,
 									  prefetch_buffer);
-			if (BufferIsValid(*buf))
-			{
-				BufferRememberUmbraActiveSlot(*buf, blkref->source_slot, true);
-				if (mode != RBM_ZERO_AND_LOCK &&
-					mode != RBM_ZERO_AND_CLEANUP_LOCK)
-				{
-					if (get_cleanup_lock)
-						LockBufferForCleanup(*buf);
-					else
-						LockBuffer(*buf, BUFFER_LOCK_EXCLUSIVE);
-				}
-				MarkBufferDirty(*buf);
-				FlushOneBuffer(*buf);
-				if (!UmRedoSlotShift(reln, forknum, blkno,
-									  blkref->source_slot,
-									  blkref->target_slot,
-									  record->EndRecPtr))
-					elog(PANIC,
-						 "Umbra mapping authority disappeared during slot-shift redo");
-				BufferRememberUmbraActiveSlot(*buf, blkref->target_slot, true);
-				MarkBufferDirty(*buf);
-				if (lsn <= PageGetLSN(BufferGetPage(*buf)))
-					return BLK_DONE;
-				return BLK_NEEDS_REDO;
-			}
-			return BLK_NOTFOUND;
+			if (!BufferIsValid(*buf))
+				return BLK_NOTFOUND;
+			if (!UmRedoSetActiveSlot(reln, forknum, blkno,
+									 blkref->source_slot))
+				elog(PANIC,
+					 "Umbra zero-page redo could not restore its source selector");
 		}
+		else
+			*buf = XLogReadBufferExtended(rlocator, forknum, blkno, mode,
+									  prefetch_buffer);
+		if (BufferIsValid(*buf))
+		{
+			BufferRememberUmbraActiveSlot(*buf, blkref->source_slot, true);
+			if (mode != RBM_ZERO_AND_LOCK &&
+				mode != RBM_ZERO_AND_CLEANUP_LOCK)
+			{
+				if (get_cleanup_lock)
+					LockBufferForCleanup(*buf);
+				else
+					LockBuffer(*buf, BUFFER_LOCK_EXCLUSIVE);
+			}
+			MarkBufferDirty(*buf);
+			FlushOneBuffer(*buf);
+			if (!UmRedoSlotShift(reln, forknum, blkno,
+								  blkref->source_slot,
+								  blkref->target_slot,
+								  record->EndRecPtr))
+				elog(PANIC,
+					 "Umbra mapping authority disappeared during slot-shift redo");
+			BufferRememberUmbraActiveSlot(*buf, blkref->target_slot, true);
+			MarkBufferDirty(*buf);
+			if (lsn <= PageGetLSN(BufferGetPage(*buf)))
+				return BLK_DONE;
+			return BLK_NEEDS_REDO;
+		}
+		return BLK_NOTFOUND;
 	}
 #endif
 
@@ -457,16 +455,6 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 	if (XLogRecBlockImageApply(record, block_id))
 	{
 		Assert(XLogRecHasBlockImage(record, block_id));
-#ifdef USE_UMBRA
-		/* An FPI cannot establish the root that defines this fork's layout. */
-		if (!UmRedoMappingPolicyResolved(
-				smgropen(rlocator, INVALID_PROC_NUMBER), forknum))
-		{
-			XLogRecordInvalidPage(rlocator, forknum, blkno, false);
-			*buf = InvalidBuffer;
-			return BLK_NOTFOUND;
-		}
-#endif
 		*buf = XLogReadBufferExtended(rlocator, forknum, blkno,
 									  get_cleanup_lock ? RBM_ZERO_AND_CLEANUP_LOCK : RBM_ZERO_AND_LOCK,
 									  prefetch_buffer);
@@ -474,7 +462,22 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 			return BLK_NOTFOUND;
 #ifdef USE_UMBRA
 		if (blkref->has_slot_shift)
+		{
+			SMgrRelation reln = smgropen(rlocator, INVALID_PROC_NUMBER);
+
+			/*
+			 * XLogReadBufferExtended() may create the fork and initializes
+			 * new selector entries to slot zero.  Publish an FPI's target
+			 * only after that capacity setup, otherwise zero-extension would
+			 * overwrite the recorded target selector.
+			 */
+			if (!UmRedoSlotShift(reln, forknum, blkno,
+								  blkref->source_slot,
+								  blkref->target_slot,
+								  record->EndRecPtr))
+				elog(PANIC, "could not publish Umbra FPI slot shift during redo");
 			BufferRememberUmbraActiveSlot(*buf, blkref->target_slot, true);
+		}
 #endif
 		page = BufferGetPage(*buf);
 		if (!RestoreBlockImage(record, block_id, page))
@@ -577,22 +580,6 @@ XLogReadBufferExtended(RelFileLocator rlocator, ForkNumber forknum,
 
 	/* Open the relation at smgr level */
 	smgr = smgropen(rlocator, INVALID_PROC_NUMBER);
-
-#ifdef USE_UMBRA
-	/*
-	 * Page redo reconstructs at most one page, not the private root that
-	 * identifies its physical layout.  Until CREATE redo resolves that root,
-	 * page redo must not create or access a direct-layout file.
-	 */
-	if ((mode == RBM_NORMAL || mode == RBM_NORMAL_NO_LOG ||
-		 mode == RBM_ZERO_ON_ERROR) &&
-		!UmRedoMappingPolicyResolved(smgr, forknum))
-	{
-		if (mode != RBM_NORMAL_NO_LOG)
-			XLogRecordInvalidPage(rlocator, forknum, blkno, false);
-		return InvalidBuffer;
-	}
-#endif
 
 	/*
 	 * Create the target file if it doesn't already exist.  This lets us cope

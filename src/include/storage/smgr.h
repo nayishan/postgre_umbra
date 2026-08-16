@@ -100,15 +100,6 @@ extern void smgrrelease(SMgrRelation reln);
 extern void smgrreleaseall(void);
 extern void smgrreleaserellocator(RelFileLocatorBackend rlocator);
 extern void smgrcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
-extern void smgrinitnewrelation(SMgrRelation reln, bool needs_wal);
-/* Complete authoritative CREATE redo after the physical fork exists. */
-extern void smgrfinishcreate(SMgrRelation reln, ForkNumber forknum);
-/*
- * Return true when a WAL-skipping relation's commit-time finalization must
- * sync files because generic full-page WAL cannot make private metadata
- * durable.
- */
-extern bool smgrforcependingsync(SMgrRelation reln);
 /*
  * Invoke one selected-smgr relation-metadata phase only after the caller has
  * completed its ordinary-fork durability work.  Core supplies the ordering
@@ -173,13 +164,6 @@ extern void smgrwritebackphysical(SMgrRelation reln, ForkNumber forknum,
 								  BlockNumber nblocks);
 extern BlockNumber smgrnblocks(SMgrRelation reln, ForkNumber forknum);
 extern BlockNumber smgrnblocks_cached(SMgrRelation reln, ForkNumber forknum);
-/*
- * Prepare allocation-capable selected-smgr state before a truncate critical
- * section.
- */
-extern void smgrpreparetruncate(SMgrRelation reln, ForkNumber *forknum,
-						 int nforks, BlockNumber *old_nblocks,
-						 BlockNumber *nblocks);
 extern void smgrtruncate(SMgrRelation reln, ForkNumber *forknum, int nforks,
 						 BlockNumber *old_nblocks,
 						 BlockNumber *nblocks);

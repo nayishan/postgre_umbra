@@ -1,92 +1,30 @@
 /*-------------------------------------------------------------------------
  *
  * ummap.h
- *	  Umbra-private metadata root lifecycle.
+ *	  Umbra selector-MAP lifecycle.
  *
- * The root format and its interpretation are private to ummap.c.  This
- * header exposes only the lifecycle hooks used by Umbra's smgr layer.
+ * The selector MAP holds only active-slot values. It is not relation-level
+ * layout or extent authority.
  *
  *-------------------------------------------------------------------------
  */
 #ifndef UMMAP_H
 #define UMMAP_H
 
-#include "access/xlogdefs.h"
 #include "storage/relfilelocator.h"
-#include "storage/shmem.h"
 
 typedef struct UmbraFileContext UmbraFileContext;
 
-extern void ummap_root_cache_backend_init(void);
-
-extern bool ummap_exists(UmbraFileContext *ctx);
-extern void ummap_create(UmbraFileContext *ctx,
-					 RelFileLocatorBackend rlocator, bool isRedo);
-/* Nonfatal on-disk root probe used by recovery and layout discovery. */
-extern bool ummap_try_validate(UmbraFileContext *ctx);
-extern BlockNumber ummap_get_main_frontier(UmbraFileContext *ctx,
-										RelFileLocatorBackend rlocator);
-extern void ummap_set_main_frontier(UmbraFileContext *ctx,
-								RelFileLocatorBackend rlocator,
-								BlockNumber logical_eof);
-/* Publish runtime capacity, but keep it out of a root flush until page WAL. */
-extern void ummap_publish_frontier_after_data(UmbraFileContext *ctx,
-										  ForkNumber forknum,
-										  RelFileLocatorBackend rlocator,
-										  BlockNumber logical_eof);
-extern bool ummap_frontier_needs_wal(UmbraFileContext *ctx,
-								 ForkNumber forknum,
-								 RelFileLocatorBackend rlocator,
-								 BlockNumber logical_eof);
-extern void ummap_note_frontier_wal(UmbraFileContext *ctx,
-								ForkNumber forknum,
-								RelFileLocatorBackend rlocator,
-								BlockNumber logical_eof,
-								XLogRecPtr record_endptr);
-/* Redo can only raise a birth frontier; truncate is the lowering path. */
-extern void ummap_advance_frontier_from_redo(UmbraFileContext *ctx,
-										 ForkNumber forknum,
-										 RelFileLocatorBackend rlocator,
-										 BlockNumber logical_eof);
-extern void ummap_prepare_main_frontier(UmbraFileContext *ctx,
-									RelFileLocatorBackend rlocator);
-extern void ummap_publish_prepared_main_frontier(UmbraFileContext *ctx,
-											 RelFileLocatorBackend rlocator,
-											 BlockNumber logical_eof);
-extern BlockNumber ummap_get_aux_frontier(UmbraFileContext *ctx,
-										ForkNumber forknum,
-										RelFileLocatorBackend rlocator);
-extern void ummap_set_aux_frontier(UmbraFileContext *ctx,
-								ForkNumber forknum,
-								RelFileLocatorBackend rlocator,
-								BlockNumber logical_eof);
-extern void ummap_prepare_aux_frontier(UmbraFileContext *ctx,
-									ForkNumber forknum,
-									RelFileLocatorBackend rlocator);
-extern void ummap_publish_prepared_aux_frontier(UmbraFileContext *ctx,
-											ForkNumber forknum,
-											RelFileLocatorBackend rlocator,
-											BlockNumber logical_eof);
-extern void ummap_validate_if_exists(UmbraFileContext *ctx,
-								 RelFileLocatorBackend rlocator);
-/*
- * Write and synchronize only relation-level MAP metadata.  The caller must
- * already have established ordinary data-fork and selector-page ordering.
- */
+/* Flush and synchronize selector pages after ordinary data forks are stable. */
 extern void ummap_sync_relation_metadata(UmbraFileContext *ctx,
 									  RelFileLocatorBackend rlocator);
 extern void ummap_unlink(RelFileLocatorBackend rlocator, bool isRedo);
-
-extern void ummap_flush_relation(UmbraFileContext *ctx,
-							 RelFileLocatorBackend rlocator);
-/* Flush the private metadata-root cache before a raw file copy. */
+/* Flush selector pages before a raw file copy. */
 extern void ummap_flush_database_tablespace_cache(Oid dbid, Oid spcOid);
-/* Discard a database's metadata-root cache state without performing I/O. */
+/* Discard a database's selector cache state without performing I/O. */
 extern void ummap_invalidate_database_cache(Oid dbid);
-/* Discard one tablespace's metadata-root cache state without I/O. */
+/* Discard one tablespace's selector cache state without I/O. */
 extern void ummap_invalidate_database_tablespace_cache(Oid dbid, Oid spcOid);
 extern void ummap_checkpoint(void);
-
-extern const ShmemCallbacks UmbraMapRootShmemCallbacks;
 
 #endif							/* UMMAP_H */

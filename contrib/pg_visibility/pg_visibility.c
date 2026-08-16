@@ -387,9 +387,6 @@ pg_truncate_visibility_map(PG_FUNCTION_ARGS)
 	fork = VISIBILITYMAP_FORKNUM;
 	block = visibilitymap_prepare_truncate(rel, 0);
 	old_block = BlockNumberIsValid(block) ? smgrnblocks(RelationGetSmgr(rel), fork) : 0;
-	if (BlockNumberIsValid(block))
-		smgrpreparetruncate(RelationGetSmgr(rel), &fork, 1,
-							&old_block, &block);
 
 	/*
 	 * WAL-logging, buffer dropping, file truncation must be atomic and all on

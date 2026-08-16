@@ -1,6 +1,6 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# Verify that CREATE redo reconstructs a damaged private metadata root.
+# Verify that physical length is the only logical-EOF authority.
 
 use strict;
 use warnings FATAL => 'all';
@@ -12,45 +12,59 @@ use Test::More;
 plan skip_all => 'requires an Umbra storage manager build'
   unless check_pg_config('^#define USE_UMBRA 1$');
 
-my $node = PostgreSQL::Test::Cluster->new('map_root_redo');
-$node->init;
+my $node = PostgreSQL::Test::Cluster->new('three_bucket_length');
+$node->init(no_data_checksums => 1);
 $node->start;
+$node->safe_psql(
+	'postgres', q{
+CREATE TABLE umbra_three_bucket_length (id integer);
+INSERT INTO umbra_three_bucket_length VALUES (42);
+CHECKPOINT;
+});
+
+my $block_size = 0 + $node->safe_psql('postgres', 'SHOW block_size');
+my $main_path = $node->safe_psql(
+	'postgres',
+	q{SELECT pg_relation_filepath('umbra_three_bucket_length'::regclass);});
+my $main_file = $node->data_dir . "/$main_path";
+my $logical_blocks = 0 + $node->safe_psql(
+	'postgres',
+	q{SELECT pg_relation_size('umbra_three_bucket_length'::regclass) /
+          current_setting('block_size')::integer;});
+
+is(-s $main_file, 3 * $logical_blocks * $block_size,
+	'data fork stores exactly three physical blocks per logical block');
+
+$node->stop;
+open(my $fh, '>>', $main_file)
+  or BAIL_OUT("could not open \"$main_file\": $!");
+binmode($fh);
+print $fh "\0" x $block_size
+  or BAIL_OUT("could not append to \"$main_file\": $!");
+close($fh) or BAIL_OUT("could not close \"$main_file\": $!");
+
+$node->start;
+is($node->safe_psql('postgres',
+		'SELECT count(*) FROM umbra_three_bucket_length'), '1',
+	'a partial physical tail preserves the completed logical prefix');
+is(0 + $node->safe_psql('postgres',
+		q{SELECT pg_relation_size('umbra_three_bucket_length'::regclass) /
+			  current_setting('block_size')::integer;}), $logical_blocks,
+	'incomplete slots do not advance the logical EOF');
 
 $node->safe_psql(
 	'postgres', q{
-CREATE TABLE umbra_redo_root (id integer);
-INSERT INTO umbra_redo_root VALUES (42);
+INSERT INTO umbra_three_bucket_length
+SELECT generate_series(1, 10000);
+CHECKPOINT;
 });
-
-my $main_path = $node->safe_psql(
-	'postgres', q{SELECT pg_relation_filepath('umbra_redo_root'::regclass);});
-my $map_path = $node->data_dir . "/${main_path}_map";
-my $root = slurp_file($map_path);
-my $crc = unpack('L', substr($root, 60, 4));
-
-# Leave CREATE and INSERT after the prior checkpoint, then force crash redo.
-$node->stop('immediate');
-
-open(my $corrupt_fh, '+<', $map_path)
-  or die "could not open \"$map_path\": $!";
-binmode($corrupt_fh);
-seek($corrupt_fh, 60, 0)
-  or die "could not seek \"$map_path\": $!";
-print $corrupt_fh pack('L', $crc ^ 1)
-  or die "could not corrupt \"$map_path\": $!";
-close($corrupt_fh)
-  or die "could not close \"$map_path\": $!";
-
-$node->start;
-is($node->safe_psql('postgres', 'SELECT id FROM umbra_redo_root'), '42',
-	'CREATE redo restores the relation after a damaged metadata root');
-
-$root = slurp_file($map_path);
-my ($magic, $version) = unpack('L2', substr($root, 0, 8));
-is($magic, 0x554d4252, 'CREATE redo reconstructs root magic');
-is($version, 3, 'CREATE redo reconstructs root version');
-is(substr($root, 64, 448), "\0" x 448,
-	'CREATE redo reconstructs zeroed root sector padding');
+my $grown_blocks = 0 + $node->safe_psql(
+	'postgres', q{SELECT pg_relation_size('umbra_three_bucket_length'::regclass) /
+		current_setting('block_size')::integer;});
+cmp_ok($grown_blocks, '>', $logical_blocks,
+	'extension grows past the incomplete tail');
+is(-s $main_file, 3 * $grown_blocks * $block_size,
+	'extension completes the trailing three-slot bucket');
 
 $node->stop;
 done_testing();

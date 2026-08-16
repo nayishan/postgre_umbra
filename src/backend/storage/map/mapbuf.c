@@ -8,6 +8,7 @@
 #include "postgres.h"
 
 #include "access/xlog.h"
+#include "access/xlogutils.h"
 #include "miscadmin.h"
 #include "storage/map_internal.h"
 #include "storage/um_defs.h"
@@ -33,6 +34,7 @@ static bool MapPageDiscardFailedLoad(MapPageDesc *desc,
 								 const MapPageTag *tag, uint32 hashcode);
 static void MapPageRememberIO(int slot_id);
 static void MapPageForgetIO(int slot_id);
+static void MapEnsureMetadataFile(UmbraFileContext *ctx);
 static BlockNumber MapSelectorPageBlock(ForkNumber forknum,
 									 uint64 page_index);
 static void MapSelectorLocation(ForkNumber forknum, BlockNumber logical_block,
@@ -136,8 +138,8 @@ MapPageBufferRead(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 			LWLock     *extension_lock = MapPageExtensionLock(rlocator);
 
 			LWLockAcquire(extension_lock, LW_SHARED);
-			known_exists = map_block <
-				umfile_nblocks(ctx, UMBRA_METADATA_FORKNUM);
+			known_exists = umfile_exists(ctx, UMBRA_METADATA_FORKNUM) &&
+				map_block < umfile_nblocks(ctx, UMBRA_METADATA_FORKNUM);
 			LWLockRelease(extension_lock);
 			if (!known_exists)
 			{
@@ -321,8 +323,8 @@ MapPageBufferReadRaw(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 			LWLock     *extension_lock = MapPageExtensionLock(rlocator);
 
 			LWLockAcquire(extension_lock, LW_SHARED);
-			known_exists = map_block <
-				umfile_nblocks(ctx, UMBRA_METADATA_FORKNUM);
+			known_exists = umfile_exists(ctx, UMBRA_METADATA_FORKNUM) &&
+				map_block < umfile_nblocks(ctx, UMBRA_METADATA_FORKNUM);
 			LWLockRelease(extension_lock);
 			if (!known_exists)
 			{
@@ -526,6 +528,7 @@ MapEnsureActiveSlotPages(UmbraFileContext *ctx,
 	Assert(CritSectionCount == 0);
 	if (nblocks == 0)
 		return;
+	MapEnsureMetadataFile(ctx);
 	logical_end = (uint64) first_block + nblocks - 1;
 	if (logical_end >= (uint64) InvalidBlockNumber)
 		ereport(ERROR,
@@ -542,6 +545,67 @@ MapEnsureActiveSlotPages(UmbraFileContext *ctx,
 
 		buffer = MapPageBufferRead(ctx, rlocator, map_block, true, skipFsync,
 								   LW_SHARED);
+		MapPageReleaseBuffer(buffer);
+	}
+}
+
+void
+MapResetActiveSlots(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
+					ForkNumber forknum, BlockNumber first_block,
+					BlockNumber nblocks, bool skipFsync)
+{
+	uint64		logical_end;
+	uint64		first_page_index;
+	uint64		last_page_index;
+	uint64		page_index;
+
+	Assert(ctx != NULL);
+	Assert(CritSectionCount == 0);
+	if (nblocks == 0 || !umfile_exists(ctx, UMBRA_METADATA_FORKNUM))
+		return;
+	logical_end = (uint64) first_block + nblocks - 1;
+	if (logical_end >= (uint64) InvalidBlockNumber)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("Umbra active-slot reset range overflow")));
+	first_page_index = (uint64) first_block /
+		UMBRA_MAP_SELECTOR_ENTRIES_PER_PAGE;
+	last_page_index = logical_end / UMBRA_MAP_SELECTOR_ENTRIES_PER_PAGE;
+
+	for (page_index = first_page_index; page_index <= last_page_index;
+		 page_index++)
+	{
+		BlockNumber	map_block = MapSelectorPageBlock(forknum, page_index);
+		MapPageBuffer buffer;
+		uint64		first_entry = 0;
+		uint64		last_entry = UMBRA_MAP_SELECTOR_ENTRIES_PER_PAGE - 1;
+		bool		changed = false;
+		char	   *page;
+
+		buffer = MapPageBufferRead(ctx, rlocator, map_block, false, skipFsync,
+								   LW_EXCLUSIVE);
+		if (buffer.desc == NULL)
+			continue;
+		if (page_index == first_page_index)
+			first_entry = (uint64) first_block %
+				UMBRA_MAP_SELECTOR_ENTRIES_PER_PAGE;
+		if (page_index == last_page_index)
+			last_entry = logical_end % UMBRA_MAP_SELECTOR_ENTRIES_PER_PAGE;
+		page = MapPageBufferGetData(buffer);
+		for (uint64 entry = first_entry; entry <= last_entry; entry++)
+		{
+			uint64		bit_index = entry * UMBRA_MAP_SELECTOR_BITS;
+			int			byte_offset = bit_index / BITS_PER_BYTE;
+			int			bit_offset = bit_index % BITS_PER_BYTE;
+
+			if (MapSelectorRead(page, byte_offset, bit_offset) != 0)
+			{
+				MapSelectorWrite(page, byte_offset, bit_offset, 0);
+				changed = true;
+			}
+		}
+		if (changed)
+			MapPageMarkBufferDirty(buffer, InvalidXLogRecPtr, skipFsync);
 		MapPageReleaseBuffer(buffer);
 	}
 }
@@ -594,6 +658,8 @@ MapRedoSetActiveSlot(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 
 	Assert(ctx != NULL);
 	Assert(active_slot < 3);
+	Assert(CritSectionCount == 0);
+	MapEnsureMetadataFile(ctx);
 	MapSelectorLocation(forknum, logical_block, &map_block, &byte_offset,
 						&bit_offset);
 	buffer = MapPageBufferRead(ctx, rlocator, map_block, true, false,
@@ -952,6 +1018,16 @@ MapPageLoad(UmbraFileContext *ctx, const MapPageTag *tag,
 		buffers[0] = page;
 		umfile_readv(ctx, UMBRA_METADATA_FORKNUM, tag->map_block, buffers, 1);
 	}
+}
+
+/* Only noncritical callers may create the selector-MAP file. */
+static void
+MapEnsureMetadataFile(UmbraFileContext *ctx)
+{
+	Assert(ctx != NULL);
+	Assert(CritSectionCount == 0);
+	if (!umfile_exists(ctx, UMBRA_METADATA_FORKNUM))
+		umfile_create(ctx, UMBRA_METADATA_FORKNUM, InRecovery);
 }
 
 static bool

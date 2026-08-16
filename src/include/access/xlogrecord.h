@@ -128,7 +128,6 @@ typedef struct XLogRecordBlockUmbraHeader
 	(sizeof(XLogRecordBlockUmbraHeader))
 
 #define XLOG_UMBRA_BLOCK_HAS_SLOT_SHIFT	0x01
-#define XLOG_UMBRA_BLOCK_HAS_LOGICAL_EOF	0x02
 #else
 #define SizeOfXLogRecordBlockUmbraHeader 0
 #endif
@@ -204,7 +203,7 @@ typedef struct XLogRecordBlockCompressHeader
 #define MaxSizeOfXLogRecordBlockHeader \
 	(SizeOfXLogRecordBlockHeader + \
 	 SizeOfXLogRecordBlockUmbraHeader + \
-	 sizeof(uint8) + sizeof(BlockNumber) + \
+	 sizeof(uint8) + \
 	 SizeOfXLogRecordBlockImageHeader + \
 	 SizeOfXLogRecordBlockCompressHeader + \
 	 sizeof(RelFileLocator) + \

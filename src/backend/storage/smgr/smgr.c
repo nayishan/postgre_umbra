@@ -97,22 +97,7 @@ typedef struct f_smgr
 	void		(*smgr_close) (SMgrRelation reln, ForkNumber forknum);
 	void		(*smgr_destroy) (SMgrRelation reln);	/* may be NULL */
 	void		(*smgr_create) (SMgrRelation reln, ForkNumber forknum,
-								bool isRedo);
-	void		(*smgr_init_new_relation) (SMgrRelation reln, bool needs_wal);
-	/*
-	 * Complete authoritative CREATE redo after smgrcreate() has created the
-	 * physical fork.  This lets an SMgr establish relation-wide metadata that
-	 * defensive page redo must not create.
-	 */
-	void		(*smgr_finish_create) (SMgrRelation reln,
-									 ForkNumber forknum); /* may be NULL */
-	/*
-	 * Return true when a WAL-skipping relation's commit-time pending-sync
-	 * finalization must sync files rather than use generic full-page WAL.  This
-	 * is required when that WAL cannot make SMgr-private metadata or layout
-	 * durable.
-	 */
-	bool		(*smgr_force_pending_sync) (SMgrRelation reln); /* may be NULL */
+									bool isRedo);
 	/*
 	 * Synchronize relation-level private metadata after the core-owned
 	 * ordinary-fork loop.  Private metadata can describe an entire relation,
@@ -173,19 +158,6 @@ typedef struct f_smgr
 											BlockNumber physical_blocknum,
 											BlockNumber nblocks);
 	BlockNumber (*smgr_nblocks) (SMgrRelation reln, ForkNumber forknum);
-	/*
-	 * Prepare selected-smgr state before smgrtruncate() enters its critical
-	 * section.  A logical nblocks lookup need not create the file contexts,
-	 * descriptor arrays, or metadata cache entries physical truncate needs.
-	 * This callback performs those allocation-capable first uses;
-	 * smgrtruncate() must use only prepared state.
-	 * I/O is permitted in the critical section; ordinary memory allocation is
-	 * not.
-	 */
-	void		(*smgr_prepare_truncate) (SMgrRelation reln,
-									 ForkNumber *forknum, int nforks,
-									 BlockNumber *old_nblocks,
-									 BlockNumber *nblocks); /* may be NULL */
 	void		(*smgr_truncate) (SMgrRelation reln, ForkNumber forknum,
 								  BlockNumber old_blocks, BlockNumber nblocks);
 	void		(*smgr_immedsync) (SMgrRelation reln, ForkNumber forknum);
@@ -210,9 +182,6 @@ static const f_smgr smgrsw[] = {
 		.smgr_close = mdclose,
 		.smgr_destroy = NULL,
 		.smgr_create = mdcreate,
-		.smgr_init_new_relation = NULL,
-		.smgr_finish_create = NULL,
-		.smgr_force_pending_sync = NULL,
 		.smgr_sync_relation_metadata = NULL,
 		.smgr_checkpoint = NULL,
 		.smgr_flush_database_tablespace_cache = NULL,
@@ -230,7 +199,6 @@ static const f_smgr smgrsw[] = {
 		.smgr_writeback = mdwriteback,
 		.smgr_writeback_physical = mdwritebackphysical,
 		.smgr_nblocks = mdnblocks,
-		.smgr_prepare_truncate = NULL,
 		.smgr_truncate = mdtruncate,
 		.smgr_immedsync = mdimmedsync,
 		.smgr_registersync = mdregistersync,
@@ -245,9 +213,6 @@ static const f_smgr smgrsw[] = {
 		.smgr_close = umclose,
 		.smgr_destroy = umdestroy,
 		.smgr_create = umcreate,
-		.smgr_init_new_relation = uminitnewrelation,
-		.smgr_finish_create = umfinishcreate,
-		.smgr_force_pending_sync = umforcependingsync,
 		.smgr_sync_relation_metadata = umsyncrelationmetadata,
 		.smgr_checkpoint = umcheckpoint,
 		.smgr_flush_database_tablespace_cache =
@@ -267,7 +232,6 @@ static const f_smgr smgrsw[] = {
 		.smgr_writeback = umwriteback,
 		.smgr_writeback_physical = umwritebackphysical,
 		.smgr_nblocks = umnblocks,
-		.smgr_prepare_truncate = umpreparetruncate,
 		.smgr_truncate = umtruncate,
 		.smgr_immedsync = umimmedsync,
 		.smgr_registersync = umregistersync,
@@ -632,44 +596,6 @@ smgrcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 	HOLD_INTERRUPTS();
 	smgrsw[reln->smgr_which].smgr_create(reln, forknum, isRedo);
 	RESUME_INTERRUPTS();
-}
-
-/*
- * Establish implementation policy once the caller knows a new relation's
- * persistence.  A shared relation locator alone cannot distinguish unlogged
- * storage from WAL-owned permanent storage.
- */
-void
-smgrinitnewrelation(SMgrRelation reln, bool needs_wal)
-{
-	if (smgrsw[reln->smgr_which].smgr_init_new_relation != NULL)
-		smgrsw[reln->smgr_which].smgr_init_new_relation(reln, needs_wal);
-}
-
-/*
- * Complete authoritative CREATE redo after smgrcreate() has made the physical
- * fork.  Defensive page redo must not invoke this relation-wide step.
- */
-void
-smgrfinishcreate(SMgrRelation reln, ForkNumber forknum)
-{
-	HOLD_INTERRUPTS();
-	if (smgrsw[reln->smgr_which].smgr_finish_create != NULL)
-		smgrsw[reln->smgr_which].smgr_finish_create(reln, forknum);
-	RESUME_INTERRUPTS();
-}
-
-/*
- * Ask whether commit-time finalization of this WAL-skipping relation must use
- * real file synchronization because generic full-page WAL omits private
- * SMgr metadata.
- */
-bool
-smgrforcependingsync(SMgrRelation reln)
-{
-	if (smgrsw[reln->smgr_which].smgr_force_pending_sync == NULL)
-		return false;
-	return smgrsw[reln->smgr_which].smgr_force_pending_sync(reln);
 }
 
 /*
@@ -1169,24 +1095,6 @@ smgrnblocks_cached(SMgrRelation reln, ForkNumber forknum)
 		return reln->smgr_cached_nblocks[forknum];
 
 	return InvalidBlockNumber;
-}
-
-/*
- * Prepare selected-smgr state before a critical-section truncate.  A logical
- * size lookup need not have created the file contexts, descriptor arrays, or
- * metadata cache entries physical truncate needs.  The callback performs
- * those allocation-capable first uses so smgrtruncate() can use prepared
- * state only.
- */
-void
-smgrpreparetruncate(SMgrRelation reln, ForkNumber *forknum, int nforks,
-					BlockNumber *old_nblocks, BlockNumber *nblocks)
-{
-	HOLD_INTERRUPTS();
-	if (smgrsw[reln->smgr_which].smgr_prepare_truncate != NULL)
-		smgrsw[reln->smgr_which].smgr_prepare_truncate(reln, forknum,
-													  nforks, old_nblocks, nblocks);
-	RESUME_INTERRUPTS();
 }
 
 /*

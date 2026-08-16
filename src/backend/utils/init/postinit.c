@@ -639,11 +639,6 @@ BaseInit(void)
 	 */
 	pgstat_initialize();
 
-#ifdef USE_UMBRA
-	/* Let AIO drain before this backend releases its lazy DSA attachment. */
-	ummap_root_cache_backend_init();
-#endif
-
 	/*
 	 * Initialize AIO before infrastructure that might need to actually
 	 * execute AIO.

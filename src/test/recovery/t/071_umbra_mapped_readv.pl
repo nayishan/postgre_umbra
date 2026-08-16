@@ -1,6 +1,6 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# Verify that logical pages sharing an active slot can use one physical read.
+# Verify that adjacent logical pages require separate reads under 3L + slot.
 
 use strict;
 use warnings FATAL => 'all';
@@ -42,8 +42,8 @@ SELECT evict_rel('umbra_mapped_readv');
 			'postgres', q[
 SELECT blockoff, blocknum, io_reqd, nblocks
 FROM read_buffers('umbra_mapped_readv', 0, 2);]),
-		'0|0|t|2',
-		"$io_method combines two contiguous mapped pages");
+		"0|0|t|1\n1|1|t|1",
+		"$io_method does not combine noncontiguous three-bucket pages");
 
 	$node->safe_psql('postgres', q[
 CHECKPOINT;
@@ -56,7 +56,7 @@ SELECT evict_rel('umbra_mapped_readv');
 SELECT blockoff, blocknum, io_reqd, nblocks
 FROM read_buffers('umbra_mapped_readv', 0, 2);]),
 		"0|0|t|1\n1|1|t|1",
-		"$io_method splits pages on an active-slot boundary");
+		"$io_method keeps one I/O per logical page after a slot shift");
 
 	$node->stop;
 }

@@ -598,11 +598,9 @@ _hash_freeovflpage(Relation rel, Buffer bucketbuf, Buffer ovflbuf,
 	}
 
 	/*
-	 * Reinitialize the freed overflow page.  Just zeroing the page won't
-	 * work, because WAL replay routines expect pages to be initialized. See
-	 * explanation of RBM_NORMAL mode atop XLogReadBufferExtended.  We are
-	 * careful to make the special space valid here so that tools like
-	 * pageinspect won't get confused.
+	 * Reinitialize the freed overflow page.  Its WAL block is marked
+	 * REGBUF_WILL_INIT, so redo rebuilds it without inspecting its old
+	 * contents.  Keep the special space valid for tools such as pageinspect.
 	 */
 	_hash_pageinit(ovflpage, BufferGetPageSize(ovflbuf));
 
@@ -705,7 +703,8 @@ _hash_freeovflpage(Relation rel, Buffer bucketbuf, Buffer ovflbuf,
 			XLogRegisterBuffer(1, wbuf, wbuf_flags);
 		}
 
-		XLogRegisterBuffer(2, ovflbuf, REGBUF_STANDARD);
+		/* This block is rebuilt from scratch by the matching redo routine. */
+		XLogRegisterBuffer(2, ovflbuf, REGBUF_STANDARD | REGBUF_WILL_INIT);
 
 		/*
 		 * If prevpage and the writepage (block in which we are moving tuples

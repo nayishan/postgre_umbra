@@ -389,8 +389,6 @@ ReplicationOriginState	"Waiting to read or update the progress of one replicatio
 ReplicationSlotIO	"Waiting for I/O on a replication slot."
 LockFastPath	"Waiting to read or update a process' fast-path lock information."
 BufferMapping	"Waiting to associate a data block with a buffer in the buffer pool."
-UmbraRootMapping	"Waiting to associate an Umbra metadata root with its resident cache entry."
-UmbraRootContent	"Waiting to read or update a resident Umbra metadata root."
 MapPageMapping	"Waiting to associate an Umbra active-slot page with a buffer pool slot."
 MapPageContent	"Waiting to read, write, or replace an Umbra active-slot page buffer."
 MapPageExtension	"Waiting to extend an Umbra metadata file with active-slot pages."

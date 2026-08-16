@@ -1,31 +1,17 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# Verify MAIN slot-0 formula mapping, durable capacity, and recovery reads.
+# Verify the exact MAIN three-bucket layout, truncate/regrow reset, and redo.
 
 use strict;
 use warnings FATAL => 'all';
 
+use Fcntl qw(SEEK_SET);
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
 plan skip_all => 'requires an Umbra storage manager build'
   unless check_pg_config('^#define USE_UMBRA 1$');
-
-use constant CHUNK_PAGES => 32;
-use constant CHUNK_SLOTS => 3;
-use constant ROOT_LOGICAL_EOF_OFFSET => 20;
-use constant ROOT_RESERVED_OFFSET => 32;
-use constant ROOT_RESERVED_LENGTH => 28;
-
-sub expected_capacity
-{
-	my $logical_eof = shift;
-
-	return 0 if $logical_eof == 0;
-	return int(($logical_eof + CHUNK_PAGES - 1) / CHUNK_PAGES)
-	  * CHUNK_PAGES * CHUNK_SLOTS;
-}
 
 sub relation_blocks
 {
@@ -37,189 +23,120 @@ sub relation_blocks
 		  . "current_setting('block_size')::integer");
 }
 
-sub check_layout
+sub read_active_slot
 {
-	my ($node, $relation, $main_path, $block_size, $label) = @_;
+	my ($path, $block_size, $logical_block) = @_;
+	my $entries_per_page = $block_size * 4;
+	my $page_index = int($logical_block / $entries_per_page);
+	my $entry_index = $logical_block % $entries_per_page;
+	my $group = int($page_index / 256);
+	my $map_block = $group * 258 + 2 + ($page_index % 256);
+	my $offset = $map_block * $block_size + int($entry_index / 4);
+	my $byte;
+
+	open(my $fh, '<', $path) or BAIL_OUT("could not open \"$path\": $!");
+	binmode($fh);
+	defined(sysseek($fh, $offset, SEEK_SET))
+	  or BAIL_OUT("could not seek in \"$path\": $!");
+	sysread($fh, $byte, 1) == 1
+	  or BAIL_OUT("could not read selector from \"$path\": $!");
+	close($fh) or BAIL_OUT("could not close \"$path\": $!");
+
+	return (unpack('C', $byte) >> (($entry_index % 4) * 2)) & 0x03;
+}
+
+sub check_main_layout
+{
+	my ($node, $relation, $main_file, $block_size, $label) = @_;
 	my $logical_eof = relation_blocks($node, $relation);
-	my $physical_capacity = expected_capacity($logical_eof);
-	my $root = slurp_file($node->data_dir . "/${main_path}_map");
-	my $root_logical_eof =
-	  unpack('L', substr($root, ROOT_LOGICAL_EOF_OFFSET, 4));
-	my $physical_bytes = -s $node->data_dir . "/$main_path";
+	my $physical_blocks = (-s $main_file) / $block_size;
 
-	is($root_logical_eof, $logical_eof,
-		"$label: root stores the exact logical EOF");
-	is(substr($root, ROOT_RESERVED_OFFSET, ROOT_RESERVED_LENGTH),
-		"\0" x ROOT_RESERVED_LENGTH,
-		"$label: root leaves derived capacity unstored");
-	is($physical_bytes, $physical_capacity * $block_size,
-		"$label: durable MAIN file has the published physical capacity");
-
+	is($physical_blocks, 3 * $logical_eof,
+		"$label: physical MAIN length is exactly three times logical EOF");
 	return $logical_eof;
 }
 
-my $node = PostgreSQL::Test::Cluster->new('slot0_mapping');
-$node->init;
+my $node = PostgreSQL::Test::Cluster->new('slot0_three_buckets');
+$node->init(no_data_checksums => 1);
 $node->append_conf(
-	'postgresql.conf', qq(
-io_method=worker
-io_worker_idle_timeout=0ms
-io_worker_launch_interval=0ms
-io_min_workers=1
-checkpoint_timeout=1h
-max_wal_size=4GB
-));
+	'postgresql.conf', q[
+autovacuum = off
+checkpoint_timeout = '1h'
+max_wal_size = '4GB'
+]);
 $node->start;
 
-is($node->safe_psql('postgres', 'SHOW io_method'), 'worker',
-	'worker AIO is enabled');
-
+# Leave CREATE and all initial page images after the redo point.
 $node->safe_psql(
 	'postgres', q{
 CHECKPOINT;
 CREATE TABLE umbra_slot0 (id integer, payload text)
-  WITH (autovacuum_enabled = false);
+  WITH (autovacuum_enabled = false, fillfactor = 50);
 INSERT INTO umbra_slot0
 SELECT g, repeat('x', 700)
 FROM generate_series(1, 600) AS g;
 });
 
 my $block_size = 0 + $node->safe_psql('postgres', 'SHOW block_size');
-my $bootstrap_path = $node->safe_psql(
-	'postgres', q{SELECT pg_relation_filepath('pg_catalog.pg_class'::regclass);});
-check_layout($node, 'pg_catalog.pg_class', $bootstrap_path, $block_size,
-	'bootstrap pg_class');
 my $main_path = $node->safe_psql(
 	'postgres', q{SELECT pg_relation_filepath('umbra_slot0'::regclass);});
-
-# Force CREATE and subsequent page redo to reconstruct a missing mapped fork.
-$node->stop('immediate');
-unlink $node->data_dir . "/$main_path"
-  or die "could not remove mapped MAIN file: $!";
-unlink $node->data_dir . "/${main_path}_map"
-  or die "could not remove mapped root file: $!";
-$node->start;
-is($node->safe_psql('postgres',
-		q{SELECT count(*) FROM umbra_slot0 WHERE payload = repeat('x', 700)}),
-	'600', 'CREATE and page redo rebuild mapped blocks across a chunk boundary');
-
-my $initial_blocks =
-	check_layout($node, 'umbra_slot0', $main_path, $block_size, 'initial grow');
-cmp_ok($initial_blocks, '>', CHUNK_PAGES,
-	'initial grow crosses the first slot-0 chunk boundary');
-
-# A global SMGRRELEASE closes descriptors but retains SMgrRelation objects.
-# Leave a pending-unlink gate in an otherwise empty tablespace so that DROP
-# TABLESPACE must issue that barrier.  A mapped handle keeps its layout across
-# the release and revalidates its root before the next mapping-dependent use.
-$node->safe_psql(
-	'postgres', q{
-SET allow_in_place_tablespaces = on;
-CREATE TABLESPACE umbra_policy_ts LOCATION '';
-CREATE TABLE umbra_policy_gate (id integer) TABLESPACE umbra_policy_ts;
-DROP TABLE umbra_policy_gate;
-});
-my $map_file = $node->data_dir . "/${main_path}_map";
-my $policy_session = $node->background_psql('postgres', on_error_stop => 0);
-is(0 + $policy_session->query_safe(q{
-SELECT pg_relation_size('umbra_slot0'::regclass) /
-       current_setting('block_size')::integer;
-}), $initial_blocks, 'retained handle initially observes the mapped logical size');
-$node->safe_psql('postgres', 'DROP TABLESPACE umbra_policy_ts');
-is(0 + $policy_session->query_safe(q{
-SELECT pg_relation_size('umbra_slot0'::regclass) /
-       current_setting('block_size')::integer;
-}), $initial_blocks,
-	'retained MAPPED handle preserves the logical size after SMGRRELEASE');
-
-$node->safe_psql(
-	'postgres', q{
-SET allow_in_place_tablespaces = on;
-CREATE TABLESPACE umbra_policy_missing_ts LOCATION '';
-CREATE TABLE umbra_policy_missing_gate (id integer)
-  TABLESPACE umbra_policy_missing_ts;
-DROP TABLE umbra_policy_missing_gate;
-});
-my $hidden_map_file = "$map_file.policy_hidden";
-rename($map_file, $hidden_map_file)
-  or BAIL_OUT("could not hide mapped root \"$map_file\": $!");
-$node->safe_psql('postgres', 'DROP TABLESPACE umbra_policy_missing_ts');
-my ($ignored, $failed) = $policy_session->query(q{
-SELECT pg_relation_size('umbra_slot0'::regclass) /
-       current_setting('block_size')::integer;
-});
-is($failed, 1,
-	'root missing after SMGRRELEASE fails instead of selecting direct I/O');
-rename($hidden_map_file, $map_file)
-  or BAIL_OUT("could not restore mapped root \"$map_file\": $!");
-$policy_session->quit;
-
-$node->stop;
-$node->start;
-is($node->safe_psql('postgres',
-		q{SELECT count(*) FROM umbra_slot0 WHERE payload = repeat('x', 700)}),
-	'600', 'worker AIO reads all mapped pages after restart');
-
-$node->safe_psql(
-	'postgres', q{
-UPDATE umbra_slot0
-SET payload = repeat('u', 700)
-WHERE id IN (1, 32, 33, 600);
-CHECKPOINT;
-});
-is($node->safe_psql('postgres',
-		q{SELECT count(*) FROM umbra_slot0 WHERE payload = repeat('u', 700)}),
-	'4', 'updates write mapped pages on both sides of the chunk boundary');
-check_layout($node, 'umbra_slot0', $main_path, $block_size, 'after update');
-
-# Exercise checkpoint root writeback followed by crash recovery.
-$node->stop('immediate');
-$node->start;
-is($node->safe_psql('postgres',
-		q{SELECT count(*) FROM umbra_slot0 WHERE payload = repeat('u', 700)}),
-	'4', 'checkpointed root and its mapped MAIN pages survive a crash');
-check_layout($node, 'umbra_slot0', $main_path, $block_size,
-	'after checkpoint recovery');
-
-is($node->safe_psql(
-		'postgres', q{
-WITH relation_parts AS
-(
-  SELECT oid, reltoastrelid
-  FROM pg_class
-  WHERE oid = 'umbra_slot0'::regclass
-)
-SELECT pg_table_size(oid) - pg_relation_size(oid) =
-       pg_relation_size(oid, 'fsm') + pg_relation_size(oid, 'vm') +
-       CASE WHEN reltoastrelid <> 0
-            THEN pg_total_relation_size(reltoastrelid)
-            ELSE 0
-       END
-FROM relation_parts
-}), 't', 'aggregate relation size uses the logical MAIN EOF');
-
 my $main_file = $node->data_dir . "/$main_path";
-my $pretruncate_bytes = -s $main_file;
+my $map_path = "${main_file}_map";
 
+# CREATE/page redo needs no relation root: the globally fixed geometry tells
+# redo how to reconstruct each page, and an absent selector is slot 0.
+$node->stop('immediate');
+unlink $main_file or BAIL_OUT("could not remove \"$main_file\": $!");
+unlink $map_path or BAIL_OUT("could not remove \"$map_path\": $!");
+$node->start;
+is($node->safe_psql('postgres',
+		q{SELECT count(*) FROM umbra_slot0 WHERE payload = repeat('x', 700)}),
+	'600', 'CREATE and page redo reconstruct mapped MAIN without a root');
+
+my $initial_blocks = check_main_layout($node, 'umbra_slot0', $main_file,
+	$block_size, 'initial recovery');
+cmp_ok($initial_blocks, '>', 1,
+	'initial relation has more than one logical page');
+is(-s $map_path, 3 * $block_size,
+	'first selector group has no reserved root block');
+
+my ($tail_id, $tail_block) = split(/\|/, $node->safe_psql(
+	'postgres', q{
+SELECT id, (ctid::text::point)[0]::integer
+FROM umbra_slot0
+ORDER BY (ctid::text::point)[0]::integer DESC, id DESC
+LIMIT 1;
+}));
+$node->safe_psql('postgres', 'CHECKPOINT');
+is(0 + $node->safe_psql('postgres',
+	"UPDATE umbra_slot0 SET payload = repeat('u', 700) "
+	  . "WHERE id = $tail_id RETURNING (ctid::text::point)[0]::integer;"),
+	$tail_block, 'tail update remains on its existing logical block');
+$node->safe_psql('postgres', 'CHECKPOINT');
+is(read_active_slot($map_path, $block_size, $tail_block), 1,
+	'tail update advances its selector from slot 0 to slot 1');
+
+my $pretruncate_bytes = -s $main_file;
 $node->safe_psql(
 	'postgres', q{
 DELETE FROM umbra_slot0;
 VACUUM (TRUNCATE, DISABLE_PAGE_SKIPPING) umbra_slot0;
 });
-my $truncated_blocks =
-	check_layout($node, 'umbra_slot0', $main_path, $block_size, 'after truncate');
+my $truncated_blocks = check_main_layout($node, 'umbra_slot0', $main_file,
+	$block_size, 'after truncate');
 cmp_ok($truncated_blocks, '<', $initial_blocks,
-	'VACUUM truncates the logical EOF');
-cmp_ok($pretruncate_bytes, '>', expected_capacity($truncated_blocks) * $block_size,
-	'truncate crosses a physical capacity boundary');
+	'truncate lowers logical EOF through physical length');
+cmp_ok($tail_block, '>=', $truncated_blocks,
+	'the shifted selector belongs to the truncated tail');
 
-# Recreate the persisted-root/raw-tail crash window before truncate redo.
+# Redo must remove any stale physical tail even though there is no root EOF.
 $node->stop('immediate');
 truncate($main_file, $pretruncate_bytes)
-  or die "could not restore stale mapped MAIN tail: $!";
+	  or BAIL_OUT("could not restore stale tail in \"$main_file\": $!");
 $node->start;
-check_layout($node, 'umbra_slot0', $main_path, $block_size,
-	'after truncate redo cleans a stale physical tail');
+is(check_main_layout($node, 'umbra_slot0', $main_file, $block_size,
+		'after truncate redo'), $truncated_blocks,
+	'truncate redo restores the physical EOF');
 
 $node->safe_psql(
 	'postgres', q{
@@ -228,32 +145,33 @@ SELECT g, repeat('r', 700)
 FROM generate_series(1, 600) AS g;
 CHECKPOINT;
 });
-my $regrown_blocks =
-	check_layout($node, 'umbra_slot0', $main_path, $block_size, 'after regrow');
-cmp_ok($regrown_blocks, '>', CHUNK_PAGES,
-	'regrow crosses the first slot-0 chunk boundary again');
+my $regrown_blocks = check_main_layout($node, 'umbra_slot0', $main_file,
+	$block_size, 'after regrow');
+cmp_ok($regrown_blocks, '>', $tail_block,
+	'regrow reaches the former shifted logical block');
+is(read_active_slot($map_path, $block_size, $tail_block), 0,
+	'regrowth resets the stale truncated-tail selector to slot 0');
 
-$node->stop;
+$node->stop('immediate');
 $node->start;
 is($node->safe_psql('postgres',
 		q{SELECT count(*) FROM umbra_slot0 WHERE payload = repeat('r', 700)}),
-	'600', 'regrown mapped pages survive restart');
-
+	'600', 'regrown slot-0 pages survive crash recovery');
+check_main_layout($node, 'umbra_slot0', $main_file, $block_size,
+	'after regrow recovery');
 $node->stop;
 
-my $minimal = PostgreSQL::Test::Cluster->new('slot0_minimal');
-$minimal->init;
+# A WAL-skipping relation still has no separate metadata authority to sync.
+my $minimal = PostgreSQL::Test::Cluster->new('slot0_three_buckets_minimal');
+$minimal->init(no_data_checksums => 1);
 $minimal->append_conf(
-	'postgresql.conf', qq(
-wal_level=minimal
-wal_skip_threshold=1GB
-checkpoint_timeout=1h
-max_wal_size=4GB
-));
+	'postgresql.conf', q[
+wal_level = minimal
+wal_skip_threshold = '1GB'
+checkpoint_timeout = '1h'
+max_wal_size = '4GB'
+]);
 $minimal->start;
-
-is($minimal->safe_psql('postgres', 'SHOW wal_level'), 'minimal',
-	'pending-sync coverage runs with minimal WAL');
 $minimal->safe_psql(
 	'postgres', q{
 BEGIN;
@@ -270,96 +188,16 @@ my $minimal_block_size =
 my $minimal_path = $minimal->safe_psql(
 	'postgres',
 	q{SELECT pg_relation_filepath('umbra_slot0_minimal'::regclass);});
-my $minimal_blocks = check_layout($minimal, 'umbra_slot0_minimal',
-	$minimal_path, $minimal_block_size, 'minimal-WAL commit');
-cmp_ok($minimal_blocks, '>', CHUNK_PAGES,
-	'minimal-WAL relation crosses the first slot-0 chunk boundary');
-
+my $minimal_file = $minimal->data_dir . "/$minimal_path";
+check_main_layout($minimal, 'umbra_slot0_minimal', $minimal_file,
+	$minimal_block_size, 'minimal-WAL commit');
 $minimal->stop('immediate');
 $minimal->start;
 is($minimal->safe_psql('postgres',
 		q{SELECT count(*) FROM umbra_slot0_minimal WHERE payload = repeat('m', 700)}),
-	'600', 'minimal-WAL pending sync preserves mapped data across a crash');
-check_layout($minimal, 'umbra_slot0_minimal', $minimal_path,
-	$minimal_block_size, 'minimal-WAL restart');
-
+	'600', 'minimal-WAL pending sync preserves three-bucket data after a crash');
+check_main_layout($minimal, 'umbra_slot0_minimal', $minimal_file,
+	$minimal_block_size, 'minimal-WAL recovery');
 $minimal->stop;
-
-# A checkpoint-first consistency-checked update retains its slot shift.  If
-# its relation root has been removed by a later DROP, redo must record an
-# invalid-page dependency rather than recreate and access the MAIN fork through
-# the direct physical layout.
-my $redo_policy = PostgreSQL::Test::Cluster->new('slot0_unknown_redo');
-$redo_policy->init(no_data_checksums => 1);
-$redo_policy->append_conf(
-	'postgresql.conf', qq(
-autovacuum = off
-checkpoint_timeout = '1h'
-log_min_messages = debug2
-max_wal_size = '4GB'
-wal_consistency_checking = heap
-));
-$redo_policy->start;
-$redo_policy->safe_psql(
-	'postgres', q{
-CREATE TABLE umbra_unknown_redo (id integer PRIMARY KEY, payload text)
-  WITH (autovacuum_enabled = false);
-INSERT INTO umbra_unknown_redo VALUES (1, repeat('a', 700));
-CHECKPOINT;
-});
-
-my $redo_filenode = 0 + $redo_policy->safe_psql(
-	'postgres',
-	q{SELECT pg_relation_filenode('umbra_unknown_redo'::regclass)});
-my $redo_block = 0 + $redo_policy->safe_psql(
-	'postgres', q{
-SELECT (ctid::text::point)[0]::integer
-FROM umbra_unknown_redo
-WHERE id = 1;
-});
-my $redo_wal_start = $redo_policy->safe_psql(
-	'postgres', 'SELECT pg_current_wal_insert_lsn();');
-$redo_policy->safe_psql(
-	'postgres', q{
-UPDATE umbra_unknown_redo
-SET payload = repeat('b', 700)
-WHERE id = 1;
-});
-my $redo_wal_end = $redo_policy->safe_psql(
-	'postgres', 'SELECT pg_current_wal_insert_lsn();');
-my ($redo_wal, $redo_stderr) = run_command(
-	[
-		'pg_waldump', '--bkp-details',
-		'--path' => $redo_policy->data_dir . '/pg_wal',
-		'--start' => $redo_wal_start,
-		'--end' => $redo_wal_end,
-	]);
-$redo_stderr =~ s/^pg_waldump: first record is after [0-9A-F]+\/[0-9A-F]+, at [0-9A-F]+\/[0-9A-F]+, skipping over \d+ bytes?\n?//;
-is($redo_stderr, '', 'pg_waldump reads ordinary consistency-FPI WAL');
-my @redo_records = grep {
-	/rel \d+\/\d+\/$redo_filenode fork main blk $redo_block\b/
-} split(/\n/, $redo_wal);
-is(scalar(@redo_records), 1,
-	'ordinary update emits one target-block WAL record');
-like($redo_records[0] // '', qr/\bFPW\b/,
-	'consistency checking emits a full-page image');
-like($redo_records[0] // '',
-	qr/slot shift: source_slot [0-2] target_slot [0-2]\b/,
-	'ordinary consistency FPI retains its slot shift');
-
-$redo_policy->safe_psql('postgres', 'DROP TABLE umbra_unknown_redo');
-my $redo_log_start = -s $redo_policy->logfile;
-$redo_policy->stop('immediate');
-ok($redo_policy->start,
-	'recovery accepts an ordinary FPI with unresolved mapping authority');
-ok($redo_policy->log_contains(
-	qr/page $redo_block of relation .* does not exist/,
-	$redo_log_start),
-	'ordinary FPI records its unresolved mapping as an invalid-page dependency');
-ok($redo_policy->log_contains(
-	qr/page $redo_block of relation .* has been dropped/,
-	$redo_log_start),
-	'later DROP clears the ordinary-FPI invalid-page dependency');
-$redo_policy->stop;
 
 done_testing();

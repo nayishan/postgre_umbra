@@ -35,13 +35,13 @@ sub read_active_slot
 
 	if ($fork eq 'fsm')
 	{
-		$map_block = 1 + $page_index * 258;
+		$map_block = $page_index * 258;
 	}
 	elsif ($fork eq 'main')
 	{
 		my $group = int($page_index / 256);
 
-		$map_block = 1 + $group * 258 + 2 + ($page_index % 256);
+		$map_block = $group * 258 + 2 + ($page_index % 256);
 	}
 	else
 	{
@@ -202,9 +202,9 @@ is($node->safe_psql(
 		'postgres', q[SELECT payload FROM umbra_hint_delta WHERE id = 1;]),
 	'after', 'ordinary WAL follows the recovered hint delta');
 
-# A later TRUNCATE removes the old relfilenode's _map root before restart
+# A later TRUNCATE removes the old relfilenode's selector MAP before restart
 # redo reaches its HINT_DELTA.  The hint record must use normal missing-page
-# accounting instead of trying to publish a selector without a root.
+# accounting instead of trying to publish a selector for deleted storage.
 $node->safe_psql(
 	'postgres', q[
 CREATE TABLE umbra_hint_delta_replaced(id integer, payload text)
@@ -217,7 +217,7 @@ my $replaced_relpath = $node->safe_psql(
 my $replaced_filenode = $node->safe_psql(
 	'postgres', q[SELECT pg_relation_filenode('umbra_hint_delta_replaced'::regclass);]);
 my $replaced_map_path = $node->data_dir . "/${replaced_relpath}_map";
-ok(-e $replaced_map_path, 'old storage has a mapping root before its hint');
+ok(-e $replaced_map_path, 'old storage has a selector MAP before its hint');
 is(xmin_is_committed($node, 'umbra_hint_delta_replaced'), 'f',
 	'old storage has no committed hint bit before replacement coverage');
 
@@ -247,7 +247,7 @@ my $replacement_filenode = $node->safe_psql(
 isnt($replacement_filenode, $replaced_filenode,
 	'TRUNCATE replaces the old storage');
 ok(!-e $replaced_map_path,
-	'TRUNCATE removes the old storage mapping root before crash recovery');
+	'TRUNCATE removes the old storage selector MAP before crash recovery');
 
 $node->stop('immediate');
 is($node->start(fail_ok => 1), 1,
@@ -320,6 +320,7 @@ my $fsm_filenode = $node->safe_psql(
 my $fsm_relpath = $node->safe_psql(
 	'postgres', q[SELECT pg_relation_filepath('umbra_hint_delta_fsm'::regclass);]);
 my $fsm_map_path = $node->data_dir . "/${fsm_relpath}_map";
+my $fsm_data_path = $node->data_dir . "/${fsm_relpath}_fsm";
 cmp_ok($node->safe_psql(
 		'postgres', q[SELECT pg_relation_size('umbra_hint_delta_fsm', 'fsm');]),
 	'>', 0, 'FSM fork exists before hint delta coverage');
@@ -365,17 +366,21 @@ ok(defined($fsm_source_slot) && defined($fsm_target_slot),
 	'FSM HINT_DELTA records a source and target slot');
 SKIP:
 {
-	skip 'FSM HINT_DELTA lacks a selector transition', 2
+	skip 'FSM HINT_DELTA lacks a selector transition', 3
 	  unless defined($fsm_block) && defined($fsm_source_slot) &&
 	  defined($fsm_target_slot);
 	is(read_active_slot($fsm_map_path, $block_size, 'fsm', $fsm_block),
 		$fsm_source_slot,
 		'FSM selector target is not checkpointed before the immediate stop');
 	$node->stop('immediate');
+	unlink $fsm_data_path
+	  or BAIL_OUT("could not remove \"$fsm_data_path\": $!");
+	ok(!-e $fsm_data_path,
+		'missing FSM fork is injected before HINT_DELTA crash redo');
 	$node->start;
 	is(read_active_slot($fsm_map_path, $block_size, 'fsm', $fsm_block),
 		$fsm_target_slot,
-		'crash redo publishes the FSM HINT_DELTA selector target');
+		'crash redo rebuilds the missing FSM source and publishes its target');
 }
 
 # A clean MAIN hint still uses the generic hint record when it does not need
@@ -427,7 +432,7 @@ $node->reload;
 is($node->safe_psql('postgres', 'SHOW full_page_writes'), 'on',
 	'full_page_writes is restored for crash-redo coverage');
 
-# A missing root without later lifecycle WAL must remain an invalid-page
+# A missing selector MAP without later lifecycle WAL must remain an invalid-page
 # dependency; otherwise a HINT_DELTA source baseline could be lost silently.
 $node->safe_psql(
 	'postgres', q[

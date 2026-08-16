@@ -168,9 +168,6 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 		pendingDeletes = pending;
 	}
 
-	/* The implementation bootstrap may perform fallible metadata I/O. */
-	smgrinitnewrelation(srel, needs_wal);
-
 	if (needs_wal)
 		log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);
 
@@ -341,13 +338,6 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 			nforks++;
 		}
 	}
-
-	/*
-	 * This may create selected-smgr file and metadata state.  Do it before the
-	 * truncation critical section below, where ordinary memory allocation is
-	 * not allowed.
-	 */
-	smgrpreparetruncate(reln, forks, nforks, old_blocks, blocks);
 
 	RelationPreTruncate(rel);
 
@@ -791,11 +781,8 @@ smgrDoPendingSyncs(bool isCommit, bool isParallelWorker)
 		BlockNumber nblocks[MAX_FORKNUM + 1];
 		uint64		total_blocks = 0;
 		SMgrRelation srel;
-		bool		force_sync;
 
 		srel = smgropen(pendingsync->rlocator, INVALID_PROC_NUMBER);
-		force_sync = smgrforcependingsync(srel);
-
 		/*
 		 * We emit newpage WAL records for smaller relations.
 		 *
@@ -834,7 +821,7 @@ smgrDoPendingSyncs(bool isCommit, bool isParallelWorker)
 		 * the current main fork is longer than ever, but there's a case where
 		 * main fork is longer than ever but FSM fork gets shorter.
 		 */
-		if (pendingsync->is_truncated || force_sync ||
+		if (pendingsync->is_truncated ||
 			total_blocks >= wal_skip_threshold * (uint64) 1024 / BLCKSZ)
 		{
 			/* allocate the initial array, or extend it, if needed */
@@ -1005,7 +992,6 @@ smgr_redo(XLogReaderState *record)
 
 		reln = smgropen(xlrec->rlocator, INVALID_PROC_NUMBER);
 		smgrcreate(reln, xlrec->forkNum, true);
-		smgrfinishcreate(reln, xlrec->forkNum);
 	}
 	else if (info == XLOG_SMGR_TRUNCATE)
 	{
@@ -1064,16 +1050,6 @@ smgr_redo(XLogReaderState *record)
 			smgrexists(reln, FSM_FORKNUM))
 		{
 			blocks[nforks] = FreeSpaceMapPrepareTruncateRel(rel, xlrec->blkno);
-#ifdef USE_UMBRA
-			/*
-			 * An interrupted Umbra recovery can persist the lower logical root
-			 * before removing the old physical tail.  Keep a logical no-op in
-			 * the truncate list so the smgr prepare callback can finish that
-			 * physical cleanup on the next recovery.
-			 */
-			if (!BlockNumberIsValid(blocks[nforks]))
-				blocks[nforks] = smgrnblocks(reln, FSM_FORKNUM);
-#endif
 			if (BlockNumberIsValid(blocks[nforks]))
 			{
 				forks[nforks] = FSM_FORKNUM;
@@ -1088,11 +1064,6 @@ smgr_redo(XLogReaderState *record)
 			smgrexists(reln, VISIBILITYMAP_FORKNUM))
 		{
 			blocks[nforks] = visibilitymap_prepare_truncate(rel, xlrec->blkno);
-#ifdef USE_UMBRA
-			if (!BlockNumberIsValid(blocks[nforks]))
-				blocks[nforks] = smgrnblocks(reln,
-											 VISIBILITYMAP_FORKNUM);
-#endif
 			if (BlockNumberIsValid(blocks[nforks]))
 			{
 				forks[nforks] = VISIBILITYMAP_FORKNUM;
@@ -1107,8 +1078,6 @@ smgr_redo(XLogReaderState *record)
 		/* Do the real work to truncate relation forks */
 		if (nforks > 0)
 		{
-			/* This may allocate selected-smgr state; the critical section may not. */
-			smgrpreparetruncate(reln, forks, nforks, old_blocks, blocks);
 			START_CRIT_SECTION();
 			smgrtruncate(reln, forks, nforks, old_blocks, blocks);
 			END_CRIT_SECTION();
