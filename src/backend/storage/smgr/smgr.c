@@ -98,6 +98,8 @@ typedef struct f_smgr
 	void		(*smgr_destroy) (SMgrRelation reln);	/* may be NULL */
 	void		(*smgr_create) (SMgrRelation reln, ForkNumber forknum,
 									bool isRedo);
+	/* Called while the creator still knows a new relation's persistence. */
+	void		(*smgr_init_new_relation) (SMgrRelation reln, bool needs_wal);
 	/*
 	 * Synchronize relation-level private metadata after the core-owned
 	 * ordinary-fork loop.  Private metadata can describe an entire relation,
@@ -182,6 +184,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_close = mdclose,
 		.smgr_destroy = NULL,
 		.smgr_create = mdcreate,
+		.smgr_init_new_relation = NULL,
 		.smgr_sync_relation_metadata = NULL,
 		.smgr_checkpoint = NULL,
 		.smgr_flush_database_tablespace_cache = NULL,
@@ -213,6 +216,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_close = umclose,
 		.smgr_destroy = umdestroy,
 		.smgr_create = umcreate,
+		.smgr_init_new_relation = uminitnewrelation,
 		.smgr_sync_relation_metadata = umsyncrelationmetadata,
 		.smgr_checkpoint = umcheckpoint,
 		.smgr_flush_database_tablespace_cache =
@@ -596,6 +600,18 @@ smgrcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 	HOLD_INTERRUPTS();
 	smgrsw[reln->smgr_which].smgr_create(reln, forknum, isRedo);
 	RESUME_INTERRUPTS();
+}
+
+/*
+ * Establish selected-smgr state while the caller still knows the persistence
+ * of a newly created relation.  A shared relation locator does not retain
+ * that distinction.
+ */
+void
+smgrinitnewrelation(SMgrRelation reln, bool needs_wal)
+{
+	if (smgrsw[reln->smgr_which].smgr_init_new_relation != NULL)
+		smgrsw[reln->smgr_which].smgr_init_new_relation(reln, needs_wal);
 }
 
 /*

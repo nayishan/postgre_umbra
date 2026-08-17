@@ -168,6 +168,9 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 		pendingDeletes = pending;
 	}
 
+	/* The selected smgr needs this before an unlogged INIT fork exists. */
+	smgrinitnewrelation(srel, needs_wal);
+
 	if (needs_wal)
 		log_smgrcreate(&srel->smgr_rlocator.locator, MAIN_FORKNUM);
 

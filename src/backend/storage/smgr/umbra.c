@@ -27,6 +27,7 @@
 typedef struct UmbraSmgrRelationState
 {
 	UmbraFileContext *filectx;
+	bool		selector_map_enabled;
 } UmbraSmgrRelationState;
 
 static UmbraFileContext *um_get_filectx(SMgrRelation reln);
@@ -75,7 +76,13 @@ umopen(SMgrRelation reln)
 		reln->smgr_private = state;
 	}
 	if (state->filectx == NULL)
+	{
 		state->filectx = umfile_open(reln->smgr_rlocator);
+		/* An existing INIT fork identifies unlogged storage after reopening. */
+		state->selector_map_enabled =
+			!RelFileLocatorBackendIsTemp(reln->smgr_rlocator) &&
+			!umfile_exists(state->filectx, INIT_FORKNUM);
+	}
 }
 
 void
@@ -87,7 +94,8 @@ umclose(SMgrRelation reln, ForkNumber forknum)
 		return;
 	umfile_close(state->filectx, forknum);
 	/* MAIN close also releases this relation's selector metadata descriptors. */
-	if (forknum == MAIN_FORKNUM)
+	if (forknum == MAIN_FORKNUM &&
+		um_fork_uses_selector_slots(reln, MAIN_FORKNUM))
 		umfile_close(state->filectx, UMBRA_METADATA_FORKNUM);
 }
 
@@ -107,7 +115,22 @@ umdestroy(SMgrRelation reln)
 void
 umcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 {
+	UmbraSmgrRelationState *state = reln->smgr_private;
+
+	/* Only unlogged relations have INIT; they always use fixed slot zero. */
+	if (forknum == INIT_FORKNUM)
+		state->selector_map_enabled = false;
 	umfile_create(um_get_filectx(reln), forknum, isRedo);
+}
+
+void
+uminitnewrelation(SMgrRelation reln, bool needs_wal)
+{
+	UmbraSmgrRelationState *state = reln->smgr_private;
+
+	Assert(state != NULL);
+	/* The creator knows this before an unlogged relation creates INIT. */
+	state->selector_map_enabled = needs_wal;
 }
 
 void
@@ -421,7 +444,7 @@ umregistersync(SMgrRelation reln, ForkNumber forknum)
 void
 umsyncrelationmetadata(SMgrRelation reln)
 {
-	if (!RelFileLocatorBackendIsTemp(reln->smgr_rlocator))
+	if (um_fork_uses_selector_slots(reln, MAIN_FORKNUM))
 		ummap_sync_relation_metadata(um_get_filectx(reln), reln->smgr_rlocator);
 }
 
@@ -615,7 +638,12 @@ um_fork_uses_three_buckets(SMgrRelation reln, ForkNumber forknum)
 static bool
 um_fork_uses_selector_slots(SMgrRelation reln, ForkNumber forknum)
 {
-	return reln != NULL && !RelFileLocatorBackendIsTemp(reln->smgr_rlocator) &&
+	UmbraSmgrRelationState *state;
+
+	if (reln == NULL)
+		return false;
+	state = reln->smgr_private;
+	return state != NULL && state->selector_map_enabled &&
 		UmbraForkUsesActiveSlots(forknum);
 }
 

@@ -27,11 +27,7 @@
 static void ResetUnloggedRelationsInTablespaceDir(const char *tsdirname,
 											  int op);
 static void ResetUnloggedRelationsInDbspaceDir(const char *dbspacedirname,
-											 int op);
-#ifdef USE_UMBRA
-static void ResetUnloggedRelationMapFiles(const char *dbspacedirname,
-												  RelFileNumber relnumber);
-#endif
+										 int op);
 
 typedef struct
 {
@@ -271,17 +267,6 @@ ResetUnloggedRelationsInDbspaceDir(const char *dbspacedirname, int op)
 
 			/* Cleanup is complete. */
 			FreeDir(dbspace_dir);
-#ifdef USE_UMBRA
-			{
-				HASH_SEQ_STATUS status;
-				unlogged_relation_entry *entry;
-
-				/* INIT is fixed at slot 0, so its old MAIN selectors cannot survive. */
-				hash_seq_init(&status, hash);
-				while ((entry = hash_seq_search(&status)) != NULL)
-					ResetUnloggedRelationMapFiles(dbspacedirname, entry->relnumber);
-			}
-#endif
 			hash_destroy(hash);
 	}
 
@@ -380,38 +365,6 @@ ResetUnloggedRelationsInDbspaceDir(const char *dbspacedirname, int op)
 		fsync_fname(dbspacedirname, true);
 	}
 }
-
-#ifdef USE_UMBRA
-/* Remove all selector-MAP segments for an unlogged relation being reset. */
-static void
-ResetUnloggedRelationMapFiles(const char *dbspacedirname,
-							  RelFileNumber relnumber)
-{
-	unsigned	segno = 0;
-
-	for (;;)
-	{
-		char		path[MAXPGPATH * 2];
-
-		if (segno == 0)
-			snprintf(path, sizeof(path), "%s/%u_map", dbspacedirname, relnumber);
-		else
-			snprintf(path, sizeof(path), "%s/%u_map.%u", dbspacedirname,
-					 relnumber, segno);
-		if (unlink(path) == 0)
-		{
-			elog(DEBUG2, "unlinked file \"%s\"", path);
-			segno++;
-			continue;
-		}
-		if (errno == ENOENT)
-			break;
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not remove file \"%s\": %m", path)));
-	}
-}
-#endif
 
 /*
  * Basic parsing of putative relation filenames.

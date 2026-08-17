@@ -100,6 +100,7 @@ extern void smgrrelease(SMgrRelation reln);
 extern void smgrreleaseall(void);
 extern void smgrreleaserellocator(RelFileLocatorBackend rlocator);
 extern void smgrcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
+extern void smgrinitnewrelation(SMgrRelation reln, bool needs_wal);
 /*
  * Invoke one selected-smgr relation-metadata phase only after the caller has
  * completed its ordinary-fork durability work.  Core supplies the ordering

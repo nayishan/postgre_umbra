@@ -134,6 +134,7 @@ extern void umopen(SMgrRelation reln);
 extern void umclose(SMgrRelation reln, ForkNumber forknum);
 extern void umdestroy(SMgrRelation reln);
 extern void umcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
+extern void uminitnewrelation(SMgrRelation reln, bool needs_wal);
 /*
  * Flush and synchronize selector MAP pages after core has made the ordinary
  * forks durable.  This is not a per-fork sync callback.
