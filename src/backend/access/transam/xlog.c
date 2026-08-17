@@ -938,6 +938,13 @@ XLogInsertRecord(XLogRecData *rdata,
 		ReserveXLogInsertLocation(rechdr->xl_tot_len, &StartPos, &EndPos,
 								  &rechdr->xl_prev);
 		RedoRecPtr = Insert->RedoRecPtr = StartPos;
+#ifdef USE_UMBRA
+		/* Align the shift-capture epoch with this checkpoint's redo point. */
+		SpinLockAcquire(&XLogCtl->info_lck);
+		XLogCtl->RedoRecPtr = StartPos;
+		SpinLockRelease(&XLogCtl->info_lck);
+		CheckPointBuffersShiftEpochBegin();
+#endif
 		inserted = true;
 	}
 
@@ -7489,6 +7496,9 @@ CreateCheckPoint(int flags)
 		if (last_important_lsn == ControlFile->checkPoint)
 		{
 			END_CRIT_SECTION();
+#ifdef USE_UMBRA
+			CheckPointBuffersAbort();
+#endif
 			ereport(DEBUG1,
 					(errmsg_internal("checkpoint skipped because system is idle")));
 			return false;
@@ -7558,6 +7568,12 @@ CreateCheckPoint(int flags)
 		 * the checkpoint.
 		 */
 		RedoRecPtr = XLogCtl->Insert.RedoRecPtr = checkPoint.redo;
+#ifdef USE_UMBRA
+		SpinLockAcquire(&XLogCtl->info_lck);
+		XLogCtl->RedoRecPtr = checkPoint.redo;
+		SpinLockRelease(&XLogCtl->info_lck);
+		CheckPointBuffersShiftEpochBegin();
+#endif
 	}
 
 	/*
@@ -8061,9 +8077,40 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 	CheckPointSUBTRANS();
 	CheckPointMultiXact();
 	CheckPointPredicate();
+
+	/*
+	 * CheckPointBuffers establishes the ordinary data-page half of the
+	 * checkpoint before an smgr can publish implementation-private metadata.
+	 * The required order is:
+	 *
+	 *   ordinary shared buffers -> selected-smgr private checkpoint state
+	 *
+	 * A private callback may flush metadata that identifies or makes a set of
+	 * data pages reachable.  It must therefore stay after CheckPointBuffers;
+	 * it must not take over ordinary buffer writeback or reverse this order.
+	 */
+#ifdef USE_UMBRA
+	PG_TRY();
+	{
+		/* The shift epoch is visible before checkpoint buffer selection. */
+		INJECTION_POINT("umbra-checkpoint-after-shift-epoch", NULL);
+
+		/* Capture the selected MAIN buffers before their writeback begins. */
+		CheckPointBuffersPrepare(flags);
+		INJECTION_POINT("umbra-checkpoint-after-buffer-selection", NULL);
+		CheckPointBuffers(flags);
+		smgrcheckpoint();
+	}
+	PG_CATCH();
+	{
+		CheckPointBuffersAbort();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+#else
 	CheckPointBuffers(flags);
-	/* Selector pages become durable only after ordinary data buffers. */
 	smgrcheckpoint();
+#endif
 
 	/* Perform all queued up fsyncs */
 	TRACE_POSTGRESQL_BUFFER_CHECKPOINT_SYNC_START();
@@ -8204,12 +8251,13 @@ CreateRestartPoint(int flags)
 	 */
 	WALInsertLockAcquireExclusive();
 	RedoRecPtr = XLogCtl->Insert.RedoRecPtr = lastCheckPoint.redo;
-	WALInsertLockRelease();
-
-	/* Also update the info_lck-protected copy */
 	SpinLockAcquire(&XLogCtl->info_lck);
 	XLogCtl->RedoRecPtr = lastCheckPoint.redo;
 	SpinLockRelease(&XLogCtl->info_lck);
+#ifdef USE_UMBRA
+	CheckPointBuffersShiftEpochBegin();
+#endif
+	WALInsertLockRelease();
 
 	/*
 	 * Prepare to accumulate statistics.

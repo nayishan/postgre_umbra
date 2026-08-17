@@ -1593,14 +1593,15 @@ XLogPublishSlotShifts(XLogRecPtr record_endptr)
 	for (int block_id = 0; block_id < max_registered_block_id; block_id++)
 	{
 		registered_buffer *regbuf = &registered_buffers[block_id];
-		uint8		target_slot;
 
 		if (!regbuf->in_use || !regbuf->slot_shift_in_record)
 			continue;
 		Assert(regbuf->slot_shift.selected);
-		target_slot = regbuf->slot_shift.target_slot;
+		BufferPublishUmbraSlotShift(regbuf->buffer,
+								record_endptr,
+								regbuf->slot_shift.source_slot,
+								regbuf->slot_shift.target_slot);
 		UmPublishSlotShift(&regbuf->slot_shift, record_endptr);
-		BufferRememberUmbraActiveSlot(regbuf->buffer, target_slot);
 		regbuf->slot_shift_in_record = false;
 	}
 	curinsert_has_slot_shift = false;

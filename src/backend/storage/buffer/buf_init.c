@@ -31,6 +31,8 @@ WritebackContext BackendWritebackContext;
 CkptSortItem *CkptBufferIds;
 #ifdef USE_UMBRA
 uint8	   *UmbraBufferActiveSlots;
+uint64	   *CkptBufferShiftEpochs;
+pg_atomic_uint64 *CkptBufferCaptureEpoch;
 #endif
 
 static void BufferManagerShmemRequest(void *arg);
@@ -120,6 +122,15 @@ BufferManagerShmemRequest(void *arg)
 					   .size = NBuffers * sizeof(uint8),
 					   .ptr = (void **) &UmbraBufferActiveSlots,
 		);
+
+	ShmemRequestStruct(.name = "Checkpoint Buffer Shift Epochs",
+					   .size = NBuffers * sizeof(uint64),
+					   .ptr = (void **) &CkptBufferShiftEpochs,
+		);
+	ShmemRequestStruct(.name = "Checkpoint Buffer Capture Epoch",
+					   .size = sizeof(pg_atomic_uint64),
+					   .ptr = (void **) &CkptBufferCaptureEpoch,
+		);
 #endif
 }
 
@@ -132,6 +143,10 @@ BufferManagerShmemRequest(void *arg)
 static void
 BufferManagerShmemInit(void *arg)
 {
+#ifdef USE_UMBRA
+	pg_atomic_init_u64(CkptBufferCaptureEpoch, 0);
+#endif
+
 	/*
 	 * Initialize all the buffer headers.
 	 */
@@ -148,6 +163,7 @@ BufferManagerShmemInit(void *arg)
 
 #ifdef USE_UMBRA
 		UmbraBufferActiveSlots[i] = UMBRA_ACTIVE_SLOT_INVALID;
+		CkptBufferShiftEpochs[i] = 0;
 #endif
 		pgaio_wref_clear(&buf->io_wref);
 

@@ -49,6 +49,13 @@ UmbraNextActiveSlot(uint8 active_slot)
 	return active_slot == UMBRA_ACTIVE_SLOT_COUNT - 1 ? 0 : active_slot + 1;
 }
 
+static inline uint8
+UmbraPreviousActiveSlot(uint8 active_slot)
+{
+	Assert(UmbraActiveSlotIsValid(active_slot));
+	return active_slot == 0 ? UMBRA_ACTIVE_SLOT_COUNT - 1 : active_slot - 1;
+}
+
 static inline bool
 UmbraActiveSlotPhysicalBlock(BlockNumber logical_block, uint8 active_slot,
 							 BlockNumber *physical_block)
@@ -135,6 +142,13 @@ extern bool UmChooseSlotShift(SMgrRelation reln, ForkNumber forknum,
 							  BlockNumber logical_block, uint8 cached_active_slot,
 							  UmbraSlotShift *shift);
 extern void UmPublishSlotShift(UmbraSlotShift *shift, XLogRecPtr lsn);
+extern bool UmCheckpointWriteSourceSlot(SMgrRelation reln, ForkNumber forknum,
+										BlockNumber lblkno, uint8 source_slot,
+										const void *buffer);
+extern void UmCheckpointWritebackSourceSlot(SMgrRelation reln,
+											ForkNumber forknum,
+											BlockNumber lblkno,
+											uint8 source_slot);
 extern bool UmRedoSetActiveSlot(SMgrRelation reln, ForkNumber forknum,
 									 BlockNumber logical_block,
 									 uint8 active_slot);
