@@ -37,6 +37,7 @@ $node->append_conf(
 	'postgresql.conf', q[
 autovacuum = off
 bgwriter_lru_maxpages = 0
+mapwriter_lru_maxpages = 0
 checkpoint_flush_after = 1
 checkpoint_timeout = '1h'
 full_page_writes = on

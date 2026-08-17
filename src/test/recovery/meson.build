@@ -70,6 +70,7 @@ tests += {
       't/062_umbra_slot_checkpoint_publication.pl',
       't/064_umbra_checkpoint_source_slot.pl',
       't/066_umbra_image_free_missing_source.pl',
+      't/067_umbra_mapwriter.pl',
       't/068_umbra_fsm_vm_mapping.pl',
       't/069_umbra_hint_delta.pl',
     ],
