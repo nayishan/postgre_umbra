@@ -730,8 +730,13 @@ hash_xlog_squeeze_page(XLogReaderState *record)
 		}
 	}
 
-	/* replay the record for initializing overflow buffer */
-	if (XLogReadBufferForRedo(record, 2, &ovflbuf) == BLK_NEEDS_REDO)
+	/*
+	 * Block 2 is WILL_INIT.  This record completely rebuilds its
+	 * LH_UNUSED_PAGE state, so redo must zero the page rather than consult its
+	 * previous PageLSN.  Repeating that initialization produces the same page
+	 * state.
+	 */
+	ovflbuf = XLogInitBufferForRedo(record, 2);
 	{
 		Page		ovflpage;
 		HashPageOpaque ovflopaque;
@@ -751,8 +756,7 @@ hash_xlog_squeeze_page(XLogReaderState *record)
 		PageSetLSN(ovflpage, lsn);
 		MarkBufferDirty(ovflbuf);
 	}
-	if (BufferIsValid(ovflbuf))
-		UnlockReleaseBuffer(ovflbuf);
+	UnlockReleaseBuffer(ovflbuf);
 
 	/* replay the record for page previous to the freed overflow page */
 	if (!xldata->is_prev_bucket_same_wrt &&

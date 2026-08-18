@@ -705,7 +705,23 @@ _hash_freeovflpage(Relation rel, Buffer bucketbuf, Buffer ovflbuf,
 			XLogRegisterBuffer(1, wbuf, wbuf_flags);
 		}
 
-		XLogRegisterBuffer(2, ovflbuf, REGBUF_STANDARD);
+		/*
+		 * The overflow page was completely reinitialized above.  A
+		 * SQUEEZE_PAGE record defines its LH_UNUSED_PAGE state without relying
+		 * on its previous contents during redo.
+		 *
+		 * _hash_pageinit() also clears PageLSN.  Registering the page normally
+		 * would therefore make full_page_writes treat each reuse-and-free cycle
+		 * of the same physical overflow page as a first post-checkpoint
+		 * modification.  That can emit multiple FPIs for one block in a
+		 * checkpoint interval.
+		 *
+		 * Register it with WILL_INIT.  This avoids the ordinary full-page-write
+		 * decision and requires redo to zero and reconstruct the page, so
+		 * recovery does not inspect or depend on the old page state.
+		 */
+		XLogRegisterBuffer(2, ovflbuf,
+						   REGBUF_STANDARD | REGBUF_WILL_INIT);
 
 		/*
 		 * If prevpage and the writepage (block in which we are moving tuples
