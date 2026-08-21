@@ -66,13 +66,16 @@ sub assert_shift_wal
 }
 
 my $node = PostgreSQL::Test::Cluster->new('umbra_slot_shift_wal');
-$node->init;
+# Keep this test focused on ordinary target-only shifts.  HINT_DELTA has
+# dedicated coverage in 069, so disable both reasons for logging hints here.
+$node->init(no_data_checksums => 1);
 $node->append_conf(
 	'postgresql.conf', q[
 autovacuum = off
 bgwriter_lru_maxpages = 0
 checkpoint_timeout = '1h'
 full_page_writes = on
+wal_log_hints = off
 max_wal_size = '4GB'
 log_min_messages = debug1
 ]);
@@ -96,9 +99,8 @@ my $target_block = 0 + $node->safe_psql(
 SELECT (ctid::text::point)[0]::integer
 FROM umbra_slot_shift_wal WHERE id = 1;]);
 
-# Read the tuple before the first shift interval begins.  With checksums
-# enabled, a post-checkpoint visibility hint would otherwise consume that
-# interval in a separate XLOG_FPI_FOR_HINT record.
+# The lookup above may set the tuple's commit hint.  Persist it before the
+# first shift interval so each following UPDATE is the operation under test.
 $node->safe_psql('postgres', 'CHECKPOINT');
 
 is(-s $map_path, 3 * $block_size,
@@ -136,8 +138,8 @@ for my $step_index (0 .. $#steps)
 			$target_slot, "$label: checkpoint persists the selector target");
 
 		# A fresh backend may set the prior update's commit hint when it next
-		# reads this tuple.  Let that separate FPI_FOR_HINT happen before the
-		# next checkpoint interval, so the next UPDATE owns its shift.
+		# reads this tuple.  Persist that hint before the next checkpoint
+		# interval; hint WAL is disabled here, so the selector does not move.
 		$node->safe_psql('postgres', q[
 SELECT (ctid::text::point)[0]::integer
 FROM umbra_slot_shift_wal WHERE id = 1;]);

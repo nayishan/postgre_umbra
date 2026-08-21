@@ -48,6 +48,10 @@ extern XLogRecPtr XLogSimpleInsertInt64(RmgrId rmid, uint8 info, int64 value);
 extern void XLogEnsureRecordSpace(int max_block_id, int ndatas);
 extern void XLogRegisterData(const void *data, uint32 len);
 extern void XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags);
+#ifdef USE_UMBRA
+extern XLogRecPtr XLogSaveBufferForHintDelta(Buffer buffer, bool buffer_std,
+											 const void *hint_delta_context);
+#endif
 extern void XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator,
 							  ForkNumber forknum, BlockNumber blknum, const PageData *page,
 							  uint8 flags);
