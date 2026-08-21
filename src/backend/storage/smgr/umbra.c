@@ -303,12 +303,12 @@ UmRedoSetActiveSlot(SMgrRelation reln, ForkNumber forknum,
 
 	if (!InRecovery || reln == NULL || !um_uses_selector_slots(reln, forknum) ||
 		!UmbraActiveSlotIsValid(active_slot))
-		elog(PANIC, "Umbra redo targets an invalid MAIN mapping");
+		elog(PANIC, "Umbra redo targets an invalid active-slot mapping");
 
 	ctx = um_get_filectx(reln);
-	if (!umfile_exists(ctx, MAIN_FORKNUM))
+	if (!umfile_exists(ctx, forknum))
 		return false;
-	physical_nblocks = umfile_nblocks(ctx, MAIN_FORKNUM);
+	physical_nblocks = umfile_nblocks(ctx, forknum);
 	if (logical_block >= physical_nblocks / UMBRA_ACTIVE_SLOT_COUNT)
 		return false;
 
@@ -316,7 +316,7 @@ UmRedoSetActiveSlot(SMgrRelation reln, ForkNumber forknum,
 	if (!umfile_exists(ctx, UMBRA_METADATA_FORKNUM))
 		umfile_create(ctx, UMBRA_METADATA_FORKNUM, true);
 
-	MapRedoSetActiveSlot(ctx, reln->smgr_rlocator, MAIN_FORKNUM,
+	MapRedoSetActiveSlot(ctx, reln->smgr_rlocator, forknum,
 						 logical_block, active_slot);
 	return true;
 }
@@ -333,14 +333,14 @@ UmRedoSlotShift(SMgrRelation reln, ForkNumber forknum,
 		!UmbraActiveSlotIsValid(target_slot) ||
 		target_slot != UmbraNextActiveSlot(source_slot) ||
 		!XLogRecPtrIsValid(shift_lsn))
-		elog(PANIC, "Umbra slot-shift WAL targets an inactive MAIN mapping");
+		elog(PANIC, "Umbra slot-shift WAL targets an inactive mapping");
 	ctx = um_get_filectx(reln);
-	reln->smgr_cached_nblocks[MAIN_FORKNUM] = InvalidBlockNumber;
-	umfile_create(ctx, MAIN_FORKNUM, true);
+	reln->smgr_cached_nblocks[forknum] = InvalidBlockNumber;
+	umfile_create(ctx, forknum, true);
 	if (!umfile_exists(ctx, UMBRA_METADATA_FORKNUM))
 		umfile_create(ctx, UMBRA_METADATA_FORKNUM, true);
 
-	MapRedoSlotShift(ctx, reln->smgr_rlocator, MAIN_FORKNUM,
+	MapRedoSlotShift(ctx, reln->smgr_rlocator, forknum,
 					 logical_block, source_slot, target_slot);
 	return true;
 }
@@ -771,8 +771,7 @@ um_reset_selector_range(SMgrRelation reln, ForkNumber forknum,
 						BlockNumber first_block, BlockNumber nblocks,
 						bool skipFsync)
 {
-	if (nblocks == 0 || forknum != MAIN_FORKNUM ||
-		!um_uses_selector_slots(reln, forknum))
+	if (nblocks == 0 || !um_uses_selector_slots(reln, forknum))
 		return;
 	Assert(CritSectionCount == 0);
 	MapResetActiveSlots(um_get_filectx(reln), reln->smgr_rlocator, forknum,

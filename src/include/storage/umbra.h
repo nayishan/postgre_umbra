@@ -127,8 +127,7 @@ UmbraForkUsesThreeBuckets(ForkNumber forknum)
 static inline bool
 UmbraForkUsesActiveSlots(ForkNumber forknum)
 {
-	/* Auxiliary forks adopt selector rotation in a later mechanism patch. */
-	return forknum == MAIN_FORKNUM;
+	return UmbraForkUsesThreeBuckets(forknum);
 }
 
 extern void uminit(void);

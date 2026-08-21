@@ -389,8 +389,13 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 	if (blkref->has_slot_shift)
 	{
 		SMgrRelation reln;
+		bool		rebuild_aux_zero_source;
 
 		reln = smgropen(rlocator, INVALID_PROC_NUMBER);
+		rebuild_aux_zero_source =
+			(forknum == FSM_FORKNUM || forknum == VISIBILITYMAP_FORKNUM) &&
+			blkref->source_slot == 0 &&
+			mode == RBM_ZERO_ON_ERROR;
 		if (XLogRecBlockImageApply(record, block_id))
 		{
 			if (!UmRedoSlotShift(reln, forknum, blkno,
@@ -409,11 +414,30 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 			if (!UmRedoSetActiveSlot(reln, forknum, blkno,
 								 blkref->source_slot))
 			{
-				XLogRecordInvalidPage(rlocator, forknum, blkno, false);
-				*buf = InvalidBuffer;
-				return BLK_NOTFOUND;
+				/*
+				 * A source-zero FSM or VM record using RBM_ZERO_ON_ERROR may
+				 * be the first WAL for a newly born all-zero auxiliary page.
+				 * That mode permits reconstruction from zeroes regardless of
+				 * its rmgr.  Other source slots and redo modes still require a
+				 * real source page and retain invalid-page handling.
+				 */
+				if (!rebuild_aux_zero_source)
+				{
+					XLogRecordInvalidPage(rlocator, forknum, blkno, false);
+					*buf = InvalidBuffer;
+					return BLK_NOTFOUND;
+				}
+				*buf = XLogReadBufferExtended(rlocator, forknum, blkno, mode,
+									  prefetch_buffer);
+				if (!BufferIsValid(*buf))
+					return BLK_NOTFOUND;
+				if (!UmRedoSetActiveSlot(reln, forknum, blkno,
+									 blkref->source_slot))
+					elog(PANIC,
+						 "Umbra zero-page redo could not restore its source selector");
 			}
-			*buf = XLogReadBufferExtended(rlocator, forknum, blkno, mode,
+			else
+				*buf = XLogReadBufferExtended(rlocator, forknum, blkno, mode,
 									  prefetch_buffer);
 			if (BufferIsValid(*buf))
 			{
