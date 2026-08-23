@@ -111,10 +111,23 @@ UmbraThreeBucketPhysicalCapacity(BlockNumber logical_eof,
 	return true;
 }
 
-/* Relation state decides whether this eligible fork uses three buckets. */
+static inline bool
+UmbraIsMappedAuxiliaryFork(ForkNumber forknum)
+{
+	return forknum == FSM_FORKNUM || forknum == VISIBILITYMAP_FORKNUM;
+}
+
+/* INIT uses direct layout so startup can copy it directly to MAIN. */
 static inline bool
 UmbraForkUsesThreeBuckets(ForkNumber forknum)
 {
+	return forknum == MAIN_FORKNUM || UmbraIsMappedAuxiliaryFork(forknum);
+}
+
+static inline bool
+UmbraForkUsesActiveSlots(ForkNumber forknum)
+{
+	/* Auxiliary forks adopt selector rotation in a later mechanism patch. */
 	return forknum == MAIN_FORKNUM;
 }
 

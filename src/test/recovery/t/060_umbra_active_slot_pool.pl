@@ -76,8 +76,8 @@ for my $relation (@relations)
 	push @map_paths, $node->data_dir . "/${main_path}_map";
 }
 
-is(-s $map_paths[0], $block_size,
-	'extension materializes the first zero selector page');
+is(-s $map_paths[0], 3 * $block_size,
+	'extension materializes the first selector group');
 
 # A restart forces a physical read through MapGetActiveSlot().  A missing
 # selector page in the existing fork remains a valid all-slot-0
@@ -101,8 +101,8 @@ $node->safe_psql(
 	'postgres', 'UPDATE umbra_selector_anchor SET id = 2 WHERE id = 1');
 my $shift_wal_end = $node->safe_psql(
 	'postgres', 'SELECT pg_current_wal_insert_lsn();');
-is(-s $map_paths[0], $block_size,
-	'slot shift materializes the missing selector page');
+is(-s $map_paths[0], 3 * $block_size,
+	'slot shift materializes the missing selector group');
 my ($shift_wal, $shift_stderr) = run_command(
 	[
 		'pg_waldump', '--bkp-details',
@@ -124,17 +124,17 @@ like($selector_shifts[0] // '',
 unlike(join("\n", @shift_records), qr/\bFPW\b/,
 	'missing-selector update remains target-only');
 $node->safe_psql('postgres', 'CHECKPOINT');
-is(-s $map_paths[0], $block_size,
-	'checkpoint retains the materialized selector page');
+is(-s $map_paths[0], 3 * $block_size,
+	'checkpoint retains the materialized selector group');
 is($node->safe_psql('postgres', 'SELECT id FROM umbra_selector_anchor'),
 	'2', 'target-only shift preserves the updated page');
 
 $node->stop;
 for my $map_path (@map_paths)
 {
-	truncate($map_path, $block_size)
-	  or BAIL_OUT("could not remove selector page from \"$map_path\": $!");
-	append_zero_block($map_path, $block_size);
+	truncate($map_path, 0)
+	  or BAIL_OUT("could not remove selector group from \"$map_path\": $!");
+	append_zero_block($map_path, $block_size) for 1 .. 3;
 }
 $node->start;
 
@@ -154,7 +154,7 @@ for my $relation (@relations)
 }
 
 $node->stop;
-write_byte($map_paths[0], 0, 3);
+write_byte($map_paths[0], 2 * $block_size, 3);
 $node->start;
 my ($result, $stdout, $stderr) =
   $node->psql('postgres', 'SELECT count(*) FROM umbra_selector_anchor');

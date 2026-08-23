@@ -44,6 +44,7 @@ typedef struct UmbraSmgrRelationState
 
 static UmbraFileContext *um_get_filectx(SMgrRelation reln);
 static bool um_uses_three_buckets(SMgrRelation reln, ForkNumber forknum);
+static bool um_uses_selector_slots(SMgrRelation reln, ForkNumber forknum);
 static BlockNumber um_active_pblk(SMgrRelation reln, ForkNumber forknum,
 							 BlockNumber logical_block, uint8 *active_slot);
 static BlockNumber um_three_bucket_nblocks(SMgrRelation reln,
@@ -168,7 +169,7 @@ UmChooseSlotShift(SMgrRelation reln, ForkNumber forknum,
 	if (reln == NULL || InRecovery ||
 		IsBootstrapProcessingMode() || IsInitProcessingMode() ||
 		!UmbraActiveSlotIsValid(cached_active_slot) ||
-		!um_uses_three_buckets(reln, forknum))
+		!um_uses_selector_slots(reln, forknum))
 		return false;
 
 	state = reln->smgr_private;
@@ -198,7 +199,8 @@ UmPublishSlotShift(UmbraSlotShift *shift, XLogRecPtr lsn)
 	state = shift->reln->smgr_private;
 	Assert(state != NULL && state->filectx != NULL);
 	MapPublishSlotShift(state->filectx, shift->reln->smgr_rlocator,
-						shift->logical_block, shift->source_slot,
+						shift->forknum, shift->logical_block,
+						shift->source_slot,
 						shift->target_slot, lsn);
 	shift->selected = false;
 	shift->reln = NULL;
@@ -215,7 +217,7 @@ UmCheckpointWriteSourceSlot(SMgrRelation reln, ForkNumber forknum,
 		*physical_block = InvalidBlockNumber;
 	if (reln == NULL || buffer == NULL || physical_block == NULL ||
 		!UmbraActiveSlotIsValid(source_slot) ||
-		!um_uses_three_buckets(reln, forknum))
+		!um_uses_selector_slots(reln, forknum))
 		return false;
 	if (!UmbraActiveSlotPhysicalBlock(logical_block, source_slot,
 									 physical_block))
@@ -235,7 +237,7 @@ UmCheckpointWriteSourceSlot(SMgrRelation reln, ForkNumber forknum,
 bool
 UmUsesMappedSlots(SMgrRelation reln, ForkNumber forknum)
 {
-	return um_uses_three_buckets(reln, forknum);
+	return um_uses_selector_slots(reln, forknum);
 }
 
 static bool
@@ -299,7 +301,7 @@ UmRedoSetActiveSlot(SMgrRelation reln, ForkNumber forknum,
 	UmbraFileContext *ctx;
 	BlockNumber	physical_nblocks;
 
-	if (!InRecovery || reln == NULL || !um_uses_three_buckets(reln, forknum) ||
+	if (!InRecovery || reln == NULL || !um_uses_selector_slots(reln, forknum) ||
 		!UmbraActiveSlotIsValid(active_slot))
 		elog(PANIC, "Umbra redo targets an invalid MAIN mapping");
 
@@ -314,7 +316,8 @@ UmRedoSetActiveSlot(SMgrRelation reln, ForkNumber forknum,
 	if (!umfile_exists(ctx, UMBRA_METADATA_FORKNUM))
 		umfile_create(ctx, UMBRA_METADATA_FORKNUM, true);
 
-	MapRedoSetActiveSlot(ctx, reln->smgr_rlocator, logical_block, active_slot);
+	MapRedoSetActiveSlot(ctx, reln->smgr_rlocator, MAIN_FORKNUM,
+						 logical_block, active_slot);
 	return true;
 }
 
@@ -325,7 +328,7 @@ UmRedoSlotShift(SMgrRelation reln, ForkNumber forknum,
 {
 	UmbraFileContext *ctx;
 
-	if (!InRecovery || reln == NULL || !um_uses_three_buckets(reln, forknum) ||
+	if (!InRecovery || reln == NULL || !um_uses_selector_slots(reln, forknum) ||
 		!UmbraActiveSlotIsValid(source_slot) ||
 		!UmbraActiveSlotIsValid(target_slot) ||
 		target_slot != UmbraNextActiveSlot(source_slot) ||
@@ -337,7 +340,7 @@ UmRedoSlotShift(SMgrRelation reln, ForkNumber forknum,
 	if (!umfile_exists(ctx, UMBRA_METADATA_FORKNUM))
 		umfile_create(ctx, UMBRA_METADATA_FORKNUM, true);
 
-	MapRedoSlotShift(ctx, reln->smgr_rlocator,
+	MapRedoSlotShift(ctx, reln->smgr_rlocator, MAIN_FORKNUM,
 					 logical_block, source_slot, target_slot);
 	return true;
 }
@@ -509,11 +512,19 @@ umstartreadv(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknum,
 	if (um_uses_three_buckets(reln, forknum))
 	{
 		Assert(nblocks == 1);
-		if (!UmGetActiveSlot(reln, forknum, blocknum, &active_slot,
-							&selector_page_present))
-			elog(ERROR, "could not resolve Umbra active slot");
-		if (!UmbraActiveSlotPhysicalBlock(blocknum, active_slot,
-									&physical_block))
+		if (um_uses_selector_slots(reln, forknum))
+		{
+			if (!UmGetActiveSlot(reln, forknum, blocknum, &active_slot,
+								&selector_page_present))
+				elog(ERROR, "could not resolve Umbra active slot");
+			if (!UmbraActiveSlotPhysicalBlock(blocknum, active_slot,
+										&physical_block))
+				ereport(ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("Umbra three-bucket block mapping overflow for fork %d",
+								(int) forknum)));
+		}
+		else if (!UmbraSlotZeroPhysicalBlock(blocknum, &physical_block))
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 					 errmsg("Umbra three-bucket block mapping overflow for fork %d",
@@ -672,6 +683,13 @@ um_uses_three_buckets(SMgrRelation reln, ForkNumber forknum)
 		UmbraForkUsesThreeBuckets(forknum);
 }
 
+static bool
+um_uses_selector_slots(SMgrRelation reln, ForkNumber forknum)
+{
+	return um_uses_three_buckets(reln, forknum) &&
+		UmbraForkUsesActiveSlots(forknum);
+}
+
 static BlockNumber
 um_active_pblk(SMgrRelation reln, ForkNumber forknum,
 				   BlockNumber logical_block, uint8 *active_slot)
@@ -681,7 +699,7 @@ um_active_pblk(SMgrRelation reln, ForkNumber forknum,
 
 	if (active_slot != NULL)
 		*active_slot = UMBRA_ACTIVE_SLOT_INVALID;
-	if (um_uses_three_buckets(reln, forknum))
+	if (um_uses_selector_slots(reln, forknum))
 	{
 		if (!UmGetActiveSlot(reln, forknum, logical_block, &slot, NULL))
 			elog(ERROR, "could not resolve Umbra active slot");
@@ -707,11 +725,11 @@ UmGetActiveSlot(SMgrRelation reln, ForkNumber forknum,
 	if (selector_page_present != NULL)
 		*selector_page_present = false;
 	if (reln == NULL || active_slot == NULL ||
-		!um_uses_three_buckets(reln, forknum))
+		!um_uses_selector_slots(reln, forknum))
 		return false;
 
 	*active_slot = MapGetActiveSlotWithPresence(um_get_filectx(reln),
-												reln->smgr_rlocator,
+												reln->smgr_rlocator, forknum,
 												logical_block,
 												selector_page_present);
 	return true;
@@ -754,11 +772,11 @@ um_reset_selector_range(SMgrRelation reln, ForkNumber forknum,
 						bool skipFsync)
 {
 	if (nblocks == 0 || forknum != MAIN_FORKNUM ||
-		!um_uses_three_buckets(reln, forknum))
+		!um_uses_selector_slots(reln, forknum))
 		return;
 	Assert(CritSectionCount == 0);
-	MapResetActiveSlots(um_get_filectx(reln), reln->smgr_rlocator,
-						first_block, nblocks, skipFsync);
+	MapResetActiveSlots(um_get_filectx(reln), reln->smgr_rlocator, forknum,
+					  first_block, nblocks, skipFsync);
 }
 
 static void
@@ -766,11 +784,11 @@ um_ensure_selector_pages(SMgrRelation reln, ForkNumber forknum,
 						 BlockNumber first_block, BlockNumber nblocks,
 						 bool skipFsync)
 {
-	if (nblocks == 0 || !um_uses_three_buckets(reln, forknum) ||
+	if (nblocks == 0 || !um_uses_selector_slots(reln, forknum) ||
 		CritSectionCount != 0)
 		return;
 	MapEnsureActiveSlotPages(um_get_filectx(reln), reln->smgr_rlocator,
-							 first_block, nblocks, skipFsync);
+							 forknum, first_block, nblocks, skipFsync);
 }
 
 static UmbraFileContext *

@@ -17,8 +17,10 @@ sub read_active_slot
 {
 	my ($path, $block_size, $logical_block) = @_;
 	my $entries_per_page = $block_size * 4;
+	my $page_index = int($logical_block / $entries_per_page);
 	my $entry_index = $logical_block % $entries_per_page;
-	my $map_block = int($logical_block / $entries_per_page);
+	my $group = int($page_index / 256);
+	my $map_block = $group * 258 + 2 + ($page_index % 256);
 	my $offset = $map_block * $block_size + int($entry_index / 4);
 	my $byte;
 
@@ -99,8 +101,8 @@ FROM umbra_slot_shift_wal WHERE id = 1;]);
 # interval in a separate XLOG_FPI_FOR_HINT record.
 $node->safe_psql('postgres', 'CHECKPOINT');
 
-is(-s $map_path, $block_size,
-	'initial insert and checkpoint seed the first selector page');
+is(-s $map_path, 3 * $block_size,
+	'initial insert and checkpoint seed the first selector group');
 is(read_active_slot($map_path, $block_size, $target_block), 0,
 	'initial selector is slot 0');
 
