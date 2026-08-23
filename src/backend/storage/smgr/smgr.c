@@ -108,9 +108,11 @@ typedef struct f_smgr
 	void		(*smgr_unlink) (RelFileLocatorBackend rlocator, ForkNumber forknum,
 								bool isRedo);
 	void		(*smgr_extend) (SMgrRelation reln, ForkNumber forknum,
-								BlockNumber blocknum, const void *buffer, bool skipFsync);
+								BlockNumber blocknum, const void *buffer,
+								bool skipFsync, BlockNumber *physical_block);
 	void		(*smgr_zeroextend) (SMgrRelation reln, ForkNumber forknum,
-									BlockNumber blocknum, int nblocks, bool skipFsync);
+									BlockNumber blocknum, int nblocks,
+									bool skipFsync, BlockNumber *physical_blocks);
 	bool		(*smgr_prefetch) (SMgrRelation reln, ForkNumber forknum,
 								  BlockNumber blocknum, int nblocks);
 	uint32		(*smgr_maxcombine) (SMgrRelation reln, ForkNumber forknum,
@@ -125,9 +127,13 @@ typedef struct f_smgr
 	void		(*smgr_writev) (SMgrRelation reln, ForkNumber forknum,
 								BlockNumber blocknum,
 								const void **buffers, BlockNumber nblocks,
-								bool skipFsync);
+								bool skipFsync, BlockNumber *physical_blocks);
 	void		(*smgr_writeback) (SMgrRelation reln, ForkNumber forknum,
 								   BlockNumber blocknum, BlockNumber nblocks);
+	void		(*smgr_writeback_physical) (SMgrRelation reln,
+											ForkNumber forknum,
+											BlockNumber physical_blocknum,
+											BlockNumber nblocks);
 	BlockNumber (*smgr_nblocks) (SMgrRelation reln, ForkNumber forknum);
 	void		(*smgr_truncate) (SMgrRelation reln, ForkNumber forknum,
 								  BlockNumber old_blocks, BlockNumber nblocks);
@@ -170,6 +176,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_startreadv = mdstartreadv,
 		.smgr_writev = mdwritev,
 		.smgr_writeback = mdwriteback,
+		.smgr_writeback_physical = mdwritebackphysical,
 		.smgr_nblocks = mdnblocks,
 		.smgr_truncate = mdtruncate,
 		.smgr_immedsync = mdimmedsync,
@@ -201,6 +208,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_startreadv = umstartreadv,
 		.smgr_writev = umwritev,
 		.smgr_writeback = umwriteback,
+		.smgr_writeback_physical = umwritebackphysical,
 		.smgr_nblocks = umnblocks,
 		.smgr_truncate = umtruncate,
 		.smgr_immedsync = umimmedsync,
@@ -356,8 +364,8 @@ smgropen(RelFileLocator rlocator, ProcNumber backend)
 #ifdef USE_UMBRA
 /*
  * Find an already-open relation handle without allocating.  WAL insertion can
- * use this from a critical section to decide whether an Umbra slot shift is
- * available; a miss simply keeps the ordinary full-page image.
+ * use this from a critical section before publishing an Umbra slot shift.  A
+ * mapped buffer must retain its relation handle until that publication.
  */
 SMgrRelation
 smgrlookup(RelFileLocator rlocator, ProcNumber backend)
@@ -369,7 +377,7 @@ smgrlookup(RelFileLocator rlocator, ProcNumber backend)
 	brlocator.locator = rlocator;
 	brlocator.backend = backend;
 	return (SMgrRelation) hash_search(SMgrRelationHash, &brlocator,
-								 HASH_FIND, NULL);
+									 HASH_FIND, NULL);
 }
 #endif
 
@@ -739,10 +747,18 @@ void
 smgrextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		   const void *buffer, bool skipFsync)
 {
+	smgrextend_with_target(reln, forknum, blocknum, buffer, skipFsync, NULL);
+}
+
+void
+smgrextend_with_target(SMgrRelation reln, ForkNumber forknum,
+					   BlockNumber blocknum, const void *buffer,
+					   bool skipFsync, BlockNumber *physical_block)
+{
 	HOLD_INTERRUPTS();
 
 	smgrsw[reln->smgr_which].smgr_extend(reln, forknum, blocknum,
-										 buffer, skipFsync);
+										 buffer, skipFsync, physical_block);
 
 	/*
 	 * Normally we expect this to increase nblocks by one, but if the cached
@@ -768,10 +784,19 @@ void
 smgrzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 			   int nblocks, bool skipFsync)
 {
+	smgrzeroextend_with_targets(reln, forknum, blocknum, nblocks, skipFsync,
+								NULL);
+}
+
+void
+smgrzeroextend_with_targets(SMgrRelation reln, ForkNumber forknum,
+							BlockNumber blocknum, int nblocks,
+							bool skipFsync, BlockNumber *physical_blocks)
+{
 	HOLD_INTERRUPTS();
 
 	smgrsw[reln->smgr_which].smgr_zeroextend(reln, forknum, blocknum,
-											 nblocks, skipFsync);
+											 nblocks, skipFsync, physical_blocks);
 
 	/*
 	 * Normally we expect this to increase the fork size by nblocks, but if
@@ -910,9 +935,20 @@ void
 smgrwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		   const void **buffers, BlockNumber nblocks, bool skipFsync)
 {
+	smgrwritev_with_targets(reln, forknum, blocknum, buffers, nblocks,
+							skipFsync, NULL);
+}
+
+void
+smgrwritev_with_targets(SMgrRelation reln, ForkNumber forknum,
+						BlockNumber blocknum, const void **buffers,
+						BlockNumber nblocks, bool skipFsync,
+						BlockNumber *physical_blocks)
+{
 	HOLD_INTERRUPTS();
 	smgrsw[reln->smgr_which].smgr_writev(reln, forknum, blocknum,
-										 buffers, nblocks, skipFsync);
+										 buffers, nblocks, skipFsync,
+										 physical_blocks);
 	RESUME_INTERRUPTS();
 }
 
@@ -927,6 +963,20 @@ smgrwriteback(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	HOLD_INTERRUPTS();
 	smgrsw[reln->smgr_which].smgr_writeback(reln, forknum, blocknum,
 											nblocks);
+	RESUME_INTERRUPTS();
+}
+
+/*
+ * smgrwritebackphysical() -- Trigger kernel writeback for an exact physical
+ *                             range returned by the storage manager's write.
+ */
+void
+smgrwritebackphysical(SMgrRelation reln, ForkNumber forknum,
+					  BlockNumber physical_blocknum, BlockNumber nblocks)
+{
+	HOLD_INTERRUPTS();
+	smgrsw[reln->smgr_which].smgr_writeback_physical(reln, forknum,
+												 physical_blocknum, nblocks);
 	RESUME_INTERRUPTS();
 }
 
@@ -1191,8 +1241,10 @@ pgaio_io_set_target_smgr(PgAioHandle *ioh,
 	sd->smgr.rlocator = smgr->smgr_rlocator.locator;
 	sd->smgr.forkNum = forknum;
 	sd->smgr.blockNum = blocknum;
+	sd->smgr.physicalBlockNum = blocknum;
 	sd->smgr.nblocks = nblocks;
 	sd->smgr.umbraActiveSlot = UINT8_MAX;
+	sd->smgr.umbraSelectorPagePresent = false;
 	sd->smgr.is_temp = SmgrIsTemp(smgr);
 	/* Temp relations should never be fsync'd */
 	sd->smgr.skip_fsync = skip_fsync && !SmgrIsTemp(smgr);
@@ -1229,11 +1281,13 @@ smgr_aio_reopen(PgAioHandle *ioh)
 			pg_unreachable();
 			break;
 		case PGAIO_OP_READV:
-			od->read.fd = smgrfd(reln, sd->smgr.forkNum, sd->smgr.blockNum, &off);
+			od->read.fd = smgrfd(reln, sd->smgr.forkNum,
+								 sd->smgr.physicalBlockNum, &off);
 			Assert(off == od->read.offset);
 			break;
 		case PGAIO_OP_WRITEV:
-			od->write.fd = smgrfd(reln, sd->smgr.forkNum, sd->smgr.blockNum, &off);
+			od->write.fd = smgrfd(reln, sd->smgr.forkNum,
+								  sd->smgr.physicalBlockNum, &off);
 			Assert(off == od->write.offset);
 			break;
 	}

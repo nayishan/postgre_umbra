@@ -36,6 +36,7 @@ typedef struct UmbraSlotShift
 	bool		selected;
 } UmbraSlotShift;
 
+/* A zero selector chooses slot 0; WAL-backed shifts can choose slots 1 or 2. */
 static inline bool
 UmbraActiveSlotIsValid(uint8 active_slot)
 {
@@ -68,6 +69,27 @@ UmbraActiveSlotPhysicalBlock(BlockNumber logical_block, uint8 active_slot,
 		return false;
 	*physical_block = (BlockNumber) physical;
 	return true;
+}
+
+/* Recover the fixed-layout selector from a logical/physical block pair. */
+static inline bool
+UmbraPhysicalBlockActiveSlot(BlockNumber logical_block,
+							 BlockNumber physical_block, uint8 *active_slot)
+{
+	BlockNumber candidate;
+
+	Assert(active_slot != NULL);
+	*active_slot = UMBRA_ACTIVE_SLOT_INVALID;
+	for (uint8 slot = 0; slot < UMBRA_ACTIVE_SLOT_COUNT; slot++)
+	{
+		if (UmbraActiveSlotPhysicalBlock(logical_block, slot, &candidate) &&
+			candidate == physical_block)
+		{
+			*active_slot = slot;
+			return true;
+		}
+	}
+	return false;
 }
 
 static inline bool
@@ -110,9 +132,11 @@ extern bool umexists(SMgrRelation reln, ForkNumber forknum);
 extern void umunlink(RelFileLocatorBackend rlocator, ForkNumber forknum,
 					 bool isRedo);
 extern void umextend(SMgrRelation reln, ForkNumber forknum,
-					 BlockNumber blocknum, const void *buffer, bool skipFsync);
+					 BlockNumber blocknum, const void *buffer, bool skipFsync,
+					 BlockNumber *physical_block);
 extern void umzeroextend(SMgrRelation reln, ForkNumber forknum,
-					 BlockNumber blocknum, int nblocks, bool skipFsync);
+					 BlockNumber blocknum, int nblocks, bool skipFsync,
+					 BlockNumber *physical_blocks);
 extern bool umprefetch(SMgrRelation reln, ForkNumber forknum,
 					   BlockNumber blocknum, int nblocks);
 extern uint32 ummaxcombine(SMgrRelation reln, ForkNumber forknum,
@@ -122,10 +146,16 @@ extern void umreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 extern void umstartreadv(PgAioHandle *ioh, SMgrRelation reln,
 						 ForkNumber forknum, BlockNumber blocknum,
 						 void **buffers, BlockNumber nblocks);
-extern void umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
-					 const void **buffers, BlockNumber nblocks, bool skipFsync);
+extern void umwritev(SMgrRelation reln, ForkNumber forknum,
+					 BlockNumber blocknum, const void **buffers,
+					 BlockNumber nblocks, bool skipFsync,
+					 BlockNumber *physical_blocks);
+/* Three-bucket logical writeback is deferred until a physical target is known. */
 extern void umwriteback(SMgrRelation reln, ForkNumber forknum,
-						 BlockNumber blocknum, BlockNumber nblocks);
+						BlockNumber blocknum, BlockNumber nblocks);
+/* This path receives the resolved physical range from the scheduler. */
+extern void umwritebackphysical(SMgrRelation reln, ForkNumber forknum,
+								BlockNumber blocknum, BlockNumber nblocks);
 extern BlockNumber umnblocks(SMgrRelation reln, ForkNumber forknum);
 extern void umtruncate(SMgrRelation reln, ForkNumber forknum,
 					   BlockNumber old_blocks, BlockNumber nblocks);
@@ -137,18 +167,25 @@ extern void uminvalidatedatabasetablespacecache(Oid dbid, Oid spcOid);
 extern int	umfd(SMgrRelation reln, ForkNumber forknum,
 				 BlockNumber blocknum, uint32 *off);
 extern bool UmGetActiveSlot(SMgrRelation reln, ForkNumber forknum,
-						 BlockNumber logical_block, uint8 *active_slot);
+							 BlockNumber logical_block, uint8 *active_slot,
+							 bool *selector_page_present);
+/* Select a shift source from BufferMgr state without reading a selector. */
 extern bool UmChooseSlotShift(SMgrRelation reln, ForkNumber forknum,
-							  BlockNumber logical_block, uint8 cached_active_slot,
+							  BlockNumber logical_block,
+							  uint8 cached_active_slot,
+							  bool selector_page_present,
 							  UmbraSlotShift *shift);
+/* Publish a selected target after WAL insertion has assigned its LSN. */
 extern void UmPublishSlotShift(UmbraSlotShift *shift, XLogRecPtr lsn);
 extern bool UmCheckpointWriteSourceSlot(SMgrRelation reln, ForkNumber forknum,
 										BlockNumber lblkno, uint8 source_slot,
-										const void *buffer);
-extern void UmCheckpointWritebackSourceSlot(SMgrRelation reln,
-											ForkNumber forknum,
-											BlockNumber lblkno,
-											uint8 source_slot);
+										const void *buffer,
+										BlockNumber *physical_block);
+extern bool UmUsesMappedSlots(SMgrRelation reln, ForkNumber forknum);
+/* Write an existing mapped page to a caller-selected slot and report its pblk. */
+extern bool UmWriteSlot(SMgrRelation reln, ForkNumber forknum,
+						BlockNumber logical_block, const void *buffer,
+						uint8 slot, BlockNumber *physical_block);
 extern bool UmRedoSetActiveSlot(SMgrRelation reln, ForkNumber forknum,
 									 BlockNumber logical_block,
 									 uint8 active_slot);

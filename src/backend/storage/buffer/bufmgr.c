@@ -227,6 +227,25 @@ int			checkpoint_flush_after = DEFAULT_CHECKPOINT_FLUSH_AFTER;
 int			bgwriter_flush_after = DEFAULT_BGWRITER_FLUSH_AFTER;
 int			backend_flush_after = DEFAULT_BACKEND_FLUSH_AFTER;
 
+#define MAX_BUFFER_WRITEBACK_TARGETS 2
+
+typedef struct BufferWritebackTargets
+{
+	int			ntargets;
+	BlockNumber physical_blocks[MAX_BUFFER_WRITEBACK_TARGETS];
+} BufferWritebackTargets;
+
+static inline void
+BufferWritebackTargetsAdd(BufferWritebackTargets *targets,
+						  BlockNumber physical_block)
+{
+	if (targets == NULL || physical_block == InvalidBlockNumber)
+		return;
+	Assert(targets->ntargets < MAX_BUFFER_WRITEBACK_TARGETS);
+	targets->physical_blocks[targets->ntargets] = physical_block;
+	targets->ntargets++;
+}
+
 /* local state for LockBufferForCleanup */
 static BufferDesc *PinCountWaitBuf = NULL;
 
@@ -644,9 +663,12 @@ static int	SyncOneBuffer(int buf_id, bool skip_recently_used,
 static void WaitIO(BufferDesc *buf);
 static void AbortBufferIO(Buffer buffer);
 static void TerminateBufferIOWithActiveSlot(BufferDesc *buf,
-									 bool clear_dirty, uint64 set_flag_bits,
-									 bool forget_owner, bool release_aio,
-									 uint8 active_slot);
+											 bool clear_dirty,
+											 uint64 set_flag_bits,
+										 bool forget_owner,
+											 bool release_aio,
+											 uint8 active_slot,
+											 bool selector_page_present);
 #ifdef USE_UMBRA
 static void InvalidateUmbraBufferActiveSlot(BufferDesc *buf);
 #endif
@@ -669,11 +691,11 @@ static Buffer GetVictimBuffer(BufferAccessStrategy strategy, IOContext io_contex
 static void FlushUnlockedBuffer(BufferDesc *buf, SMgrRelation reln,
 								IOObject io_object, IOContext io_context,
 								bool checkpoint_flush,
-								uint8 *writeback_source_slot);
+								BufferWritebackTargets *writeback_targets);
 static void FlushBuffer(BufferDesc *buf, SMgrRelation reln,
 						IOObject io_object, IOContext io_context,
 						bool checkpoint_flush,
-						uint8 *writeback_source_slot);
+						BufferWritebackTargets *writeback_targets);
 #ifdef USE_UMBRA
 #define CKPT_BUFFER_EPOCH_ACTIVE	(UINT64CONST(1) << 63)
 #define CKPT_BUFFER_EPOCH_MASK	(~CKPT_BUFFER_EPOCH_ACTIVE)
@@ -698,7 +720,9 @@ static void CheckForBufferLeaks(void);
 static void AssertNotCatalogBufferLock(Buffer buffer, BufferLockMode mode);
 #endif
 static int	rlocator_comparator(const void *p1, const void *p2);
+#ifndef USE_UMBRA
 static inline int buffertag_comparator(const BufferTag *ba, const BufferTag *bb);
+#endif
 static inline int ckpt_buforder_comparator(const CkptSortItem *a, const CkptSortItem *b);
 static int	ts_ckpt_progress_comparator(Datum a, Datum b, void *arg);
 
@@ -1169,6 +1193,7 @@ ZeroAndLockBuffer(Buffer buffer, ReadBufferMode mode, bool already_valid,
 	bool		isLocalBuf = BufferIsLocal(buffer);
 	StartBufferIOResult sbres;
 	uint8		active_slot = UINT8_MAX;
+	bool		selector_page_present = false;
 
 #ifndef USE_UMBRA
 	(void) smgr;
@@ -1215,7 +1240,8 @@ ZeroAndLockBuffer(Buffer buffer, ReadBufferMode mode, bool already_valid,
 #ifdef USE_UMBRA
 		if (!isLocalBuf)
 			(void) UmGetActiveSlot(smgr, BufTagGetForkNum(&bufHdr->tag),
-								   bufHdr->tag.blockNum, &active_slot);
+									   bufHdr->tag.blockNum, &active_slot,
+									   &selector_page_present);
 #endif
 		memset(BufferGetPage(buffer), 0, BLCKSZ);
 
@@ -1238,7 +1264,8 @@ ZeroAndLockBuffer(Buffer buffer, ReadBufferMode mode, bool already_valid,
 			TerminateLocalBufferIO(bufHdr, false, BM_VALID, false);
 		else
 			TerminateBufferIOWithActiveSlot(bufHdr, false, BM_VALID, true,
-									false, active_slot);
+											false, active_slot,
+											selector_page_present);
 	}
 	else if (!isLocalBuf)
 	{
@@ -2602,6 +2629,7 @@ GetVictimBuffer(BufferAccessStrategy strategy, IOContext io_context)
 	Buffer		buf;
 	uint64		buf_state;
 	bool		from_ring;
+	BufferWritebackTargets writeback_targets;
 
 	/*
 	 * Ensure, before we pin a victim buffer, that there's a free refcount
@@ -2682,11 +2710,14 @@ again:
 		}
 
 		/* OK, do the I/O */
-		FlushBuffer(buf_hdr, NULL, IOOBJECT_RELATION, io_context, false, NULL);
+		FlushBuffer(buf_hdr, NULL, IOOBJECT_RELATION, io_context, false,
+					&writeback_targets);
 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 
-		ScheduleBufferTagForWriteback(&BackendWritebackContext, io_context,
-									  &buf_hdr->tag, UINT8_MAX);
+		for (int i = 0; i < writeback_targets.ntargets; i++)
+			ScheduleBufferTagForWriteback(&BackendWritebackContext, io_context,
+									  &buf_hdr->tag,
+									  writeback_targets.physical_blocks[i]);
 	}
 
 
@@ -2853,8 +2884,12 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 						uint32 *extended_by)
 {
 	BlockNumber first_block;
+	BlockNumber *extension_pblks;
 	IOContext	io_context = IOContextForStrategy(strategy);
 	instr_time	io_start;
+#ifdef USE_UMBRA
+	bool		extension_uses_slots;
+#endif
 
 	LimitAdditionalPins(&extend_by);
 
@@ -3070,7 +3105,12 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	 *
 	 * We don't need to set checksum for all-zero pages.
 	 */
-	smgrzeroextend(BMR_GET_SMGR(bmr), fork, first_block, extend_by, false);
+	extension_pblks = palloc_array(BlockNumber, extend_by);
+	smgrzeroextend_with_targets(BMR_GET_SMGR(bmr), fork, first_block,
+								extend_by, false, extension_pblks);
+#ifdef USE_UMBRA
+	extension_uses_slots = UmUsesMappedSlots(BMR_GET_SMGR(bmr), fork);
+#endif
 
 	/*
 	 * Release the file-extension lock; it's now OK for someone else to extend
@@ -3091,11 +3131,29 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 		Buffer		buf = buffers[i];
 		BufferDesc *buf_hdr = GetBufferDescriptor(buf - 1);
 		bool		lock = false;
+		bool		selector_page_present = false;
 		uint8		active_slot = UINT8_MAX;
+#ifdef USE_UMBRA
+		uint8		selector_slot = UMBRA_ACTIVE_SLOT_INVALID;
+#endif
 
 #ifdef USE_UMBRA
-		(void) UmGetActiveSlot(BMR_GET_SMGR(bmr), fork, first_block + i,
-							   &active_slot);
+		if (extension_uses_slots)
+		{
+			if (!UmbraPhysicalBlockActiveSlot(first_block + i,
+										  extension_pblks[i], &active_slot))
+				elog(ERROR, "Umbra extension returned an invalid physical block");
+
+			/* A missing selector page can only represent slot zero. */
+			if (active_slot != 0)
+				selector_page_present = true;
+			else if (CritSectionCount == 0 &&
+					 UmGetActiveSlot(BMR_GET_SMGR(bmr), fork,
+									 first_block + i, &selector_slot,
+									 &selector_page_present) &&
+				selector_slot != active_slot)
+				elog(ERROR, "Umbra extension active slot disagrees with its selector");
+		}
 #endif
 
 		if (flags & EB_LOCK_FIRST && i == 0)
@@ -3111,8 +3169,21 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 
 		TerminateBufferIOWithActiveSlot(buf_hdr, false, BM_VALID, true, false,
-									active_slot);
+											active_slot, selector_page_present);
 	}
+
+	for (uint32 i = 0; i < extend_by; i++)
+	{
+		BufferTag	tag;
+
+		if (extension_pblks[i] == InvalidBlockNumber)
+			continue;
+		InitBufferTag(&tag, &BMR_GET_SMGR(bmr)->smgr_rlocator.locator, fork,
+					  first_block + i);
+		ScheduleBufferTagForWriteback(&BackendWritebackContext, io_context,
+									  &tag, extension_pblks[i]);
+	}
+	pfree(extension_pblks);
 
 	pgBufferUsage.shared_blks_written += extend_by;
 
@@ -3728,7 +3799,6 @@ BufferSync(int flags)
 	}
 
 	WritebackContextInit(&wb_context, &checkpoint_flush_after);
-
 	TRACE_POSTGRESQL_BUFFER_SYNC_START(NBuffers, num_to_scan);
 
 	/*
@@ -4003,6 +4073,7 @@ BufferPublishUmbraSlotShift(Buffer buffer, XLogRecPtr shift_end_lsn,
 		   UmbraBufferActiveSlots[buf->buf_id] == source_slot ||
 		   UmbraBufferActiveSlots[buf->buf_id] == target_slot);
 	UmbraBufferActiveSlots[buf->buf_id] = target_slot;
+	UmbraBufferSelectorPagePresent[buf->buf_id] = true;
 	if (capture_epoch && CheckpointBufferActiveEpoch() == epoch)
 	{
 		/* A buffer can shift at most once in one checkpoint epoch. */
@@ -4336,7 +4407,7 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, bool checkpoint_flush,
 	int			result = 0;
 	uint64		buf_state;
 	BufferTag	tag;
-	uint8			writeback_source_slot = UINT8_MAX;
+	BufferWritebackTargets writeback_targets;
 
 	/* Make sure we can handle the pin */
 	ReservePrivateRefCountEntry();
@@ -4379,7 +4450,7 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, bool checkpoint_flush,
 	PinBuffer_Locked(bufHdr);
 
 	FlushUnlockedBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL,
-						checkpoint_flush, &writeback_source_slot);
+						checkpoint_flush, &writeback_targets);
 
 	tag = bufHdr->tag;
 
@@ -4389,8 +4460,9 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, bool checkpoint_flush,
 	 * SyncOneBuffer() is only called by checkpointer and bgwriter, so
 	 * IOContext will always be IOCONTEXT_NORMAL.
 	 */
-	ScheduleBufferTagForWriteback(wb_context, IOCONTEXT_NORMAL, &tag,
-							  writeback_source_slot);
+	for (int i = 0; i < writeback_targets.ntargets; i++)
+		ScheduleBufferTagForWriteback(wb_context, IOCONTEXT_NORMAL, &tag,
+									  writeback_targets.physical_blocks[i]);
 
 	return result | BUF_WRITTEN;
 }
@@ -4709,25 +4781,29 @@ BufferGetTag(Buffer buffer, RelFileLocator *rlocator, ForkNumber *forknum,
 static void
 FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 			IOContext io_context, bool checkpoint_flush,
-			uint8 *writeback_source_slot)
+			BufferWritebackTargets *writeback_targets)
 {
 	XLogRecPtr	recptr;
 	ErrorContextCallback errcallback;
 	instr_time	io_start;
 	Block		bufBlock;
 	uint32		blocks_written = 1;
+	BlockNumber active_physical_block = InvalidBlockNumber;
 #ifdef USE_UMBRA
 	uint8			checkpoint_source_slot = UMBRA_ACTIVE_SLOT_INVALID;
 	uint8			active_slot = UMBRA_ACTIVE_SLOT_INVALID;
+	BlockNumber checkpoint_source_block = InvalidBlockNumber;
 	bool		checkpoint_directed = false;
+	bool		checkpoint_directed_requested = false;
+	bool		slot_write_done = false;
 #else
 	(void) checkpoint_flush;
 #endif
 
 	Assert(BufferLockHeldByMeInMode(buf, BUFFER_LOCK_EXCLUSIVE) ||
 			BufferLockHeldByMeInMode(buf, BUFFER_LOCK_SHARE_EXCLUSIVE));
-	if (writeback_source_slot != NULL)
-		*writeback_source_slot = UINT8_MAX;
+	if (writeback_targets != NULL)
+		writeback_targets->ntargets = 0;
 
 	/*
 	 * Try to start an I/O operation.  If StartBufferIO returns false, then
@@ -4809,31 +4885,58 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	io_start = pgstat_prepare_io_time(track_io_timing);
 
 #ifdef USE_UMBRA
-	if (UmbraActiveSlotIsValid(checkpoint_source_slot))
+	checkpoint_directed_requested =
+		UmbraActiveSlotIsValid(checkpoint_source_slot);
+	if (checkpoint_directed_requested)
 		checkpoint_directed = UmCheckpointWriteSourceSlot(reln,
 											  BufTagGetForkNum(&buf->tag),
 											  buf->tag.blockNum,
 											  checkpoint_source_slot,
-											  bufBlock);
+											  bufBlock,
+											  &checkpoint_source_block);
 	if (checkpoint_directed)
 	{
+		BufferWritebackTargetsAdd(writeback_targets, checkpoint_source_block);
 		if (!checkpoint_flush)
 		{
-			smgrwrite(reln,
-					  BufTagGetForkNum(&buf->tag),
-					  buf->tag.blockNum,
-					  bufBlock,
-					  false);
+			if (UmbraActiveSlotIsValid(active_slot))
+				slot_write_done = UmWriteSlot(reln,
+											  BufTagGetForkNum(&buf->tag),
+											  buf->tag.blockNum, bufBlock,
+											  active_slot,
+											  &active_physical_block);
+			if (!slot_write_done)
+				smgrwrite_with_target(reln,
+									  BufTagGetForkNum(&buf->tag),
+									  buf->tag.blockNum, bufBlock, false,
+									  &active_physical_block);
+			BufferWritebackTargetsAdd(writeback_targets, active_physical_block);
 			blocks_written++;
 		}
 	}
 	else
+	{
+		if (UmbraActiveSlotIsValid(active_slot))
+			slot_write_done = UmWriteSlot(reln,
+										  BufTagGetForkNum(&buf->tag),
+										  buf->tag.blockNum, bufBlock,
+										  active_slot, &active_physical_block);
+		if (!slot_write_done)
+		{
+			smgrwrite_with_target(reln,
+								  BufTagGetForkNum(&buf->tag),
+								  buf->tag.blockNum, bufBlock, false,
+								  &active_physical_block);
+		}
+		BufferWritebackTargetsAdd(writeback_targets, active_physical_block);
+	}
+#else
+	smgrwrite_with_target(reln,
+						  BufTagGetForkNum(&buf->tag),
+						  buf->tag.blockNum, bufBlock, false,
+						  &active_physical_block);
+	BufferWritebackTargetsAdd(writeback_targets, active_physical_block);
 #endif
-		smgrwrite(reln,
-				  BufTagGetForkNum(&buf->tag),
-				  buf->tag.blockNum,
-				  bufBlock,
-				  false);
 
 	/*
 	 * When a strategy is in use, only flushes of dirty buffers already in the
@@ -4865,8 +4968,6 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 #ifdef USE_UMBRA
 	if (checkpoint_directed && checkpoint_flush)
 	{
-		if (writeback_source_slot != NULL)
-			*writeback_source_slot = checkpoint_source_slot;
 		TerminateCheckpointBufferIO(buf);
 	}
 	else
@@ -4890,13 +4991,14 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 static void
 FlushUnlockedBuffer(BufferDesc *buf, SMgrRelation reln,
 					IOObject io_object, IOContext io_context,
-					bool checkpoint_flush, uint8 *writeback_source_slot)
+					bool checkpoint_flush,
+					BufferWritebackTargets *writeback_targets)
 {
 	Buffer		buffer = BufferDescriptorGetBuffer(buf);
 
 	BufferLockAcquire(buffer, buf, BUFFER_LOCK_SHARE_EXCLUSIVE);
 	FlushBuffer(buf, reln, io_object, io_context, checkpoint_flush,
-				writeback_source_slot);
+				writeback_targets);
 	BufferLockUnlock(buffer, buf);
 }
 
@@ -7626,8 +7728,9 @@ StartBufferIO(Buffer buffer, bool forInput, bool wait, PgAioWaitRef *io_wref)
  */
 static void
 TerminateBufferIOWithActiveSlot(BufferDesc *buf, bool clear_dirty,
-								uint64 set_flag_bits, bool forget_owner,
-								bool release_aio, uint8 active_slot)
+									uint64 set_flag_bits, bool forget_owner,
+									bool release_aio, uint8 active_slot,
+									bool selector_page_present)
 {
 	uint64		buf_state;
 	uint64		unset_flag_bits = 0;
@@ -7640,10 +7743,13 @@ TerminateBufferIOWithActiveSlot(BufferDesc *buf, bool clear_dirty,
 	if (UmbraActiveSlotIsValid(active_slot))
 	{
 		Assert(set_flag_bits & BM_VALID);
+		Assert(selector_page_present || active_slot == 0);
 		UmbraBufferActiveSlots[buf->buf_id] = active_slot;
+		UmbraBufferSelectorPagePresent[buf->buf_id] = selector_page_present;
 	}
 #else
 	Assert(active_slot == UINT8_MAX);
+	Assert(!selector_page_present);
 #endif
 	unset_flag_bits |= BM_IO_IN_PROGRESS;
 
@@ -7693,12 +7799,13 @@ TerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint64 set_flag_bits,
 				  bool forget_owner, bool release_aio)
 {
 	TerminateBufferIOWithActiveSlot(buf, clear_dirty, set_flag_bits,
-									forget_owner, release_aio, UINT8_MAX);
+										forget_owner, release_aio, UINT8_MAX, false);
 }
 
 #ifdef USE_UMBRA
 bool
-BufferGetUmbraActiveSlot(Buffer buffer, uint8 *active_slot)
+BufferGetUmbraActiveSlot(Buffer buffer, uint8 *active_slot,
+						 bool *selector_page_present)
 {
 	BufferDesc *buf;
 	uint64		buf_state;
@@ -7706,6 +7813,8 @@ BufferGetUmbraActiveSlot(Buffer buffer, uint8 *active_slot)
 
 	if (active_slot != NULL)
 		*active_slot = UMBRA_ACTIVE_SLOT_INVALID;
+	if (selector_page_present != NULL)
+		*selector_page_present = false;
 	if (!BufferIsValid(buffer) || BufferIsLocal(buffer) || active_slot == NULL)
 		return false;
 	Assert(BufferIsPinned(buffer));
@@ -7713,6 +7822,8 @@ BufferGetUmbraActiveSlot(Buffer buffer, uint8 *active_slot)
 	buf = GetBufferDescriptor(buffer - 1);
 	buf_state = LockBufHdr(buf);
 	slot = UmbraBufferActiveSlots[buf->buf_id];
+	if (selector_page_present != NULL)
+		*selector_page_present = UmbraBufferSelectorPagePresent[buf->buf_id];
 	UnlockBufHdr(buf);
 	if ((buf_state & BM_VALID) == 0 || !UmbraActiveSlotIsValid(slot))
 		return false;
@@ -7721,7 +7832,8 @@ BufferGetUmbraActiveSlot(Buffer buffer, uint8 *active_slot)
 }
 
 void
-BufferRememberUmbraActiveSlot(Buffer buffer, uint8 active_slot)
+BufferRememberUmbraActiveSlot(Buffer buffer, uint8 active_slot,
+							  bool selector_page_present)
 {
 	BufferDesc *buf;
 	uint64		buf_state;
@@ -7730,11 +7842,13 @@ BufferRememberUmbraActiveSlot(Buffer buffer, uint8 active_slot)
 		!UmbraActiveSlotIsValid(active_slot))
 		return;
 	Assert(BufferIsPinned(buffer));
+	Assert(selector_page_present || active_slot == 0);
 
 	buf = GetBufferDescriptor(buffer - 1);
 	buf_state = LockBufHdr(buf);
 	Assert(buf_state & BM_VALID);
 	UmbraBufferActiveSlots[buf->buf_id] = active_slot;
+	UmbraBufferSelectorPagePresent[buf->buf_id] = selector_page_present;
 	UnlockBufHdr(buf);
 }
 
@@ -7743,6 +7857,7 @@ InvalidateUmbraBufferActiveSlot(BufferDesc *buf)
 {
 	Assert(pg_atomic_read_u64(&buf->state) & BM_LOCKED);
 	UmbraBufferActiveSlots[buf->buf_id] = UMBRA_ACTIVE_SLOT_INVALID;
+	UmbraBufferSelectorPagePresent[buf->buf_id] = false;
 }
 
 /* A source-slot write satisfies this checkpoint, not the current selector. */
@@ -7947,6 +8062,7 @@ WaitBufHdrUnlocked(BufferDesc *buf)
 	return buf_state;
 }
 
+#ifndef USE_UMBRA
 /*
  * BufferTag comparator.
  */
@@ -7977,6 +8093,7 @@ buffertag_comparator(const BufferTag *ba, const BufferTag *bb)
 
 	return 0;
 }
+#endif
 
 /*
  * Comparator determining the writeout order in a checkpoint.
@@ -8053,9 +8170,12 @@ WritebackContextInit(WritebackContext *context, int *max_pending)
 void
 ScheduleBufferTagForWriteback(WritebackContext *wb_context, IOContext io_context,
 							  BufferTag *tag,
-							  uint8 checkpoint_source_slot)
+							  BlockNumber physical_block)
 {
 	PendingWriteback *pending;
+
+	if (physical_block == InvalidBlockNumber)
+		return;
 
 	/*
 	 * As pg_flush_data() doesn't do anything with fsync disabled, there's no
@@ -8076,7 +8196,7 @@ ScheduleBufferTagForWriteback(WritebackContext *wb_context, IOContext io_context
 		pending = &wb_context->pending_writebacks[wb_context->nr_pending++];
 
 		pending->tag = *tag;
-		pending->checkpoint_source_slot = checkpoint_source_slot;
+		pending->physical_block = physical_block;
 	}
 
 	/*
@@ -8084,16 +8204,19 @@ ScheduleBufferTagForWriteback(WritebackContext *wb_context, IOContext io_context
 	 * includes the case where previously an item has been added, but control
 	 * is now disabled.
 	 */
-	if (wb_context->nr_pending >= *wb_context->max_pending)
+	if (wb_context->nr_pending > 0 &&
+		wb_context->nr_pending >= *wb_context->max_pending)
 		IssuePendingWritebacks(wb_context, io_context);
 }
 
+#ifndef USE_UMBRA
 #define ST_SORT sort_pending_writebacks
 #define ST_ELEMENT_TYPE PendingWriteback
 #define ST_COMPARE(a, b) buffertag_comparator(&a->tag, &b->tag)
 #define ST_SCOPE static
 #define ST_DEFINE
 #include "lib/sort_template.h"
+#endif
 
 /*
  * Issue all pending writeback requests, previously scheduled with
@@ -8111,14 +8234,30 @@ IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
 	if (wb_context->nr_pending == 0)
 		return;
 
+	io_start = pgstat_prepare_io_time(track_io_timing);
+
+#ifdef USE_UMBRA
+	/*
+	 * Umbra records the physical target while writing.  A later selector
+	 * change must not redirect the writeback advice to a different slot.
+	 */
+	for (i = 0; i < wb_context->nr_pending; i++)
+	{
+		PendingWriteback *pending = &wb_context->pending_writebacks[i];
+		BufferTag	tag = pending->tag;
+		SMgrRelation reln;
+
+		reln = smgropen(BufTagGetRelFileLocator(&tag), INVALID_PROC_NUMBER);
+		smgrwritebackphysical(reln, BufTagGetForkNum(&tag),
+							 pending->physical_block, 1);
+	}
+#else
 	/*
 	 * Executing the writes in-order can make them a lot faster, and allows to
 	 * merge writeback requests to consecutive blocks into larger writebacks.
 	 */
 	sort_pending_writebacks(wb_context->pending_writebacks,
 							wb_context->nr_pending);
-
-	io_start = pgstat_prepare_io_time(track_io_timing);
 
 	/*
 	 * Coalesce neighbouring writes, but nothing else. For that we iterate
@@ -8139,30 +8278,13 @@ IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
 		tag = cur->tag;
 		currlocator = BufTagGetRelFileLocator(&tag);
 
-#ifdef USE_UMBRA
-		if (UmbraActiveSlotIsValid(cur->checkpoint_source_slot))
-		{
-			reln = smgropen(currlocator, INVALID_PROC_NUMBER);
-			UmCheckpointWritebackSourceSlot(reln, BufTagGetForkNum(&tag),
-											 tag.blockNum,
-											 cur->checkpoint_source_slot);
-			continue;
-		}
-#endif
-
 		/*
 		 * Peek ahead, into following writeback requests, to see if they can
 		 * be combined with the current one.
 		 */
 		for (ahead = 0; i + ahead + 1 < wb_context->nr_pending; ahead++)
 		{
-
 			next = &wb_context->pending_writebacks[i + ahead + 1];
-
-#ifdef USE_UMBRA
-			if (UmbraActiveSlotIsValid(next->checkpoint_source_slot))
-				break;
-#endif
 
 			/* different file, stop */
 			if (!RelFileLocatorEquals(currlocator,
@@ -8188,6 +8310,7 @@ IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
 		reln = smgropen(currlocator, INVALID_PROC_NUMBER);
 		smgrwriteback(reln, BufTagGetForkNum(&tag), tag.blockNum, nblocks);
 	}
+#endif
 
 	/*
 	 * Assume that writeback requests are only issued for buffers containing
@@ -8920,6 +9043,7 @@ buffer_readv_complete_one(PgAioTargetData *td, uint8 buf_off, Buffer buffer,
 	uint64		set_flag_bits;
 	int			piv_flags;
 	uint8		active_slot = UINT8_MAX;
+	bool		selector_page_present = false;
 
 	/* check that the buffer is in the expected state for a read */
 #ifdef USE_ASSERT_CHECKING
@@ -9032,13 +9156,18 @@ buffer_readv_complete_one(PgAioTargetData *td, uint8 buf_off, Buffer buffer,
 #ifdef USE_UMBRA
 	if (!failed && !is_temp && td->smgr.nblocks == 1 &&
 		UmbraActiveSlotIsValid(td->smgr.umbraActiveSlot))
+	{
+		Assert(buf_off == 0);
 		active_slot = td->smgr.umbraActiveSlot;
+		selector_page_present = td->smgr.umbraSelectorPagePresent;
+	}
 #endif
 	if (is_temp)
 		TerminateLocalBufferIO(buf_hdr, false, set_flag_bits, true);
 	else
 		TerminateBufferIOWithActiveSlot(buf_hdr, false, set_flag_bits, false,
-									true, active_slot);
+											true, active_slot,
+											selector_page_present);
 
 	/*
 	 * Call the BUFFER_READ_DONE tracepoint in the callback, even though the

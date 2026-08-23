@@ -289,8 +289,10 @@ extern void AssertBufferLocksPermitCatalogRead(void);
 #endif
 extern char *DebugPrintBufferRefcount(Buffer buffer);
 #ifdef USE_UMBRA
-extern bool BufferGetUmbraActiveSlot(Buffer buffer, uint8 *active_slot);
-extern void BufferRememberUmbraActiveSlot(Buffer buffer, uint8 active_slot);
+extern bool BufferGetUmbraActiveSlot(Buffer buffer, uint8 *active_slot,
+								 bool *selector_page_present);
+extern void BufferRememberUmbraActiveSlot(Buffer buffer, uint8 active_slot,
+								  bool selector_page_present);
 extern void CheckPointBuffersShiftEpochBegin(void);
 extern void CheckPointBuffersPrepare(int flags);
 extern void CheckPointBuffersAbort(void);

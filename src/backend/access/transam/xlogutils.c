@@ -417,6 +417,7 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 									  prefetch_buffer);
 			if (BufferIsValid(*buf))
 			{
+				BufferRememberUmbraActiveSlot(*buf, blkref->source_slot, true);
 				if (mode != RBM_ZERO_AND_LOCK &&
 					mode != RBM_ZERO_AND_CLEANUP_LOCK)
 				{
@@ -432,9 +433,9 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 									  blkref->target_slot,
 									  record->EndRecPtr))
 					elog(PANIC,
-						 "Umbra selector disappeared during slot-shift redo");
+							 "Umbra selector disappeared during slot-shift redo");
 				/* Recovery keeps this shared buffer for normal backends. */
-				BufferRememberUmbraActiveSlot(*buf, blkref->target_slot);
+				BufferRememberUmbraActiveSlot(*buf, blkref->target_slot, true);
 				MarkBufferDirty(*buf);
 				if (lsn <= PageGetLSN(BufferGetPage(*buf)))
 					return BLK_DONE;
@@ -452,6 +453,12 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 		*buf = XLogReadBufferExtended(rlocator, forknum, blkno,
 									  get_cleanup_lock ? RBM_ZERO_AND_CLEANUP_LOCK : RBM_ZERO_AND_LOCK,
 									  prefetch_buffer);
+		if (!BufferIsValid(*buf))
+			return BLK_NOTFOUND;
+#ifdef USE_UMBRA
+		if (blkref->has_slot_shift)
+			BufferRememberUmbraActiveSlot(*buf, blkref->target_slot, true);
+#endif
 		page = BufferGetPage(*buf);
 		if (!RestoreBlockImage(record, block_id, page))
 			ereport(ERROR,

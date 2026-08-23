@@ -33,15 +33,19 @@ extern uint8 MapGetActiveSlot(UmbraFileContext *ctx,
 						  RelFileLocatorBackend rlocator,
 						  BlockNumber logical_block);
 extern void MapEnsureActiveSlotPages(UmbraFileContext *ctx,
-							 RelFileLocatorBackend rlocator,
-							 BlockNumber first_block,
-							 BlockNumber nblocks,
-							 bool skipFsync);
+								 RelFileLocatorBackend rlocator,
+								 BlockNumber first_block,
+								 BlockNumber nblocks,
+								 bool skipFsync);
 /* Restore selector-default slot 0 before a truncated logical range regrows. */
 extern void MapResetActiveSlots(UmbraFileContext *ctx,
 								RelFileLocatorBackend rlocator,
 								BlockNumber first_block,
 								BlockNumber nblocks, bool skipFsync);
+extern uint8 MapGetActiveSlotWithPresence(UmbraFileContext *ctx,
+								  RelFileLocatorBackend rlocator,
+								  BlockNumber logical_block,
+								  bool *selector_page_present);
 extern void MapPublishSlotShift(UmbraFileContext *ctx,
 								RelFileLocatorBackend rlocator,
 								BlockNumber logical_block, uint8 source_slot,
@@ -50,8 +54,8 @@ extern void MapRedoSetActiveSlot(UmbraFileContext *ctx,
 								 RelFileLocatorBackend rlocator,
 								 BlockNumber logical_block, uint8 active_slot);
 extern void MapRedoSlotShift(UmbraFileContext *ctx,
-							 RelFileLocatorBackend rlocator,
-							 BlockNumber logical_block, uint8 source_slot,
-							 uint8 target_slot);
+					 RelFileLocatorBackend rlocator,
+					 BlockNumber logical_block, uint8 source_slot,
+					 uint8 target_slot);
 
 #endif                          /* UMBRA_MAP_H */

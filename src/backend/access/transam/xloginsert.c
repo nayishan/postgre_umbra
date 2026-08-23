@@ -1217,17 +1217,21 @@ XLogRecordAssembleUmbra(RmgrId rmid, uint8 info,
 		{
 			if (!regbuf->slot_shift.selected)
 			{
-				SMgrRelation reln = NULL;
+				SMgrRelation reln;
 				uint8		cached_active_slot = UMBRA_ACTIVE_SLOT_INVALID;
+				bool		selector_page_present = false;
 
-				if (BufferGetUmbraActiveSlot(regbuf->buffer,
-										 &cached_active_slot))
-					reln = smgrlookup(regbuf->rlocator, INVALID_PROC_NUMBER);
-				if (reln != NULL)
-					(void) UmChooseSlotShift(reln, regbuf->forkno,
-											  regbuf->block,
-											  cached_active_slot,
-											  &regbuf->slot_shift);
+				(void) BufferGetUmbraActiveSlot(regbuf->buffer,
+									 &cached_active_slot,
+									 &selector_page_present);
+				reln = smgrlookup(regbuf->rlocator, INVALID_PROC_NUMBER);
+				if (reln == NULL)
+					elog(PANIC,
+						 "Umbra slot-shift WAL has no relation handle");
+				(void) UmChooseSlotShift(reln, regbuf->forkno,
+								  regbuf->block, cached_active_slot,
+								  selector_page_present,
+								  &regbuf->slot_shift);
 			}
 			include_slot_shift = regbuf->slot_shift.selected;
 			if (include_slot_shift)

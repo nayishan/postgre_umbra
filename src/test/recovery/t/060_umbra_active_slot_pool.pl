@@ -38,10 +38,10 @@ sub write_byte
 }
 
 my $node = PostgreSQL::Test::Cluster->new('active_slot_pool');
-$node->init;
+$node->init(no_data_checksums => 1);
 $node->append_conf(
 	'postgresql.conf',
-	"shared_buffers = '128kB'\nautovacuum = off\ncheckpoint_timeout = '1h'\nmax_wal_size = '4GB'");
+	"shared_buffers = '128kB'\nautovacuum = off\ncheckpoint_timeout = '1h'\nmax_wal_size = '4GB'\nwal_log_hints = off");
 $node->start;
 
 $node->safe_psql(
@@ -93,7 +93,7 @@ is(-s $map_paths[0], 0,
 
 # A missing selector represents slot zero until the first shift materializes
 # it.  Precreation keeps the normal extension path outside the WAL critical
-# section, but this recovery-compatible case remains valid.
+# section, while this recovery-compatible case remains target-only.
 $node->safe_psql('postgres', 'CHECKPOINT');
 my $shift_wal_start = $node->safe_psql(
 	'postgres', 'SELECT pg_current_wal_insert_lsn();');
@@ -121,11 +121,13 @@ is(scalar(@selector_shifts), 1,
 like($selector_shifts[0] // '',
 	qr/slot shift: source_slot 0 target_slot 1\b/,
 	'missing-selector update advances the default selector');
+unlike(join("\n", @shift_records), qr/\bFPW\b/,
+	'missing-selector update remains target-only');
 $node->safe_psql('postgres', 'CHECKPOINT');
 is(-s $map_paths[0], $block_size,
 	'checkpoint retains the materialized selector page');
 is($node->safe_psql('postgres', 'SELECT id FROM umbra_selector_anchor'),
-	'2', 'slot shift preserves the updated page');
+	'2', 'target-only shift preserves the updated page');
 
 $node->stop;
 for my $map_path (@map_paths)
