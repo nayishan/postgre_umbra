@@ -157,9 +157,13 @@ umfile_init(void)
 		return;
 
 	if (UmFileCxt == NULL)
+	{
 		UmFileCxt = AllocSetContextCreate(TopMemoryContext,
-										  "UmbraFile",
-										  ALLOCSET_DEFAULT_SIZES);
+									  "UmbraFile",
+									  ALLOCSET_DEFAULT_SIZES);
+		/* MAP publication can evict a dirty selector page after WAL insertion. */
+		MemoryContextAllowInCriticalSection(UmFileCxt, true);
+	}
 
 	memset(&ctl, 0, sizeof(ctl));
 	ctl.keysize = sizeof(RelFileLocatorBackend);

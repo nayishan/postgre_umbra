@@ -132,6 +132,13 @@ typedef struct
 	/* copy of the fork_flags field from the XLogRecordBlockHeader */
 	uint8		flags;
 
+#ifdef USE_UMBRA
+	/* Umbra source/target slot transition, if one is attached. */
+	bool		has_slot_shift;
+	uint8		source_slot;
+	uint8		target_slot;
+#endif
+
 	/* Information on full-page image, if any */
 	bool		has_image;		/* has image, even for consistency checking */
 	bool		apply_image;	/* has image that should be restored */

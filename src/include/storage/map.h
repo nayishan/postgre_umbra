@@ -32,5 +32,21 @@ extern void MapCheckpoint(void);
 extern uint8 MapGetActiveSlot(UmbraFileContext *ctx,
 						  RelFileLocatorBackend rlocator,
 						  BlockNumber logical_block);
+extern void MapEnsureActiveSlotPages(UmbraFileContext *ctx,
+							 RelFileLocatorBackend rlocator,
+							 BlockNumber first_block,
+							 BlockNumber nblocks,
+							 bool skipFsync);
+extern void MapPublishSlotShift(UmbraFileContext *ctx,
+								RelFileLocatorBackend rlocator,
+								BlockNumber logical_block, uint8 source_slot,
+								uint8 target_slot, XLogRecPtr lsn);
+extern void MapRedoSetActiveSlot(UmbraFileContext *ctx,
+								 RelFileLocatorBackend rlocator,
+								 BlockNumber logical_block, uint8 active_slot);
+extern void MapRedoSlotShift(UmbraFileContext *ctx,
+						 RelFileLocatorBackend rlocator,
+						 BlockNumber logical_block, uint8 source_slot,
+						 uint8 target_slot);
 
 #endif                          /* UMBRA_MAP_H */

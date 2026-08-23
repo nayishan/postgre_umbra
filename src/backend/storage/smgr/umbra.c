@@ -19,6 +19,8 @@
 
 #include <limits.h>
 
+#include "access/xlogutils.h"
+#include "miscadmin.h"
 #include "storage/aio.h"
 #include "storage/map.h"
 #include "storage/smgr.h"
@@ -50,6 +52,10 @@ static void um_ensure_three_bucket_capacity(SMgrRelation reln,
 										 ForkNumber forknum,
 										 BlockNumber physical_capacity,
 										 bool skipFsync);
+static void um_ensure_selector_pages(SMgrRelation reln,
+								 ForkNumber forknum, BlockNumber first_block,
+								 BlockNumber nblocks,
+								 bool skipFsync);
 
 void
 uminit(void)
@@ -135,6 +141,105 @@ uminitnewrelation(SMgrRelation reln, bool needs_wal)
 	state->uses_three_buckets = needs_wal;
 }
 
+/*
+ * Choose a transition from a buffer's cached slot.  Selector pages are
+ * materialized by the MAIN extension path, before WAL insertion.
+ */
+bool
+UmChooseSlotShift(SMgrRelation reln, ForkNumber forknum,
+				  BlockNumber logical_block, uint8 cached_active_slot,
+				  UmbraSlotShift *shift)
+{
+	UmbraSmgrRelationState *state;
+
+	Assert(shift != NULL);
+	MemSet(shift, 0, sizeof(*shift));
+	if (reln == NULL || InRecovery ||
+		IsBootstrapProcessingMode() || IsInitProcessingMode() ||
+		!UmbraActiveSlotIsValid(cached_active_slot) ||
+		!um_uses_three_buckets(reln, forknum))
+		return false;
+
+	state = reln->smgr_private;
+	if (state == NULL || state->filectx == NULL)
+		return false;
+	shift->reln = reln;
+	shift->forknum = forknum;
+	shift->logical_block = logical_block;
+	shift->source_slot = cached_active_slot;
+	shift->target_slot = UmbraNextActiveSlot(cached_active_slot);
+	shift->selected = true;
+	return true;
+}
+
+void
+UmPublishSlotShift(UmbraSlotShift *shift, XLogRecPtr lsn)
+{
+	UmbraSmgrRelationState *state;
+
+	Assert(shift != NULL);
+	Assert(shift->selected);
+	Assert(shift->reln != NULL);
+	Assert(XLogRecPtrIsValid(lsn));
+	state = shift->reln->smgr_private;
+	Assert(state != NULL && state->filectx != NULL);
+	MapPublishSlotShift(state->filectx, shift->reln->smgr_rlocator,
+						shift->logical_block, shift->source_slot,
+						shift->target_slot, lsn);
+	shift->selected = false;
+	shift->reln = NULL;
+}
+
+bool
+UmRedoSetActiveSlot(SMgrRelation reln, ForkNumber forknum,
+					BlockNumber logical_block, uint8 active_slot)
+{
+	UmbraFileContext *ctx;
+	BlockNumber	physical_nblocks;
+
+	if (!InRecovery || reln == NULL || !um_uses_three_buckets(reln, forknum) ||
+		!UmbraActiveSlotIsValid(active_slot))
+		elog(PANIC, "Umbra redo targets an invalid MAIN mapping");
+
+	ctx = um_get_filectx(reln);
+	if (!umfile_exists(ctx, MAIN_FORKNUM))
+		return false;
+	physical_nblocks = umfile_nblocks(ctx, MAIN_FORKNUM);
+	if (logical_block >= physical_nblocks / UMBRA_ACTIVE_SLOT_COUNT)
+		return false;
+
+	/* The selector is derived metadata, not an authority for source existence. */
+	if (!umfile_exists(ctx, UMBRA_METADATA_FORKNUM))
+		umfile_create(ctx, UMBRA_METADATA_FORKNUM, true);
+
+	MapRedoSetActiveSlot(ctx, reln->smgr_rlocator, logical_block, active_slot);
+	return true;
+}
+
+bool
+UmRedoSlotShift(SMgrRelation reln, ForkNumber forknum,
+				BlockNumber logical_block, uint8 source_slot,
+				uint8 target_slot, XLogRecPtr shift_lsn)
+{
+	UmbraFileContext *ctx;
+
+	if (!InRecovery || reln == NULL || !um_uses_three_buckets(reln, forknum) ||
+		!UmbraActiveSlotIsValid(source_slot) ||
+		!UmbraActiveSlotIsValid(target_slot) ||
+		target_slot != UmbraNextActiveSlot(source_slot) ||
+		!XLogRecPtrIsValid(shift_lsn))
+		elog(PANIC, "Umbra slot-shift WAL targets an inactive MAIN mapping");
+	ctx = um_get_filectx(reln);
+	reln->smgr_cached_nblocks[MAIN_FORKNUM] = InvalidBlockNumber;
+	umfile_create(ctx, MAIN_FORKNUM, true);
+	if (!umfile_exists(ctx, UMBRA_METADATA_FORKNUM))
+		umfile_create(ctx, UMBRA_METADATA_FORKNUM, true);
+
+	MapRedoSlotShift(ctx, reln->smgr_rlocator,
+					 logical_block, source_slot, target_slot);
+	return true;
+}
+
 bool
 umexists(SMgrRelation reln, ForkNumber forknum)
 {
@@ -182,13 +287,16 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	physical_block = um_active_pblk(reln, forknum, blocknum, NULL);
 	umfile_writev(um_get_filectx(reln), forknum, physical_block, buffers, 1,
 				  skipFsync);
+	um_ensure_selector_pages(reln, forknum, logical_eof,
+						 blocknum + 1 - logical_eof, skipFsync);
 }
 
 void
 umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
-			 int nblocks, bool skipFsync)
+				 int nblocks, bool skipFsync)
 {
 	BlockNumber	logical_end;
+	BlockNumber	logical_eof;
 	BlockNumber	physical_capacity;
 
 	if (!um_uses_three_buckets(reln, forknum))
@@ -204,12 +312,18 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("Umbra three-bucket logical range overflow")));
 	logical_end = blocknum + (BlockNumber) nblocks;
-	if (!UmbraThreeBucketPhysicalCapacity(logical_end, &physical_capacity))
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("Umbra three-bucket capacity overflow")));
-	um_ensure_three_bucket_capacity(reln, forknum, physical_capacity,
-								skipFsync);
+	logical_eof = um_three_bucket_nblocks(reln, forknum);
+	if (logical_end > logical_eof)
+	{
+		if (!UmbraThreeBucketPhysicalCapacity(logical_end, &physical_capacity))
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("Umbra three-bucket capacity overflow")));
+		um_ensure_three_bucket_capacity(reln, forknum, physical_capacity,
+									skipFsync);
+		um_ensure_selector_pages(reln, forknum, logical_eof,
+								logical_end - logical_eof, skipFsync);
+	}
 }
 
 bool
@@ -465,6 +579,17 @@ um_ensure_three_bucket_capacity(SMgrRelation reln, ForkNumber forknum,
 	}
 }
 
+static void
+um_ensure_selector_pages(SMgrRelation reln, ForkNumber forknum,
+						 BlockNumber first_block, BlockNumber nblocks,
+						 bool skipFsync)
+{
+	if (nblocks == 0 || !um_uses_three_buckets(reln, forknum) ||
+		CritSectionCount != 0)
+		return;
+	MapEnsureActiveSlotPages(um_get_filectx(reln), reln->smgr_rlocator,
+								 first_block, nblocks, skipFsync);
+}
 static UmbraFileContext *
 um_get_filectx(SMgrRelation reln)
 {

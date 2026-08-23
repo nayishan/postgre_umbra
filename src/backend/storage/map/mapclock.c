@@ -36,6 +36,7 @@ static LWLockPadded *MapPageExtensionLocks = NULL;
 static void MapPageRefreshBufferCount(void);
 static uint32 MapPageRelationHash(RelFileLocatorBackend rlocator);
 static int MapPageClockTick(void);
+static int MapPageClockGetBufferInternal(bool owner_pin);
 
 void
 MapPagePoolShmemRequest(void)
@@ -124,10 +125,16 @@ MapPagePoolShmemAttach(void)
 void
 MapPageEnsureInitialized(void)
 {
-	if (MapPagePoolCtlData == NULL || MapPageDescriptors == NULL ||
-		MapPageBlocks == NULL || MapPageCacheHash == NULL ||
-		MapPageCacheLocks == NULL || MapPageExtensionLocks == NULL)
+	if (!MapPagePoolIsInitialized())
 		elog(ERROR, "Umbra MAP page buffer pool is not initialized");
+}
+
+bool
+MapPagePoolIsInitialized(void)
+{
+	return MapPagePoolCtlData != NULL && MapPageDescriptors != NULL &&
+		MapPageBlocks != NULL && MapPageCacheHash != NULL &&
+		MapPageCacheLocks != NULL && MapPageExtensionLocks != NULL;
 }
 
 uint32
@@ -204,6 +211,19 @@ MapPageExtensionLock(RelFileLocatorBackend rlocator)
 int
 MapPageClockGetBuffer(void)
 {
+	return MapPageClockGetBufferInternal(true);
+}
+
+/* Critical-section callers own their reference count pins directly. */
+int
+MapPageClockGetBufferRaw(void)
+{
+	return MapPageClockGetBufferInternal(false);
+}
+
+static int
+MapPageClockGetBufferInternal(bool owner_pin)
+{
 	int         trycounter;
 
 	MapPageEnsureInitialized();
@@ -226,7 +246,8 @@ MapPageClockGetBuffer(void)
 			break;
 		if (MapPageTryClaimBuffer(slot_id))
 		{
-			MapPageRememberPin(slot_id);
+			if (owner_pin)
+				MapPageRememberPin(slot_id);
 			return slot_id;
 		}
 		/* Invalidation can briefly leave its claimed descriptor on this list. */
@@ -263,7 +284,8 @@ MapPageClockGetBuffer(void)
 				trycounter = MapPagePoolCtlData->nslots;
 				break;
 			}
-			MapPageRememberPin(slot_id);
+			if (owner_pin)
+				MapPageRememberPin(slot_id);
 			return slot_id;
 		}
 		if (--trycounter == 0)

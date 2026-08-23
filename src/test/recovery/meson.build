@@ -64,7 +64,11 @@ tests += {
       't/053_standby_login_event_trigger.pl',
       't/054_umbra_mainfork_unlink.pl',
       't/057_umbra_unlogged_selector.pl',
+      't/058_umbra_image_free_recovery.pl',
       't/060_umbra_active_slot_pool.pl',
+      't/061_umbra_slot_shift_wal.pl',
+      't/062_umbra_slot_checkpoint_publication.pl',
+      't/066_umbra_image_free_missing_source.pl',
     ],
   },
 }

@@ -1845,6 +1845,11 @@ PerformWalRecovery(void)
 
 		RmgrCleanup();
 
+#ifdef USE_UMBRA
+		/* Require image-free source dependencies to be resolved before redo ends. */
+		XLogCheckInvalidPages();
+#endif
+
 		ereport(LOG,
 				errmsg("redo done at %X/%08X system usage: %s",
 					   LSN_FORMAT_ARGS(xlogreader->ReadRecPtr),

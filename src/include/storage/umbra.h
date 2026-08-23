@@ -16,6 +16,7 @@
 #ifndef UMBRA_H
 #define UMBRA_H
 
+#include "access/xlogdefs.h"
 #include "storage/aio_types.h"
 #include "storage/block.h"
 #include "storage/relfilelocator.h"
@@ -25,10 +26,27 @@
 #define UMBRA_ACTIVE_SLOT_COUNT 3U
 #define UMBRA_ACTIVE_SLOT_INVALID UINT8_MAX
 
+typedef struct UmbraSlotShift
+{
+	SMgrRelation reln;
+	ForkNumber	forknum;
+	BlockNumber logical_block;
+	uint8		source_slot;
+	uint8		target_slot;
+	bool		selected;
+} UmbraSlotShift;
+
 static inline bool
 UmbraActiveSlotIsValid(uint8 active_slot)
 {
 	return active_slot < UMBRA_ACTIVE_SLOT_COUNT;
+}
+
+static inline uint8
+UmbraNextActiveSlot(uint8 active_slot)
+{
+	Assert(UmbraActiveSlotIsValid(active_slot));
+	return active_slot == UMBRA_ACTIVE_SLOT_COUNT - 1 ? 0 : active_slot + 1;
 }
 
 static inline bool
@@ -87,22 +105,20 @@ extern void umunlink(RelFileLocatorBackend rlocator, ForkNumber forknum,
 extern void umextend(SMgrRelation reln, ForkNumber forknum,
 					 BlockNumber blocknum, const void *buffer, bool skipFsync);
 extern void umzeroextend(SMgrRelation reln, ForkNumber forknum,
-						 BlockNumber blocknum, int nblocks, bool skipFsync);
+					 BlockNumber blocknum, int nblocks, bool skipFsync);
 extern bool umprefetch(SMgrRelation reln, ForkNumber forknum,
 					   BlockNumber blocknum, int nblocks);
 extern uint32 ummaxcombine(SMgrRelation reln, ForkNumber forknum,
-						   BlockNumber blocknum);
-extern void umreadv(SMgrRelation reln, ForkNumber forknum,
-					BlockNumber blocknum, void **buffers, BlockNumber nblocks);
-extern void umstartreadv(PgAioHandle *ioh,
-						 SMgrRelation reln, ForkNumber forknum,
-						 BlockNumber blocknum,
+						  BlockNumber blocknum);
+extern void umreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+					void **buffers, BlockNumber nblocks);
+extern void umstartreadv(PgAioHandle *ioh, SMgrRelation reln,
+						 ForkNumber forknum, BlockNumber blocknum,
 						 void **buffers, BlockNumber nblocks);
-extern void umwritev(SMgrRelation reln, ForkNumber forknum,
-					 BlockNumber blocknum, const void **buffers,
-					 BlockNumber nblocks, bool skipFsync);
+extern void umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+					 const void **buffers, BlockNumber nblocks, bool skipFsync);
 extern void umwriteback(SMgrRelation reln, ForkNumber forknum,
-						BlockNumber blocknum, BlockNumber nblocks);
+						 BlockNumber blocknum, BlockNumber nblocks);
 extern BlockNumber umnblocks(SMgrRelation reln, ForkNumber forknum);
 extern void umtruncate(SMgrRelation reln, ForkNumber forknum,
 					   BlockNumber old_blocks, BlockNumber nblocks);
@@ -114,6 +130,16 @@ extern void uminvalidatedatabasetablespacecache(Oid dbid, Oid spcOid);
 extern int	umfd(SMgrRelation reln, ForkNumber forknum,
 				 BlockNumber blocknum, uint32 *off);
 extern bool UmGetActiveSlot(SMgrRelation reln, ForkNumber forknum,
-					 BlockNumber logical_block, uint8 *active_slot);
+						 BlockNumber logical_block, uint8 *active_slot);
+extern bool UmChooseSlotShift(SMgrRelation reln, ForkNumber forknum,
+							  BlockNumber logical_block, uint8 cached_active_slot,
+							  UmbraSlotShift *shift);
+extern void UmPublishSlotShift(UmbraSlotShift *shift, XLogRecPtr lsn);
+extern bool UmRedoSetActiveSlot(SMgrRelation reln, ForkNumber forknum,
+									 BlockNumber logical_block,
+									 uint8 active_slot);
+extern bool UmRedoSlotShift(SMgrRelation reln, ForkNumber forknum,
+							BlockNumber logical_block, uint8 source_slot,
+							uint8 target_slot, XLogRecPtr shift_lsn);
 
 #endif							/* UMBRA_H */

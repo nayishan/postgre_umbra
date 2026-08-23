@@ -353,6 +353,26 @@ smgropen(RelFileLocator rlocator, ProcNumber backend)
 	return reln;
 }
 
+#ifdef USE_UMBRA
+/*
+ * Find an already-open relation handle without allocating.  WAL insertion can
+ * use this from a critical section to decide whether an Umbra slot shift is
+ * available; a miss simply keeps the ordinary full-page image.
+ */
+SMgrRelation
+smgrlookup(RelFileLocator rlocator, ProcNumber backend)
+{
+	RelFileLocatorBackend brlocator;
+
+	if (SMgrRelationHash == NULL)
+		return NULL;
+	brlocator.locator = rlocator;
+	brlocator.backend = backend;
+	return (SMgrRelation) hash_search(SMgrRelationHash, &brlocator,
+								 HASH_FIND, NULL);
+}
+#endif
+
 /*
  * smgrpin() -- Prevent an SMgrRelation object from being destroyed at end of
  *				transaction

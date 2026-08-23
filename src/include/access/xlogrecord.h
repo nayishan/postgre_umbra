@@ -114,6 +114,22 @@ typedef struct XLogRecordBlockHeader
 
 #define SizeOfXLogRecordBlockHeader (offsetof(XLogRecordBlockHeader, data_length) + sizeof(uint16))
 
+#ifdef USE_UMBRA
+/*
+ * A WAL block reference can move an Umbra MAIN page to its next active slot.
+ * It stores the target slot; the reader derives the preceding source slot.
+ */
+typedef struct XLogRecordBlockSlotShiftHeader
+{
+	uint8		target_slot;
+} XLogRecordBlockSlotShiftHeader;
+
+#define SizeOfXLogRecordBlockSlotShiftHeader \
+	sizeof(XLogRecordBlockSlotShiftHeader)
+#else
+#define SizeOfXLogRecordBlockSlotShiftHeader 0
+#endif
+
 /*
  * Additional header information when a full-page image is included
  * (i.e. when BKPBLOCK_HAS_IMAGE is set).
@@ -184,17 +200,24 @@ typedef struct XLogRecordBlockCompressHeader
  */
 #define MaxSizeOfXLogRecordBlockHeader \
 	(SizeOfXLogRecordBlockHeader + \
+	 SizeOfXLogRecordBlockSlotShiftHeader + \
 	 SizeOfXLogRecordBlockImageHeader + \
 	 SizeOfXLogRecordBlockCompressHeader + \
 	 sizeof(RelFileLocator) + \
 	 sizeof(BlockNumber))
 
 /*
- * The fork number fits in the lower 4 bits in the fork_flags field. The upper
- * bits are used for flags.
+ * The fork number normally fits in the lower 4 bits in fork_flags.  Umbra
+ * reserves one of those bits for its private slot-shift marker.
  */
+#ifdef USE_UMBRA
+#define BKPBLOCK_FORK_MASK	0x07
+#define BKPBLOCK_HAS_SLOT_SHIFT 0x08
+#define BKPBLOCK_FLAG_MASK	0xF8
+#else
 #define BKPBLOCK_FORK_MASK	0x0F
 #define BKPBLOCK_FLAG_MASK	0xF0
+#endif
 #define BKPBLOCK_HAS_IMAGE	0x10	/* block data is an XLogRecordBlockImage */
 #define BKPBLOCK_HAS_DATA	0x20
 #define BKPBLOCK_WILL_INIT	0x40	/* redo will re-init the page */

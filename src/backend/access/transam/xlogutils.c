@@ -26,6 +26,9 @@
 #include "miscadmin.h"
 #include "storage/fd.h"
 #include "storage/smgr.h"
+#ifdef USE_UMBRA
+#include "storage/umbra.h"
+#endif
 #include "utils/hsearch.h"
 #include "utils/rel.h"
 
@@ -158,6 +161,14 @@ log_invalid_page(RelFileLocator locator, ForkNumber forkno, BlockNumber blkno,
 	{
 		/* repeat reference ... leave "present" as it was */
 	}
+}
+
+/* Record a recovery dependency on a later DROP or covering TRUNCATE. */
+void
+XLogRecordInvalidPage(RelFileLocator locator, ForkNumber forkno,
+					  BlockNumber blkno, bool present)
+{
+	log_invalid_page(locator, forkno, blkno, present);
 }
 
 /* Forget any invalid pages >= minblkno, because they've been dropped */
@@ -350,6 +361,9 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 	Page		page;
 	bool		zeromode;
 	bool		willinit;
+#ifdef USE_UMBRA
+	DecodedBkpBlock *blkref;
+#endif
 
 	if (!XLogRecGetBlockTagExtended(record, block_id, &rlocator, &forknum, &blkno,
 									&prefetch_buffer))
@@ -369,6 +383,67 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 		elog(PANIC, "block with WILL_INIT flag in WAL record must be zeroed by redo routine");
 	if (!willinit && zeromode)
 		elog(PANIC, "block to be initialized in redo routine must be marked with WILL_INIT flag in the WAL record");
+
+#ifdef USE_UMBRA
+	blkref = XLogRecGetBlock(record, block_id);
+	if (blkref->has_slot_shift)
+	{
+		SMgrRelation reln;
+
+		reln = smgropen(rlocator, INVALID_PROC_NUMBER);
+		if (XLogRecBlockImageApply(record, block_id))
+		{
+			if (!UmRedoSlotShift(reln, forknum, blkno,
+								  blkref->source_slot,
+								  blkref->target_slot,
+								  record->EndRecPtr))
+			{
+				XLogRecordInvalidPage(rlocator, forknum, blkno, false);
+				*buf = InvalidBuffer;
+				return BLK_NOTFOUND;
+			}
+		}
+		else
+		{
+			/* Materialize the old baseline before publishing the target. */
+			if (!UmRedoSetActiveSlot(reln, forknum, blkno,
+								 blkref->source_slot))
+			{
+				XLogRecordInvalidPage(rlocator, forknum, blkno, false);
+				*buf = InvalidBuffer;
+				return BLK_NOTFOUND;
+			}
+			*buf = XLogReadBufferExtended(rlocator, forknum, blkno, mode,
+									  prefetch_buffer);
+			if (BufferIsValid(*buf))
+			{
+				if (mode != RBM_ZERO_AND_LOCK &&
+					mode != RBM_ZERO_AND_CLEANUP_LOCK)
+				{
+					if (get_cleanup_lock)
+						LockBufferForCleanup(*buf);
+					else
+						LockBuffer(*buf, BUFFER_LOCK_EXCLUSIVE);
+				}
+				MarkBufferDirty(*buf);
+				FlushOneBuffer(*buf);
+				if (!UmRedoSlotShift(reln, forknum, blkno,
+									  blkref->source_slot,
+									  blkref->target_slot,
+									  record->EndRecPtr))
+					elog(PANIC,
+						 "Umbra selector disappeared during slot-shift redo");
+				/* Recovery keeps this shared buffer for normal backends. */
+				BufferRememberUmbraActiveSlot(*buf, blkref->target_slot);
+				MarkBufferDirty(*buf);
+				if (lsn <= PageGetLSN(BufferGetPage(*buf)))
+					return BLK_DONE;
+				return BLK_NEEDS_REDO;
+			}
+			return BLK_NOTFOUND;
+		}
+	}
+#endif
 
 	/* If it has a full-page image and it should be restored, do it. */
 	if (XLogRecBlockImageApply(record, block_id))

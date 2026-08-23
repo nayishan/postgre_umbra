@@ -9080,6 +9080,7 @@ xlog_redo(XLogReaderState *record)
 		for (uint8 block_id = 0; block_id <= XLogRecMaxBlockId(record); block_id++)
 		{
 			Buffer		buffer;
+			XLogRedoAction action;
 
 			if (!XLogRecHasBlockImage(record, block_id))
 			{
@@ -9088,7 +9089,8 @@ xlog_redo(XLogReaderState *record)
 				continue;
 			}
 
-			if (XLogReadBufferForRedo(record, block_id, &buffer) != BLK_RESTORED)
+			action = XLogReadBufferForRedo(record, block_id, &buffer);
+			if (action != BLK_RESTORED)
 				elog(ERROR, "unexpected XLogReadBufferForRedo result when restoring backup block");
 			UnlockReleaseBuffer(buffer);
 		}
