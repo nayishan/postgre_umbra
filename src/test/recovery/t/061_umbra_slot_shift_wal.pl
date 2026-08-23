@@ -152,11 +152,33 @@ is(read_active_slot($map_path, $block_size, $target_block), 0,
 is($node->safe_psql('postgres',
 		q[SELECT payload FROM umbra_slot_shift_wal WHERE id = 1;]),
 	'three', 'crash redo restores the final update through the target slot');
+$node->safe_psql('postgres', 'CHECKPOINT');
 $node->safe_psql('postgres',
 	q[UPDATE umbra_slot_shift_wal SET payload = 'four' WHERE id = 1;]);
 is($node->safe_psql('postgres',
 		q[SELECT payload FROM umbra_slot_shift_wal WHERE id = 1;]),
 	'four', 'a post-recovery update uses the selector target as its source');
+$node->safe_psql('postgres', 'CHECKPOINT');
+is(read_active_slot($map_path, $block_size, $target_block), 1,
+	'a post-recovery shift advances the old logical page to slot 1');
+
+# DELETE plus VACUUM (TRUNCATE) shrinks the existing fork without assigning a
+# new relfilenode.  Regrowth must not inherit the old selector target.
+$node->safe_psql(
+	'postgres', q[
+DELETE FROM umbra_slot_shift_wal;
+VACUUM (TRUNCATE, DISABLE_PAGE_SKIPPING) umbra_slot_shift_wal;
+INSERT INTO umbra_slot_shift_wal VALUES (2, 'regrown');
+CHECKPOINT;
+]);
+my $regrown_block = 0 + $node->safe_psql(
+	'postgres', q[
+SELECT (ctid::text::point)[0]::integer
+FROM umbra_slot_shift_wal WHERE id = 2;]);
+is($regrown_block, $target_block,
+	'regrowth reuses the truncated logical block');
+is(read_active_slot($map_path, $block_size, $regrown_block), 0,
+	'regrowth restores the selector default before the physical triple returns');
 
 # A later DROP can remove the selector fork before a crash even though the
 # checkpoint redo point still precedes the shift.  Redo must tolerate a

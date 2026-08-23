@@ -500,6 +500,75 @@ MapEnsureActiveSlotPages(UmbraFileContext *ctx,
 }
 
 void
+MapResetActiveSlots(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
+					BlockNumber first_block, BlockNumber nblocks,
+					bool skipFsync)
+{
+	uint64		logical_end;
+	uint64		first_page_index;
+	uint64		last_page_index;
+	uint64		page_index;
+	LWLock	   *extension_lock;
+
+	Assert(ctx != NULL);
+	Assert(CritSectionCount == 0);
+	if (nblocks == 0 || !umfile_exists(ctx, UMBRA_METADATA_FORKNUM))
+		return;
+	logical_end = (uint64) first_block + nblocks - 1;
+	if (logical_end >= (uint64) InvalidBlockNumber)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("Umbra active-slot reset range overflow")));
+	first_page_index = (uint64) first_block /
+		UMBRA_MAP_SELECTOR_ENTRIES_PER_PAGE;
+	last_page_index = logical_end / UMBRA_MAP_SELECTOR_ENTRIES_PER_PAGE;
+	extension_lock = MapPageExtensionLock(rlocator);
+
+	for (page_index = first_page_index; page_index <= last_page_index;
+		 page_index++)
+	{
+		BlockNumber	map_block = UMBRA_MAP_SELECTOR_FIRST_BLOCK + page_index;
+		MapPageBuffer buffer;
+		uint64		first_entry = 0;
+		uint64		last_entry = UMBRA_MAP_SELECTOR_ENTRIES_PER_PAGE - 1;
+		bool		changed = false;
+		char	   *page;
+
+		/* A missing selector page already represents the slot-0 default. */
+		LWLockAcquire(extension_lock, LW_SHARED);
+		if (map_block >= umfile_nblocks(ctx, UMBRA_METADATA_FORKNUM))
+		{
+			LWLockRelease(extension_lock);
+			continue;
+		}
+		buffer = MapPageBufferRead(ctx, rlocator, map_block, false, skipFsync,
+								   LW_EXCLUSIVE);
+		LWLockRelease(extension_lock);
+		if (page_index == first_page_index)
+			first_entry = (uint64) first_block %
+				UMBRA_MAP_SELECTOR_ENTRIES_PER_PAGE;
+		if (page_index == last_page_index)
+			last_entry = logical_end % UMBRA_MAP_SELECTOR_ENTRIES_PER_PAGE;
+		page = MapPageBufferGetData(buffer);
+		for (uint64 entry = first_entry; entry <= last_entry; entry++)
+		{
+			uint64		bit_index = entry * UMBRA_MAP_SELECTOR_BITS;
+			int			byte_offset = bit_index / BITS_PER_BYTE;
+			int			bit_offset = bit_index % BITS_PER_BYTE;
+
+			if (MapSelectorRead(page, byte_offset, bit_offset) != 0)
+			{
+				MapSelectorWrite(page, byte_offset, bit_offset, 0);
+				changed = true;
+			}
+		}
+		if (changed)
+			MapPageMarkBufferDirty(buffer, InvalidXLogRecPtr, skipFsync);
+		MapPageReleaseBuffer(buffer);
+	}
+}
+
+void
 MapPublishSlotShift(UmbraFileContext *ctx, RelFileLocatorBackend rlocator,
 					BlockNumber logical_block, uint8 source_slot,
 					uint8 target_slot, XLogRecPtr lsn)

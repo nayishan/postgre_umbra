@@ -53,9 +53,14 @@ static void um_ensure_three_bucket_capacity(SMgrRelation reln,
 										 BlockNumber physical_capacity,
 										 bool skipFsync);
 static void um_ensure_selector_pages(SMgrRelation reln,
-								 ForkNumber forknum, BlockNumber first_block,
-								 BlockNumber nblocks,
-								 bool skipFsync);
+									 ForkNumber forknum, BlockNumber first_block,
+									 BlockNumber nblocks,
+									 bool skipFsync);
+static void um_reset_selector_range(SMgrRelation reln,
+										ForkNumber forknum,
+										BlockNumber first_block,
+										BlockNumber nblocks,
+										bool skipFsync);
 
 void
 uminit(void)
@@ -282,6 +287,9 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("Umbra three-bucket capacity overflow")));
+	/* A truncated tail can retain selectors, but no longer has physical slots. */
+	um_reset_selector_range(reln, forknum, logical_eof,
+						blocknum + 1 - logical_eof, skipFsync);
 	um_ensure_three_bucket_capacity(reln, forknum, physical_capacity,
 								skipFsync);
 	physical_block = um_active_pblk(reln, forknum, blocknum, NULL);
@@ -319,6 +327,8 @@ umzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 					 errmsg("Umbra three-bucket capacity overflow")));
+		um_reset_selector_range(reln, forknum, logical_eof,
+							logical_end - logical_eof, skipFsync);
 		um_ensure_three_bucket_capacity(reln, forknum, physical_capacity,
 									skipFsync);
 		um_ensure_selector_pages(reln, forknum, logical_eof,
@@ -581,14 +591,27 @@ um_ensure_three_bucket_capacity(SMgrRelation reln, ForkNumber forknum,
 
 static void
 um_ensure_selector_pages(SMgrRelation reln, ForkNumber forknum,
-						 BlockNumber first_block, BlockNumber nblocks,
-						 bool skipFsync)
+							 BlockNumber first_block, BlockNumber nblocks,
+							 bool skipFsync)
 {
 	if (nblocks == 0 || !um_uses_three_buckets(reln, forknum) ||
 		CritSectionCount != 0)
 		return;
 	MapEnsureActiveSlotPages(um_get_filectx(reln), reln->smgr_rlocator,
-								 first_block, nblocks, skipFsync);
+									 first_block, nblocks, skipFsync);
+}
+
+static void
+um_reset_selector_range(SMgrRelation reln, ForkNumber forknum,
+						BlockNumber first_block, BlockNumber nblocks,
+						bool skipFsync)
+{
+	if (nblocks == 0 || forknum != MAIN_FORKNUM ||
+		!um_uses_selector_slots(reln, forknum))
+		return;
+	Assert(CritSectionCount == 0);
+	MapResetActiveSlots(um_get_filectx(reln), reln->smgr_rlocator,
+						first_block, nblocks, skipFsync);
 }
 static UmbraFileContext *
 um_get_filectx(SMgrRelation reln)
