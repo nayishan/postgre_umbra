@@ -242,17 +242,19 @@ typedef struct BufferWritebackTargets
 {
 	int			ntargets;
 	BlockNumber physical_blocks[MAX_BUFFER_WRITEBACK_TARGETS];
+	PendingWritebackKind kinds[MAX_BUFFER_WRITEBACK_TARGETS];
 } BufferWritebackTargets;
 
 static inline void
 BufferWritebackTargetsAdd(BufferWritebackTargets *targets,
-						  BlockNumber physical_block)
+						  BlockNumber physical_block,
+						  PendingWritebackKind kind)
 {
 	if (targets == NULL || physical_block == InvalidBlockNumber)
 		return;
 	Assert(targets->ntargets < MAX_BUFFER_WRITEBACK_TARGETS);
 	targets->physical_blocks[targets->ntargets] = physical_block;
-	targets->ntargets++;
+	targets->kinds[targets->ntargets++] = kind;
 }
 
 /* local state for LockBufferForCleanup */
@@ -669,6 +671,7 @@ static void BufferSync(int flags);
 static int	SyncOneBuffer(int buf_id, bool skip_recently_used,
 						  bool checkpoint_flush,
 						  WritebackContext *wb_context);
+static void LogCheckpointPhysicalWritebackStats(WritebackContext *wb_context);
 static void WaitIO(BufferDesc *buf);
 static void AbortBufferIO(Buffer buffer);
 static void TerminateBufferIOWithActiveSlot(BufferDesc *buf,
@@ -729,9 +732,6 @@ static void CheckForBufferLeaks(void);
 static void AssertNotCatalogBufferLock(Buffer buffer, BufferLockMode mode);
 #endif
 static int	rlocator_comparator(const void *p1, const void *p2);
-#ifndef USE_UMBRA
-static inline int buffertag_comparator(const BufferTag *ba, const BufferTag *bb);
-#endif
 static inline int ckpt_buforder_comparator(const CkptSortItem *a, const CkptSortItem *b);
 static int	ts_ckpt_progress_comparator(Datum a, Datum b, void *arg);
 
@@ -2726,7 +2726,8 @@ again:
 		for (int i = 0; i < writeback_targets.ntargets; i++)
 			ScheduleBufferTagForWriteback(&BackendWritebackContext, io_context,
 									  &buf_hdr->tag,
-									  writeback_targets.physical_blocks[i]);
+									  writeback_targets.physical_blocks[i],
+									  writeback_targets.kinds[i]);
 	}
 
 
@@ -3190,7 +3191,8 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 		InitBufferTag(&tag, &BMR_GET_SMGR(bmr)->smgr_rlocator.locator, fork,
 					  first_block + i);
 		ScheduleBufferTagForWriteback(&BackendWritebackContext, io_context,
-									  &tag, extension_pblks[i]);
+									  &tag, extension_pblks[i],
+									  PENDING_WB_EXTENSION);
 	}
 	pfree(extension_pblks);
 
@@ -3808,6 +3810,8 @@ BufferSync(int flags)
 	}
 
 	WritebackContextInit(&wb_context, &checkpoint_flush_after);
+	wb_context.collect_stats = true;
+
 	TRACE_POSTGRESQL_BUFFER_SYNC_START(NBuffers, num_to_scan);
 
 	/*
@@ -3991,6 +3995,7 @@ BufferSync(int flags)
 	 * buffers written by other backends or bgwriter scan.
 	 */
 	CheckpointStats.ckpt_bufs_written += num_written;
+	LogCheckpointPhysicalWritebackStats(&wb_context);
 
 	TRACE_POSTGRESQL_BUFFER_SYNC_DONE(NBuffers, num_written, num_to_scan);
 
@@ -4474,7 +4479,8 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, bool checkpoint_flush,
 	 */
 	for (int i = 0; i < writeback_targets.ntargets; i++)
 		ScheduleBufferTagForWriteback(wb_context, IOCONTEXT_NORMAL, &tag,
-									  writeback_targets.physical_blocks[i]);
+									  writeback_targets.physical_blocks[i],
+									  writeback_targets.kinds[i]);
 
 	return result | BUF_WRITTEN;
 }
@@ -4908,7 +4914,8 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 											  &checkpoint_source_block);
 	if (checkpoint_directed)
 	{
-		BufferWritebackTargetsAdd(writeback_targets, checkpoint_source_block);
+		BufferWritebackTargetsAdd(writeback_targets, checkpoint_source_block,
+								  PENDING_WB_CHECKPOINT_SOURCE);
 		if (!checkpoint_flush)
 		{
 			if (UmbraActiveSlotIsValid(active_slot))
@@ -4922,7 +4929,8 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 									  BufTagGetForkNum(&buf->tag),
 									  buf->tag.blockNum, bufBlock, false,
 									  &active_physical_block);
-			BufferWritebackTargetsAdd(writeback_targets, active_physical_block);
+			BufferWritebackTargetsAdd(writeback_targets, active_physical_block,
+								  PENDING_WB_REGULAR);
 			blocks_written++;
 		}
 	}
@@ -4940,14 +4948,18 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 								  buf->tag.blockNum, bufBlock, false,
 								  &active_physical_block);
 		}
-		BufferWritebackTargetsAdd(writeback_targets, active_physical_block);
+		BufferWritebackTargetsAdd(writeback_targets, active_physical_block,
+								  checkpoint_directed_requested ?
+								  PENDING_WB_CHECKPOINT_FALLBACK :
+								  PENDING_WB_REGULAR);
 	}
 #else
 	smgrwrite_with_target(reln,
 						  BufTagGetForkNum(&buf->tag),
 						  buf->tag.blockNum, bufBlock, false,
 						  &active_physical_block);
-	BufferWritebackTargetsAdd(writeback_targets, active_physical_block);
+	BufferWritebackTargetsAdd(writeback_targets, active_physical_block,
+								  PENDING_WB_REGULAR);
 #endif
 
 	/*
@@ -8468,39 +8480,6 @@ WaitBufHdrUnlocked(BufferDesc *buf)
 	return buf_state;
 }
 
-#ifndef USE_UMBRA
-/*
- * BufferTag comparator.
- */
-static inline int
-buffertag_comparator(const BufferTag *ba, const BufferTag *bb)
-{
-	int			ret;
-	RelFileLocator rlocatora;
-	RelFileLocator rlocatorb;
-
-	rlocatora = BufTagGetRelFileLocator(ba);
-	rlocatorb = BufTagGetRelFileLocator(bb);
-
-	ret = rlocator_comparator(&rlocatora, &rlocatorb);
-
-	if (ret != 0)
-		return ret;
-
-	if (BufTagGetForkNum(ba) < BufTagGetForkNum(bb))
-		return -1;
-	if (BufTagGetForkNum(ba) > BufTagGetForkNum(bb))
-		return 1;
-
-	if (ba->blockNum < bb->blockNum)
-		return -1;
-	if (ba->blockNum > bb->blockNum)
-		return 1;
-
-	return 0;
-}
-#endif
-
 /*
  * Comparator determining the writeout order in a checkpoint.
  *
@@ -8568,6 +8547,14 @@ WritebackContextInit(WritebackContext *context, int *max_pending)
 
 	context->max_pending = max_pending;
 	context->nr_pending = 0;
+	context->collect_stats = false;
+	MemSet(context->input_blocks, 0, sizeof(context->input_blocks));
+	context->unique_blocks = 0;
+	context->issued_runs = 0;
+	context->issued_blocks = 0;
+	context->max_run_blocks = 0;
+	MemSet(context->run_length_counts, 0,
+		   sizeof(context->run_length_counts));
 }
 
 /*
@@ -8576,12 +8563,14 @@ WritebackContextInit(WritebackContext *context, int *max_pending)
 void
 ScheduleBufferTagForWriteback(WritebackContext *wb_context, IOContext io_context,
 							  BufferTag *tag,
-							  BlockNumber physical_block)
+							  BlockNumber physical_block,
+							  PendingWritebackKind kind)
 {
 	PendingWriteback *pending;
 
 	if (physical_block == InvalidBlockNumber)
 		return;
+	Assert(kind >= 0 && kind < PENDING_WB_KIND_COUNT);
 
 	/*
 	 * As pg_flush_data() doesn't do anything with fsync disabled, there's no
@@ -8603,6 +8592,9 @@ ScheduleBufferTagForWriteback(WritebackContext *wb_context, IOContext io_context
 
 		pending->tag = *tag;
 		pending->physical_block = physical_block;
+		pending->kind = (uint8) kind;
+		if (wb_context->collect_stats)
+			wb_context->input_blocks[kind]++;
 	}
 
 	/*
@@ -8615,14 +8607,43 @@ ScheduleBufferTagForWriteback(WritebackContext *wb_context, IOContext io_context
 		IssuePendingWritebacks(wb_context, io_context);
 }
 
-#ifndef USE_UMBRA
+static inline int
+pending_writeback_comparator(const PendingWriteback *a,
+							 const PendingWriteback *b)
+{
+	int			ret;
+	RelFileLocator rlocatora;
+	RelFileLocator rlocatorb;
+	ForkNumber	forknuma;
+	ForkNumber	forknumb;
+
+	rlocatora = BufTagGetRelFileLocator(&a->tag);
+	rlocatorb = BufTagGetRelFileLocator(&b->tag);
+	ret = rlocator_comparator(&rlocatora, &rlocatorb);
+	if (ret != 0)
+		return ret;
+
+	forknuma = BufTagGetForkNum(&a->tag);
+	forknumb = BufTagGetForkNum(&b->tag);
+	if (forknuma < forknumb)
+		return -1;
+	if (forknuma > forknumb)
+		return 1;
+
+	if (a->physical_block < b->physical_block)
+		return -1;
+	if (a->physical_block > b->physical_block)
+		return 1;
+
+	return (int) a->kind - (int) b->kind;
+}
+
 #define ST_SORT sort_pending_writebacks
 #define ST_ELEMENT_TYPE PendingWriteback
-#define ST_COMPARE(a, b) buffertag_comparator(&a->tag, &b->tag)
+#define ST_COMPARE(a, b) pending_writeback_comparator(a, b)
 #define ST_SCOPE static
 #define ST_DEFINE
 #include "lib/sort_template.h"
-#endif
 
 /*
  * Issue all pending writeback requests, previously scheduled with
@@ -8635,35 +8656,22 @@ void
 IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
 {
 	instr_time	io_start;
+	SMgrRelation reln = NULL;
+	RelFileLocator relnlocator;
+	bool		have_reln = false;
 	int			i;
 
 	if (wb_context->nr_pending == 0)
 		return;
 
-	io_start = pgstat_prepare_io_time(track_io_timing);
-
-#ifdef USE_UMBRA
-	/*
-	 * Umbra records the physical target while writing.  A later selector
-	 * change must not redirect the writeback advice to a different slot.
-	 */
-	for (i = 0; i < wb_context->nr_pending; i++)
-	{
-		PendingWriteback *pending = &wb_context->pending_writebacks[i];
-		BufferTag	tag = pending->tag;
-		SMgrRelation reln;
-
-		reln = smgropen(BufTagGetRelFileLocator(&tag), INVALID_PROC_NUMBER);
-		smgrwritebackphysical(reln, BufTagGetForkNum(&tag),
-							 pending->physical_block, 1);
-	}
-#else
 	/*
 	 * Executing the writes in-order can make them a lot faster, and allows to
 	 * merge writeback requests to consecutive blocks into larger writebacks.
 	 */
 	sort_pending_writebacks(wb_context->pending_writebacks,
 							wb_context->nr_pending);
+
+	io_start = pgstat_prepare_io_time(track_io_timing);
 
 	/*
 	 * Coalesce neighbouring writes, but nothing else. For that we iterate
@@ -8674,15 +8682,22 @@ IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
 	{
 		PendingWriteback *cur;
 		PendingWriteback *next;
-		SMgrRelation reln;
 		int			ahead;
 		BufferTag	tag;
 		RelFileLocator currlocator;
+		ForkNumber	forknum;
+		BlockNumber run_start;
+		BlockNumber last_block;
 		Size		nblocks = 1;
 
 		cur = &wb_context->pending_writebacks[i];
 		tag = cur->tag;
 		currlocator = BufTagGetRelFileLocator(&tag);
+		forknum = BufTagGetForkNum(&tag);
+		run_start = cur->physical_block;
+		last_block = run_start;
+		if (wb_context->collect_stats)
+			wb_context->unique_blocks++;
 
 		/*
 		 * Peek ahead, into following writeback requests, to see if they can
@@ -8695,28 +8710,45 @@ IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
 			/* different file, stop */
 			if (!RelFileLocatorEquals(currlocator,
 									  BufTagGetRelFileLocator(&next->tag)) ||
-				BufTagGetForkNum(&cur->tag) != BufTagGetForkNum(&next->tag))
+				forknum != BufTagGetForkNum(&next->tag))
 				break;
 
 			/* ok, block queued twice, skip */
-			if (cur->tag.blockNum == next->tag.blockNum)
+			if (last_block == next->physical_block)
 				continue;
 
-			/* only merge consecutive writes */
-			if (cur->tag.blockNum + 1 != next->tag.blockNum)
+			/* Only merge consecutive physical blocks in one segment file. */
+			if (last_block + 1 != next->physical_block ||
+				last_block / ((BlockNumber) RELSEG_SIZE) !=
+				next->physical_block / ((BlockNumber) RELSEG_SIZE))
 				break;
 
 			nblocks++;
-			cur = next;
+			last_block = next->physical_block;
+			if (wb_context->collect_stats)
+				wb_context->unique_blocks++;
 		}
 
 		i += ahead;
 
 		/* and finally tell the kernel to write the data to storage */
-		reln = smgropen(currlocator, INVALID_PROC_NUMBER);
-		smgrwriteback(reln, BufTagGetForkNum(&tag), tag.blockNum, nblocks);
+		if (!have_reln || !RelFileLocatorEquals(relnlocator, currlocator))
+		{
+			reln = smgropen(currlocator, INVALID_PROC_NUMBER);
+			relnlocator = currlocator;
+			have_reln = true;
+		}
+		smgrwritebackphysical(reln, forknum, run_start, nblocks);
+		if (wb_context->collect_stats)
+		{
+			wb_context->issued_runs++;
+			wb_context->issued_blocks += nblocks;
+			wb_context->max_run_blocks =
+				Max(wb_context->max_run_blocks, (uint64) nblocks);
+			Assert(nblocks <= WRITEBACK_MAX_PENDING_FLUSHES);
+			wb_context->run_length_counts[nblocks]++;
+		}
 	}
-#endif
 
 	/*
 	 * Assume that writeback requests are only issued for buffers containing
@@ -8726,6 +8758,52 @@ IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context)
 							IOOP_WRITEBACK, io_start, wb_context->nr_pending, 0);
 
 	wb_context->nr_pending = 0;
+}
+
+static void
+LogCheckpointPhysicalWritebackStats(WritebackContext *wb_context)
+{
+	uint64		inputs = 0;
+	uint64		p95_target;
+	uint64		p95_seen = 0;
+	int			p95_run_blocks = 0;
+	double		average_run_blocks = 0.0;
+
+	if (!log_checkpoints)
+		return;
+
+	for (int kind = 0; kind < PENDING_WB_KIND_COUNT; kind++)
+		inputs += wb_context->input_blocks[kind];
+	if (wb_context->issued_runs > 0)
+	{
+		average_run_blocks = (double) wb_context->issued_blocks /
+			(double) wb_context->issued_runs;
+		p95_target = (wb_context->issued_runs * 95 + 99) / 100;
+		for (int run_blocks = 1;
+			 run_blocks <= WRITEBACK_MAX_PENDING_FLUSHES;
+			 run_blocks++)
+		{
+			p95_seen += wb_context->run_length_counts[run_blocks];
+			if (p95_seen >= p95_target)
+			{
+				p95_run_blocks = run_blocks;
+				break;
+			}
+		}
+	}
+
+	elog(LOG, "checkpoint physical writeback: inputs=%llu regular=%llu source=%llu fallback=%llu extension=%llu unique_pblks=%llu runs=%llu run_blocks=%llu average_run=%.3f p95_run=%d max_run=%llu",
+		 (unsigned long long) inputs,
+		 (unsigned long long) wb_context->input_blocks[PENDING_WB_REGULAR],
+		 (unsigned long long) wb_context->input_blocks[PENDING_WB_CHECKPOINT_SOURCE],
+		 (unsigned long long) wb_context->input_blocks[PENDING_WB_CHECKPOINT_FALLBACK],
+		 (unsigned long long) wb_context->input_blocks[PENDING_WB_EXTENSION],
+		 (unsigned long long) wb_context->unique_blocks,
+		 (unsigned long long) wb_context->issued_runs,
+		 (unsigned long long) wb_context->issued_blocks,
+		 average_run_blocks,
+		 p95_run_blocks,
+		 (unsigned long long) wb_context->max_run_blocks);
 }
 
 /* ResourceOwner callbacks */
