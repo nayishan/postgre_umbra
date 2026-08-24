@@ -32,6 +32,7 @@
 #include "storage/aio.h"
 #include "storage/bufmgr.h"
 #include "storage/fd.h"
+#include "storage/um_defs.h"
 #include "storage/umfile.h"
 #include "storage/relfilelocator.h"
 #include "storage/sync.h"
@@ -62,8 +63,9 @@ typedef struct UmfdVec
 struct UmbraFileContext
 {
 	RelFileLocatorBackend rlocator;
-	int			num_open_segs[MAX_FORKNUM + 1];
-	UmfdVec    *seg_fds[MAX_FORKNUM + 1];
+	int			num_open_segs[UMBRA_NUM_FORKS];
+	UmfdVec    *seg_fds[UMBRA_NUM_FORKS];
+	bool		registered;
 };
 
 static MemoryContext UmFileCxt; /* context for all UmfdVec objects */
@@ -130,6 +132,8 @@ static UmfdVec *umfile_openseg(UmbraFileContext *ctx, ForkNumber forknum,
 static UmfdVec *umfile_getseg(UmbraFileContext *ctx, ForkNumber forknum,
 							  BlockNumber blkno, bool skipFsync, int behavior);
 static BlockNumber umfile_nblocks_in_seg(UmfdVec *seg);
+static RelPathStr umfile_relpath(RelFileLocatorBackend rlocator,
+							 ForkNumber forknum);
 static inline int umfile_open_flags(void);
 
 static inline int
@@ -171,7 +175,7 @@ bool
 umfile_exists(UmbraFileContext *ctx, ForkNumber forknum)
 {
 	Assert(ctx != NULL);
-	Assert(forknum >= 0 && forknum <= MAX_FORKNUM);
+	Assert(UmbraForkNumberIsValid(forknum));
 
 	/*
 	 * Reopen outside recovery so an unlinked cached descriptor is not
@@ -192,7 +196,7 @@ umfile_create(UmbraFileContext *ctx, ForkNumber forknum, bool isRedo)
 	File		fd;
 
 	Assert(ctx != NULL);
-	Assert(forknum >= 0 && forknum <= MAX_FORKNUM);
+	Assert(UmbraForkNumberIsValid(forknum));
 
 	if (isRedo && ctx->num_open_segs[forknum] > 0)
 		return;					/* created and opened already... */
@@ -204,7 +208,7 @@ umfile_create(UmbraFileContext *ctx, ForkNumber forknum, bool isRedo)
 							ctx->rlocator.locator.dbOid,
 							isRedo);
 
-	path = relpath(ctx->rlocator, forknum);
+	path = umfile_relpath(ctx->rlocator, forknum);
 
 	fd = PathNameOpenFile(path.str, umfile_open_flags() | O_CREAT | O_EXCL);
 
@@ -282,9 +286,9 @@ umfile_unlinkfork(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRed
 	int			ret;
 	int			save_errno;
 
-	Assert(forknum >= 0 && forknum <= MAX_FORKNUM);
+	Assert(UmbraForkNumberIsValid(forknum));
 
-	path = relpath(rlocator, forknum);
+	path = umfile_relpath(rlocator, forknum);
 
 	/* MAIN segment zero may be delayed as described by umfile_unlink(). */
 	if (isRedo || IsBinaryUpgrade || forknum != MAIN_FORKNUM ||
@@ -371,7 +375,7 @@ umfile_extend(UmbraFileContext *ctx, ForkNumber forknum,
 	UmfdVec    *v;
 
 	Assert(ctx != NULL);
-	Assert(forknum >= 0 && forknum <= MAX_FORKNUM);
+	Assert(UmbraForkNumberIsValid(forknum));
 
 	/* If this build supports direct I/O, the buffer must be I/O aligned. */
 	if (PG_O_DIRECT != 0 && PG_IO_ALIGN_SIZE <= BLCKSZ)
@@ -392,7 +396,7 @@ umfile_extend(UmbraFileContext *ctx, ForkNumber forknum,
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("cannot extend file \"%s\" beyond %u blocks",
-						relpath(ctx->rlocator, forknum).str,
+						umfile_relpath(ctx->rlocator, forknum).str,
 						InvalidBlockNumber)));
 
 	v = umfile_getseg(ctx, forknum, blocknum, skipFsync, EXTENSION_CREATE);
@@ -440,7 +444,7 @@ umfile_zeroextend(UmbraFileContext *ctx, ForkNumber forknum,
 	int			remblocks = nblocks;
 
 	Assert(ctx != NULL);
-	Assert(forknum >= 0 && forknum <= MAX_FORKNUM);
+	Assert(UmbraForkNumberIsValid(forknum));
 	Assert(nblocks > 0);
 
 	/* This assert is too expensive to have on normally ... */
@@ -457,7 +461,7 @@ umfile_zeroextend(UmbraFileContext *ctx, ForkNumber forknum,
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("cannot extend file \"%s\" beyond %u blocks",
-						relpath(ctx->rlocator, forknum).str,
+						umfile_relpath(ctx->rlocator, forknum).str,
 						InvalidBlockNumber)));
 
 	while (remblocks > 0)
@@ -549,13 +553,13 @@ umfile_openfork(UmbraFileContext *ctx, ForkNumber forknum, int behavior)
 	File		fd;
 
 	Assert(ctx != NULL);
-	Assert(forknum >= 0 && forknum <= MAX_FORKNUM);
+	Assert(UmbraForkNumberIsValid(forknum));
 
 	/* No work if already open */
 	if (ctx->num_open_segs[forknum] > 0)
 		return &ctx->seg_fds[forknum][0];
 
-	path = relpath(ctx->rlocator, forknum);
+	path = umfile_relpath(ctx->rlocator, forknum);
 
 	fd = PathNameOpenFile(path.str, umfile_open_flags());
 
@@ -596,7 +600,22 @@ umfile_open(RelFileLocatorBackend rlocator)
 	ctx->rlocator = rlocator;
 	memset(ctx->num_open_segs, 0, sizeof(ctx->num_open_segs));
 	memset(ctx->seg_fds, 0, sizeof(ctx->seg_fds));
+	ctx->registered = true;
 
+	return ctx;
+}
+
+/* Create an unregistered context for a cache writeback without an SMgr handle. */
+UmbraFileContext *
+umfile_open_temporary(RelFileLocatorBackend rlocator)
+{
+	UmbraFileContext *ctx;
+
+	if (UmFileContextHash == NULL)
+		umfile_init();
+
+	ctx = MemoryContextAllocZero(UmFileCxt, sizeof(UmbraFileContext));
+	ctx->rlocator = rlocator;
 	return ctx;
 }
 
@@ -607,7 +626,7 @@ umfile_close(UmbraFileContext *ctx, ForkNumber forknum)
 	int			nopensegs;
 
 	Assert(ctx != NULL);
-	Assert(forknum >= 0 && forknum <= MAX_FORKNUM);
+	Assert(UmbraForkNumberIsValid(forknum));
 
 	nopensegs = ctx->num_open_segs[forknum];
 
@@ -634,12 +653,17 @@ umfile_destroy(UmbraFileContext *ctx)
 	if (ctx == NULL)
 		return;
 
-	for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
+	for (forknum = 0; forknum <= UMBRA_METADATA_FORKNUM; forknum++)
 		umfile_close(ctx, forknum);
 
-	rlocator = ctx->rlocator;
-	if (hash_search(UmFileContextHash, &rlocator, HASH_REMOVE, NULL) == NULL)
-		elog(ERROR, "Umbra file context registry corrupted");
+	if (ctx->registered)
+	{
+		rlocator = ctx->rlocator;
+		if (hash_search(UmFileContextHash, &rlocator, HASH_REMOVE, NULL) == NULL)
+			elog(ERROR, "Umbra file context registry corrupted");
+	}
+	else
+		pfree(ctx);
 }
 
 /* Initiate asynchronous read of relation blocks. */
@@ -1053,7 +1077,7 @@ umfile_nblocks(UmbraFileContext *ctx, ForkNumber forknum)
 	BlockNumber segno;
 
 	Assert(ctx != NULL);
-	Assert(forknum >= 0 && forknum <= MAX_FORKNUM);
+	Assert(UmbraForkNumberIsValid(forknum));
 
 	umfile_openfork(ctx, forknum, EXTENSION_FAIL);
 
@@ -1096,7 +1120,7 @@ umfile_truncate(UmbraFileContext *ctx, ForkNumber forknum,
 	int			curopensegs;
 
 	Assert(ctx != NULL);
-	Assert(forknum >= 0 && forknum <= MAX_FORKNUM);
+	Assert(UmbraForkNumberIsValid(forknum));
 
 	if (nblocks > curnblk)
 	{
@@ -1105,7 +1129,7 @@ umfile_truncate(UmbraFileContext *ctx, ForkNumber forknum,
 			return;
 		ereport(ERROR,
 				(errmsg("could not truncate file \"%s\" to %u blocks: it's only %u blocks now",
-						relpath(ctx->rlocator, forknum).str,
+						umfile_relpath(ctx->rlocator, forknum).str,
 						nblocks, curnblk)));
 	}
 	if (nblocks == curnblk)
@@ -1357,6 +1381,16 @@ umfile_fdvec_resize(UmbraFileContext *ctx,
 	ctx->num_open_segs[forknum] = nseg;
 }
 
+static RelPathStr
+umfile_relpath(RelFileLocatorBackend rlocator, ForkNumber forknum)
+{
+	Assert(UmbraForkNumberIsValid(forknum));
+
+	if (forknum == UMBRA_METADATA_FORKNUM)
+		return UmMetadataRelPathBackend(rlocator);
+	return relpath(rlocator, forknum);
+}
+
 /* Return the fixed-size path for a relation segment. */
 static UmFilePathStr
 umfile_segpath(RelFileLocatorBackend rlocator, ForkNumber forknum, BlockNumber segno)
@@ -1364,7 +1398,7 @@ umfile_segpath(RelFileLocatorBackend rlocator, ForkNumber forknum, BlockNumber s
 	RelPathStr	path;
 	UmFilePathStr fullpath;
 
-	path = relpath(rlocator, forknum);
+	path = umfile_relpath(rlocator, forknum);
 
 	if (segno > 0)
 		sprintf(fullpath.str, "%s.%u", path.str, segno);

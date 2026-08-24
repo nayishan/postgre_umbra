@@ -63,6 +63,8 @@ tests += {
       't/052_checkpoint_segment_missing.pl',
       't/053_standby_login_event_trigger.pl',
       't/054_umbra_mainfork_unlink.pl',
+      't/057_umbra_unlogged_selector.pl',
+      't/060_umbra_active_slot_pool.pl',
     ],
   },
 }

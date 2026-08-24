@@ -10,5 +10,6 @@ if get_option('umbra')
   backend_sources += files(
     'umbra.c',
     'umfile.c',
+    'ummap.c',
   )
 endif

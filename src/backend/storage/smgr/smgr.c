@@ -100,6 +100,10 @@ typedef struct f_smgr
 								bool isRedo);
 	/* Called while a new relation's persistence is still known. */
 	void		(*smgr_init_new_relation) (SMgrRelation reln, bool needs_wal);
+	/* Run once after core has made every ordinary fork durable. */
+	void		(*smgr_sync_relation_metadata) (SMgrRelation reln); /* may be NULL */
+	/* Run after CheckPointBuffers() writes ordinary shared buffers. */
+	void		(*smgr_checkpoint) (void); /* may be NULL */
 	bool		(*smgr_exists) (SMgrRelation reln, ForkNumber forknum);
 	void		(*smgr_unlink) (RelFileLocatorBackend rlocator, ForkNumber forknum,
 								bool isRedo);
@@ -154,6 +158,8 @@ static const f_smgr smgrsw[] = {
 		.smgr_destroy = NULL,
 		.smgr_create = mdcreate,
 		.smgr_init_new_relation = NULL,
+		.smgr_sync_relation_metadata = NULL,
+		.smgr_checkpoint = NULL,
 		.smgr_exists = mdexists,
 		.smgr_unlink = mdunlink,
 		.smgr_extend = mdextend,
@@ -183,6 +189,8 @@ static const f_smgr smgrsw[] = {
 		.smgr_destroy = umdestroy,
 		.smgr_create = umcreate,
 		.smgr_init_new_relation = uminitnewrelation,
+		.smgr_sync_relation_metadata = umsyncrelationmetadata,
+		.smgr_checkpoint = umcheckpoint,
 		.smgr_exists = umexists,
 		.smgr_unlink = umunlink,
 		.smgr_extend = umextend,
@@ -197,9 +205,11 @@ static const f_smgr smgrsw[] = {
 		.smgr_truncate = umtruncate,
 		.smgr_immedsync = umimmedsync,
 		.smgr_registersync = umregistersync,
-		.smgr_flush_database_tablespace_cache = NULL,
-		.smgr_invalidate_database_cache = NULL,
-		.smgr_invalidate_database_tablespace_cache = NULL,
+		.smgr_flush_database_tablespace_cache =
+			umflushdatabasetablespacecache,
+		.smgr_invalidate_database_cache = uminvalidatedatabasecache,
+		.smgr_invalidate_database_tablespace_cache =
+			uminvalidatedatabasetablespacecache,
 		.smgr_fd = umfd,
 	},
 #endif
@@ -551,14 +561,35 @@ smgrinitnewrelation(SMgrRelation reln, bool needs_wal)
 		smgrsw[reln->smgr_which].smgr_init_new_relation(reln, needs_wal);
 }
 
+/* Complete one selected-smgr metadata phase after ordinary fork durability. */
+void
+smgrsyncrelationmetadata(SMgrRelation reln)
+{
+	if (smgrsw[reln->smgr_which].smgr_sync_relation_metadata != NULL)
+		smgrsw[reln->smgr_which].smgr_sync_relation_metadata(reln);
+}
+
+/* Run selected-smgr checkpoint work after ordinary buffer writeback. */
+void
+smgrcheckpoint(void)
+{
+	if (smgrsw[SMGR_DEFAULT].smgr_checkpoint != NULL)
+		smgrsw[SMGR_DEFAULT].smgr_checkpoint();
+}
+
 /*
  * smgrdosyncall() -- Immediately sync all forks of all given relations
  *
  * All forks of all given relations are synced out to the store.
  *
  * This is equivalent to FlushRelationBuffers() for each smgr relation,
- * then calling smgrimmedsync() for all forks of each relation, but it's
- * significantly quicker so should be preferred when possible.
+ * then calling smgrimmedsync() for every ordinary fork and completing one
+ * selected-smgr metadata phase per relation, but it's significantly quicker
+ * so should be preferred when possible.
+ *
+ * A private selector page can make a different physical slot visible for an
+ * ordinary page.  The order is therefore ordinary buffer writeback, ordinary
+ * fork synchronization, then private metadata synchronization.
  */
 void
 smgrdosyncall(SMgrRelation *rels, int nrels)
@@ -585,6 +616,8 @@ smgrdosyncall(SMgrRelation *rels, int nrels)
 			if (smgrsw[which].smgr_exists(rels[i], forknum))
 				smgrsw[which].smgr_immedsync(rels[i], forknum);
 		}
+
+		smgrsyncrelationmetadata(rels[i]);
 	}
 
 	RESUME_INTERRUPTS();

@@ -20,8 +20,11 @@
 #include <limits.h>
 
 #include "storage/aio.h"
+#include "storage/map.h"
 #include "storage/smgr.h"
+#include "storage/um_defs.h"
 #include "storage/umfile.h"
+#include "storage/ummap.h"
 #include "storage/umbra.h"
 #include "utils/memutils.h"
 
@@ -39,8 +42,8 @@ typedef struct UmbraSmgrRelationState
 
 static UmbraFileContext *um_get_filectx(SMgrRelation reln);
 static bool um_uses_three_buckets(SMgrRelation reln, ForkNumber forknum);
-static BlockNumber um_slot_zero_pblk(SMgrRelation reln, ForkNumber forknum,
-								 BlockNumber logical_block);
+static BlockNumber um_active_pblk(SMgrRelation reln, ForkNumber forknum,
+							 BlockNumber logical_block);
 static BlockNumber um_three_bucket_nblocks(SMgrRelation reln,
 									ForkNumber forknum);
 static void um_ensure_three_bucket_capacity(SMgrRelation reln,
@@ -87,7 +90,12 @@ umclose(SMgrRelation reln, ForkNumber forknum)
 	UmbraSmgrRelationState *state = reln->smgr_private;
 
 	if (state != NULL && state->filectx != NULL)
+	{
 		umfile_close(state->filectx, forknum);
+		if (forknum == MAIN_FORKNUM &&
+			um_uses_three_buckets(reln, forknum))
+			umfile_close(state->filectx, UMBRA_METADATA_FORKNUM);
+	}
 }
 
 void
@@ -136,6 +144,11 @@ umexists(SMgrRelation reln, ForkNumber forknum)
 void
 umunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 {
+	if (forknum == MAIN_FORKNUM || forknum == InvalidForkNumber)
+	{
+		MapInvalidateRelation(rlocator);
+		umfile_unlink(rlocator, UMBRA_METADATA_FORKNUM, isRedo);
+	}
 	umfile_unlink(rlocator, forknum, isRedo);
 }
 
@@ -166,7 +179,7 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 				 errmsg("Umbra three-bucket capacity overflow")));
 	um_ensure_three_bucket_capacity(reln, forknum, physical_capacity,
 								skipFsync);
-	physical_block = um_slot_zero_pblk(reln, forknum, blocknum);
+	physical_block = um_active_pblk(reln, forknum, blocknum);
 	umfile_writev(um_get_filectx(reln), forknum, physical_block, buffers, 1,
 				  skipFsync);
 }
@@ -225,7 +238,7 @@ umreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		for (BlockNumber i = 0; i < nblocks; i++)
 		{
 			BlockNumber	physical_block =
-				um_slot_zero_pblk(reln, forknum, blocknum + i);
+				um_active_pblk(reln, forknum, blocknum + i);
 
 			umfile_readv(um_get_filectx(reln), forknum, physical_block,
 						 buffers + i, 1);
@@ -244,7 +257,7 @@ umstartreadv(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknum,
 	if (um_uses_three_buckets(reln, forknum))
 	{
 		Assert(nblocks == 1);
-		physical_block = um_slot_zero_pblk(reln, forknum, blocknum);
+		physical_block = um_active_pblk(reln, forknum, blocknum);
 	}
 	pgaio_io_set_target_smgr(ioh, reln, forknum, blocknum, nblocks, false);
 	pgaio_io_register_callbacks(ioh, PGAIO_HCB_MD_READV, 0);
@@ -261,7 +274,7 @@ umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		for (BlockNumber i = 0; i < nblocks; i++)
 		{
 			BlockNumber	physical_block =
-				um_slot_zero_pblk(reln, forknum, blocknum + i);
+				um_active_pblk(reln, forknum, blocknum + i);
 
 			umfile_writev(um_get_filectx(reln), forknum, physical_block,
 						  buffers + i, 1, skipFsync);
@@ -280,7 +293,7 @@ umwriteback(SMgrRelation reln, ForkNumber forknum,
 	{
 		for (BlockNumber i = 0; i < nblocks; i++)
 			umfile_writeback(um_get_filectx(reln), forknum,
-						 um_slot_zero_pblk(reln, forknum, blocknum + i), 1);
+						 um_active_pblk(reln, forknum, blocknum + i), 1);
 		return;
 	}
 	umfile_writeback(um_get_filectx(reln), forknum, blocknum, nblocks);
@@ -322,16 +335,48 @@ umimmedsync(SMgrRelation reln, ForkNumber forknum)
 }
 
 void
+umsyncrelationmetadata(SMgrRelation reln)
+{
+	if (um_uses_three_buckets(reln, MAIN_FORKNUM))
+		ummap_sync_relation_metadata(um_get_filectx(reln),
+									 reln->smgr_rlocator);
+}
+
+void
+umcheckpoint(void)
+{
+	ummap_checkpoint();
+}
+
+void
 umregistersync(SMgrRelation reln, ForkNumber forknum)
 {
 	umfile_registersync(um_get_filectx(reln), forknum);
+}
+
+void
+umflushdatabasetablespacecache(Oid dbid, Oid spcOid)
+{
+	MapFlushDatabaseTablespace(dbid, spcOid);
+}
+
+void
+uminvalidatedatabasecache(Oid dbid)
+{
+	MapInvalidateDatabase(dbid);
+}
+
+void
+uminvalidatedatabasetablespacecache(Oid dbid, Oid spcOid)
+{
+	MapInvalidateDatabaseTablespace(dbid, spcOid);
 }
 
 int
 umfd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint32 *off)
 {
 	if (um_uses_three_buckets(reln, forknum))
-		blocknum = um_slot_zero_pblk(reln, forknum, blocknum);
+		blocknum = um_active_pblk(reln, forknum, blocknum);
 	return umfile_fd(um_get_filectx(reln), forknum, blocknum, off);
 }
 
@@ -348,12 +393,17 @@ um_uses_three_buckets(SMgrRelation reln, ForkNumber forknum)
 }
 
 static BlockNumber
-um_slot_zero_pblk(SMgrRelation reln, ForkNumber forknum,
-				  BlockNumber logical_block)
+um_active_pblk(SMgrRelation reln, ForkNumber forknum,
+				   BlockNumber logical_block)
 {
 	BlockNumber	physical_block;
+	uint8		active_slot = 0;
 
-	if (!UmbraSlotZeroPhysicalBlock(logical_block, &physical_block))
+	if (um_uses_three_buckets(reln, forknum))
+		active_slot = MapGetActiveSlot(um_get_filectx(reln),
+								   reln->smgr_rlocator, logical_block);
+	if (!UmbraActiveSlotPhysicalBlock(logical_block, active_slot,
+								  &physical_block))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("Umbra three-bucket block mapping overflow for fork %d",

@@ -25,15 +25,30 @@
 #define UMBRA_ACTIVE_SLOT_COUNT 3U
 
 static inline bool
-UmbraSlotZeroPhysicalBlock(BlockNumber logical_block,
-						   BlockNumber *physical_block)
+UmbraActiveSlotIsValid(uint8 active_slot)
 {
-	uint64		physical = (uint64) logical_block * UMBRA_ACTIVE_SLOT_COUNT;
+	return active_slot < UMBRA_ACTIVE_SLOT_COUNT;
+}
 
+static inline bool
+UmbraActiveSlotPhysicalBlock(BlockNumber logical_block, uint8 active_slot,
+							 BlockNumber *physical_block)
+{
+	uint64		physical;
+
+	Assert(UmbraActiveSlotIsValid(active_slot));
+	physical = (uint64) logical_block * UMBRA_ACTIVE_SLOT_COUNT + active_slot;
 	if (physical >= (uint64) InvalidBlockNumber)
 		return false;
 	*physical_block = (BlockNumber) physical;
 	return true;
+}
+
+static inline bool
+UmbraSlotZeroPhysicalBlock(BlockNumber logical_block,
+						   BlockNumber *physical_block)
+{
+	return UmbraActiveSlotPhysicalBlock(logical_block, 0, physical_block);
 }
 
 static inline bool
@@ -61,6 +76,10 @@ extern void umclose(SMgrRelation reln, ForkNumber forknum);
 extern void umdestroy(SMgrRelation reln);
 extern void umcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
 extern void uminitnewrelation(SMgrRelation reln, bool needs_wal);
+/* Synchronize selector MAP pages after ordinary relation forks are durable. */
+extern void umsyncrelationmetadata(SMgrRelation reln);
+/* Flush checkpoint selector MAP pages after ordinary shared buffers. */
+extern void umcheckpoint(void);
 extern bool umexists(SMgrRelation reln, ForkNumber forknum);
 extern void umunlink(RelFileLocatorBackend rlocator, ForkNumber forknum,
 					 bool isRedo);
@@ -88,6 +107,9 @@ extern void umtruncate(SMgrRelation reln, ForkNumber forknum,
 					   BlockNumber old_blocks, BlockNumber nblocks);
 extern void umimmedsync(SMgrRelation reln, ForkNumber forknum);
 extern void umregistersync(SMgrRelation reln, ForkNumber forknum);
+extern void umflushdatabasetablespacecache(Oid dbid, Oid spcOid);
+extern void uminvalidatedatabasecache(Oid dbid);
+extern void uminvalidatedatabasetablespacecache(Oid dbid, Oid spcOid);
 extern int	umfd(SMgrRelation reln, ForkNumber forknum,
 				 BlockNumber blocknum, uint32 *off);
 

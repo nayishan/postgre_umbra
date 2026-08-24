@@ -23,6 +23,8 @@ typedef struct UmbraFileContext UmbraFileContext;
 
 extern void umfile_init(void);
 extern UmbraFileContext *umfile_open(RelFileLocatorBackend rlocator);
+/* A backend-local, unregistered context for selector-cache writeback. */
+extern UmbraFileContext *umfile_open_temporary(RelFileLocatorBackend rlocator);
 extern void umfile_close(UmbraFileContext *ctx, ForkNumber forknum);
 extern void umfile_destroy(UmbraFileContext *ctx);
 

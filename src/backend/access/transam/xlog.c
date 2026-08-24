@@ -8062,6 +8062,8 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 	CheckPointMultiXact();
 	CheckPointPredicate();
 	CheckPointBuffers(flags);
+	/* Selector pages become durable only after ordinary data buffers. */
+	smgrcheckpoint();
 
 	/* Perform all queued up fsyncs */
 	TRACE_POSTGRESQL_BUFFER_CHECKPOINT_SYNC_START();
