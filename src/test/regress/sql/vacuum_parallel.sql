@@ -1,3 +1,11 @@
+\getenv libdir PG_LIBDIR
+\getenv dlsuffix PG_DLSUFFIX
+\set regresslib :libdir '/regress' :dlsuffix
+CREATE FUNCTION test_umbra_vacuum_build()
+RETURNS boolean
+AS :'regresslib', 'test_umbra_build'
+LANGUAGE C IMMUTABLE;
+
 SET max_parallel_maintenance_workers TO 4;
 SET min_parallel_index_scan_size TO '128kB';
 
@@ -18,18 +26,23 @@ CREATE INDEX vacuum_in_leader_small_index ON parallel_vacuum_table((1));
 -- Verify (as best we can) that the cost model for parallel VACUUM
 -- will make our VACUUM run in parallel, while always leaving it up to the
 -- parallel leader to handle the vacuum_in_leader_small_index index:
+-- pg_relation_size() reports physical fork bytes.  Umbra uses three slots per
+-- permanent logical MAIN-fork page, but parallel VACUUM uses logical nblocks;
+-- normalize only the Umbra test value to check the same threshold.
 SELECT EXISTS (
 SELECT 1
 FROM pg_class
 WHERE oid = 'vacuum_in_leader_small_index'::regclass AND
   pg_relation_size(oid) <
-  pg_size_bytes(current_setting('min_parallel_index_scan_size'))
+  pg_size_bytes(current_setting('min_parallel_index_scan_size')) *
+  CASE WHEN test_umbra_vacuum_build() THEN 3 ELSE 1 END
 ) as leader_will_handle_small_index;
 SELECT count(*) as trigger_parallel_vacuum_nindexes
 FROM pg_class
 WHERE oid in ('regular_sized_index'::regclass, 'typically_sized_index'::regclass) AND
   pg_relation_size(oid) >=
-  pg_size_bytes(current_setting('min_parallel_index_scan_size'));
+  pg_size_bytes(current_setting('min_parallel_index_scan_size')) *
+  CASE WHEN test_umbra_vacuum_build() THEN 3 ELSE 1 END;
 
 -- Parallel VACUUM with B-Tree page deletions, ambulkdelete calls:
 DELETE FROM parallel_vacuum_table;
@@ -44,3 +57,4 @@ RESET min_parallel_index_scan_size;
 
 -- Deliberately don't drop table, to get further coverage from tools like
 -- pg_amcheck in some testing scenarios
+DROP FUNCTION test_umbra_vacuum_build();

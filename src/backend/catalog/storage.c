@@ -148,6 +148,8 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 	}
 
 	srel = smgropen(rlocator, procNumber);
+	/* Decide the selected smgr's physical layout before creating MAIN. */
+	smgrinitnewrelation(srel, needs_wal);
 	smgrcreate(srel, MAIN_FORKNUM, false);
 
 	if (needs_wal)

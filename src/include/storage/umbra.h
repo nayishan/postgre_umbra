@@ -21,11 +21,46 @@
 #include "storage/relfilelocator.h"
 #include "storage/smgr.h"
 
+/* Every logical page owns three physical slots. */
+#define UMBRA_ACTIVE_SLOT_COUNT 3U
+
+static inline bool
+UmbraSlotZeroPhysicalBlock(BlockNumber logical_block,
+						   BlockNumber *physical_block)
+{
+	uint64		physical = (uint64) logical_block * UMBRA_ACTIVE_SLOT_COUNT;
+
+	if (physical >= (uint64) InvalidBlockNumber)
+		return false;
+	*physical_block = (BlockNumber) physical;
+	return true;
+}
+
+static inline bool
+UmbraThreeBucketPhysicalCapacity(BlockNumber logical_eof,
+							 BlockNumber *physical_capacity)
+{
+	uint64		capacity = (uint64) logical_eof * UMBRA_ACTIVE_SLOT_COUNT;
+
+	if (capacity >= (uint64) InvalidBlockNumber)
+		return false;
+	*physical_capacity = (BlockNumber) capacity;
+	return true;
+}
+
+/* Relation state decides whether this eligible fork uses three buckets. */
+static inline bool
+UmbraForkUsesThreeBuckets(ForkNumber forknum)
+{
+	return forknum == MAIN_FORKNUM;
+}
+
 extern void uminit(void);
 extern void umopen(SMgrRelation reln);
 extern void umclose(SMgrRelation reln, ForkNumber forknum);
 extern void umdestroy(SMgrRelation reln);
 extern void umcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
+extern void uminitnewrelation(SMgrRelation reln, bool needs_wal);
 extern bool umexists(SMgrRelation reln, ForkNumber forknum);
 extern void umunlink(RelFileLocatorBackend rlocator, ForkNumber forknum,
 					 bool isRedo);

@@ -93,6 +93,18 @@ PG_MODULE_MAGIC_EXT(
 					.version = PG_VERSION
 );
 
+/* Report the storage-manager mode to regression SQL without a test GUC. */
+PG_FUNCTION_INFO_V1(test_umbra_build);
+
+Datum
+test_umbra_build(PG_FUNCTION_ARGS)
+{
+#ifdef USE_UMBRA
+	PG_RETURN_BOOL(true);
+#else
+	PG_RETURN_BOOL(false);
+#endif
+}
 
 /* return the point where two paths intersect, or NULL if no intersection. */
 PG_FUNCTION_INFO_V1(interpt_pp);

@@ -40,6 +40,14 @@ drop table inserttest;
 --
 -- tuple larger than fillfactor
 --
+\getenv libdir PG_LIBDIR
+\getenv dlsuffix PG_DLSUFFIX
+\set regresslib :libdir '/regress' :dlsuffix
+CREATE FUNCTION test_umbra_insert_build()
+RETURNS boolean
+AS :'regresslib', 'test_umbra_build'
+LANGUAGE C IMMUTABLE;
+
 CREATE TABLE large_tuple_test (a int, b text) WITH (fillfactor = 10);
 ALTER TABLE large_tuple_test ALTER COLUMN b SET STORAGE plain;
 
@@ -48,7 +56,12 @@ INSERT INTO large_tuple_test (select 1, NULL);
 
 -- should still fit on the page
 INSERT INTO large_tuple_test (select 2, repeat('a', 1000));
-SELECT pg_size_pretty(pg_relation_size('large_tuple_test'::regclass, 'main'));
+-- pg_relation_size() reports physical fork bytes.  Umbra reserves three
+-- physical slots for each permanent logical MAIN-fork page.
+SELECT pg_relation_size('large_tuple_test'::regclass, 'main') =
+       current_setting('block_size')::int *
+       CASE WHEN test_umbra_insert_build() THEN 3 ELSE 1 END
+       AS physical_size_matches_layout;
 
 -- add small record to the second page
 INSERT INTO large_tuple_test (select 3, NULL);
@@ -58,6 +71,15 @@ INSERT INTO large_tuple_test (select 3, NULL);
 INSERT INTO large_tuple_test (select 4, repeat('a', 8126));
 
 DROP TABLE large_tuple_test;
+
+-- Unlogged relations do not participate in the three-bucket layout.
+CREATE UNLOGGED TABLE unlogged_layout_test (id integer);
+INSERT INTO unlogged_layout_test VALUES (1);
+SELECT pg_relation_size('unlogged_layout_test'::regclass, 'main') =
+       current_setting('block_size')::int AS unlogged_uses_direct_layout;
+DROP TABLE unlogged_layout_test;
+
+DROP FUNCTION test_umbra_insert_build();
 
 --
 -- check indirection (field/array assignment), cf bug #14265
