@@ -64,6 +64,9 @@
 #include "storage/read_stream.h"
 #include "storage/smgr.h"
 #include "storage/standby.h"
+#ifdef USE_UMBRA
+#include "storage/umbra.h"
+#endif
 #include "utils/memdebug.h"
 #include "utils/ps_status.h"
 #include "utils/rel.h"
@@ -638,6 +641,13 @@ static int	SyncOneBuffer(int buf_id, bool skip_recently_used,
 						  WritebackContext *wb_context);
 static void WaitIO(BufferDesc *buf);
 static void AbortBufferIO(Buffer buffer);
+static void TerminateBufferIOWithActiveSlot(BufferDesc *buf,
+									 bool clear_dirty, uint64 set_flag_bits,
+									 bool forget_owner, bool release_aio,
+									 uint8 active_slot);
+#ifdef USE_UMBRA
+static void InvalidateUmbraBufferActiveSlot(BufferDesc *buf);
+#endif
 static void shared_buffer_write_error_callback(void *arg);
 static void local_buffer_write_error_callback(void *arg);
 static inline BufferDesc *BufferAlloc(SMgrRelation smgr,
@@ -1134,12 +1144,18 @@ ExtendBufferedRelTo(BufferManagerRelation bmr,
  * pinned.  If the buffer is not already valid, it is zeroed and made valid.
  */
 static void
-ZeroAndLockBuffer(Buffer buffer, ReadBufferMode mode, bool already_valid)
+ZeroAndLockBuffer(Buffer buffer, ReadBufferMode mode, bool already_valid,
+				  SMgrRelation smgr)
 {
 	BufferDesc *bufHdr;
 	bool		need_to_zero;
 	bool		isLocalBuf = BufferIsLocal(buffer);
 	StartBufferIOResult sbres;
+	uint8		active_slot = UINT8_MAX;
+
+#ifndef USE_UMBRA
+	(void) smgr;
+#endif
 
 	Assert(mode == RBM_ZERO_AND_LOCK || mode == RBM_ZERO_AND_CLEANUP_LOCK);
 
@@ -1179,6 +1195,11 @@ ZeroAndLockBuffer(Buffer buffer, ReadBufferMode mode, bool already_valid)
 
 	if (need_to_zero)
 	{
+#ifdef USE_UMBRA
+		if (!isLocalBuf)
+			(void) UmGetActiveSlot(smgr, BufTagGetForkNum(&bufHdr->tag),
+								   bufHdr->tag.blockNum, &active_slot);
+#endif
 		memset(BufferGetPage(buffer), 0, BLCKSZ);
 
 		/*
@@ -1199,7 +1220,8 @@ ZeroAndLockBuffer(Buffer buffer, ReadBufferMode mode, bool already_valid)
 		if (isLocalBuf)
 			TerminateLocalBufferIO(bufHdr, false, BM_VALID, false);
 		else
-			TerminateBufferIO(bufHdr, false, BM_VALID, true, false);
+			TerminateBufferIOWithActiveSlot(bufHdr, false, BM_VALID, true,
+									false, active_slot);
 	}
 	else if (!isLocalBuf)
 	{
@@ -1341,7 +1363,7 @@ ReadBuffer_common(Relation rel, SMgrRelation smgr, char smgr_persistence,
 		buffer = PinBufferForBlock(rel, smgr, persistence,
 								   forkNum, blockNum, strategy,
 								   io_object, io_context, &found);
-		ZeroAndLockBuffer(buffer, mode, found);
+		ZeroAndLockBuffer(buffer, mode, found, smgr);
 		return buffer;
 	}
 
@@ -2325,6 +2347,9 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	Assert(BUF_STATE_GET_REFCOUNT(victim_buf_state) == 1);
 	Assert(!(victim_buf_state & (BM_TAG_VALID | BM_VALID | BM_DIRTY | BM_IO_IN_PROGRESS)));
 
+#ifdef USE_UMBRA
+	InvalidateUmbraBufferActiveSlot(victim_buf_hdr);
+#endif
 	victim_buf_hdr->tag = newTag;
 
 	/*
@@ -2439,6 +2464,9 @@ retry:
 	 * linear scans of the buffer array don't think the buffer is valid.
 	 */
 	oldFlags = buf_state & BUF_FLAG_MASK;
+#ifdef USE_UMBRA
+	InvalidateUmbraBufferActiveSlot(buf);
+#endif
 	ClearBufferTag(&buf->tag);
 
 	UnlockBufHdrExt(buf, buf_state,
@@ -2523,6 +2551,9 @@ InvalidateVictimBuffer(BufferDesc *buf_hdr)
 	 * cheaper pre-check for several linear scans of shared buffers use the
 	 * tag (see e.g. FlushDatabaseBuffers()).
 	 */
+#ifdef USE_UMBRA
+	InvalidateUmbraBufferActiveSlot(buf_hdr);
+#endif
 	ClearBufferTag(&buf_hdr->tag);
 	UnlockBufHdrExt(buf_hdr, buf_state,
 					0,
@@ -2986,6 +3017,9 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 			Assert(!(buf_state & (BM_VALID | BM_TAG_VALID | BM_DIRTY)));
 			Assert(BUF_STATE_GET_REFCOUNT(buf_state) == 1);
 
+#ifdef USE_UMBRA
+			InvalidateUmbraBufferActiveSlot(victim_buf_hdr);
+#endif
 			victim_buf_hdr->tag = tag;
 
 			set_bits |= BM_TAG_VALID | BUF_USAGECOUNT_ONE;
@@ -3036,6 +3070,12 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 		Buffer		buf = buffers[i];
 		BufferDesc *buf_hdr = GetBufferDescriptor(buf - 1);
 		bool		lock = false;
+		uint8		active_slot = UINT8_MAX;
+
+#ifdef USE_UMBRA
+		(void) UmGetActiveSlot(BMR_GET_SMGR(bmr), fork, first_block + i,
+							   &active_slot);
+#endif
 
 		if (flags & EB_LOCK_FIRST && i == 0)
 			lock = true;
@@ -3049,7 +3089,8 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 		if (lock)
 			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 
-		TerminateBufferIO(buf_hdr, false, BM_VALID, true, false);
+		TerminateBufferIOWithActiveSlot(buf_hdr, false, BM_VALID, true, false,
+									active_slot);
 	}
 
 	pgBufferUsage.shared_blks_written += extend_by;
@@ -7363,9 +7404,10 @@ StartBufferIO(Buffer buffer, bool forInput, bool wait, PgAioWaitRef *io_wref)
  * resource owner. (forget_owner=false is used when the resource owner itself
  * is being released)
  */
-void
-TerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint64 set_flag_bits,
-				  bool forget_owner, bool release_aio)
+static void
+TerminateBufferIOWithActiveSlot(BufferDesc *buf, bool clear_dirty,
+								uint64 set_flag_bits, bool forget_owner,
+								bool release_aio, uint8 active_slot)
 {
 	uint64		buf_state;
 	uint64		unset_flag_bits = 0;
@@ -7374,6 +7416,15 @@ TerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint64 set_flag_bits,
 	buf_state = LockBufHdr(buf);
 
 	Assert(buf_state & BM_IO_IN_PROGRESS);
+#ifdef USE_UMBRA
+	if (UmbraActiveSlotIsValid(active_slot))
+	{
+		Assert(set_flag_bits & BM_VALID);
+		UmbraBufferActiveSlots[buf->buf_id] = active_slot;
+	}
+#else
+	Assert(active_slot == UINT8_MAX);
+#endif
 	unset_flag_bits |= BM_IO_IN_PROGRESS;
 
 	/* Clear earlier errors, if this IO failed, it'll be marked again */
@@ -7411,6 +7462,64 @@ TerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint64 set_flag_bits,
 	if (release_aio && (buf_state & BM_PIN_COUNT_WAITER))
 		WakePinCountWaiter(buf);
 }
+
+void
+TerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint64 set_flag_bits,
+				  bool forget_owner, bool release_aio)
+{
+	TerminateBufferIOWithActiveSlot(buf, clear_dirty, set_flag_bits,
+									forget_owner, release_aio, UINT8_MAX);
+}
+
+#ifdef USE_UMBRA
+bool
+BufferGetUmbraActiveSlot(Buffer buffer, uint8 *active_slot)
+{
+	BufferDesc *buf;
+	uint64		buf_state;
+	uint8		slot;
+
+	if (active_slot != NULL)
+		*active_slot = UMBRA_ACTIVE_SLOT_INVALID;
+	if (!BufferIsValid(buffer) || BufferIsLocal(buffer) || active_slot == NULL)
+		return false;
+	Assert(BufferIsPinned(buffer));
+
+	buf = GetBufferDescriptor(buffer - 1);
+	buf_state = LockBufHdr(buf);
+	slot = UmbraBufferActiveSlots[buf->buf_id];
+	UnlockBufHdr(buf);
+	if ((buf_state & BM_VALID) == 0 || !UmbraActiveSlotIsValid(slot))
+		return false;
+	*active_slot = slot;
+	return true;
+}
+
+void
+BufferRememberUmbraActiveSlot(Buffer buffer, uint8 active_slot)
+{
+	BufferDesc *buf;
+	uint64		buf_state;
+
+	if (!BufferIsValid(buffer) || BufferIsLocal(buffer) ||
+		!UmbraActiveSlotIsValid(active_slot))
+		return;
+	Assert(BufferIsPinned(buffer));
+
+	buf = GetBufferDescriptor(buffer - 1);
+	buf_state = LockBufHdr(buf);
+	Assert(buf_state & BM_VALID);
+	UmbraBufferActiveSlots[buf->buf_id] = active_slot;
+	UnlockBufHdr(buf);
+}
+
+static void
+InvalidateUmbraBufferActiveSlot(BufferDesc *buf)
+{
+	Assert(pg_atomic_read_u64(&buf->state) & BM_LOCKED);
+	UmbraBufferActiveSlots[buf->buf_id] = UMBRA_ACTIVE_SLOT_INVALID;
+}
+#endif
 
 /*
  * AbortBufferIO: Clean up active buffer I/O after an error.
@@ -8545,6 +8654,7 @@ buffer_readv_complete_one(PgAioTargetData *td, uint8 buf_off, Buffer buffer,
 	char	   *bufdata = BufferGetBlock(buffer);
 	uint64		set_flag_bits;
 	int			piv_flags;
+	uint8		active_slot = UINT8_MAX;
 
 	/* check that the buffer is in the expected state for a read */
 #ifdef USE_ASSERT_CHECKING
@@ -8654,10 +8764,16 @@ buffer_readv_complete_one(PgAioTargetData *td, uint8 buf_off, Buffer buffer,
 
 	/* Terminate I/O and set BM_VALID. */
 	set_flag_bits = failed ? BM_IO_ERROR : BM_VALID;
+#ifdef USE_UMBRA
+	if (!failed && !is_temp && td->smgr.nblocks == 1 &&
+		UmbraActiveSlotIsValid(td->smgr.umbraActiveSlot))
+		active_slot = td->smgr.umbraActiveSlot;
+#endif
 	if (is_temp)
 		TerminateLocalBufferIO(buf_hdr, false, set_flag_bits, true);
 	else
-		TerminateBufferIO(buf_hdr, false, set_flag_bits, false, true);
+		TerminateBufferIOWithActiveSlot(buf_hdr, false, set_flag_bits, false,
+									true, active_slot);
 
 	/*
 	 * Call the BUFFER_READ_DONE tracepoint in the callback, even though the

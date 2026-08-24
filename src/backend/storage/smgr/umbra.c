@@ -43,7 +43,7 @@ typedef struct UmbraSmgrRelationState
 static UmbraFileContext *um_get_filectx(SMgrRelation reln);
 static bool um_uses_three_buckets(SMgrRelation reln, ForkNumber forknum);
 static BlockNumber um_active_pblk(SMgrRelation reln, ForkNumber forknum,
-							 BlockNumber logical_block);
+							 BlockNumber logical_block, uint8 *active_slot);
 static BlockNumber um_three_bucket_nblocks(SMgrRelation reln,
 									ForkNumber forknum);
 static void um_ensure_three_bucket_capacity(SMgrRelation reln,
@@ -179,7 +179,7 @@ umextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 				 errmsg("Umbra three-bucket capacity overflow")));
 	um_ensure_three_bucket_capacity(reln, forknum, physical_capacity,
 								skipFsync);
-	physical_block = um_active_pblk(reln, forknum, blocknum);
+	physical_block = um_active_pblk(reln, forknum, blocknum, NULL);
 	umfile_writev(um_get_filectx(reln), forknum, physical_block, buffers, 1,
 				  skipFsync);
 }
@@ -238,7 +238,7 @@ umreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		for (BlockNumber i = 0; i < nblocks; i++)
 		{
 			BlockNumber	physical_block =
-				um_active_pblk(reln, forknum, blocknum + i);
+				um_active_pblk(reln, forknum, blocknum + i, NULL);
 
 			umfile_readv(um_get_filectx(reln), forknum, physical_block,
 						 buffers + i, 1);
@@ -253,13 +253,15 @@ umstartreadv(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknum,
 			 BlockNumber blocknum, void **buffers, BlockNumber nblocks)
 {
 	BlockNumber	physical_block = blocknum;
+	uint8		active_slot = UMBRA_ACTIVE_SLOT_INVALID;
 
 	if (um_uses_three_buckets(reln, forknum))
 	{
 		Assert(nblocks == 1);
-		physical_block = um_active_pblk(reln, forknum, blocknum);
+		physical_block = um_active_pblk(reln, forknum, blocknum, &active_slot);
 	}
 	pgaio_io_set_target_smgr(ioh, reln, forknum, blocknum, nblocks, false);
+	pgaio_io_get_target_data(ioh)->smgr.umbraActiveSlot = active_slot;
 	pgaio_io_register_callbacks(ioh, PGAIO_HCB_MD_READV, 0);
 	umfile_startreadv(ioh, um_get_filectx(reln), forknum, physical_block, buffers,
 					  nblocks);
@@ -274,7 +276,7 @@ umwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		for (BlockNumber i = 0; i < nblocks; i++)
 		{
 			BlockNumber	physical_block =
-				um_active_pblk(reln, forknum, blocknum + i);
+				um_active_pblk(reln, forknum, blocknum + i, NULL);
 
 			umfile_writev(um_get_filectx(reln), forknum, physical_block,
 						  buffers + i, 1, skipFsync);
@@ -293,7 +295,7 @@ umwriteback(SMgrRelation reln, ForkNumber forknum,
 	{
 		for (BlockNumber i = 0; i < nblocks; i++)
 			umfile_writeback(um_get_filectx(reln), forknum,
-						 um_active_pblk(reln, forknum, blocknum + i), 1);
+						 um_active_pblk(reln, forknum, blocknum + i, NULL), 1);
 		return;
 	}
 	umfile_writeback(um_get_filectx(reln), forknum, blocknum, nblocks);
@@ -376,7 +378,7 @@ int
 umfd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint32 *off)
 {
 	if (um_uses_three_buckets(reln, forknum))
-		blocknum = um_active_pblk(reln, forknum, blocknum);
+		blocknum = um_active_pblk(reln, forknum, blocknum, NULL);
 	return umfile_fd(um_get_filectx(reln), forknum, blocknum, off);
 }
 
@@ -394,21 +396,42 @@ um_uses_three_buckets(SMgrRelation reln, ForkNumber forknum)
 
 static BlockNumber
 um_active_pblk(SMgrRelation reln, ForkNumber forknum,
-				   BlockNumber logical_block)
+				   BlockNumber logical_block, uint8 *active_slot)
 {
 	BlockNumber	physical_block;
-	uint8		active_slot = 0;
+	uint8		slot = 0;
 
+	if (active_slot != NULL)
+		*active_slot = UMBRA_ACTIVE_SLOT_INVALID;
 	if (um_uses_three_buckets(reln, forknum))
-		active_slot = MapGetActiveSlot(um_get_filectx(reln),
-								   reln->smgr_rlocator, logical_block);
-	if (!UmbraActiveSlotPhysicalBlock(logical_block, active_slot,
+	{
+		if (!UmGetActiveSlot(reln, forknum, logical_block, &slot))
+			elog(ERROR, "could not resolve Umbra active slot");
+		if (active_slot != NULL)
+			*active_slot = slot;
+	}
+	if (!UmbraActiveSlotPhysicalBlock(logical_block, slot,
 								  &physical_block))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("Umbra three-bucket block mapping overflow for fork %d",
 						(int) forknum)));
 	return physical_block;
+}
+
+bool
+UmGetActiveSlot(SMgrRelation reln, ForkNumber forknum,
+				BlockNumber logical_block, uint8 *active_slot)
+{
+	if (active_slot != NULL)
+		*active_slot = UMBRA_ACTIVE_SLOT_INVALID;
+	if (reln == NULL || active_slot == NULL ||
+		!um_uses_three_buckets(reln, forknum))
+		return false;
+
+	*active_slot = MapGetActiveSlot(um_get_filectx(reln), reln->smgr_rlocator,
+								logical_block);
+	return true;
 }
 
 static BlockNumber

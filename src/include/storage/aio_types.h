@@ -65,6 +65,7 @@ typedef union PgAioTargetData
 		RelFileLocator rlocator;	/* physical relation identifier */
 		BlockNumber blockNum;	/* blknum relative to begin of reln */
 		BlockNumber nblocks;
+		uint8		umbraActiveSlot;	/* slot resolved for an Umbra AIO read */
 		ForkNumber	forkNum:8;	/* don't waste 4 byte for four values */
 		bool		is_temp:1;	/* proc can be inferred by owning AIO */
 		bool		skip_fsync:1;

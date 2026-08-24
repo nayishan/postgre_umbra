@@ -23,6 +23,7 @@
 
 /* Every logical page owns three physical slots. */
 #define UMBRA_ACTIVE_SLOT_COUNT 3U
+#define UMBRA_ACTIVE_SLOT_INVALID UINT8_MAX
 
 static inline bool
 UmbraActiveSlotIsValid(uint8 active_slot)
@@ -112,5 +113,7 @@ extern void uminvalidatedatabasecache(Oid dbid);
 extern void uminvalidatedatabasetablespacecache(Oid dbid, Oid spcOid);
 extern int	umfd(SMgrRelation reln, ForkNumber forknum,
 				 BlockNumber blocknum, uint32 *off);
+extern bool UmGetActiveSlot(SMgrRelation reln, ForkNumber forknum,
+					 BlockNumber logical_block, uint8 *active_slot);
 
 #endif							/* UMBRA_H */
