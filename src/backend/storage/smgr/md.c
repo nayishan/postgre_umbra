@@ -1588,24 +1588,6 @@ register_forget_request(RelFileLocatorBackend rlocator, ForkNumber forknum,
 }
 
 /*
- * ForgetDatabaseSyncRequests -- forget any fsyncs and unlinks for a DB
- */
-void
-ForgetDatabaseSyncRequests(Oid dbid)
-{
-	FileTag		tag;
-	RelFileLocator rlocator;
-
-	rlocator.dbOid = dbid;
-	rlocator.spcOid = 0;
-	rlocator.relNumber = 0;
-
-	INIT_MD_FILETAG(tag, rlocator, InvalidForkNumber, InvalidBlockNumber);
-
-	RegisterSyncRequest(&tag, SYNC_FILTER_REQUEST, true /* retryOnError */ );
-}
-
-/*
  * DropRelationFiles -- drop files of all given relations
  */
 void

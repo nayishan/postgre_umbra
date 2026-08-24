@@ -33,8 +33,12 @@ The files in this directory, and their contents, are
 		an interface to the kernel's filesystem operations.
 
     umbra.c	The experimental Umbra storage manager, which is built only
-		when configured with --with-umbra or -Dumbra=true.  It
-		initially forwards ordinary relation operations to md.c.
+		when configured with --with-umbra or -Dumbra=true.  It owns
+		the smgr callback implementation and relation-private state.
+
+    umfile.c	Umbra's private md-style physical segment file layer.  It
+		uses ordinary relation fork paths in this patch, while keeping
+		open segment descriptors below Umbra's implementation boundary.
 
 Note that md.c in turn relies on src/backend/storage/file/fd.c.
 

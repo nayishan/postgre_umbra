@@ -29,6 +29,9 @@
 #include "storage/fd.h"
 #include "storage/latch.h"
 #include "storage/md.h"
+#ifdef USE_UMBRA
+#include "storage/umfile.h"
+#endif
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/wait_event.h"
@@ -100,6 +103,14 @@ static const SyncOps syncsw[] = {
 		.sync_unlinkfiletag = mdunlinkfiletag,
 		.sync_filetagmatches = mdfiletagmatches
 	},
+#ifdef USE_UMBRA
+	/* Umbra physical segment files */
+	[SYNC_HANDLER_UMFILE] = {
+		.sync_syncfiletag = umfilesyncfiletag,
+		.sync_unlinkfiletag = umfileunlinkfiletag,
+		.sync_filetagmatches = umfilefiletagmatches
+	},
+#endif
 	/* pg_xact */
 	[SYNC_HANDLER_CLOG] = {
 		.sync_syncfiletag = clogsyncfiletag
@@ -156,6 +167,33 @@ InitSync(void)
 								 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 		pendingUnlinks = NIL;
 	}
+}
+
+/*
+ * ForgetDatabaseSyncRequests -- forget any fsyncs and unlinks for a DB
+ */
+void
+ForgetDatabaseSyncRequests(Oid dbid)
+{
+	FileTag		tag;
+	RelFileLocator rlocator;
+
+	rlocator.dbOid = dbid;
+	rlocator.spcOid = 0;
+	rlocator.relNumber = 0;
+
+	memset(&tag, 0, sizeof(FileTag));
+	tag.rlocator = rlocator;
+	tag.forknum = InvalidForkNumber;
+	tag.segno = InvalidBlockNumber;
+
+#ifdef USE_UMBRA
+	tag.handler = SYNC_HANDLER_UMFILE;
+#else
+	tag.handler = SYNC_HANDLER_MD;
+#endif
+
+	RegisterSyncRequest(&tag, SYNC_FILTER_REQUEST, true /* retryOnError */ );
 }
 
 /*

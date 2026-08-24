@@ -3323,6 +3323,10 @@ ULONG
 ULONG_PTR
 UV
 UVersionInfo
+UmFilePathStr
+UmbraFileContext
+UmbraSmgrRelationState
+UmfdVec
 UnicodeNormalizationForm
 UnicodeNormalizationQC
 Unique

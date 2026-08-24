@@ -9,5 +9,6 @@ backend_sources += files(
 if get_option('umbra')
   backend_sources += files(
     'umbra.c',
+    'umfile.c',
   )
 endif
