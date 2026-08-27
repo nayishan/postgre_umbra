@@ -819,6 +819,14 @@
   check_hook => 'check_default_with_oids',
 },
 
+{ name => 'double_write', type => 'bool', context => 'PGC_POSTMASTER', group => 'WAL_SETTINGS',
+  short_desc => 'Writes full pages to a double-write area before data files.',
+  long_desc => 'Before an ordinary relation page write reaches its destination, the server stores and synchronizes a full copy in pg_doublewrite. This allows startup recovery to repair a torn destination page.',
+  variable => 'enableDoubleWrite',
+  boot_val => 'false',
+  check_hook => 'check_double_write',
+},
+
 { name => 'dynamic_library_path', type => 'string', context => 'PGC_SUSET', group => 'CLIENT_CONN_OTHER',
   short_desc => 'Sets the path for dynamically loadable modules.',
   long_desc => 'If a dynamically loadable module needs to be opened and the specified name does not have a directory component (i.e., the name does not contain a slash), the system will search this path for the specified file.',
@@ -1113,6 +1121,7 @@
   long_desc => 'The server will use the fsync() system call in several places to make sure that updates are physically written to disk. This ensures that a database cluster will recover to a consistent state after an operating system or hardware crash.',
   variable => 'enableFsync',
   boot_val => 'true',
+  check_hook => 'check_fsync_for_double_write',
 },
 
 { name => 'full_page_writes', type => 'bool', context => 'PGC_SIGHUP', group => 'WAL_SETTINGS',

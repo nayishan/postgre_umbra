@@ -86,6 +86,7 @@
 #include "replication/walreceiver.h"
 #include "replication/walsender.h"
 #include "storage/bufmgr.h"
+#include "storage/doublewrite.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/large_object.h"
@@ -6118,6 +6119,9 @@ StartupXLOG(void)
 	RedoRecPtr = XLogCtl->RedoRecPtr = XLogCtl->Insert.RedoRecPtr = checkPoint.redo;
 	doPageWrites = lastFullPageWrites;
 
+	/* Restore durable shadow copies before WAL redo can inspect data pages. */
+	DoubleWriteStartup();
+
 	/* REDO */
 	if (InRecovery)
 	{
@@ -7435,6 +7439,7 @@ CreateCheckPoint(int flags)
 	 * smgr must not do anything that'd have to be undone if we decide no
 	 * checkpoint is needed.
 	 */
+	DoubleWriteCheckpointBegin();
 	SyncPreCheckpoint();
 
 	/* Run these points outside the critical section. */
@@ -7833,6 +7838,7 @@ CreateCheckPoint(int flags)
 	 * Let smgr do post-checkpoint cleanup (eg, deleting old files).
 	 */
 	SyncPostCheckpoint();
+	DoubleWriteCheckpointComplete(shutdown);
 
 	/*
 	 * Update the average distance between checkpoints if the prior checkpoint

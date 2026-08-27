@@ -189,6 +189,13 @@ foreach my $filename (
 	close $file;
 }
 
+# The double-write area is transient and must remain empty in a backup.
+if (!-d "$pgdata/pg_doublewrite" && !mkdir "$pgdata/pg_doublewrite")
+{
+	BAIL_OUT("unable to create pg_doublewrite");
+}
+append_to_file("$pgdata/pg_doublewrite/dw.1", "DONOTCOPY");
+
 # Test that macOS system files are skipped. Only test on non-macOS systems
 # however since creating incorrect .DS_Store files on a macOS system may have
 # unintended side effects.
@@ -255,7 +262,7 @@ is_deeply(
 
 # Contents of these directories should not be copied.
 foreach my $dirname (
-	qw(pg_dynshmem pg_notify pg_replslot pg_serial pg_snapshots pg_stat_tmp pg_subtrans)
+	qw(pg_doublewrite pg_dynshmem pg_notify pg_replslot pg_serial pg_snapshots pg_stat_tmp pg_subtrans)
   )
 {
 	is_deeply(
@@ -263,6 +270,10 @@ foreach my $dirname (
 		[ sort qw(. ..) ],
 		"contents of $dirname/ not copied");
 }
+
+# Leave the source cluster in a clean state for the restart-based tests below.
+unlink "$pgdata/pg_doublewrite/dw.1"
+	or BAIL_OUT("unable to remove pg_doublewrite test file");
 
 # These files should not be copied.
 foreach my $filename (

@@ -68,6 +68,7 @@
 #include "miscadmin.h"
 #include "storage/aio.h"
 #include "storage/bufmgr.h"
+#include "storage/doublewrite.h"
 #include "storage/ipc.h"
 #include "storage/md.h"
 #include "storage/smgr.h"
@@ -620,20 +621,44 @@ void
 smgrextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		   const void *buffer, bool skipFsync)
 {
-	HOLD_INTERRUPTS();
+	bool		double_write_locked = false;
+	const void *buffers[1] = {buffer};
 
-	smgrsw[reln->smgr_which].smgr_extend(reln, forknum, blocknum,
+	HOLD_INTERRUPTS();
+	PG_TRY();
+	{
+		double_write_locked = DoubleWriteBeginWrite(reln, forknum, blocknum,
+												 buffers, 1);
+		if (double_write_locked)
+			skipFsync = false;
+
+		smgrsw[reln->smgr_which].smgr_extend(reln, forknum, blocknum,
 										 buffer, skipFsync);
 
-	/*
-	 * Normally we expect this to increase nblocks by one, but if the cached
-	 * value isn't as expected, just invalidate it so the next call asks the
-	 * kernel.
-	 */
-	if (reln->smgr_cached_nblocks[forknum] == blocknum)
-		reln->smgr_cached_nblocks[forknum] = blocknum + 1;
-	else
-		reln->smgr_cached_nblocks[forknum] = InvalidBlockNumber;
+		/*
+		 * Normally we expect this to increase nblocks by one, but if the cached
+		 * value isn't as expected, just invalidate it so the next call asks the
+		 * kernel.
+		 */
+		if (reln->smgr_cached_nblocks[forknum] == blocknum)
+			reln->smgr_cached_nblocks[forknum] = blocknum + 1;
+		else
+			reln->smgr_cached_nblocks[forknum] = InvalidBlockNumber;
+
+		if (double_write_locked)
+		{
+			DoubleWriteEndWrite();
+			double_write_locked = false;
+		}
+	}
+	PG_CATCH();
+	{
+		if (double_write_locked)
+			DoubleWriteEndWrite();
+		RESUME_INTERRUPTS();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	RESUME_INTERRUPTS();
 }
@@ -791,9 +816,33 @@ void
 smgrwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		   const void **buffers, BlockNumber nblocks, bool skipFsync)
 {
+	bool		double_write_locked = false;
+
 	HOLD_INTERRUPTS();
-	smgrsw[reln->smgr_which].smgr_writev(reln, forknum, blocknum,
+	PG_TRY();
+	{
+		double_write_locked = DoubleWriteBeginWrite(reln, forknum, blocknum,
+												 buffers, nblocks);
+		if (double_write_locked)
+			skipFsync = false;
+
+		smgrsw[reln->smgr_which].smgr_writev(reln, forknum, blocknum,
 										 buffers, nblocks, skipFsync);
+
+		if (double_write_locked)
+		{
+			DoubleWriteEndWrite();
+			double_write_locked = false;
+		}
+	}
+	PG_CATCH();
+	{
+		if (double_write_locked)
+			DoubleWriteEndWrite();
+		RESUME_INTERRUPTS();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 	RESUME_INTERRUPTS();
 }
 

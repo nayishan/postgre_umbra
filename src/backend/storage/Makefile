@@ -11,6 +11,7 @@ include $(top_builddir)/src/Makefile.global
 SUBDIRS = \
 	aio \
 	buffer \
+	doublewrite \
 	file \
 	freespace \
 	ipc \

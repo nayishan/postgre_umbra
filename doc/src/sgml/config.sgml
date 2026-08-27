@@ -3367,6 +3367,29 @@ include_dir 'conf.d'
       </listitem>
      </varlistentry>
 
+     <varlistentry id="guc-double-write" xreflabel="double_write">
+      <term><varname>double_write</varname> (<type>boolean</type>)
+      <indexterm>
+       <primary><varname>double_write</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        When this parameter is on, the server writes a complete copy of each
+        ordinarily written relation page to <filename>pg_doublewrite</filename>
+        and synchronizes that copy before writing the destination page. At
+        startup, a valid copy can repair a destination page with a bad
+        checksum or an older LSN.
+       </para>
+       <para>
+        This parameter requires <xref linkend="guc-fsync"/> and can only be
+        set at server start. The implementation covers ordinary
+        storage-manager page writes; writes that bypass that path are not
+        protected by this setting.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="guc-synchronous-commit" xreflabel="synchronous_commit">
       <term><varname>synchronous_commit</varname> (<type>enum</type>)
       <indexterm>
